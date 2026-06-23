@@ -100,7 +100,8 @@ class TestStreamOffset:
     def test_to_consume_arguments_timestamp(self) -> None:
         dt = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
         args = StreamOffset.timestamp(dt).to_consume_arguments()
-        assert args == {"x-stream-offset": dt}
+        # RabbitMQ expects a Unix timestamp in seconds (int), not a datetime.
+        assert args == {"x-stream-offset": int(dt.timestamp())}
 
     def test_repr_no_value(self) -> None:
         assert repr(StreamOffset.first()) == "StreamOffset(first)"

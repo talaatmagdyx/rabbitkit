@@ -77,6 +77,21 @@ class DIResolver:
     Constraint: At most one body-bound parameter per handler.
     """
 
+    def __init__(self) -> None:
+        # Per-handler cache of (signature, type-hints). Reflection — especially
+        # typing.get_type_hints() — is expensive and STATIC per handler, so it is
+        # computed once and reused on the per-message hot path.
+        self._sig_hints_cache: dict[Any, tuple[inspect.Signature, dict[str, Any]]] = {}
+
+    def _sig_and_hints(
+        self, handler: Callable[..., Any]
+    ) -> tuple[inspect.Signature, dict[str, Any]]:
+        cached = self._sig_hints_cache.get(handler)
+        if cached is None:
+            cached = (inspect.signature(handler), self._get_type_hints(handler))
+            self._sig_hints_cache[handler] = cached
+        return cached
+
     def _get_type_hints(self, handler: Callable[..., Any]) -> dict[str, Any]:
         """Get resolved type hints for handler, handling `from __future__ import annotations`.
 
@@ -131,8 +146,7 @@ class DIResolver:
         - *args or **kwargs
         - Multiple body-like parameters
         """
-        sig = inspect.signature(handler)
-        hints = self._get_type_hints(handler)
+        sig, hints = self._sig_and_hints(handler)
         body_params: list[str] = []
 
         for param_name, param in sig.parameters.items():
@@ -176,8 +190,7 @@ class DIResolver:
         scope: DependencyScope | None = None,
     ) -> dict[str, Any]:
         """Resolve all handler parameters at message processing time."""
-        sig = inspect.signature(handler)
-        hints = self._get_type_hints(handler)
+        sig, hints = self._sig_and_hints(handler)
         kwargs: dict[str, Any] = {}
         depends_cache: dict[int, Any] = {}
         body_injected = False
@@ -218,8 +231,7 @@ class DIResolver:
         scope: DependencyScope | None = None,
     ) -> dict[str, Any]:
         """Resolve all handler parameters, supporting async generator dependencies."""
-        sig = inspect.signature(handler)
-        hints = self._get_type_hints(handler)
+        sig, hints = self._sig_and_hints(handler)
         kwargs: dict[str, Any] = {}
         depends_cache: dict[int, Any] = {}
         body_injected = False

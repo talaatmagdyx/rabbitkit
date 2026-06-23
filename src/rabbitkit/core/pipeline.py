@@ -50,6 +50,9 @@ class HandlerPipeline:
         self._serializer = serializer
         self._di_resolver = di_resolver
         self._context_repo = context_repo
+        # Per-handler cache of the body parameter type (static per route) so the
+        # hot path avoids inspect.signature() on every message.
+        self._body_type_cache: dict[Any, type | None] = {}
 
     def process_sync(
         self,
@@ -315,10 +318,16 @@ class HandlerPipeline:
         return message.body
 
     def _get_body_type(self, route: RouteDefinition) -> type | None:
-        """Get the body parameter type from handler signature.
+        """Get the body parameter type from the handler signature (cached per handler)."""
+        handler = route.handler
+        if handler in self._body_type_cache:
+            return self._body_type_cache[handler]
+        body_type = self._compute_body_type(route)
+        self._body_type_cache[handler] = body_type
+        return body_type
 
-        Returns None if no body parameter or if type is bytes.
-        """
+    def _compute_body_type(self, route: RouteDefinition) -> type | None:
+        """Resolve the body parameter type. Returns None if none or if it is bytes."""
         import inspect
 
         sig = inspect.signature(route.handler)

@@ -382,6 +382,27 @@ class SyncTransport:
         if self._channel and self._channel.is_open:
             self._channel.stop_consuming()
 
+    # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
+
+    def basic_get(self, queue: str) -> RabbitMessage | None:
+        """Get a single message without subscribing (auto_ack=False).
+
+        Used by DLQInspector for peek/replay. Returns None if the queue is empty.
+        """
+        self._ensure_connected()
+        method, properties, body = self._run_on_io_thread(
+            lambda: self._channel.basic_get(queue=queue, auto_ack=False)
+        )
+        if method is None:
+            return None
+        return self._build_message(method, properties, body)
+
+    def purge_queue(self, queue: str) -> int:
+        """Purge all messages from a queue. Returns the number of messages purged."""
+        self._ensure_connected()
+        frame = self._run_on_io_thread(lambda: self._channel.queue_purge(queue=queue))
+        return int(frame.method.message_count)
+
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _build_message(self, method: Any, properties: Any, body: bytes) -> RabbitMessage:
@@ -400,7 +421,7 @@ class SyncTransport:
             exchange=method.exchange,
             delivery_tag=method.delivery_tag,
             redelivered=method.redelivered,
-            consumer_tag=method.consumer_tag,
+            consumer_tag=getattr(method, "consumer_tag", None),  # absent on basic_get (Basic.GetOk)
         )
 
         # Wire sync settlement functions

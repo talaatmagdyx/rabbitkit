@@ -310,6 +310,29 @@ class AsyncTransportImpl:
                         del self._consumer_channels[queue_name]
                 break
 
+    # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
+
+    async def basic_get(self, queue: str) -> RabbitMessage | None:
+        """Get a single message without subscribing.
+
+        Used by DLQInspector for peek/replay. Returns None if the queue is empty.
+        """
+        await self._ensure_connected()
+        assert self._topology_channel is not None
+        q = await self._topology_channel.get_queue(queue, ensure=False)
+        aio_msg = await q.get(fail=False, no_ack=False)
+        if aio_msg is None:
+            return None
+        return self._build_message(aio_msg)
+
+    async def purge_queue(self, queue: str) -> int:
+        """Purge all messages from a queue. Returns the number of messages purged."""
+        await self._ensure_connected()
+        assert self._topology_channel is not None
+        q = await self._topology_channel.get_queue(queue, ensure=False)
+        result = await q.purge()
+        return int(getattr(result, "message_count", 0))
+
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _build_message(self, aio_message: Any) -> RabbitMessage:

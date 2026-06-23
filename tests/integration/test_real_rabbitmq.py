@@ -743,3 +743,50 @@ def test_sync_error_handling(rabbitmq_url: str) -> None:
     # the pipeline will have settled the message after the raise.
     # At minimum the handler was called.
     assert len(dispositions) >= 0  # handler was invoked
+
+
+def test_dlq_inspector_sync_real_transport(rabbitmq_url: str) -> None:
+    """DLQInspector.peek/purge work against the REAL sync transport (basic_get/purge_queue)."""
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.dlq import DLQInspector
+    from rabbitkit.sync.broker import SyncBroker
+
+    broker = SyncBroker(config=_make_sync_config(rabbitmq_url))
+    broker.start()
+    q = "dlq-inspect-sync"
+    assert broker._transport is not None
+    broker._transport.declare_queue(RabbitQueue(name=q, durable=True))
+    for i in range(3):
+        broker.publish(MessageEnvelope(routing_key=q, body=f"m{i}".encode()))
+
+    inspector = DLQInspector(broker._transport)
+    msgs = inspector.peek(q, limit=3)          # basic_get x3 + requeue
+    purged = inspector.purge(q)                # purge_queue
+    broker.stop()
+
+    assert len(msgs) == 3
+    assert purged == 3
+
+
+async def test_dlq_inspector_async_real_transport(rabbitmq_url: str) -> None:
+    """DLQInspector.peek_async/purge_async work against the REAL async transport."""
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.dlq import DLQInspector
+
+    broker = AsyncBroker(_make_async_config(rabbitmq_url))
+    await broker.start()
+    q = "dlq-inspect-async"
+    await broker._transport.declare_queue(RabbitQueue(name=q, durable=True))
+    for i in range(3):
+        await broker.publish(MessageEnvelope(routing_key=q, body=f"m{i}".encode()))
+
+    inspector = DLQInspector(broker._transport)
+    msgs = await inspector.peek_async(q, limit=3)
+    purged = await inspector.purge_async(q)
+    await broker.stop()
+
+    assert len(msgs) == 3
+    assert purged == 3

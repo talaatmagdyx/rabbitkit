@@ -146,11 +146,19 @@ class ConsumerConfig:
 
 @dataclass(frozen=True, slots=True)
 class PoolConfig:
-    """Connection and channel pool sizing."""
+    """Connection and channel pool sizing.
+
+    ``channel_pool_size`` (publisher channel pool) and ``channel_acquire_timeout``
+    are active. ``publisher_connections`` / ``consumer_connections`` are
+    **reserved**: the transport currently uses one connection per role, because
+    multiple connections sharing a single event loop showed no throughput benefit
+    in benchmarks (the loop is the bound). Scale throughput by running more
+    processes/pods, not more connections per process.
+    """
 
     channel_pool_size: int = 10
-    publisher_connections: int = 1
-    consumer_connections: int = 1
+    publisher_connections: int = 1   # reserved — see class docstring
+    consumer_connections: int = 1    # reserved — see class docstring
     channel_acquire_timeout: float = 10.0  # seconds to wait for a pooled channel
 
 

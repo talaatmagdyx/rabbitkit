@@ -56,12 +56,15 @@ for logging / classification.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Any
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+
+logger = logging.getLogger(__name__)
 
 
 class HandlerTimeoutError(TimeoutError):
@@ -117,6 +120,14 @@ class TimeoutMiddleware(BaseMiddleware):
         thread.join(timeout=self._config.timeout_seconds)
 
         if thread.is_alive():
+            # CPython cannot safely kill a thread — the handler keeps running
+            # detached. Warn so this is visible (a slow handler can pile up
+            # abandoned threads). For true cancellation, use an async handler.
+            logger.warning(
+                "Sync handler exceeded %.1fs timeout; thread abandoned (still running). "
+                "Use an async handler for real cancellation.",
+                self._config.timeout_seconds,
+            )
             raise HandlerTimeoutError(self._config.timeout_seconds)
 
         if exception_holder:

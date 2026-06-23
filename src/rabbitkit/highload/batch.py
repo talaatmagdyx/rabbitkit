@@ -37,6 +37,13 @@ class BatchPublisher:
     ``max_in_flight`` is reserved for future async-confirm support and has
     no runtime effect in the current synchronous-confirm model.
 
+    NOTE (throughput): this is a *buffering/timing* helper, not wire-level
+    batching. ``flush`` publishes each buffered envelope via ``publish_fn``, so
+    if ``publish_fn`` awaits a confirm per message the confirms do not pipeline —
+    you get ergonomics, not extra throughput. For high-volume confirmed
+    publishing, pipeline confirms yourself (publish many, then await) or use the
+    transactional outbox; for safety-critical events, always use the outbox.
+
     Usage::
 
         bp = BatchPublisher(

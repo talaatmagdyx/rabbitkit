@@ -508,3 +508,30 @@ class TestRetryEnvelopeNoOriginalQueue:
         envelope = mw._build_retry_envelope(msg, retry_count=0)
 
         assert envelope.headers.get("x-rabbitkit-original-queue") == ""
+
+
+class TestRetryPredicates:
+    def test_predicate_overrides_type_classification(self) -> None:
+        """A predicate can make a normally-PERMANENT error retry as transient."""
+        published: list[MessageEnvelope] = []
+
+        def capture(env: MessageEnvelope) -> PublishOutcome:
+            published.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        # ValueError is normally PERMANENT; the predicate marks it transient.
+        mw = RetryMiddleware(
+            config, publish_fn=capture,
+            predicates=[lambda exc: isinstance(exc, ValueError)],
+        )
+        msg = _make_message()
+
+        def handler(m: RabbitMessage) -> None:
+            raise ValueError("normally permanent, but predicate says retry")
+
+        mw.consume_scope(handler, msg)
+
+        assert len(published) == 1                         # routed to a delay queue
+        assert ".retry." in published[0].routing_key
+        assert msg._disposition == "acked"                # source acked, not DLQ'd

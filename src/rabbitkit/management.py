@@ -187,6 +187,7 @@ class RabbitManagementClient:
                 headers=headers,
                 data=body,
                 timeout=aiohttp.ClientTimeout(total=self._config.timeout),
+                raise_for_status=True,   # match the sync path: raise on non-2xx, don't return error JSON
             ) as resp:
                 if resp.status == 204:
                     return None

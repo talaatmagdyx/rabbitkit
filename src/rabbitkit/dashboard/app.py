@@ -71,6 +71,7 @@ Health status values
 
 from __future__ import annotations
 
+from html import escape
 from typing import Any
 
 
@@ -81,6 +82,10 @@ def create_dashboard_app(
     metrics_collector: Any | None = None,
 ) -> Any:
     """Create an ASGI dashboard application.
+
+    SECURITY: this app has NO authentication and exposes broker topology
+    (queue/exchange names, consumer counts). Mount it behind authn (OIDC/reverse
+    proxy) and restrict it to an internal network — never expose it publicly.
 
     Args:
         broker: A rabbitkit broker instance (SyncBroker or AsyncBroker).
@@ -125,7 +130,11 @@ th {{ background: #f5f5f5; }}
 <table><tr><th>Name</th><th>Queue</th><th>Exchange</th><th>Ack Policy</th></tr>"""
         for r in broker.routes:
             exchange = r.exchange.name if r.exchange else ""
-            html += f"<tr><td>{r.name}</td><td>{r.queue.name}</td><td>{exchange}</td><td>{r.ack_policy.value}</td></tr>"
+            # escape() — queue/exchange/route names render into HTML; never trust them raw
+            html += (
+                f"<tr><td>{escape(r.name)}</td><td>{escape(r.queue.name)}</td>"
+                f"<td>{escape(exchange)}</td><td>{escape(r.ack_policy.value)}</td></tr>"
+            )
         html += "</table></body></html>"
         return HTMLResponse(html)
 

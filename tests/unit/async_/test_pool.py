@@ -25,6 +25,20 @@ class TestAsyncChannelPool:
         ch = await pool.acquire()
         assert ch is mock_channel
         assert pool.created_count == 1
+        mock_conn.channel.assert_called_once_with(publisher_confirms=True)  # default: confirms ON
+
+    @pytest.mark.asyncio
+    async def test_publisher_confirms_threaded_to_channel(self) -> None:
+        """confirm_delivery=False reaches the channel as publisher_confirms=False."""
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5, publisher_confirms=False)
+        await pool.acquire()
+
+        mock_conn.channel.assert_called_once_with(publisher_confirms=False)
 
     @pytest.mark.asyncio
     async def test_release_returns_to_pool(self) -> None:

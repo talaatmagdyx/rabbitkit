@@ -46,6 +46,21 @@ class TestDashboard:
         assert resp.status_code == 200
         assert "rabbitkit Dashboard" in resp.text
 
+    def test_route_names_are_html_escaped(self):
+        """Regression: a queue/route name with HTML must not inject markup (XSS)."""
+        from rabbitkit.dashboard import create_dashboard_app
+        route = MagicMock()
+        route.name = "<script>alert(1)</script>"
+        route.queue = RabbitQueue(name="<img src=x onerror=alert(2)>")
+        route.exchange = None
+        route.ack_policy = AckPolicy.AUTO
+        broker = _make_mock_broker(routes=[route])
+        client = TestClient(create_dashboard_app(broker))
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "<script>alert(1)</script>" not in resp.text     # raw markup not present
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in resp.text  # escaped instead
+
     def test_api_health(self):
         from rabbitkit.dashboard import create_dashboard_app
         broker = _make_mock_broker()

@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from rabbitkit.async_.pool import AsyncConnectionPool
@@ -128,22 +127,21 @@ class AsyncTransportImpl:
             return
         await self.connect()
 
-    @asynccontextmanager
-    async def _publisher_channel(self) -> AsyncIterator[Any]:
-        """Context manager that acquires/releases a channel from the publisher pool."""
-        await self._ensure_connected()
-        channel = await self._conn_pool.acquire_publisher_channel()
-        try:
-            yield channel
-        finally:
-            await self._conn_pool.release_publisher_channel(channel)
-
     async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
-        """Publish a message using a channel from the publisher pool."""
+        """Publish a message using a channel from the publisher pool.
+
+        Hot path: inlined channel acquire/release (no @asynccontextmanager) and a
+        synchronous connected-check, to cut per-publish coroutine overhead. Same
+        acquire -> publish -> release -> confirm semantics.
+        """
         try:
             import aio_pika
 
-            async with self._publisher_channel() as channel:
+            if not self._connected:
+                await self._ensure_connected()
+
+            channel = await self._conn_pool.acquire_publisher_channel()
+            try:
                 message = aio_pika.Message(
                     body=envelope.body,
                     message_id=envelope.message_id,
@@ -170,6 +168,8 @@ class AsyncTransportImpl:
                     routing_key=envelope.routing_key,
                     mandatory=envelope.mandatory,
                 )
+            finally:
+                await self._conn_pool.release_publisher_channel(channel)
 
             return PublishOutcome(
                 status=PublishStatus.CONFIRMED,

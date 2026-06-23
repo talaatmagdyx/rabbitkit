@@ -156,7 +156,7 @@ class TestLockMiddleware:
 
         assert result == "result"
         handler.assert_called_once_with(msg)
-        lock.acquire.assert_called_once_with("test.key", 10.0)
+        lock.acquire.assert_called_once_with("test.key", 0.0)  # non-blocking default
         lock.release.assert_called_once_with("test.key")
 
     def test_acquire_fail_nacks_with_requeue(self) -> None:
@@ -211,7 +211,7 @@ class TestLockMiddleware:
 
         mw.consume_scope(handler, msg)
 
-        lock.acquire.assert_called_once_with("custom:orders.created", 10.0)
+        lock.acquire.assert_called_once_with("custom:orders.created", 0.0)
         lock.release.assert_called_once_with("custom:orders.created")
 
     def test_custom_timeout(self) -> None:
@@ -239,7 +239,7 @@ class TestLockMiddleware:
 
         assert result == "async-result"
         handler.assert_awaited_once_with(msg)
-        lock.acquire_async.assert_awaited_once_with("test.key", 10.0)
+        lock.acquire_async.assert_awaited_once_with("test.key", 0.0)
         lock.release_async.assert_awaited_once_with("test.key")
 
     @pytest.mark.asyncio
@@ -279,3 +279,46 @@ class TestDistributedLockProtocol:
         redis = MagicMock()
         lock = RedisLock(redis)
         assert isinstance(lock, DistributedLock)
+
+
+class TestRedisLockTimeout:
+    def test_timeout_zero_is_single_non_blocking_attempt(self) -> None:
+        redis = MagicMock()
+        redis.set.return_value = False  # always locked
+        lock = RedisLock(redis)
+
+        assert lock.acquire("k", timeout=0) is False
+        assert redis.set.call_count == 1  # did NOT poll
+
+    def test_positive_timeout_polls_then_gives_up(self) -> None:
+        import time
+
+        redis = MagicMock()
+        redis.set.return_value = False  # never acquirable
+        lock = RedisLock(redis)
+
+        start = time.monotonic()
+        assert lock.acquire("k", timeout=0.15) is False
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= 0.15  # waited up to the timeout
+        assert redis.set.call_count >= 2  # polled more than once
+
+    def test_concurrent_acquire_distinct_keys_is_thread_safe(self) -> None:
+        import threading
+
+        redis = MagicMock()
+        redis.set.return_value = True  # every distinct key acquires
+        lock = RedisLock(redis)
+
+        def worker(i: int) -> None:
+            assert lock.acquire(f"key-{i}", timeout=0) is True
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # _lock_values guarded by a lock — all 50 keys recorded, no lost writes.
+        assert len(lock._lock_values) == 50

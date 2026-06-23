@@ -122,7 +122,7 @@ class TestConsumeScopeSync:
 
     def test_consume_scope_nack_when_limited(self) -> None:
         """on_limited='nack' nacks message with requeue=True."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="nack")
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="nack")
         mw = RateLimitMiddleware(cfg)
 
         # First message consumes the token
@@ -141,7 +141,7 @@ class TestConsumeScopeSync:
 
     def test_consume_scope_drop_when_limited(self) -> None:
         """on_limited='drop' nacks with requeue=False."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="drop")
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="drop")
         mw = RateLimitMiddleware(cfg)
 
         # First message consumes the token
@@ -182,7 +182,7 @@ class TestConsumeScopeSync:
 
     def test_consume_scope_nack_skips_settled(self) -> None:
         """on_limited='nack' does not nack already-settled messages."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="nack")
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="nack")
         mw = RateLimitMiddleware(cfg)
 
         # Exhaust the bucket
@@ -222,7 +222,7 @@ class TestConsumeScopeAsync:
     @pytest.mark.asyncio
     async def test_consume_scope_async_nack(self) -> None:
         """Async variant nacks when limited."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="nack")
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="nack")
         mw = RateLimitMiddleware(cfg)
 
         # Exhaust the bucket
@@ -246,7 +246,7 @@ class TestConsumeScopeAsync:
     @pytest.mark.asyncio
     async def test_consume_scope_async_drop(self) -> None:
         """Async variant drops when limited with on_limited='drop'."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="drop")
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="drop")
         mw = RateLimitMiddleware(cfg)
 
         msg1 = _make_message()

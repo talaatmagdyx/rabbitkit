@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from rabbitkit.core.pipeline import HandlerPipeline
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.testing import TestBroker
 
@@ -76,3 +78,57 @@ def test_middleware_can_short_circuit_the_handler() -> None:
     broker.publish("q", b"{}")
 
     assert order == ["skip"]  # handler never ran
+
+
+# ── C4: route publish_scope middlewares apply to result publishing ───────────
+
+
+class _Route:
+    """Minimal stand-in: _compose_publish_* only reads route_middlewares."""
+
+    def __init__(self, middlewares: list[Any]) -> None:
+        self.route_middlewares = middlewares
+
+
+def test_compose_publish_sync_applies_route_publish_scope() -> None:
+    order: list[str] = []
+
+    class PubProbe(BaseMiddleware):
+        def publish_scope(self, call_next: Any, envelope: Any) -> Any:
+            order.append("pub:before")
+            result = call_next(envelope)
+            order.append("pub:after")
+            return result
+
+    def publish_fn(env: MessageEnvelope) -> PublishOutcome:
+        order.append("publish")
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+    pipeline = HandlerPipeline()
+    chain = pipeline._compose_publish_sync(_Route([PubProbe()]), publish_fn)
+    outcome = chain(MessageEnvelope(routing_key="x", body=b"{}"))
+
+    assert order == ["pub:before", "publish", "pub:after"]
+    assert outcome.ok
+
+
+async def test_compose_publish_async_applies_route_publish_scope() -> None:
+    order: list[str] = []
+
+    class PubProbe(BaseMiddleware):
+        async def publish_scope_async(self, call_next: Any, envelope: Any) -> Any:
+            order.append("pub:before")
+            result = await call_next(envelope)
+            order.append("pub:after")
+            return result
+
+    async def publish_fn(env: MessageEnvelope) -> PublishOutcome:
+        order.append("publish")
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+    pipeline = HandlerPipeline()
+    chain = pipeline._compose_publish_async(_Route([PubProbe()]), publish_fn)
+    outcome = await chain(MessageEnvelope(routing_key="x", body=b"{}"))
+
+    assert order == ["pub:before", "publish", "pub:after"]
+    assert outcome.ok

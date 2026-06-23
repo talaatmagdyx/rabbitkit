@@ -1,0 +1,336 @@
+"""Batch publish and multi-ack — high-throughput helpers.
+
+``BatchPublisher`` buffers outgoing envelopes and flushes them as a batch,
+optionally confirming delivery after flush.
+
+``BatchAcker`` accumulates delivery tags and issues a single
+``ack(max_tag, multiple=True)`` when the batch fills or is flushed.
+
+Both are channel-scoped — never cross channels.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+from collections.abc import Callable
+from typing import Any
+
+from rabbitkit.core.config import BatchAckConfig, BatchPublishConfig
+from rabbitkit.core.types import MessageEnvelope
+
+logger = logging.getLogger(__name__)
+
+
+# ── BatchPublisher ───────────────────────────────────────────────────────
+
+
+class BatchPublisher:
+    """Buffer outgoing envelopes and flush as a batch.
+
+    When ``flush_interval_ms > 0`` (default 50 ms), a background timer
+    fires periodically to flush any buffered envelopes even if
+    ``batch_size`` has not been reached.  The timer starts lazily on the
+    first call to ``add()`` and is cancelled by ``close()`` / ``close_async()``.
+
+    ``max_in_flight`` is reserved for future async-confirm support and has
+    no runtime effect in the current synchronous-confirm model.
+
+    Usage::
+
+        bp = BatchPublisher(
+            config=BatchPublishConfig(batch_size=50, flush_interval_ms=100),
+            publish_fn=transport.publish,
+            confirm_fn=transport.wait_for_confirms,  # optional
+        )
+        bp.add(envelope1)
+        bp.add(envelope2)
+        ...
+        bp.flush()   # publishes all buffered
+        bp.close()   # flush remaining + cancel timer
+    """
+
+    def __init__(
+        self,
+        publish_fn: Callable[[MessageEnvelope], Any],
+        config: BatchPublishConfig | None = None,
+        confirm_fn: Callable[[], Any] | None = None,
+    ) -> None:
+        self._config = config or BatchPublishConfig()
+        self._publish_fn = publish_fn
+        self._confirm_fn = confirm_fn
+        self._buffer: list[MessageEnvelope] = []
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._closed = False
+        self._flush_task: asyncio.Task[None] | None = None
+
+    @property
+    def pending(self) -> int:
+        """Number of envelopes buffered but not yet flushed."""
+        return len(self._buffer)
+
+    # ── Timer helpers ────────────────────────────────────────────────────
+
+    def _schedule_timer(self) -> None:
+        if self._config.flush_interval_ms > 0 and not self._closed:
+            interval = self._config.flush_interval_ms / 1000.0
+            self._timer = threading.Timer(interval, self._timer_callback)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _timer_callback(self) -> None:
+        self._timer = None
+        self.flush()
+        self._schedule_timer()
+
+    # ── Sync API ─────────────────────────────────────────────────────────
+
+    def add(self, envelope: MessageEnvelope) -> None:
+        """Add an envelope to the batch buffer.
+
+        Auto-flushes when ``batch_size`` is reached.  Starts the interval
+        timer on the first call when ``flush_interval_ms > 0``.
+        """
+        with self._lock:
+            self._buffer.append(envelope)
+            should_flush = len(self._buffer) >= self._config.batch_size
+            if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
+                self._schedule_timer()
+        if should_flush:
+            self.flush()
+
+    def flush(self) -> int:
+        """Publish all buffered envelopes.
+
+        Returns the number of envelopes published.
+        """
+        with self._lock:
+            if not self._buffer:
+                return 0
+            count = len(self._buffer)
+            batch = list(self._buffer)
+            self._buffer.clear()
+
+        for envelope in batch:
+            self._publish_fn(envelope)
+
+        if self._confirm_fn is not None:
+            self._confirm_fn()
+
+        logger.debug("Batch-published %d envelopes", count)
+        return count
+
+    def close(self) -> int:
+        """Flush remaining envelopes, cancel the interval timer, and clean up.
+
+        Returns the number of envelopes flushed.
+        """
+        self._closed = True
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        return self.flush()
+
+    # ── Async API ────────────────────────────────────────────────────────
+
+    async def _interval_loop_async(self) -> None:
+        interval = self._config.flush_interval_ms / 1000.0
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.flush_async()
+        except asyncio.CancelledError:
+            pass
+
+    async def add_async(self, envelope: MessageEnvelope) -> None:
+        """Async: add envelope; auto-flush at batch_size.
+
+        Starts the async interval loop on the first call when
+        ``flush_interval_ms > 0``.
+        """
+        self._buffer.append(envelope)
+        if len(self._buffer) >= self._config.batch_size:
+            await self.flush_async()
+        elif self._config.flush_interval_ms > 0 and self._flush_task is None:
+            self._flush_task = asyncio.create_task(self._interval_loop_async())
+
+    async def flush_async(self) -> int:
+        """Async: publish all buffered envelopes."""
+        if not self._buffer:
+            return 0
+
+        count = len(self._buffer)
+        batch = list(self._buffer)
+        self._buffer.clear()
+
+        for envelope in batch:
+            result = self._publish_fn(envelope)
+            if hasattr(result, "__await__"):
+                await result
+
+        if self._confirm_fn is not None:
+            result = self._confirm_fn()
+            if hasattr(result, "__await__"):
+                await result
+
+        logger.debug("Async batch-published %d envelopes", count)
+        return count
+
+    async def close_async(self) -> int:
+        """Async: cancel the interval loop, flush remaining, and clean up."""
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            self._flush_task = None
+        return await self.flush_async()
+
+
+# ── BatchAcker ───────────────────────────────────────────────────────────
+
+
+class BatchAcker:
+    """Accumulate delivery tags and ack in batches.
+
+    Uses ``multiple=True`` on the maximum delivery tag in the batch.
+
+    When ``flush_interval_ms > 0`` (default 200 ms), a background timer
+    fires periodically to ack any buffered tags even if ``batch_size`` has
+    not been reached.  The timer starts lazily on the first call to
+    ``add()`` and is cancelled by ``close()`` / ``close_async()``.
+
+    **Ownership rules:**
+    - Channel-scoped — NEVER cross channels
+    - Handlers MUST NOT call ``msg.ack()`` when BatchAcker is active
+    - Compatible with AUTO and NACK_ON_ERROR policies only
+
+    Usage::
+
+        ba = BatchAcker(
+            config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
+            ack_fn=channel.basic_ack,
+        )
+        ba.add(delivery_tag=1)
+        ba.add(delivery_tag=2)
+        ...
+        ba.flush()  # ack(max_tag, multiple=True)
+        ba.close()  # flush remaining + cancel timer
+    """
+
+    def __init__(
+        self,
+        ack_fn: Callable[..., Any],
+        config: BatchAckConfig | None = None,
+    ) -> None:
+        self._config = config or BatchAckConfig()
+        self._ack_fn = ack_fn
+        self._tags: list[int] = []
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._closed = False
+        self._flush_task: asyncio.Task[None] | None = None
+
+    @property
+    def pending(self) -> int:
+        """Number of delivery tags buffered."""
+        return len(self._tags)
+
+    # ── Timer helpers ────────────────────────────────────────────────────
+
+    def _schedule_timer(self) -> None:
+        if self._config.flush_interval_ms > 0 and not self._closed:
+            interval = self._config.flush_interval_ms / 1000.0
+            self._timer = threading.Timer(interval, self._timer_callback)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _timer_callback(self) -> None:
+        self._timer = None
+        self.flush()
+        self._schedule_timer()
+
+    # ── Sync API ─────────────────────────────────────────────────────────
+
+    def add(self, delivery_tag: int) -> None:
+        """Add a delivery tag to the batch.
+
+        Auto-flushes when ``batch_size`` is reached.  Starts the interval
+        timer on the first call when ``flush_interval_ms > 0``.
+        """
+        with self._lock:
+            self._tags.append(delivery_tag)
+            should_flush = len(self._tags) >= self._config.batch_size
+            if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
+                self._schedule_timer()
+        if should_flush:
+            self.flush()
+
+    def flush(self) -> int:
+        """Ack all buffered tags using the max tag with multiple=True.
+
+        Returns the number of tags acked.
+        """
+        with self._lock:
+            if not self._tags:
+                return 0
+            count = len(self._tags)
+            max_tag = max(self._tags)
+            self._tags.clear()
+
+        self._ack_fn(max_tag, multiple=True)
+        logger.debug("Batch-acked %d messages (max_tag=%d)", count, max_tag)
+        return count
+
+    def close(self) -> int:
+        """Flush remaining tags, cancel the interval timer, and clean up."""
+        self._closed = True
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        return self.flush()
+
+    # ── Async API ────────────────────────────────────────────────────────
+
+    async def _interval_loop_async(self) -> None:
+        interval = self._config.flush_interval_ms / 1000.0
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.flush_async()
+        except asyncio.CancelledError:
+            pass
+
+    async def add_async(self, delivery_tag: int) -> None:
+        """Async: add tag; auto-flush at batch_size.
+
+        Starts the async interval loop on the first call when
+        ``flush_interval_ms > 0``.
+        """
+        self._tags.append(delivery_tag)
+        if len(self._tags) >= self._config.batch_size:
+            await self.flush_async()
+        elif self._config.flush_interval_ms > 0 and self._flush_task is None:
+            self._flush_task = asyncio.create_task(self._interval_loop_async())
+
+    async def flush_async(self) -> int:
+        """Async: ack all buffered tags."""
+        if not self._tags:
+            return 0
+
+        count = len(self._tags)
+        max_tag = max(self._tags)
+        self._tags.clear()
+
+        result = self._ack_fn(max_tag, multiple=True)
+        if hasattr(result, "__await__"):
+            await result
+
+        logger.debug("Async batch-acked %d messages (max_tag=%d)", count, max_tag)
+        return count
+
+    async def close_async(self) -> int:
+        """Async: cancel the interval loop, flush remaining, and clean up."""
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            self._flush_task = None
+        return await self.flush_async()

@@ -774,3 +774,17 @@ class TestResolveDependsGenerators:
         resolver = DIResolver()
         with pytest.raises(ConfigurationError, match="Async generator dependency"):
             resolver._resolve_depends(marker, {})
+
+
+class TestSignatureHintsCache:
+    def test_sig_and_hints_is_cached_per_handler(self) -> None:
+        """Reflection (signature + get_type_hints) is computed once and reused."""
+
+        def handler(body: bytes) -> None: ...
+
+        resolver = DIResolver()
+        first = resolver._sig_and_hints(handler)
+        second = resolver._sig_and_hints(handler)
+
+        assert first is second  # same cached tuple, not recomputed
+        assert handler in resolver._sig_hints_cache

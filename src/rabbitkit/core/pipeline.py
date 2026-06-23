@@ -50,9 +50,9 @@ class HandlerPipeline:
         self._serializer = serializer
         self._di_resolver = di_resolver
         self._context_repo = context_repo
-        # Per-handler cache of the body parameter type (static per route) so the
-        # hot path avoids inspect.signature() on every message.
+        # Per-handler caches so the hot path avoids inspect.signature() per message.
         self._body_type_cache: dict[Any, type | None] = {}
+        self._sig_cache: dict[Any, Any] = {}  # handler -> inspect.Signature (fallback resolver)
 
     def process_sync(
         self,
@@ -361,10 +361,15 @@ class HandlerPipeline:
         if self._di_resolver is not None and hasattr(self._di_resolver, "resolve"):
             return self._di_resolver.resolve(route.handler, message, self._context_repo, body, scope=scope)  # type: ignore[no-any-return]
 
-        # Simple fallback: inject body and/or message based on signature
+        # Simple fallback: inject body and/or message based on signature.
+        # Cache the signature per handler — inspect.signature() per message is the
+        # single biggest cost in this path (profiled at ~50% of pipeline time).
         import inspect
 
-        sig = inspect.signature(route.handler)
+        sig = self._sig_cache.get(route.handler)
+        if sig is None:
+            sig = inspect.signature(route.handler)
+            self._sig_cache[route.handler] = sig
         kwargs: dict[str, Any] = {}
 
         body_injected = False

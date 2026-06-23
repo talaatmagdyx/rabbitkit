@@ -109,9 +109,10 @@ class StreamOffset:
         if self.type == StreamOffsetType.OFFSET:
             return {"x-stream-offset": self.value}
         if self.type == StreamOffsetType.TIMESTAMP:
-            assert isinstance(self.value, datetime)
-            # RabbitMQ expects Unix timestamp in seconds
-            return {"x-stream-offset": self.value}
+            if not isinstance(self.value, datetime):
+                raise TypeError("TIMESTAMP stream offset requires a datetime value")
+            # RabbitMQ x-stream-offset by time expects a Unix timestamp in seconds.
+            return {"x-stream-offset": int(self.value.timestamp())}
         return {}  # pragma: no cover
 
     def __repr__(self) -> str:

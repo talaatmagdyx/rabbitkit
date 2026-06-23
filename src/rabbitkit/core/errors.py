@@ -1,0 +1,127 @@
+"""Error classification — transport-agnostic.
+
+Transport-specific exception tuples (pika.exceptions.StreamLostError, etc.)
+live in sync/connection.py and async_/connection.py, NOT here.
+
+This module provides:
+- Generic stdlib exception tuples for classification
+- Pluggable predicate-based classification
+- Configurable unknown_policy (default=PERMANENT)
+
+See Contract 7 in the plan for evaluation order and rationale.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Sequence
+
+from rabbitkit.core.types import ClassifiedError, ErrorSeverity
+
+# Generic (stdlib) error categories — transport layers extend these
+TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionResetError,
+    BrokenPipeError,
+    ConnectionAbortedError,
+    TimeoutError,
+    EOFError,
+    OSError,
+)
+
+PERMANENT_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError,
+    KeyError,
+    ValueError,
+    TypeError,
+    UnicodeDecodeError,
+    AttributeError,
+)
+
+# Type alias for error predicates
+ErrorPredicate = Callable[[BaseException], bool | None]
+
+
+def classify_error(
+    exc: BaseException,
+    *,
+    predicates: Sequence[ErrorPredicate] = (),
+    transient: tuple[type[BaseException], ...] = TRANSIENT_ERRORS,
+    permanent: tuple[type[BaseException], ...] = PERMANENT_ERRORS,
+    unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT,
+) -> ClassifiedError:
+    """Classify exception severity.
+
+    Evaluation order:
+    1. User predicates (first non-None wins)
+    2. transient tuple (isinstance check)
+    3. permanent tuple (isinstance check)
+    4. unknown_policy (configurable, default=PERMANENT)
+
+    DEFAULT IS PERMANENT, NOT TRANSIENT.
+    Reason: unknown errors include malformed payloads, business validation
+    failures, handler bugs, and schema mismatches. Treating these as
+    transient creates retry storms. Network/connection errors are already
+    in the transient tuple.
+
+    Override per-route: RetryMiddleware accepts unknown_policy to change
+    per route.
+
+    Args:
+        exc: The exception to classify.
+        predicates: User-provided classification functions.
+            Return True=transient, False=permanent, None=no opinion.
+        transient: Exception types considered transient.
+        permanent: Exception types considered permanent.
+        unknown_policy: Severity for unclassified exceptions.
+
+    Returns:
+        ClassifiedError with severity, original exception, and reason.
+    """
+    # 1. User predicates (first non-None wins)
+    for predicate in predicates:
+        result = predicate(exc)
+        if result is True:
+            return ClassifiedError(
+                severity=ErrorSeverity.TRANSIENT,
+                original=exc,
+                reason=f"predicate classified as transient: {type(exc).__name__}",
+            )
+        if result is False:
+            return ClassifiedError(
+                severity=ErrorSeverity.PERMANENT,
+                original=exc,
+                reason=f"predicate classified as permanent: {type(exc).__name__}",
+            )
+
+    # 2. Transient tuple (isinstance check)
+    if isinstance(exc, transient):
+        return ClassifiedError(
+            severity=ErrorSeverity.TRANSIENT,
+            original=exc,
+            reason=f"transient error: {type(exc).__name__}",
+        )
+
+    # 3. Permanent tuple (isinstance check)
+    if isinstance(exc, permanent):
+        return ClassifiedError(
+            severity=ErrorSeverity.PERMANENT,
+            original=exc,
+            reason=f"permanent error: {type(exc).__name__}",
+        )
+
+    # 4. Unknown policy
+    return ClassifiedError(
+        severity=unknown_policy,
+        original=exc,
+        reason=f"unknown error classified as {unknown_policy.value}: {type(exc).__name__}",
+    )
+
+
+# ── Backpressure error ───────────────────────────────────────────────────
+
+
+class BackpressureError(Exception):
+    """Raised when publish-side flow control blocks a publish attempt.
+
+    Only raised when ``BackpressureConfig.on_blocked == "raise"``.
+    """

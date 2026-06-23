@@ -1,4 +1,10 @@
-"""High-load infrastructure module — backpressure, batch publish/ack.
+"""High-load infrastructure module — backpressure, batch publish/ack."""
 
-Planned for 0.2.0.
-"""
+from rabbitkit.highload.backpressure import FlowController
+from rabbitkit.highload.batch import BatchAcker, BatchPublisher
+
+__all__ = [
+    "BatchAcker",
+    "BatchPublisher",
+    "FlowController",
+]

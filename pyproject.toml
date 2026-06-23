@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.1.0"
+version = "0.6.1"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -38,7 +38,12 @@ pydantic    = ["pydantic>=2.0.0,<3.0.0"]
 msgspec     = ["msgspec>=0.18.0"]
 fastapi     = ["fastapi>=0.111.0"]
 compression = ["zstandard>=0.22.0"]
-all         = ["rabbitkit[all-brokers,obskit,redis,pydantic,compression]"]
+management = ["aiohttp>=3.9.0"]
+settings    = ["pydantic-settings>=2.0.0,<3.0.0"]
+cli         = ["typer>=0.12.0,<1.0.0"]
+dashboard   = ["starlette>=0.37.0", "uvicorn>=0.29.0"]
+reload      = ["watchfiles>=0.21.0"]
+all         = ["rabbitkit[all-brokers,obskit,redis,pydantic,compression,settings,cli,dashboard,reload,management]"]
 dev         = [
     "rabbitkit[all]",
     "pytest>=8.0",
@@ -48,6 +53,14 @@ dev         = [
     "ruff>=0.4.0",
     "mypy>=1.10",
 ]
+integration = [
+    "rabbitkit[dev]",
+    "testcontainers[rabbitmq]>=4.0.0",
+    "docker>=7.0.0",
+]
+
+[project.scripts]
+rabbitkit = "rabbitkit.cli:app"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -79,8 +92,25 @@ select = [
     "T20",  # flake8-print
 ]
 ignore = [
-    "S101",  # assert usage (used in tests and guards)
+    "S101",    # assert usage (tests + guards)
+    "TC001",   # app imports in type-checking block — runtime imports by design
+    "TC003",   # stdlib imports in type-checking block — runtime imports by design
+    "BLE001",  # blind exception — intentional in transport/pool/pipeline cleanup
+    "SIM117",  # nested with — readability preference in test mocking
+    "UP042",   # str+Enum inheritance — intentional for JSON serialization
+    "S110",    # try-except-pass — intentional defensive guards in DI/pool
+    "S105",    # hardcoded password — default config values ("guest")
+    "S106",    # hardcoded password arg — test fixtures
+    "E731",    # lambda assignment — test convenience
+    "SIM105",  # contextlib.suppress — preference
+    "SIM108",  # ternary — readability preference
+    "SIM102",  # nested if — readability preference
+    "N818",    # exception naming — AckMessage/NackMessage/RejectMessage are control flow
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S311", "RUF006"]
+"benchmarks/**/*.py" = ["T20"]
 
 [tool.mypy]
 strict = true
@@ -91,3 +121,4 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["integration: integration tests (may need RabbitMQ)"]

@@ -2030,6 +2030,51 @@ Publishing is **broker-write bound** and the runtimes differ sharply: **async pi
 
 **The one-line plan:** *reliability floor first → split by workload class → async for I/O & publishing, sync `wc=1` for CPU-trivial firehoses → tune prefetch/pods to the formula → autoscale on depth → prove it under chaos → ramp.*
 
+## 39.8 Hitting 10k msg/s per worker
+
+**10k msg/s = a 100µs per-message budget.** What fits in that budget decides whether one worker can do it. Measured per process on a real broker (`benchmarks/load_test_handler_latency.py`):
+
+| Per-message work | Async (1 worker, prefetch 300) | Sync `worker_count=1` |
+|---|---|---|
+| trivial | **~13.1k** ✅ | **~35.9k** ✅ |
+| **1 ms I/O** (DB/HTTP/Redis) | **~13.7k** ✅ | **~0.6k** ❌ |
+| 100 µs **CPU** | ~6.0k ❌ | ~7.3k ❌ |
+
+Two facts the numbers prove:
+- **I/O time is FREE on async, FATAL on sync.** Async overlaps the 1 ms waits across the prefetch window, so one worker still does ~13.7k. Sync `wc=1` is serial → 1 ms/msg ≈ 600/s. This is the whole game.
+- **CPU time counts against both** (one GIL): keep per-message CPU **≤ ~50 µs** to clear 10k on a single worker.
+
+**Async → 10k/worker for I/O-bound *and* trivial handlers (the common case):**
+
+```python
+broker = AsyncBroker(config)                              # worker_count stays 1
+@broker.subscriber(queue="orders", prefetch_count=300,   # prefetch IS the concurrency
+                   ack_policy=AckPolicy.NACK_ON_ERROR, middlewares=[...])
+async def handle(event: OrderCreated, svc: Annotated[Svc, Depends(get_svc)]) -> None:
+    await svc.persist(event)                              # awaited I/O overlaps across in-flight msgs
+await broker.start()
+```
+
+Requirements to actually hold 10k on one async worker:
+1. **Handler is fully async** — a single blocking call (sync DB driver, `time.sleep`, heavy CPU) freezes the loop and collapses it to serial speed.
+2. **`prefetch_count` ≥ ~`throughput × latency`, with headroom** — at 1 ms latency, 10k/s needs ≥ 10 in-flight; use **100–300** for jitter (measured ~13.7k at 300).
+3. **Downstream sustains it** — size DB/HTTP/Redis pools for the in-flight concurrency; at 10k/s the bottleneck moves from the broker to your dependency.
+4. **CPU/message < ~50 µs** — offload heavy CPU to a process pool.
+
+**Sync → 10k/worker only for CPU-trivial handlers:**
+
+```python
+broker = SyncBroker(config)
+@broker.subscriber(queue="events", prefetch_count=300, ack_policy=AckPolicy.NACK_ON_ERROR)
+def handle(event: Evt) -> None:
+    ...                                                   # < ~50 µs CPU, NO I/O (serial!)
+broker.run()                                              # worker_count=1, ~36k for trivial
+```
+
+Sync **cannot** do 10k/worker when the handler does I/O (serial → ~600/s for 1 ms). If you're stuck on sync + I/O handlers: (a) move that workload to **async** (right answer); (b) use `worker_count=N` — a blocking-I/O library can approach 10k because the GIL releases during socket I/O, but at ~8–9k/pod base + the marshaling tax, so size `N` and scale pods; (c) scale pods (sync `wc=1` at ~0.6k/pod → ~17 pods for 10k — don't; use async).
+
+**Decision in one line:** *async + high prefetch for I/O-bound (10k/worker easily); sync `wc=1` only for CPU-trivial firehoses; CPU-heavy (any runtime) caps ~6–7k/worker on one GIL → scale processes.*
+
 ---
 
 *Design for duplicates. Design for crashes. Design for downstream outages. Design for replay. Design for the on-call engineer at 3am, and for the team that inherits this in two years. At-least-once is the floor; idempotency is how you build a reliable system on top of it.*

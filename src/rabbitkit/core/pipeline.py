@@ -393,6 +393,28 @@ class HandlerPipeline:
 
     # ── Internal: result publishing ──────────────────────────────────────
 
+    def _compose_publish_sync(
+        self,
+        route: RouteDefinition,
+        publish_fn: Callable[[MessageEnvelope], PublishOutcome],
+    ) -> Callable[[MessageEnvelope], Any]:
+        """Compose this route's ``publish_scope`` middlewares around publish_fn.
+
+        So a route that carries e.g. a signing/tracing middleware applies it to
+        the results it publishes. (Standalone producer publishes via
+        ``broker.publish`` are not route-scoped and apply publish middlewares
+        manually — see docs.)
+        """
+        chain: Callable[[MessageEnvelope], Any] = publish_fn
+        for mw in reversed(route.route_middlewares):
+            nxt = chain
+
+            def wrapped(env: MessageEnvelope, _mw: Any = mw, _nxt: Any = nxt) -> Any:
+                return _mw.publish_scope(_nxt, env)
+
+            chain = wrapped
+        return chain
+
     def _publish_result_sync(
         self,
         route: RouteDefinition,
@@ -412,7 +434,7 @@ class HandlerPipeline:
         if envelope is None:
             return True
 
-        outcome = publish_fn(envelope)
+        outcome = self._compose_publish_sync(route, publish_fn)(envelope)
         if not outcome.ok:
             logger.warning(
                 "Result publish failed: status=%s, exchange=%s, routing_key=%s",
@@ -422,6 +444,22 @@ class HandlerPipeline:
             )
             return False
         return True
+
+    def _compose_publish_async(
+        self,
+        route: RouteDefinition,
+        publish_fn: Callable[[MessageEnvelope], Awaitable[PublishOutcome]],
+    ) -> Callable[[MessageEnvelope], Awaitable[Any]]:
+        """Async variant of :meth:`_compose_publish_sync`."""
+        chain: Callable[[MessageEnvelope], Awaitable[Any]] = publish_fn
+        for mw in reversed(route.route_middlewares):
+            nxt = chain
+
+            async def wrapped(env: MessageEnvelope, _mw: Any = mw, _nxt: Any = nxt) -> Any:
+                return await _mw.publish_scope_async(_nxt, env)
+
+            chain = wrapped
+        return chain
 
     async def _publish_result_async(
         self,
@@ -441,7 +479,7 @@ class HandlerPipeline:
         if envelope is None:
             return True
 
-        outcome = await publish_fn(envelope)
+        outcome = await self._compose_publish_async(route, publish_fn)(envelope)
         if not outcome.ok:
             logger.warning(
                 "Result publish failed: status=%s, exchange=%s, routing_key=%s",

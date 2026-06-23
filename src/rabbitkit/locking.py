@@ -68,11 +68,16 @@ Any object satisfying the ``DistributedLock`` protocol works:
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 import uuid
 from typing import Any, Protocol, runtime_checkable
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+
+_POLL_INTERVAL = 0.05  # seconds between lock-acquire retries when waiting
 
 
 @runtime_checkable
@@ -93,35 +98,51 @@ class RedisLock:
         self._prefix = prefix
         self._ttl = ttl
         self._lock_values: dict[str, str] = {}
+        self._guard = threading.Lock()  # protects _lock_values across threads
 
     def _key(self, key: str) -> str:
         return f"{self._prefix}{key}"
 
     def acquire(self, key: str, timeout: float = 10.0) -> bool:
+        """Acquire the lock. Waits up to ``timeout`` seconds (polling); ``timeout
+        <= 0`` makes a single non-blocking attempt."""
         lock_value = uuid.uuid4().hex
-        result = self._redis.set(self._key(key), lock_value, nx=True, ex=self._ttl)
-        if result:
-            self._lock_values[key] = lock_value
-            return True
-        return False
+        redis_key = self._key(key)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self._redis.set(redis_key, lock_value, nx=True, ex=self._ttl):
+                with self._guard:
+                    self._lock_values[key] = lock_value
+                return True
+            if timeout <= 0 or time.monotonic() >= deadline:
+                return False
+            time.sleep(_POLL_INTERVAL)
 
     def release(self, key: str) -> None:
-        lock_value = self._lock_values.pop(key, None)
+        with self._guard:
+            lock_value = self._lock_values.pop(key, None)
         if lock_value is not None:
             stored = self._redis.get(self._key(key))
             if stored is not None and (stored == lock_value or stored == lock_value.encode()):
                 self._redis.delete(self._key(key))
 
     async def acquire_async(self, key: str, timeout: float = 10.0) -> bool:
+        """Async variant of :meth:`acquire` (polls with ``asyncio.sleep``)."""
         lock_value = uuid.uuid4().hex
-        result = await self._redis.set(self._key(key), lock_value, nx=True, ex=self._ttl)
-        if result:
-            self._lock_values[key] = lock_value
-            return True
-        return False
+        redis_key = self._key(key)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if await self._redis.set(redis_key, lock_value, nx=True, ex=self._ttl):
+                with self._guard:
+                    self._lock_values[key] = lock_value
+                return True
+            if timeout <= 0 or time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_POLL_INTERVAL)
 
     async def release_async(self, key: str) -> None:
-        lock_value = self._lock_values.pop(key, None)
+        with self._guard:
+            lock_value = self._lock_values.pop(key, None)
         if lock_value is not None:
             stored = await self._redis.get(self._key(key))
             if stored is not None and (stored == lock_value or stored == lock_value.encode()):
@@ -139,8 +160,10 @@ class LockMiddleware(BaseMiddleware):
         self,
         lock: DistributedLock,
         key_fn: Any | None = None,
-        timeout: float = 10.0,
+        timeout: float = 0.0,
     ) -> None:
+        # Default 0.0 = non-blocking: on contention, nack(requeue=True) immediately
+        # rather than blocking the consumer. Set timeout > 0 to wait for the lock.
         self._lock = lock
         self._key_fn = key_fn or (lambda m: m.routing_key)
         self._timeout = timeout

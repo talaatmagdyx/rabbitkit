@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — 2026-06-23
 
 ### Fixed
 
@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **C3 — Subscriber middlewares were never executed**
   - `@subscriber(middlewares=[...])` stored `route_middlewares` on the route, but `HandlerPipeline` never composed them and never called `consume_scope` — so `RetryMiddleware`, `DeduplicationMiddleware`, `CircuitBreakerMiddleware`, `TimeoutMiddleware`, `RateLimitMiddleware`, tracing, etc. silently did nothing when wired the documented way. There was no delayed-retry-with-backoff via the subscriber API.
   - Fixed: `HandlerPipeline._run_consume_sync` / `_run_consume_async` now run each middleware's `on_receive` hook and compose the `consume_scope` / `consume_scope_async` chain outer→inner around the handler (first middleware in the list is outermost). Covered by `tests/unit/core/test_pipeline_middleware.py`.
+
+- **C4 — A route's publish-side middlewares were ignored on result publishing**
+  - When a handler returned a result, `_publish_result_*` published it directly, bypassing the route's `publish_scope` middlewares (signing, tracing, etc.).
+  - Fixed: `HandlerPipeline` now composes the route's `publish_scope` / `publish_scope_async` chain around result publishing. (Standalone producer publishes via `broker.publish` are not route-scoped; apply publish middlewares manually — a broker-level publish-middleware API is a future enhancement.)
 
 #### High Severity Bug Fixes
 

@@ -35,10 +35,12 @@ class AsyncChannelPool:
         connection: Any,  # aio_pika.RobustConnection
         pool_size: int = 10,
         acquire_timeout: float = 10.0,
+        publisher_confirms: bool = True,
     ) -> None:
         self._connection = connection
         self._pool_size = pool_size
         self._acquire_timeout = acquire_timeout
+        self._publisher_confirms = publisher_confirms
         self._pool: asyncio.Queue[Any] = asyncio.Queue(maxsize=pool_size)
         self._lock = asyncio.Lock()
         self._created = 0
@@ -61,7 +63,9 @@ class AsyncChannelPool:
 
         async with self._lock:
             if self._created < self._pool_size:
-                channel = await self._connection.channel()
+                channel = await self._connection.channel(
+                    publisher_confirms=self._publisher_confirms
+                )
                 self._created += 1
                 return channel
 
@@ -141,10 +145,12 @@ class AsyncConnectionPool:
         connection_config: ConnectionConfig,
         security_config: SecurityConfig,
         pool_config: PoolConfig | None = None,
+        publisher_confirms: bool = True,
     ) -> None:
         self._connection_config = connection_config
         self._security_config = security_config
         self._pool_config = pool_config or PoolConfig()
+        self._publisher_confirms = publisher_confirms
 
         self._publisher_connection: Any | None = None
         self._consumer_connection: Any | None = None
@@ -160,6 +166,7 @@ class AsyncConnectionPool:
                     self._publisher_connection,
                     pool_size=self._pool_config.channel_pool_size,
                     acquire_timeout=self._pool_config.channel_acquire_timeout,
+                    publisher_confirms=self._publisher_confirms,
                 )
             if self._consumer_connection is None:
                 self._consumer_connection = await self._create_connection()
@@ -176,6 +183,7 @@ class AsyncConnectionPool:
                     self._publisher_connection,
                     pool_size=self._pool_config.channel_pool_size,
                     acquire_timeout=self._pool_config.channel_acquire_timeout,
+                    publisher_confirms=self._publisher_confirms,
                 )
             return self._publisher_connection
 

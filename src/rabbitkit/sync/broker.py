@@ -230,15 +230,18 @@ class SyncBroker:
         self._started = False
         logger.info("SyncBroker stopped")
 
-    def run(self) -> None:
+    def run(self, worker_config: WorkerConfig | None = None) -> None:
         """Start and run the blocking consume loop.
 
         Blocks until KeyboardInterrupt or stop() is called. Recovers from
         connection drops by reconnecting, re-declaring topology, and
         re-subscribing all consumers — pika's BlockingConnection has no
         built-in recovery, so without this a single blip kills the consumer.
+
+        ``worker_config`` is forwarded to :meth:`start`, so a multi-worker
+        consumer (``worker_count > 1``) also gets the recovery loop.
         """
-        self.start()
+        self.start(worker_config=worker_config)
         connection_errors = get_connection_errors()
         try:
             while True:

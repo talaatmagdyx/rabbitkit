@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from rabbitkit.core.config import RetryConfig
+from rabbitkit.core.errors import ErrorPredicate
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import ErrorSeverity, MessageEnvelope
@@ -40,9 +41,14 @@ class RetryMiddleware(BaseMiddleware):
         *,
         publish_fn: Callable[[MessageEnvelope], Any] | None = None,
         publish_async_fn: Callable[[MessageEnvelope], Awaitable[Any]] | None = None,
+        predicates: Sequence[ErrorPredicate] = (),
     ) -> None:
         self._config = config
+        # predicates run first (True=transient, False=permanent, None=defer to the
+        # built-in type tuples, then unknown_policy). Lets callers classify by
+        # something other than exception type (e.g. an HTTP status attribute).
         self._classifier = ErrorClassifierMiddleware(
+            predicates=predicates,
             unknown_policy=config.unknown_policy,
         )
         self._publish_fn = publish_fn

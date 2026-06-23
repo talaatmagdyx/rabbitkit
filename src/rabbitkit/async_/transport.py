@@ -58,6 +58,7 @@ class AsyncTransportImpl:
             self._connection_config,
             self._security_config,
             self._pool_config,
+            publisher_confirms=self._confirm_delivery,
         )
         self._connected = False
 

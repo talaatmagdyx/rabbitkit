@@ -1805,6 +1805,24 @@ Watch: `connection.blocked`/`unblocked` duration, mem/disk alarms, confirm laten
 
 **Retry:** jitter, capped attempts, exponential/staged backoff via TTL+DLX; never `requeue=True` loops, never sleep in the consumer; circuit-break failing dependencies; rate-limit DLQ replay.
 
+**Sync vs async — pick by handler shape, not by habit.** Measured on a real broker, per process, with a *trivial* handler (`benchmarks/load_test_sync.py` / `load_test_worker_pool.py` / `load_test_publisher.py`):
+
+| Path | msg/s (per process) | Concurrency model | Notes |
+|---|---|---|---|
+| **Sync consumer, `worker_count=1`** | **~34k** | serial (one msg at a time) | lowest per-message overhead — inline ack, no event loop, no marshaling |
+| **Async consumer** | **~14.8k** (→ ~42k at 4 procs) | concurrent via **prefetch** | scales near-linearly across processes |
+| Sync consumer, `worker_count=4–8` | ~8–9k | thread pool | **slower than `wc=1`** for light handlers — pays the ack-marshaling + GIL tax; only worth it for *blocking* handlers needing thread parallelism |
+| **Async publisher** | **~6.1k** | pipelined confirms | concurrent publishes |
+| Sync publisher (blocking) | **~0.9k** | serial confirm round-trips | ~7× slower; avoid for volume |
+
+**The caveat that flips the ranking:** the ~34k sync `wc=1` number is a *trivial-handler ceiling*. Sync `wc=1` is single-threaded, so for real work its ceiling is `1 / handler_latency` — a 5 ms DB/HTTP handler caps it at **~200 msg/s**, while async runs hundreds concurrently (prefetch-bound) → thousands/s. Decision rule:
+
+- **I/O-bound handlers (DB, HTTP, Redis) → async.** Concurrency wins by orders of magnitude.
+- **CPU-light / trivial high-throughput consumers → sync `worker_count=1`** for the lowest per-message overhead.
+- **Sync `worker_count>1` → only for blocking/CPU handlers** that genuinely need thread parallelism (else it is *slower* than `wc=1`).
+- **Publishing at volume → async** (pipelined confirms), or multiple sync producer threads/processes; never the single-threaded blocking publisher for throughput.
+- **Default for a high-throughput service: async** — best all-rounder (concurrent consume + pipelined publish + horizontal scaling).
+
 ## 38.9 Prefetch and Worker-Count Sizing
 
 ```

@@ -1932,4 +1932,104 @@ Per test record: msg/s, p50/p95/p99 latency, confirm latency, retry rate, DLQ ra
 
 ---
 
+# 39. High-Throughput Reference Architecture & Plan (sync **and** async)
+
+> The lever for scale is **process count**, not `worker_count` or extra connections in one runtime — measured: consume scales near-linearly across processes (1 → ~14.8k, 4 → ~42k msg/s) while in-loop connection count and async `worker_count` are flat-or-worse. Both runtimes scale the same way: **stateless pods + autoscale on queue depth.** The runtime you pick (sync vs async) is decided by **handler shape**, and it does **not** change the topology, the reliability invariants, or the publisher design — those are shared.
+
+## 39.1 Pick the runtime by handler shape (measured)
+
+| Handler shape | Runtime | Per-pod | Why |
+|---|---|---|---|
+| **I/O-bound** (DB/HTTP/Redis awaits) | **async** | ~14.8k (trivial); for real work = prefetch concurrent | concurrency is free on one loop; sync would serialize |
+| **CPU-trivial, very high volume** | **sync `worker_count=1`** | ~34k, **serial** | lowest per-message overhead — no loop, no marshaling |
+| **Blocking libs / CPU-bound** (no async client) | **sync `worker_count=N`** | ~8–9k | thread pool gives parallelism; pays the ack-marshaling + GIL tax |
+| **Mixed fleet** | **async default**, sync only where forced | — | one runtime to operate; reach for sync only when a handler can't be async |
+
+Rule of thumb: **default async.** Use **sync `wc=1`** only when handlers are CPU-trivial and you want max raw throughput. Use **sync `wc=N`** only when a handler must call a blocking library and you need thread parallelism (and accept it's ~4× slower per pod than `wc=1`).
+
+## 39.2 Shared foundation (identical for sync and async)
+
+These do not change with the runtime — get them right once:
+
+- **Topology:** durable exchanges + **quorum** queues (critical) / classic-lazy (bulk), per-source retry (TTL+DLX) + `.dlq`, `TopologyMode.PASSIVE_ONLY` in prod, provisioned as code.
+- **Workload-class isolation:** separate queues **and** separate deployments for fast vs slow vs bulk — a slow handler must never share a queue/pod with a fast one (head-of-line blocking is the #1 throughput killer).
+- **Reliability invariants** (§38.18): confirms with outcome checked; **commit-before-ack** (`AckPolicy.NACK_ON_ERROR`, never `ACK_FIRST`); **DB idempotency** (`processed_messages` unique key); bounded retry + jitter (never `requeue=True`, never sleep); DLQ-per-queue with a growth alert + throttled replay; backpressure to durable storage only.
+- **Observability:** the no-data-loss metrics (§38.15), queue-**age** SLO, KEDA scale signal = queue depth.
+- **Scaling:** KEDA `rabbitmq` trigger on `QueueLength`, `maxReplicas` capped to downstream capacity, scale on **backlog not CPU**.
+
+## 39.3 Async consumer plan (default)
+
+```python
+broker = AsyncBroker(config, serializer=SerializationPipeline(JsonParser(), PydanticDecoder()),
+                     di_resolver=DIResolver())
+retry_mw = RetryMiddleware(config.retry, publish_async_fn=broker.publish)
+
+@broker.subscriber(queue="orders.fast", ack_policy=AckPolicy.NACK_ON_ERROR,
+                   middlewares=[trace_mw, exc_mw, retry_mw, timeout_mw], prefetch_count=200)
+async def handle(event: OrderCreated, svc: Annotated[Svc, Depends(get_svc)]) -> None: ...
+
+await broker.start()   # worker_count left at 1 for async — prefetch drives concurrency
+```
+
+- **Concurrency knob = `prefetch_count`** (IO-bound 100–300; mixed 32–64; slow 1–8). Leave `worker_count=1` (its semaphore only *caps*).
+- **Sizing:** `pods = ceil(incoming_rate × handler_latency / target_util / prefetch)`. Then KEDA to absorb bursts.
+- **Scales near-linearly across pods** (measured 1→4 = ~14.8k→~42k).
+
+## 39.4 Sync consumer plan
+
+```python
+broker = SyncBroker(config, serializer=..., di_resolver=DIResolver())
+@broker.subscriber(queue="reports.bulk", ack_policy=AckPolicy.NACK_ON_ERROR,
+                   middlewares=[trace_mw, exc_mw, RetryMiddleware(config.retry, publish_fn=broker.publish)])
+def handle(event: ReportRequested, svc: Annotated[Svc, Depends(get_svc)]) -> None: ...
+
+# worker_count=1 path (recommended for CPU-light): run() = start + reconnect/recovery
+broker.run()                                              # ONE thread: connect + consume + recover
+
+# worker_count=N path (blocking handlers): start() takes the worker_config, then consume
+# on the SAME thread. NOTE: run()'s recovery loop is not available with wc>1 today —
+# add a reconnect loop around start_consuming() yourself if you need wc>1 + recovery.
+broker.start(worker_config=WorkerConfig(worker_count=8))  # channel_pool_size >= worker_count
+broker._transport.start_consuming()
+```
+
+- **CPU-trivial / fast handlers → `worker_count=1`** via `broker.run()` (gets the reconnect/recovery loop), scale by pods. One pod ≈ ~34k (trivial); for real work, throughput per pod ≈ `1 / handler_latency` (serial), so **add pods** to hit the rate. Fastest per-pod path when handlers are light.
+- **Blocking-library handlers → `worker_count=N`** (thread pool) via `start()`. Expect ~8–9k/pod (the C1 ack-marshaling routes every ack through the I/O thread — correct, but a tax). Size `N` to the concurrency the handler needs; **`channel_pool_size ≥ worker_count`**.
+- **Critical:** `connect()` and `start_consuming()` must run on the **same thread**. `broker.run()` guarantees this; if you drive `start()` + `start_consuming()` manually, do both on one thread (splitting them with `worker_count=1` deadlocks the ack marshaling).
+- **Known gap:** `run()` (the recovery loop) does not accept `worker_config`, so `worker_count>1` + automatic reconnect-recovery isn't wired today — wrap `start_consuming()` in your own reconnect loop if you need both.
+- **Sizing (blocking handler):** `pods × worker_count = ceil(incoming_rate × handler_latency / target_util)`.
+
+## 39.5 Publisher plan (both runtimes — decouple it)
+
+Publishing is **broker-write bound** and the runtimes differ sharply: **async pipelines confirms (~6.1k/pod); the sync blocking publisher is serial (~0.9k/pod).** So:
+
+- **Always publish through the transactional outbox + a relay** (§38.2) — write the event in the same DB tx as the business change; a separate relay publishes with confirms and marks `PUBLISHED`.
+- **Make the relay async even if the consumer is sync.** The relay is a standalone component; there's no reason to inherit the sync publisher's serial penalty. ~6.1k/relay-pod, scale relay pods.
+- If you must publish synchronously at volume, run **multiple sync producer threads/processes** (each ~0.9k) — but prefer the async relay.
+
+## 39.6 Capacity cookbook
+
+| Need | Async | Sync |
+|---|---|---|
+| 10k/s, light handlers | 1–2 pods, prefetch 100 | 1 pod `wc=1` (trivial) → few pods for real work |
+| 50k/s, light | ~4–6 pods (linear) | partitioned queues + `wc=1` pods |
+| 50k/s, 20ms I/O handler | `58 concurrent` → ~2 pods × prefetch 64 (+KEDA) | **bad fit** — sync would need ~1000 threads; use async |
+| CPU-bound transform | thread offload or process pool | `wc=N` sized to cores, scale pods |
+| Publish 30k/s | ~5–8 async relay pods | async relay (don't use sync blocking) |
+| Strict per-key order | partition (hash→queue), 1 consumer/partition | same; or SAC (caps to 1) |
+
+## 39.7 Phased rollout plan
+
+- **Phase 0 — Baseline & classify.** Inventory handlers; tag each I/O-bound / CPU-trivial / blocking. Pick runtime per workload class (§39.1). Stand up topology-as-code (quorum, per-queue retry/DLQ), `PASSIVE_ONLY`.
+- **Phase 1 — Reliability floor (before chasing speed).** Confirms + outcome checks; outbox + relay; commit-before-ack; DB idempotency; bounded retry + DLQ alert. *Nothing is "high throughput" if it loses messages.*
+- **Phase 2 — Per-class deployments.** Separate fast/slow/bulk queues + deployments. Async for I/O classes; sync `wc=1` for any CPU-trivial firehose. `channel_pool_size ≥ worker_count` on sync `wc>1`.
+- **Phase 3 — Tune to the formula.** Set prefetch (async) / worker_count (sync) and pod count from §39.3/39.4 sizing. Run `benchmarks/load_test_*` against a staging broker to confirm per-pod numbers on your hardware.
+- **Phase 4 — Autoscale.** KEDA on queue depth, `min/max` per class, `max` capped to downstream limits. Alert on queue **age**, DLQ growth, no-acks-while-depth-grows.
+- **Phase 5 — Prove under failure.** Run the §38.16 load+chaos suite: broker restart, consumer crash-after-commit, Redis outage, downstream 503 storm, rolling deploy under load. Acceptance = §38.17 (no confirmed-message loss, no committed-work loss, bounded duplicates).
+- **Phase 6 — Production ramp.** Canary one class, watch queue-age + DLQ + duplicate rate, ramp pods, keep rollback one command away.
+
+**The one-line plan:** *reliability floor first → split by workload class → async for I/O & publishing, sync `wc=1` for CPU-trivial firehoses → tune prefetch/pods to the formula → autoscale on depth → prove it under chaos → ramp.*
+
+---
+
 *Design for duplicates. Design for crashes. Design for downstream outages. Design for replay. Design for the on-call engineer at 3am, and for the team that inherits this in two years. At-least-once is the floor; idempotency is how you build a reliable system on top of it.*

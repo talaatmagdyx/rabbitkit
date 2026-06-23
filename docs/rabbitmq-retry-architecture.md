@@ -1581,4 +1581,337 @@ Build async-first. Use sync only for simple, single-purpose workers where async 
 
 ---
 
+# 38. Performance, Connection Loss, and Data-Loss Prevention
+
+> **Measured baselines (this codebase, local container, single connection).** These are real numbers from `benchmarks/`, not aspirations. Use them to size, not as guarantees — your hardware/broker/network differ.
+> - **Consumer:** ~14.8k msg/s per process; scales near-linearly with processes (2 → ~27k, 4 → ~42k). Concurrency is driven by **prefetch**, not `worker_count`.
+> - **Publisher:** ~6.1k msg/s per process (publisher-confirm + broker-write bound; raw aio-pika ceiling ~8k/connection). Scales across producer processes.
+> - **Pipeline CPU:** ~2.7µs/msg (negligible vs broker I/O). The lever for "more" is **horizontal** (more pods), not bigger `worker_count` or more connections in one event loop (both measured flat).
+
+## 38.1 The Data-Loss Model
+
+RabbitMQ does **not** give exactly-once processing. There is no such thing over a network. The honest guarantee target:
+
+- **At-least-once delivery** (the floor).
+- **No acknowledged-message loss** (an acked message's work is durably done).
+- **No silently-lost publish** (every critical publish is confirmed or retried).
+- **Duplicate-safe processing** (idempotent handlers).
+- **Recoverable publish failures** (durable outbox + resend).
+- **Recoverable consumer failures** (commit-before-ack + inbox dedup).
+- **Auditable DLQ + replay** (every dead-letter and replay is observable and logged).
+
+**Five places messages die:**
+
+| # | Loss class | Cause | Defense |
+|---|---|---|---|
+| 1 | **Publisher-side** | publish without confirms; crash before resend | confirms + durable outbox (§38.2) |
+| 2 | **Broker-side** | non-durable queue/exchange or non-persistent message lost on restart | durable topology + persistent + quorum (§38.4) |
+| 3 | **Consumer-side** | ack before the work is durable | commit-before-ack (§38.3) |
+| 4 | **Application-side** | non-idempotent handler corrupts on redelivery | inbox/dedup + DB constraints (§38.3) |
+| 5 | **Operational** | human purges/replays the DLQ wrongly | change-gated, audited, throttled replay (§38.14) |
+
+State it plainly to the team:
+- Confirms off → the publisher can believe a message was sent when the broker never durably accepted it.
+- Non-persistent messages → lost on broker restart.
+- Non-durable queues → the **queue itself** disappears on broker restart.
+- Ack before committing business state → **data loss**.
+- Commit business state then crash before ack → **duplicate** (redelivery). ⇒ **the system must be idempotent.**
+
+## 38.2 Publisher-Side Data Safety
+
+**Requirements:** confirms enabled, `persistent=True`, `mandatory=True` for must-route messages, durable exchanges + queues, resend-on-failure from a **durable outbox**, never drop from memory before confirm, treat confirm-timeout as **unknown**, and make resend safe (duplicates happen — consumers dedup).
+
+Per RabbitMQ's reliability guidance: a publisher recovering from a connection/channel failure should **retransmit any message for which it did not receive a confirm**, and because this can create duplicates, consumers must deduplicate or be idempotent.
+
+```python
+# config.py — safe publisher
+from rabbitkit import PublisherConfig
+PublisherConfig(confirm_delivery=True, confirm_timeout=5.0, persistent=True, mandatory=True)
+```
+
+```python
+# check the outcome — never trust "publish returned"
+outcome = await broker.publish(envelope)        # PublishOutcome
+if outcome.status == PublishStatus.CONFIRMED:   # outcome.ok
+    mark_published(envelope)
+elif outcome.status == PublishStatus.RETURNED:  # unroutable (mandatory=True)
+    alert_unroutable(envelope)                  # a routing bug — do not silently drop
+elif outcome.status == PublishStatus.TIMEOUT:
+    pass            # UNKNOWN — leave PENDING, resend later (idempotent consumers absorb dupes)
+else:               # NACKED / ERROR
+    pass            # leave PENDING, retry with backoff
+```
+
+> **rabbitkit notes:** On the **async** path confirms are always on (aio-pika opens channels with publisher confirms by default) — exactly what a safety-first design wants. `confirm_delivery=False` is **not** honored on async (no fire-and-forget fast path); that's acceptable here since §38 wants confirms always on. The data-integrity fix (C2) ensures a failed retry/result publish **nacks instead of acking**, so a publish failure never silently drops the source message.
+
+**Outbox table (the source of truth for outbound events):**
+
+```sql
+CREATE TABLE outbox_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    aggregate_id    TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    routing_key     TEXT NOT NULL,
+    exchange        TEXT NOT NULL DEFAULT '',
+    payload         BYTEA NOT NULL,
+    headers         JSONB NOT NULL DEFAULT '{}',          -- incl. message_id, idempotency_key
+    status          TEXT NOT NULL DEFAULT 'PENDING',      -- PENDING | PUBLISHED | FAILED
+    publish_attempts INT  NOT NULL DEFAULT 0,
+    next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at     TIMESTAMPTZ
+);
+CREATE INDEX outbox_due ON outbox_messages (next_attempt_at) WHERE status = 'PENDING';
+```
+
+**Outbox relay loop** (separate from the request path; the message is written to `outbox` in the *same DB transaction* as the business change, then this loop publishes it):
+
+```python
+async def outbox_relay(db, broker) -> None:
+    while True:
+        rows = await db.fetch_due_pending(limit=200)          # status=PENDING, next_attempt_at<=now
+        for row in rows:
+            env = MessageEnvelope(
+                exchange=row.exchange, routing_key=row.routing_key, body=row.payload,
+                headers=row.headers, message_id=row.headers["message_id"],
+                correlation_id=row.headers.get("correlation_id"), delivery_mode=2,
+            )
+            outcome = await broker.publish(env)
+            if outcome.ok:
+                await db.mark_published(row.id)                 # -> PUBLISHED, published_at=now
+            else:
+                # TIMEOUT/NACK/ERROR -> leave PENDING, back off; preserve message_id (dedupe key)
+                await db.bump_attempt(row.id, error=str(outcome.status),
+                                      next_attempt_at=backoff(row.publish_attempts))
+            metrics.inc("publish_attempt_total")
+            metrics.inc("publish_confirmed_total" if outcome.ok else "publish_unconfirmed_total")
+        await asyncio.sleep(0.2)
+```
+
+Rules: read PENDING → publish with confirms → CONFIRMED ⇒ PUBLISHED; TIMEOUT/lost ⇒ leave PENDING and retry with backoff; **never** delete a row before a confirm; keep `message_id` stable across resends.
+
+## 38.3 Consumer-Side Data Safety
+
+Use server-side acks (`AckPolicy.AUTO` or `MANUAL`; **never `ACK_FIRST`** for business workflows — see §8). **Do not ack until the DB transaction is committed.** Redelivery is normal ⇒ handlers must be idempotent; external side effects must use idempotency keys with the external system.
+
+**Safe sequence:** receive → validate → extract `message_id`/idempotency key → check inbox → BEGIN → mutate → insert processed record → COMMIT → ack → emit follow-up events **via the outbox** (not inline).
+
+```sql
+CREATE TABLE processed_messages (
+    message_id     TEXT NOT NULL,
+    consumer_name  TEXT NOT NULL,
+    aggregate_id   TEXT,
+    correlation_id TEXT,
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at   TIMESTAMPTZ,
+    status         TEXT NOT NULL,            -- PROCESSING | DONE
+    payload_hash   TEXT,
+    result_hash    TEXT,
+    PRIMARY KEY (message_id, consumer_name)  -- the dedupe guarantee
+);
+```
+
+**Crash windows (the whole point of commit-before-ack):**
+
+| Case | Sequence | Result |
+|---|---|---|
+| **A** | crash **before** commit and before ack | redelivered → reprocessed → **safe** |
+| **B** | crash **after** commit, before ack | redelivered → inbox detects dupe → ack the dupe → **safe** |
+| **C** | **ack before commit**, crash | message gone, work not done → **UNSAFE — never do this** |
+| **D** | publish follow-up **before** commit | downstream sees an event for state that may not exist → **UNSAFE — use the outbox** |
+
+This maps directly to rabbitkit: with `AckPolicy.AUTO`/`NACK_ON_ERROR` the pipeline acks only after the handler returns successfully; do your commit *inside* the handler before it returns.
+
+## 38.4 Broker-Side Durability
+
+Require: durable exchanges + queues, persistent messages (`delivery_mode=2`), **quorum queues** for critical workloads, a multi-node cluster, disk + memory alarms, queue-length limits, DLQ retention, definition/config backups, and **topology as code**.
+
+- **Quorum queues** (Raft-replicated, per RabbitMQ docs) — the safer default for replicated, highly-available queues. Use for **orders, payments, inventory, billing** and anything where losing a node must not lose messages. (Also gives `x-delivery-limit` poison protection — §11.)
+- **Classic queues** — acceptable for low-value telemetry, ephemeral notifications, non-critical analytics, where throughput beats replicated durability.
+
+## 38.5 Connection-Loss Scenarios
+
+For each: what happens · loss? · dup? · mitigation · alert · runbook.
+
+**Publisher:**
+
+| # | Scenario | Loss? | Dup? | Mitigation |
+|---|---|---|---|---|
+| P1 | conn lost before publish reaches broker | no (still PENDING) | no | outbox resend |
+| P2 | broker got it, confirm never returned | no | **yes on resend** | treat TIMEOUT as unknown; resend; consumer dedup |
+| P3 | accepted but unroutable | yes (dropped) unless mandatory | no | `mandatory=True` → RETURNED → alert |
+| P4 | broker blocked (mem/disk alarm) | no | no | FlowController `on_blocked` (§38.7); shed load |
+| P5 | confirm timeout | unknown | maybe | leave PENDING; resend |
+| P6 | channel closed (protocol error) | no (PENDING) | maybe | reconnect; resend unconfirmed |
+| P7 | TLS handshake fails post cert-rotation | no (can't publish) | no | cert monitoring; rotate with overlap |
+| P8 | DNS → dead node | no | no | reconnect/backoff; healthy endpoints |
+| P9 | K8s network blip | no | maybe | reconnect; outbox |
+| P10 | rolling broker restart | no (if quorum+persistent) | maybe | quorum queues; reconnect |
+
+**Consumer:**
+
+| # | Scenario | Loss? | Dup? | Mitigation |
+|---|---|---|---|---|
+| C1 | conn lost mid-processing (unacked) | no | yes | redelivery + idempotency |
+| C2 | crash after receive, before ack | no | yes | redelivery + idempotency |
+| C3 | crash after commit, before ack | no | yes | inbox dedup (Case B) |
+| C4 | crash after ack, before side effect | **yes** | no | side effect **inside** tx / via outbox, before ack |
+| C5 | duplicate after reconnect | no | yes | inbox dedup |
+| C6 | Redis dedupe conn lost | no | maybe ↑ | `fallback_on_redis_error=True` + DB constraint (§38.13) |
+| C7 | graceful shutdown exceeds timeout | no | maybe | drain window ≥ handler timeout (§38.12) |
+| C8 | SIGKILL | no | yes | idempotency; unacked redeliver |
+| C9 | channel closed `PRECONDITION_FAILED` | no | no | `PASSIVE_ONLY` topology; reconcile (§24.12) |
+| C10 | consumer cancelled (queue delete/redeclare) | maybe | maybe | topology ownership; alert on cancel |
+
+The only true data-loss rows are **P3 without `mandatory`** and **C4 (ack-before-side-effect)** — both are eliminated by the rules in §38.18.
+
+## 38.6 Reconnect Strategy
+
+Defaults (these are rabbitkit's `ConnectionConfig` defaults): `heartbeat=30`, `socket_timeout=10`, `blocked_connection_timeout=300`, `reconnect_backoff_base=1`, `reconnect_backoff_max=30`; exponential backoff **with jitter**; separate publisher/consumer connections; `connection_name=f"{service}@{env}/{pod}/{version}"` (priceless in the mgmt UI during incidents); reconnect metrics + logs; alert on a sustained reconnect loop.
+
+**After reconnect, do not assume any prior channel state survived:** reopen connection → reopen channel → re-enable publisher confirms → re-declare or passively verify topology → re-bind/re-subscribe consumers → resume consuming → resend only *unconfirmed* outbox rows → emit a reconnect event → alert if the loop continues.
+
+> **rabbitkit:** async uses aio-pika `connect_robust` (automatic recovery + consumer re-establishment). Sync recovers via `SyncBroker.run()`'s loop (reconnect → re-declare topology → re-subscribe — fix H1). Production should run `PASSIVE_ONLY` so a post-reconnect topology mismatch fails loudly instead of drifting.
+
+## 38.7 Backpressure and Flow Control
+
+When the broker raises a memory/disk alarm it **blocks publishers**. The app must slow or stop publishing — do **not** keep accepting unlimited HTTP requests and buffering in memory (lost on pod restart). Push backpressure to the edge: return **429/503**, buffer only in the **durable outbox**.
+
+```python
+from rabbitkit import FlowController, BackpressureConfig
+
+# important data — wait (bounded) for capacity rather than drop
+flow = FlowController(BackpressureConfig(max_in_flight=1000, rate_limit=5000,
+                                         blocked_timeout=60.0, on_blocked="wait"))
+
+# API edge that must fail fast — raise so the handler can return 503
+api_flow = FlowController(BackpressureConfig(max_in_flight=1000, on_blocked="raise"))
+```
+
+- `on_blocked="wait"` — bounded wait; for important data.
+- `on_blocked="raise"` — fail fast; for API edges (translate to 503/429).
+- `on_blocked="drop"` — **never** for business-critical events.
+
+Watch: `connection.blocked`/`unblocked` duration, mem/disk alarms, confirm latency, queue depth **and age**, consumer lag, retry-queue depth, DLQ depth.
+
+## 38.8 Performance Tuning
+
+**Publisher:** per-message confirms are safe but serialize on the round-trip — *pipeline* by publishing concurrently (confirms then overlap; measured ~equal to no-confirm at concurrency). Use pooled channels; compress above a threshold; avoid huge messages (claim-check, §38.10); avoid unroutable messages; monitor confirm latency. *(Measured: concurrency and channel-pool size barely move single-process publish — it's broker-write bound. Scale across processes.)*
+
+**Consumer:** tune **prefetch** (the real async concurrency knob); `worker_count` for sync thread pools; async I/O over blocking; size DB/Redis pools and downstream concurrency to match; separate queues by workload class (slow vs fast — avoid head-of-line blocking); SAC only when ordering matters. *(Measured: pipeline CPU ~2.7µs/msg; the bound is aio-pika + ack round-trip on one loop. `worker_count`'s semaphore only **caps** async concurrency that prefetch already provides — a low value can reduce throughput.)*
+
+**Queues:** per-source retry queues (never one global); quorum for critical durability; classic (optionally lazy) for high-throughput non-critical or deep backlogs; set `max-length`/overflow intentionally; **alert on queue age, not just depth**.
+
+**Retry:** jitter, capped attempts, exponential/staged backoff via TTL+DLX; never `requeue=True` loops, never sleep in the consumer; circuit-break failing dependencies; rate-limit DLQ replay.
+
+## 38.9 Prefetch and Worker-Count Sizing
+
+```
+consumer_concurrency   = replicas × worker_count
+max_unacked_messages   = replicas × consumer_connections × prefetch_count
+required_concurrency   = incoming_rate × avg_processing_time / target_utilization
+```
+
+Example: `500 msg/s × 0.05s / 0.70 = 35.7` → start with **6 pods × worker_count 8 = 48** concurrency, `prefetch_count` ~8–16 per worker group (tune by handler latency).
+
+- Too-low prefetch starves throughput; too-high wastes memory and skews fairness.
+- Slow jobs → low prefetch; fast I/O → raise carefully.
+- Strict ordering → low concurrency or partitioned queues.
+- Downstream-limited → concurrency must respect the downstream's limit.
+
+> **rabbitkit caveat:** for the **async** broker, raw concurrency is driven by **prefetch + pods**, not `worker_count` (its semaphore caps, it does not multiply). The formula's `worker_count` term maps cleanly to the **sync** thread-pool broker and to per-pod parallelism; for async, treat `worker_count` as a *cap* and size with prefetch × pods.
+
+## 38.10 Message Size and Payload Design
+
+Keep messages small; compress only above a threshold (`CompressionConfig.threshold`); for large blobs use the **claim-check** pattern — store the blob in object storage, send a reference + checksum in the message. Always include `content_type`, `schema_version`/`event_version`, and an **idempotency key**. Large messages cut throughput and raise memory/disk pressure (worse in retry/DLQ where they linger). **No large stack traces or PII in headers** — store diagnostics externally keyed by `x-error-stack-hash` (§9).
+
+## 38.11 Batch Publishing and Batch Ack
+
+- **Batch publishing** — good for analytics, high-throughput non-interactive pipelines, buffered outbox flushing. **Dangerous** for payment/low-latency/user-facing flows or memory-only buffering. **rabbitkit reality:** `BatchPublisher` is **buffering/timing only** — its flush loops per-message publish, so it does **not** reduce confirm round-trips or give wire-level throughput. Use it for ergonomics, not as a speed lever; for safety-critical outbound use the durable outbox.
+- **Batch ack** — good for high-volume idempotent processing where duplicates are safe. **Dangerous** when per-message results aren't independently tracked, a later failure makes the batch ambiguous, or ordering/side effects are complex. Only batch-ack when duplicate safety is **proven**.
+
+## 38.12 Graceful Shutdown
+
+Avoid loss on deploy/scale-down:
+
+1. readiness → false (stop new HTTP traffic), 2. stop consuming new messages, 3. wait for in-flight handlers, 4. finish or nack uncompleted, 5. flush the outbox relay, 6. wait for publisher confirms, 7. close channels, 8. close connections, 9. exit.
+
+```
+SIGTERM ─▶ readiness=false ─▶ cancel consumers ─▶ drain in-flight (≤ graceful_timeout)
+        ─▶ commit+ack done work ─▶ flush outbox + await confirms ─▶ close channels/conns ─▶ exit
+        (Kubernetes SIGKILL only if terminationGracePeriodSeconds is exceeded)
+```
+
+Kubernetes: `terminationGracePeriodSeconds ≥ max handler timeout + buffer`; `preStop` marks not-ready; align with `ConsumerConfig.graceful_timeout`; **liveness must not kill pods during a temporary broker outage** (use readiness for that). rabbitkit's `broker.stop()` cancels consumers and drains the worker pool — call it from your SIGTERM handler / FastAPI lifespan.
+
+## 38.13 Redis / Dedup Failure Policy
+
+`DeduplicationMiddleware` is a **fast-path optimization, not the correctness boundary.**
+
+- `fallback_on_redis_error=True` — availability first: process on Redis failure; duplicates possible ⇒ **DB idempotency must catch them**. (Recommended; alert on `dedupe_fallback_total`.)
+- `fallback_on_redis_error=False` — safety first: fail closed (retry) when Redis is down; grows the retry queue.
+
+**For financial/order flows, DB-level idempotency (`processed_messages` unique constraint) is mandatory.** Never depend on Redis dedupe alone for correctness.
+
+## 38.14 DLQ Replay Performance and Safety
+
+DLQ replay **is production traffic** — it can overload consumers and downstreams and create duplicate side effects. Controls (build on `DLQInspector`, which has no built-in throttle — see §31's `safe_replay`): batch size, rate limit, **dry-run**, predicate, **audit log (operator, reason, correlation id, count)**, stop-on-spike (DLQ/retry rate or downstream unhealthy), replay to a **quarantine** queue first for risky fixes, and prefer low-traffic windows.
+
+## 38.15 Monitoring for No-Data-Loss Confidence
+
+**Publisher:** `publish_attempt_total`, `publish_confirmed_total`, `publish_unconfirmed_total`, `publish_confirm_timeout_total`, `publish_returned_unroutable_total`, `publish_reconnect_total`, `outbox_pending_count`, `outbox_oldest_pending_age_seconds`, `outbox_retry_total`, `broker_connection_blocked_total`.
+
+**Consumer:** `consumed_total`, `ack_total`, `nack_total`, `reject_total`, `redelivered_total`, `duplicate_detected_total`, `idempotency_conflict_total`, `handler_success/failure_total`, `retry_scheduled_total`, `dlq_published_total`, `processing_duration_seconds`, `in_flight_messages`.
+
+**Broker (from the mgmt API):** `queue_depth`, `queue_oldest_message_age`, `unacked_messages`, `ready_messages`, publish/deliver/ack rates, `disk_free`, `memory_used`, `connection_blocked`, `channel_count`, `consumer_count`.
+
+**Alert on:** outbox oldest-pending-age > 2m; unconfirmed publishes rising; confirmed publish rate → 0; connection blocked > 60s; redelivery spike; duplicate spike; DLQ growth; retry-queue growth; queue-age SLO breach; `consumer_count == 0`; **no acks while depth grows** (a stuck consumer). The keystone success metric is **publish_confirmed**, never publish_attempt.
+
+## 38.16 Performance Load Tests
+
+Run and record each (rabbitkit ships `benchmarks/load_test_worker_pool.py` for consumer drain and `benchmarks/load_test_publisher.py` for publish):
+
+1. baseline throughput · 2. publisher-confirm throughput · 3. batch-publisher throughput · 4. consumer throughput × prefetch · 5. × worker_count · 6. broker restart during publish · 7. broker restart during consume · 8. network drop before confirm · 9. consumer crash after commit before ack · 10. Redis outage during dedupe · 11. downstream 503 storm · 12. retry-queue storm · 13. DLQ replay storm · 14. broker memory alarm / `connection.blocked` · 15. K8s rolling deploy under load.
+
+Per test record: msg/s, p50/p95/p99 latency, confirm latency, retry rate, DLQ rate, duplicate rate, CPU, memory, broker disk/network I/O, queue age, consumer lag.
+
+## 38.17 Performance Acceptance Criteria
+
+- No **confirmed** message lost during broker restart.
+- No **committed** business operation lost during consumer crash.
+- Duplicate rate observable and safely handled.
+- Confirm timeout → outbox resend (not lost, not assumed-sent).
+- Queue age within SLO at peak.
+- Survives broker pod restart and consumer rolling deploy.
+- DLQ replay at the configured rate does not breach downstream limits.
+- Redis outage causes no data corruption.
+- **No unbounded in-memory buffering** anywhere.
+- All critical queues durable; all critical messages persistent; all critical publishers confirmed; all critical consumers idempotent.
+
+## 38.18 Hard Rules
+
+1. No ack before the durable side effect is committed.
+2. No direct publish of business events without confirms.
+3. No memory-only queue/buffer for critical outbound events.
+4. No infinite retry.
+5. No `requeue=True` loop for arbitrary exceptions.
+6. No sleeping inside consumers for retry delay.
+7. No DLQ without an alert.
+8. No DLQ replay without a rate limit.
+9. No business-critical consumer without idempotency.
+10. No production topology auto-mutation without ownership (`PASSIVE_ONLY`/`MANUAL`).
+11. No large payloads in RabbitMQ unless explicitly approved (claim-check).
+12. No stack traces or PII in headers.
+13. No single RabbitMQ user shared across services.
+14. No `ACK_FIRST` for important workflows.
+15. No batch-ack unless duplicate safety is proven.
+16. Confirm timeout is **unknown** — never treated as success or failure blindly.
+17. No manual queue delete/purge without change approval.
+18. No scaling consumers beyond downstream capacity.
+19. No retrying permanent validation errors.
+20. Success is measured by **publish confirms**, never publish attempts.
+
+---
+
 *Design for duplicates. Design for crashes. Design for downstream outages. Design for replay. Design for the on-call engineer at 3am, and for the team that inherits this in two years. At-least-once is the floor; idempotency is how you build a reliable system on top of it.*

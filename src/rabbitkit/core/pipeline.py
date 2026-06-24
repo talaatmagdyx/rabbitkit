@@ -53,6 +53,11 @@ class HandlerPipeline:
         # Per-handler caches so the hot path avoids inspect.signature() per message.
         self._body_type_cache: dict[Any, type | None] = {}
         self._sig_cache: dict[Any, Any] = {}  # handler -> inspect.Signature (fallback resolver)
+        # Auto-DI: when no resolver is passed, handlers that use Depends/Header/Path/
+        # Context markers get a lazily-created resolver; marker-free handlers keep the
+        # fast fallback (so the simple-handler hot path and its behavior are unchanged).
+        self._auto_resolver: Any | None = None
+        self._needs_di_cache: dict[Any, bool] = {}
 
     def process_sync(
         self,
@@ -358,8 +363,9 @@ class HandlerPipeline:
         Uses DI resolver if available, otherwise falls back to simple
         body + message injection.
         """
-        if self._di_resolver is not None and hasattr(self._di_resolver, "resolve"):
-            return self._di_resolver.resolve(route.handler, message, self._context_repo, body, scope=scope)  # type: ignore[no-any-return]
+        resolver = self._effective_resolver(route.handler)
+        if resolver is not None and hasattr(resolver, "resolve"):
+            return resolver.resolve(route.handler, message, self._context_repo, body, scope=scope)  # type: ignore[no-any-return]
 
         # Simple fallback: inject body and/or message based on signature.
         # Cache the signature per handler — inspect.signature() per message is the
@@ -398,12 +404,59 @@ class HandlerPipeline:
 
         Uses async DI resolver if available, otherwise falls back to sync resolve.
         """
-        if self._di_resolver is not None and hasattr(self._di_resolver, "resolve_async"):
-            return await self._di_resolver.resolve_async(  # type: ignore[no-any-return]
+        resolver = self._effective_resolver(route.handler)
+        if resolver is not None and hasattr(resolver, "resolve_async"):
+            return await resolver.resolve_async(  # type: ignore[no-any-return]
                 route.handler, message, self._context_repo, body, scope=scope
             )
-        # Fall back to sync resolve
+        # Fall back to sync resolve (fast path for marker-free handlers)
         return self._resolve_params(route, message, body, scope=scope)
+
+    def _effective_resolver(self, handler: Any) -> Any | None:
+        """Return the resolver to use for a handler.
+
+        Explicit `di_resolver` always wins. Otherwise, handlers that use DI markers
+        (Depends/Header/Path/Context) get a lazily-created default DIResolver, so the
+        documented markers work without the caller wiring one. Marker-free handlers
+        return None → the fast body/message fallback, unchanged.
+        """
+        if self._di_resolver is not None:
+            return self._di_resolver
+        if not self._handler_needs_di(handler):
+            return None
+        if self._auto_resolver is None:
+            from rabbitkit.di.resolver import DIResolver
+
+            self._auto_resolver = DIResolver()
+        return self._auto_resolver
+
+    def _handler_needs_di(self, handler: Any) -> bool:
+        """True if any parameter is Annotated with a DI marker. Cached per handler."""
+        cached = self._needs_di_cache.get(handler)
+        if cached is not None:
+            return cached
+
+        import inspect
+        import typing
+
+        try:
+            hints = typing.get_type_hints(handler, include_extras=True)
+        except Exception:
+            try:
+                hints = inspect.get_annotations(handler, eval_str=True)
+            except Exception:
+                hints = getattr(handler, "__annotations__", {})
+
+        from rabbitkit.di.context import Context, Header, Path
+        from rabbitkit.di.depends import Depends
+
+        markers = (Depends, Header, Path, Context)
+        needs = any(
+            any(isinstance(m, markers) for m in getattr(ann, "__metadata__", ()))
+            for ann in hints.values()
+        )
+        self._needs_di_cache[handler] = needs
+        return needs
 
     # ── Internal: result publishing ──────────────────────────────────────
 

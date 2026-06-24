@@ -8,7 +8,7 @@ from typing import Annotated
 
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.di.context import Path
-from rabbitkit.di.resolver import DIResolver
+from rabbitkit.di.depends import Depends
 from rabbitkit.testing import TestBroker
 
 
@@ -50,13 +50,13 @@ class TestExtractPath:
 
 
 class TestPathDIEndToEnd:
-    """The bug: a real broker never filled msg.path, so Path() raised KeyError even
-    with DI enabled. Proven here through TestBroker, which now extracts named segments
-    on dispatch. (Path(), like all DI markers, requires an explicit DIResolver.)"""
+    """Two bugs: (1) no broker filled msg.path, so Path() always raised KeyError;
+    (2) DI markers only worked with an explicitly-passed DIResolver. Both fixed —
+    DI markers now auto-enable, so a bare broker resolves them."""
 
-    def test_path_di_resolves_from_routing_key(self) -> None:
+    def test_path_di_resolves_without_explicit_resolver(self) -> None:
         seen: dict[str, str] = {}
-        broker = TestBroker(di_resolver=DIResolver())
+        broker = TestBroker()  # no di_resolver — auto-detected from the Path() marker
 
         @broker.subscriber(queue="events", routing_key="events.{level}.#")
         def handle(body: bytes, level: Annotated[str, Path("level")]) -> None:
@@ -66,3 +66,34 @@ class TestPathDIEndToEnd:
         broker.publish("events", b"{}", routing_key="events.info.svc.a")
 
         assert seen["level"] == "info"
+
+    def test_depends_di_works_without_explicit_resolver(self) -> None:
+        seen: dict[str, str] = {}
+        broker = TestBroker()  # no di_resolver
+
+        def get_service() -> str:
+            return "svc-1"
+
+        @broker.subscriber(queue="jobs")
+        def handle(body: bytes, svc: Annotated[str, Depends(get_service)]) -> None:
+            seen["svc"] = svc
+
+        broker.start()
+        broker.publish("jobs", b"{}")
+
+        assert seen["svc"] == "svc-1"
+
+    def test_marker_free_handler_still_uses_fast_path(self) -> None:
+        """Simple handlers must NOT change behavior: a bare RabbitMessage-typed
+        second param still gets the message (the fast fallback), not a DI error."""
+        seen: dict[str, object] = {}
+        broker = TestBroker()
+
+        @broker.subscriber(queue="plain")
+        def handle(body: bytes) -> None:
+            seen["body"] = body
+
+        broker.start()
+        broker.publish("plain", b"hello")
+
+        assert seen["body"] == b"hello"

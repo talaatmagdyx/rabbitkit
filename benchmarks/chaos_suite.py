@@ -302,13 +302,119 @@ async def scenario_sync_restart_during_consume() -> tuple[bool, str]:
                 f"landed_mid={landed_mid} — sync consumer did not resume (or restart missed)")
 
 
+# ── Scenario 5: SYNC transient failures → retry → DLQ ────────────────────────
+def _run_sync_retry_consumer(queue: str, retry_cfg: RetryConfig, attempts: list[int],
+                             ready: threading.Event) -> None:
+    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL), retry=retry_cfg))
+    retry_mw = RetryMiddleware(retry_cfg, publish_fn=broker.publish)
+
+    @broker.subscriber(queue=RabbitQueue(name=queue, durable=True),
+                       ack_policy=AckPolicy.NACK_ON_ERROR, retry=retry_cfg, middlewares=[retry_mw])
+    def handle(body: bytes) -> None:
+        attempts[0] += 1
+        if attempts[0] >= 3 and broker._transport is not None:
+            broker._transport.stop_consuming()  # exhausted → let the consume loop exit
+        raise ConnectionError("downstream down")  # transient → retry → eventually DLQ
+
+    broker.start()  # declares the delay-queue + DLQ topology
+    broker.publish(MessageEnvelope(routing_key=queue, body=b"poison"))
+    ready.set()
+    try:
+        broker._transport.start_consuming()
+    except Exception:  # connection torn down by stop()/shutdown
+        pass
+    broker.stop()
+
+
+async def scenario_sync_retry_to_dlq() -> tuple[bool, str]:
+    queue = "chaos.sync.retry"
+    retry_cfg = RetryConfig(max_retries=2, delays=(1, 1), jitter_factor=0.0,
+                            per_queue=True, unknown_policy=ErrorSeverity.PERMANENT)
+    attempts = [0]
+    ready = threading.Event()
+    thread = threading.Thread(
+        target=_run_sync_retry_consumer, args=(queue, retry_cfg, attempts, ready), daemon=True
+    )
+    thread.start()
+    ready.wait(10)
+
+    inspect_broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    await inspect_broker.start()
+    inspector = DLQInspector(inspect_broker._transport)
+    dlq = f"{queue}.dlq"
+    deadline = time.monotonic() + 30
+    in_dlq = 0
+    while time.monotonic() < deadline:
+        msgs = await inspector.peek_async(dlq, limit=5)
+        if msgs:
+            in_dlq = len(msgs)
+            break
+        await asyncio.sleep(0.5)
+    await inspect_broker.stop()
+    thread.join(timeout=10)
+
+    ok = in_dlq >= 1 and attempts[0] >= 3
+    return ok, (f"{attempts[0]} attempts then landed in {dlq} (sync retry exhausted → DLQ, no loss/loop)"
+                if ok else f"FAIL: attempts={attempts[0]}, in_dlq={in_dlq}")
+
+
+# ── Scenario 6: SYNC broker restart mid-publish, resend unconfirmed ──────────
+def _run_sync_publisher(queue: str, n: int, confirmed: list[int],
+                        ready: threading.Event, done: threading.Event) -> None:
+    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    broker.start()
+    broker._transport.declare_queue(RabbitQueue(name=queue, durable=True))
+    ready.set()
+    for i in range(n):
+        for _ in range(120):  # outlast a full reboot
+            try:
+                outcome = broker.publish(
+                    MessageEnvelope(routing_key=queue, body=f"{i}".encode(), delivery_mode=2))
+                if outcome.status == PublishStatus.CONFIRMED:
+                    confirmed[0] += 1
+                    break
+            except Exception:  # connection dropped mid-publish; resend
+                pass
+            time.sleep(0.5)
+    broker.stop()
+    done.set()
+
+
+async def scenario_sync_restart_during_publish() -> tuple[bool, str]:
+    queue = "chaos.sync.publish"
+    n = 300
+    confirmed = [0]
+    ready = threading.Event()
+    done = threading.Event()
+    thread = threading.Thread(
+        target=_run_sync_publisher, args=(queue, n, confirmed, ready, done), daemon=True
+    )
+    thread.start()
+    ready.wait(10)
+
+    await asyncio.sleep(0.8)             # restart ~0.8s into the publish loop
+    await asyncio.to_thread(restart_broker)
+
+    deadline = time.monotonic() + 150
+    while not done.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+    thread.join(timeout=5)
+
+    ok = confirmed[0] == n
+    return ok, (f"{confirmed[0]}/{n} confirmed despite a mid-publish restart "
+                f"(sync publisher reconnected + resent unconfirmed)"
+                if ok else f"FAIL: only {confirmed[0]}/{n} confirmed")
+
+
 async def main() -> None:
     start_broker()
     scenarios = [
-        ("broker restart mid-consume (no loss + idempotent dedup)", scenario_restart_during_consume),
-        ("transient failures → retry → DLQ", scenario_retry_to_dlq),
-        ("broker restart mid-publish (resend unconfirmed)", scenario_restart_during_publish),
-        ("SYNC broker restart mid-consume (recovery)", scenario_sync_restart_during_consume),
+        ("ASYNC restart mid-consume (no loss + idempotent dedup)", scenario_restart_during_consume),
+        ("ASYNC transient failures → retry → DLQ", scenario_retry_to_dlq),
+        ("ASYNC restart mid-publish (resend unconfirmed)", scenario_restart_during_publish),
+        ("SYNC restart mid-consume (recovery)", scenario_sync_restart_during_consume),
+        ("SYNC transient failures → retry → DLQ", scenario_sync_retry_to_dlq),
+        ("SYNC restart mid-publish (resend unconfirmed)", scenario_sync_restart_during_publish),
     ]
     results = []
     try:

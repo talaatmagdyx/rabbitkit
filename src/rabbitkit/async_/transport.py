@@ -153,7 +153,9 @@ class AsyncTransportImpl:
                     headers=envelope.headers or None,
                     delivery_mode=aio_pika.DeliveryMode(envelope.delivery_mode),
                     priority=envelope.priority,
-                    expiration=(int(envelope.expiration) * 1000 if envelope.expiration else None),
+                    # envelope.expiration is milliseconds (str); aio-pika wants SECONDS.
+                    # (Was *1000, making the TTL 1e6x too long and inconsistent with sync.)
+                    expiration=(int(envelope.expiration) / 1000 if envelope.expiration else None),
                     type=envelope.type,
                     user_id=envelope.user_id,
                     app_id=envelope.app_id,

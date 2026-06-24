@@ -246,6 +246,21 @@ class TestPublish:
         mock_exchange.publish.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_publish_expiration_ms_converted_to_seconds(self) -> None:
+        """Regression: envelope.expiration is milliseconds; aio-pika expects SECONDS.
+        Was `* 1000`, making the TTL 1e6x too long and inconsistent with sync."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        channel.get_exchange = AsyncMock(return_value=AsyncMock())
+
+        envelope = MessageEnvelope(routing_key="q", body=b"{}", exchange="e", expiration="60000")
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            await transport.publish(envelope)
+
+        assert mock_msg_cls.call_args.kwargs["expiration"] == 60.0  # 60000 ms -> 60 s
+
+    @pytest.mark.asyncio
     async def test_publish_default_exchange(self) -> None:
         transport = _make_transport()
         channel = await self._connect_transport(transport)

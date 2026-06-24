@@ -25,9 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The async publish path never set the message timestamp (sync did), and **neither** transport surfaced `properties.timestamp` on consume — `message.timestamp` was always `None` for consumers.
   - Fixed: async publish sends `envelope.timestamp`; both transports populate `message.timestamp` on consume (sync converts pika's Unix int to a tz-aware `datetime`).
 
+- **Async per-message TTL (`expiration`) was 1,000,000× too long**
+  - `MessageEnvelope.expiration` is milliseconds, but the async publish did `int(expiration) * 1000` and aio-pika's `Message.expiration` is in **seconds** — so `"60000"` (60 s) became 60,000,000 s (~1.9 years), and it disagreed with the sync transport (which passes the ms string straight to pika, correctly).
+  - Fixed: async now passes `int(expiration) / 1000` (ms → seconds), matching sync on the wire.
+
 ### Testing
 
-- `benchmarks/chaos_suite.py`: the "restart mid-consume" scenario was a **false positive** — its `sleep(0.01)` handler drained the queue before the 1.5 s restart fired, so consumer recovery was never exercised. The handler is now slow enough that the restart lands mid-drain, with a guard (`0 < at_restart < n`) that fails if it doesn't; the "restart mid-publish" resend budget was raised to outlast a full reboot; the port is overridable via `RK_CHAOS_PORT`. Added a **sync** restart-mid-consume scenario (4/4 total) — proves `SyncBroker` resumes after a reconnect.
+- `benchmarks/chaos_suite.py`: the "restart mid-consume" scenario was a **false positive** — its `sleep(0.01)` handler drained the queue before the 1.5 s restart fired, so consumer recovery was never exercised. The handler is now slow enough that the restart lands mid-drain, with a guard (`0 < at_restart < n`) that fails if it doesn't; the "restart mid-publish" resend budget was raised to outlast a full reboot; the port is overridable via `RK_CHAOS_PORT`. Now **6 scenarios** with full sync/async parity — each failure mode (restart mid-consume, transient→retry→DLQ, restart mid-publish) is exercised on **both** transports, all asserting zero loss.
 - New `examples/header_inspector/chaos_reconnect.py` — chaos test for the reconnect + consumer-recovery + resend path (100 messages, hard restart + freeze, asserts zero loss).
 
 ## [0.7.0] — 2026-06-23

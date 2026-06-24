@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`Path()` dependency injection never worked — `message.path` was never populated**
   - No broker filled `message.path`, so `Path("name")` always raised `KeyError` in real use (the resolver unit tests pre-set `path` and masked it). There was also no way to *name* a routing-key segment.
-  - Fixed: routes may now name a single-word segment with `{name}` (e.g. `routing_key="events.{level}.#"`), which binds to AMQP as `*`; on each delivery the sync, async, and Test brokers extract the named segments into `message.path` (new `core/path.py`). `Path()`, like every DI marker, still requires an explicit `di_resolver=DIResolver()`.
+  - Fixed: routes may now name a single-word segment with `{name}` (e.g. `routing_key="events.{level}.#"`), which binds to AMQP as `*`; on each delivery the sync, async, and Test brokers extract the named segments into `message.path` (new `core/path.py`).
+
+- **DI markers (`Depends`/`Header`/`Path`/`Context`) silently did nothing without an explicit `DIResolver`**
+  - The documented markers only resolved when `di_resolver=DIResolver()` was passed to the broker; otherwise the fallback ignored them (a marked parameter got the `RabbitMessage` instead of the resolved value). The README showed them working without any setup.
+  - Fixed: the pipeline now auto-detects DI markers per handler and uses a resolver automatically. Marker-free handlers keep the zero-overhead body/message fast path (no behavior change, no perf regression); the detection result is cached per handler.
 
 - **AMQP `timestamp` not round-tripped**
   - The async publish path never set the message timestamp (sync did), and **neither** transport surfaced `properties.timestamp` on consume — `message.timestamp` was always `None` for consumers.

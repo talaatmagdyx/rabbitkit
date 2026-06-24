@@ -427,10 +427,10 @@ Middleware is applied as a chain. The outermost middleware runs first on receive
 
 ## Dependency Injection
 
-> **Enable DI:** the `Depends()` / `Header()` / `Path()` / `Context()` markers are
-> resolved only when the broker is given a resolver:
-> `AsyncBroker(config, di_resolver=DIResolver())` (from `rabbitkit.di.resolver`).
-> Without it, handlers get only the body (and a `RabbitMessage`-typed parameter).
+> **DI works out of the box:** the `Depends()` / `Header()` / `Path()` / `Context()`
+> markers are auto-detected per handler — no setup needed. Handlers without markers
+> use a zero-overhead fast path (body + `RabbitMessage` injection). Pass a custom
+> `di_resolver=` to the broker only if you need to override resolution.
 
 ### Depends()
 

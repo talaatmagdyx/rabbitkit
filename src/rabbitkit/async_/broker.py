@@ -27,6 +27,7 @@ from rabbitkit.core.config import (
     WorkerConfig,
 )
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
@@ -320,7 +321,7 @@ class AsyncBroker:
                 await self._transport.bind_queue(
                     queue=route.queue.name,
                     exchange=route.exchange.name,
-                    routing_key=route.queue.routing_key,
+                    routing_key=to_binding_key(route.queue.routing_key),
                 )
 
             # Declare retry/DLQ topology if retry is enabled
@@ -345,6 +346,9 @@ class AsyncBroker:
             # Set the original queue in headers for retry routing
             if "x-rabbitkit-original-queue" not in message.headers:
                 message.headers["x-rabbitkit-original-queue"] = route.queue.name
+
+            # Populate named routing-key segments for Path() DI
+            message.path = extract_path(message.routing_key, route.queue.routing_key)
 
             await self._pipeline.process_async(
                 route,

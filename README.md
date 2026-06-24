@@ -427,6 +427,11 @@ Middleware is applied as a chain. The outermost middleware runs first on receive
 
 ## Dependency Injection
 
+> **Enable DI:** the `Depends()` / `Header()` / `Path()` / `Context()` markers are
+> resolved only when the broker is given a resolver:
+> `AsyncBroker(config, di_resolver=DIResolver())` (from `rabbitkit.di.resolver`).
+> Without it, handlers get only the body (and a `RabbitMessage`-typed parameter).
+
 ### Depends()
 
 Inject dependencies into handler parameters using `Depends()` with `typing.Annotated`.
@@ -481,7 +486,9 @@ Extract values from message headers, topic wildcard segments, or application con
 from typing import Annotated
 from rabbitkit.di.context import Header, Path, Context
 
-@broker.subscriber(queue="events", routing_key="events.*.#")
+# Name a routing-key segment with {name}; it binds to AMQP as '*' and is
+# extracted into message.path for Path() to read.
+@broker.subscriber(queue="events", routing_key="events.{level}.#")
 def handle(
     body: bytes,
     tenant: Annotated[str, Header("x-tenant")],

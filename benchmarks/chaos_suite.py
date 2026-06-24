@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import threading
 import time
 
 from rabbitkit import MessageEnvelope, RabbitConfig, RetryConfig
@@ -28,6 +29,7 @@ from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import AckPolicy, ErrorSeverity, PublishStatus
 from rabbitkit.dlq import DLQInspector
 from rabbitkit.middleware.retry import RetryMiddleware
+from rabbitkit.sync.broker import SyncBroker
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
@@ -242,12 +244,71 @@ async def scenario_restart_during_publish() -> tuple[bool, str]:
                 if ok else f"FAIL: only {confirmed}/{n} confirmed")
 
 
+# ── Scenario 4: SYNC broker restart mid-consume ──────────────────────────────
+def _run_sync_consumer(queue: str, n: int, processed: set[str], dups: list[int],
+                       ready: threading.Event) -> None:
+    """Runs in a thread: a SyncBroker consumer with recovery that self-stops at n.
+
+    worker_count=1 runs the handler inline on the connection's I/O thread, so the
+    handler can call stop_consuming() directly (no cross-thread channel call) to
+    unblock run() once the queue is drained.
+    """
+    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+
+    @broker.subscriber(queue=RabbitQueue(name=queue, durable=True),
+                       ack_policy=AckPolicy.NACK_ON_ERROR, prefetch_count=20)
+    def handle(body: bytes) -> None:
+        oid = body.decode()
+        if oid in processed:
+            dups[0] += 1
+            return
+        processed.add(oid)
+        time.sleep(0.05)  # slow enough that the restart lands mid-drain
+        if len(processed) >= n and broker._transport is not None:
+            broker._transport.stop_consuming()  # on the I/O thread → unblocks run()
+
+    ready.set()
+    broker.run()
+
+
+async def scenario_sync_restart_during_consume() -> tuple[bool, str]:
+    queue = "chaos.sync.consume"
+    n = 250
+    await _preload(queue, n)
+
+    processed: set[str] = set()
+    dups = [0]
+    ready = threading.Event()
+    thread = threading.Thread(
+        target=_run_sync_consumer, args=(queue, n, processed, dups, ready), daemon=True
+    )
+    thread.start()
+    ready.wait(10)
+
+    await asyncio.sleep(1.0)             # let some drain before the bounce
+    at_restart = len(processed)
+    await asyncio.to_thread(restart_broker)
+
+    deadline = time.monotonic() + 120
+    while thread.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+
+    landed_mid = 0 < at_restart < n
+    ok = len(processed) == n and landed_mid
+    return ok, (f"processed {len(processed)}/{n} unique ({at_restart} before the bounce, "
+                f"{dups[0]} redelivered-dups absorbed); sync consumer RESUMED after reconnect"
+                if ok else
+                f"FAIL: processed={len(processed)}/{n}, at_restart={at_restart}, "
+                f"landed_mid={landed_mid} — sync consumer did not resume (or restart missed)")
+
+
 async def main() -> None:
     start_broker()
     scenarios = [
         ("broker restart mid-consume (no loss + idempotent dedup)", scenario_restart_during_consume),
         ("transient failures → retry → DLQ", scenario_retry_to_dlq),
         ("broker restart mid-publish (resend unconfirmed)", scenario_restart_during_publish),
+        ("SYNC broker restart mid-consume (recovery)", scenario_sync_restart_during_consume),
     ]
     results = []
     try:

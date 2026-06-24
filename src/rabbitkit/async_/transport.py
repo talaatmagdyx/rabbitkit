@@ -157,6 +157,7 @@ class AsyncTransportImpl:
                     type=envelope.type,
                     user_id=envelope.user_id,
                     app_id=envelope.app_id,
+                    timestamp=envelope.timestamp,  # was dropped on async; sync already sends it
                 )
 
                 if envelope.exchange:
@@ -351,6 +352,7 @@ class AsyncTransportImpl:
             content_encoding=aio_message.content_encoding,
             type=aio_message.type,
             app_id=aio_message.app_id,
+            timestamp=aio_message.timestamp,  # was never surfaced on consume
             routing_key=aio_message.routing_key,
             exchange=aio_message.exchange or "",
             delivery_tag=aio_message.delivery_tag,

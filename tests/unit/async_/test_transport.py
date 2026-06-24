@@ -365,6 +365,21 @@ class TestConsume:
 
 
 class TestBuildMessage:
+    def test_build_message_surfaces_timestamp(self) -> None:
+        """Regression: msg.timestamp was never populated on consume (always None)."""
+        from datetime import UTC, datetime
+
+        transport = _make_transport()
+        ts = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = ts
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.timestamp == ts
+
     def test_build_message_from_aio_pika(self) -> None:
         transport = _make_transport()
 

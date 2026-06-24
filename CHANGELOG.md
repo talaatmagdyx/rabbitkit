@@ -17,9 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `make_aio_pika_connect_kwargs()` passed only `url` + `timeout` to `connect_robust`, dropping the configured heartbeat on async (the sync transport already honored it); aio-pika fell back to its negotiated default.
   - Fixed: heartbeat is carried on the connection URL (`?heartbeat=N`), and `reconnect_backoff_base` is mapped to `connect_robust(reconnect_interval=...)`.
 
+- **`Path()` dependency injection never worked — `message.path` was never populated**
+  - No broker filled `message.path`, so `Path("name")` always raised `KeyError` in real use (the resolver unit tests pre-set `path` and masked it). There was also no way to *name* a routing-key segment.
+  - Fixed: routes may now name a single-word segment with `{name}` (e.g. `routing_key="events.{level}.#"`), which binds to AMQP as `*`; on each delivery the sync, async, and Test brokers extract the named segments into `message.path` (new `core/path.py`). `Path()`, like every DI marker, still requires an explicit `di_resolver=DIResolver()`.
+
+- **AMQP `timestamp` not round-tripped**
+  - The async publish path never set the message timestamp (sync did), and **neither** transport surfaced `properties.timestamp` on consume — `message.timestamp` was always `None` for consumers.
+  - Fixed: async publish sends `envelope.timestamp`; both transports populate `message.timestamp` on consume (sync converts pika's Unix int to a tz-aware `datetime`).
+
 ### Testing
 
-- `benchmarks/chaos_suite.py`: the "restart mid-consume" scenario was a **false positive** — its `sleep(0.01)` handler drained the queue before the 1.5 s restart fired, so consumer recovery was never exercised. The handler is now slow enough that the restart lands mid-drain, with a guard (`0 < at_restart < n`) that fails if it doesn't; the "restart mid-publish" resend budget was raised to outlast a full reboot; the port is overridable via `RK_CHAOS_PORT`.
+- `benchmarks/chaos_suite.py`: the "restart mid-consume" scenario was a **false positive** — its `sleep(0.01)` handler drained the queue before the 1.5 s restart fired, so consumer recovery was never exercised. The handler is now slow enough that the restart lands mid-drain, with a guard (`0 < at_restart < n`) that fails if it doesn't; the "restart mid-publish" resend budget was raised to outlast a full reboot; the port is overridable via `RK_CHAOS_PORT`. Added a **sync** restart-mid-consume scenario (4/4 total) — proves `SyncBroker` resumes after a reconnect.
 - New `examples/header_inspector/chaos_reconnect.py` — chaos test for the reconnect + consumer-recovery + resend path (100 messages, hard restart + freeze, asserts zero loss).
 
 ## [0.7.0] — 2026-06-23

@@ -465,6 +465,26 @@ class TestConsumeCallback:
         assert isinstance(received[0], RabbitMessage)
         assert received[0].routing_key == "orders"
 
+    def test_build_message_converts_timestamp(self) -> None:
+        """Regression: pika's int timestamp is surfaced as a tz-aware datetime
+        (msg.timestamp used to always be None on consume)."""
+        from datetime import UTC, datetime
+
+        transport = _make_transport()
+        method = MagicMock()
+        method.routing_key = "q"
+        method.exchange = ""
+        method.delivery_tag = 1
+        method.redelivered = False
+        method.consumer_tag = "t"
+        props = MagicMock()
+        props.headers = None
+        props.timestamp = 1704164645  # 2024-01-02T03:04:05Z
+
+        msg = transport._build_message(method, props, b"{}")
+
+        assert msg.timestamp == datetime.fromtimestamp(1704164645, tz=UTC)
+
     def test_build_message_wires_ack_functions(self) -> None:
         """_build_message sets ack/nack/reject callables on the message."""
         transport = _make_transport()

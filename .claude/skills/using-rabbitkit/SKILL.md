@@ -6,6 +6,8 @@ argument-hint: "[topic, e.g. retry | di | testing | config]"
 
 Authoritative usage guide for the **rabbitkit** library. The full API reference lives in `@README.md`; the canonical end-to-end configurations are `examples/full_config/sync_app.py` and `examples/full_config/async_app.py`. This skill is the fast path plus the non-obvious gotchas.
 
+**For the complete configuration reference** — every config object, every field + default, and the full sync-vs-async difference table — read `config-reference.md` in this skill directory (`${CLAUDE_SKILL_DIR}/config-reference.md`). Pull it whenever the user asks about config, options, or sync/async wiring.
+
 ## Minimal consumer + publisher
 
 ```python
@@ -41,7 +43,7 @@ broker.publish(MessageEnvelope(routing_key="orders", body=b"{}", exchange=""))
 # async: await broker.publish(MessageEnvelope(...))
 ```
 
-Config is composed from frozen dataclasses: `RabbitConfig(connection=ConnectionConfig(...), publisher=PublisherConfig(...), consumer=ConsumerConfig(...), retry=RetryConfig(...), topology_mode=..., ...)`. From env: `RabbitSettings().to_rabbit_config()` (needs `rabbitkit[settings]`). See README "Configuration Reference".
+Config is composed from frozen dataclasses: `RabbitConfig(connection=ConnectionConfig(...), publisher=PublisherConfig(...), consumer=ConsumerConfig(...), retry=RetryConfig(...), topology_mode=..., ...)`. From env: `RabbitSettings().to_rabbit_config()` (needs `rabbitkit[settings]`). **Every field + default is in `config-reference.md` (this dir)** — and a complete `RabbitConfig` literal with everything set.
 
 ## Gotchas that bite (read before debugging)
 

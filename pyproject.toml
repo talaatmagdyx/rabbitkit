@@ -111,6 +111,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S311", "RUF006"]
 "benchmarks/**/*.py" = ["T20", "S603", "S607"]  # benchmark/chaos scripts may shell out (docker)
+"examples/**/*.py" = ["T20", "S311"]  # examples print output and use random for demo data
 
 [tool.mypy]
 strict = true

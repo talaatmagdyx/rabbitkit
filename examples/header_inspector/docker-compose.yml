@@ -1,0 +1,16 @@
+# RabbitMQ for the header-inspector example.
+#   docker compose up -d   → broker on 127.0.0.1:5672, management UI on http://127.0.0.1:15672 (guest/guest)
+#   docker compose down    → stop + remove
+# Bound to 127.0.0.1 (not 0.0.0.0) so aio-pika resolves IPv4 — avoids the ::1 "connection reset" trap.
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitkit-header-demo
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

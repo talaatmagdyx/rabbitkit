@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SocketConfig
@@ -407,6 +408,10 @@ class SyncTransport:
 
     def _build_message(self, method: Any, properties: Any, body: bytes) -> RabbitMessage:
         """Build RabbitMessage from pika delivery."""
+        # pika carries the AMQP timestamp as a Unix int (seconds); surface it as a
+        # tz-aware datetime to match the publish side. Was never populated before.
+        ts = properties.timestamp
+        timestamp = datetime.fromtimestamp(ts, tz=UTC) if isinstance(ts, (int, float)) else None
         message = RabbitMessage(
             body=body,
             headers=dict(properties.headers) if properties.headers else {},
@@ -417,6 +422,7 @@ class SyncTransport:
             content_encoding=properties.content_encoding,
             type=properties.type,
             app_id=properties.app_id,
+            timestamp=timestamp,
             routing_key=method.routing_key,
             exchange=method.exchange,
             delivery_tag=method.delivery_tag,

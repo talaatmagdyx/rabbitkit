@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.path import extract_path
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
@@ -224,6 +225,7 @@ class TestBroker:
         message._nack_fn = nack_mock
         message._reject_fn = reject_mock
 
+        message.path = extract_path(message.routing_key, route.queue.routing_key)
         self._consumed.append(message)
 
         # Process through pipeline
@@ -282,6 +284,7 @@ class TestBroker:
         message._nack_async_fn = async_nack
         message._reject_async_fn = async_reject
 
+        message.path = extract_path(message.routing_key, route.queue.routing_key)
         self._consumed.append(message)
 
         async def test_publish_fn(envelope: MessageEnvelope) -> PublishOutcome:

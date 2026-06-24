@@ -326,6 +326,27 @@ class TestConsume:
         channel.set_qos.assert_called_with(prefetch_count=50)
 
     @pytest.mark.asyncio
+    async def test_consume_passively_declares_queue_for_robust_restoration(self) -> None:
+        """Regression: consume() must declare_queue(passive=True), NOT get_queue().
+
+        RobustChannel only restores queues in its _queues registry (populated by
+        declare_queue, not get_queue), so get_queue left the consumer un-restored
+        after a reconnect — a broker bounce silently stopped consumption.
+        """
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=mock_queue)
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+
+        await transport.consume("orders", AsyncMock(), prefetch=10)
+
+        channel.declare_queue.assert_awaited_once_with("orders", passive=True)
+        channel.get_queue.assert_not_called()
+        mock_queue.consume.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_cancel_consumer(self) -> None:
         transport = _make_transport()
         channel = await self._connect_transport(transport)
@@ -615,7 +636,7 @@ class TestOnMessageCallback:
             received.append(msg)
 
         mock_queue = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=mock_queue)
+        channel.declare_queue = AsyncMock(return_value=mock_queue)
 
         await transport.consume("orders", handler)
 

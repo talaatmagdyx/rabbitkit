@@ -99,12 +99,20 @@ def make_aio_pika_connect_kwargs(
             "Install it with: pip install rabbitkit[async]"
         ) from None
 
-    # Build URL
+    # Build URL — carry heartbeat as a query param. aio-pika/aiormq read heartbeat
+    # from the URL; passing it as a kwarg is not portable across versions. Without
+    # this the configured ConnectionConfig.heartbeat was silently dropped on async
+    # (the sync transport already honors it).
     url = connection.url
+    sep = "&" if "?" in url else "?"
+    url = f"{url}{sep}heartbeat={connection.heartbeat}"
 
     kwargs: dict[str, Any] = {
         "url": url,
         "timeout": connection.socket_timeout,
+        # connect_robust uses a FIXED reconnect interval; map our backoff base to it.
+        # aio-pika has no exponential backoff, so reconnect_backoff_max is not applied here.
+        "reconnect_interval": connection.reconnect_backoff_base,
     }
 
     # SSL

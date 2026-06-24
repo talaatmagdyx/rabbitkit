@@ -92,6 +92,35 @@ class TestMakeAioPikaConnectKwargs:
         assert "timeout" in kwargs
         assert kwargs["timeout"] == 10.0
 
+    def test_heartbeat_carried_in_url(self) -> None:
+        """Regression: ConnectionConfig.heartbeat must reach aio-pika via the URL
+        query (it was silently dropped on async before)."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="h", heartbeat=17)
+        kwargs = make_aio_pika_connect_kwargs(conn, SecurityConfig())
+
+        assert "heartbeat=17" in kwargs["url"]
+
+    def test_reconnect_interval_from_backoff_base(self) -> None:
+        """connect_robust gets a reconnect interval from reconnect_backoff_base."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=3.5)
+        kwargs = make_aio_pika_connect_kwargs(conn, SecurityConfig())
+
+        assert kwargs["reconnect_interval"] == 3.5
+
     def test_url_contains_host(self) -> None:
         try:
             import aio_pika  # noqa: F401

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import time
 
@@ -33,7 +34,7 @@ logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
 logging.getLogger("aiormq").setLevel(logging.CRITICAL)
 
 CONTAINER = "rk-chaos"
-PORT = 5672
+PORT = int(os.environ.get("RK_CHAOS_PORT", "5672"))  # override to avoid a busy 5672
 # 127.0.0.1, NOT localhost: localhost can resolve to IPv6 ::1 first, but a
 # docker -p mapping binds IPv4 only — aio-pika then gets a connection reset.
 HOST = "127.0.0.1"
@@ -129,6 +130,8 @@ async def scenario_restart_during_consume() -> tuple[bool, str]:
 
     broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
 
+    at_restart = -1
+
     @broker.subscriber(queue=RabbitQueue(name=queue, durable=True),
                        ack_policy=AckPolicy.NACK_ON_ERROR, prefetch_count=20)
     async def handle(body: bytes) -> None:
@@ -138,21 +141,33 @@ async def scenario_restart_during_consume() -> tuple[bool, str]:
             redeliveries += 1
             return
         processed.add(oid)
-        await asyncio.sleep(0.01)   # slow enough that the restart lands mid-stream
+        # MUST be slow enough that the restart lands mid-drain. A fast handler
+        # empties the queue before the restart fires, so the scenario passes
+        # without ever exercising consumer recovery (the original false positive).
+        await asyncio.sleep(0.15)
 
     await broker.start()
-    restart = asyncio.create_task(_delayed_restart(1.5))  # restart ~1.5s into the drain
 
-    deadline = time.monotonic() + 90
+    async def restart_mid_drain() -> None:
+        nonlocal at_restart
+        await asyncio.sleep(1.0)
+        at_restart = len(processed)          # how far we got before the bounce
+        await asyncio.to_thread(restart_broker)
+    restart = asyncio.create_task(restart_mid_drain())
+
+    deadline = time.monotonic() + 120
     while len(processed) < n and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
     await restart  # ensure the restart finished (no stray task at teardown)
     await broker.stop()
 
-    ok = len(processed) == n
-    return ok, (f"processed {len(processed)}/{n} unique, {redeliveries} redelivered-dups absorbed "
-                f"(durable+persistent survived restart; connect_robust recovered)"
-                if ok else f"LOST messages: only {len(processed)}/{n} processed")
+    landed_mid = 0 < at_restart < n          # guard: the bounce truly interrupted the drain
+    ok = len(processed) == n and landed_mid
+    return ok, (f"processed {len(processed)}/{n} unique ({at_restart} before the bounce, "
+                f"{redeliveries} redelivered-dups absorbed); consumer RESUMED after reconnect"
+                if ok else
+                f"FAIL: processed={len(processed)}/{n}, at_restart={at_restart}, "
+                f"landed_mid={landed_mid} — consumer did not resume (or restart missed the drain)")
 
 
 # ── Scenario 2: transient failures exhaust retries → DLQ ──────────────────────
@@ -207,14 +222,16 @@ async def scenario_restart_during_publish() -> tuple[bool, str]:
     restart = asyncio.create_task(_delayed_restart(1.0))  # restart ~1s into the publish loop
 
     for i in range(n):
-        # outbox-style resend: keep trying until confirmed (idempotent consumers absorb dups)
-        for _ in range(10):
+        # outbox-style resend: keep trying until confirmed (idempotent consumers absorb dups).
+        # Budget must outlast a full broker reboot (~15s) — a 2s budget gives up while the
+        # broker is still down and undercounts (the app's policy, not a rabbitkit loss).
+        for _ in range(120):
             outcome = await broker.publish(
                 MessageEnvelope(routing_key=queue, body=f"{i}".encode(), delivery_mode=2))
             if outcome.status == PublishStatus.CONFIRMED:
                 confirmed += 1
                 break
-            await asyncio.sleep(0.2)   # wait out the reconnect
+            await asyncio.sleep(0.5)   # wait out the reconnect
     if not restart.done():
         await restart
     await broker.stop()

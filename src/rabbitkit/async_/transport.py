@@ -206,7 +206,11 @@ class AsyncTransportImpl:
         await channel.set_qos(prefetch_count=prefetch)
         self._consumer_channels[queue] = channel
 
-        q = await channel.get_queue(queue, ensure=False)
+        # passive declare (not get_queue): RobustChannel only restores queues in
+        # its _queues registry, which declare_queue populates and get_queue does
+        # not. Without this, the consumer is silently NOT resumed after a
+        # connect_robust reconnect (the queue — and its consumer — are untracked).
+        q = await channel.declare_queue(queue, passive=True)
         consumer_tag = f"rabbitkit.{uuid.uuid4()}"
 
         async def on_message(message: Any) -> None:

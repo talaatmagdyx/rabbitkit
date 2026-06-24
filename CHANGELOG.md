@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Async consumer was not resumed after a broker reconnect (silent stall)**
+  - `AsyncTransportImpl.consume()` used `channel.get_queue(name, ensure=False)`, which returns a queue that aio-pika's `RobustChannel` does **not** track for restoration — only `declare_queue` populates the channel's `_queues` restore set. So after a `connect_robust` reconnect (broker restart / network drop) the connection recovered but the consumer subscription was never re-established: the consumer silently stopped receiving while publishes kept working. Reproduced by `examples/header_inspector/chaos_reconnect.py` — 99/100 published but only 44/100 consumed after a restart.
+  - Fixed: `consume()` now does `declare_queue(name, passive=True)`, registering the queue (and its consumer) for robust restoration, so the consumer resumes after a reconnect. Verified: 400/400 consumed across a mid-drain restart.
+
+- **`ConnectionConfig.heartbeat` was ignored on the async transport**
+  - `make_aio_pika_connect_kwargs()` passed only `url` + `timeout` to `connect_robust`, dropping the configured heartbeat on async (the sync transport already honored it); aio-pika fell back to its negotiated default.
+  - Fixed: heartbeat is carried on the connection URL (`?heartbeat=N`), and `reconnect_backoff_base` is mapped to `connect_robust(reconnect_interval=...)`.
+
+### Testing
+
+- `benchmarks/chaos_suite.py`: the "restart mid-consume" scenario was a **false positive** — its `sleep(0.01)` handler drained the queue before the 1.5 s restart fired, so consumer recovery was never exercised. The handler is now slow enough that the restart lands mid-drain, with a guard (`0 < at_restart < n`) that fails if it doesn't; the "restart mid-publish" resend budget was raised to outlast a full reboot; the port is overridable via `RK_CHAOS_PORT`.
+- New `examples/header_inspector/chaos_reconnect.py` — chaos test for the reconnect + consumer-recovery + resend path (100 messages, hard restart + freeze, asserts zero loss).
+
 ## [0.7.0] — 2026-06-23
 
 ### Fixed

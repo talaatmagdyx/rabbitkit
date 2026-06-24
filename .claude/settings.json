@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pytest *)",
+      "Bash(.venv/bin/ruff *)",
+      "Bash(.venv/bin/mypy *)",
+      "Bash(python -m benchmarks*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.py) if [ -x .venv/bin/ruff ]; then .venv/bin/ruff check \"$f\"; fi;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -28,8 +28,10 @@ coverage.xml
 .vscode/
 *.swp
 
-# Local agent / assistant config
-.claude/
+# Local agent / assistant config — commit shared artifacts, ignore personal/ephemeral
+.claude/settings.local.json
+.claude/worktrees/
+.claude/agent-memory-local/
 
 # OS
 .DS_Store

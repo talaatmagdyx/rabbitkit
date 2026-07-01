@@ -489,6 +489,33 @@ class SyncBroker:
             self._restore_signal_handlers()
             self.stop()
 
+    def pump_idle(self, time_limit: float = 0.05) -> None:
+        """Service the connection's I/O loop without consuming (idle keep-alive).
+
+        ``run()``/``start_consuming()`` pumps ``process_data_events()``
+        continuously while consumers are registered, which incidentally
+        keeps the (single, shared) connection's heartbeats serviced too —
+        see ``sync/transport.py``'s module docstring on the one-connection
+        model. A **publish-only** broker (no registered routes, or one that
+        never calls ``run()``) has nothing driving that pump: the connection
+        is only touched when ``publish()`` actually runs, so a long idle gap
+        can get it heartbeat-timed-out broker-side, and a dead connection is
+        only discovered (and reconnected) on the *next* publish attempt.
+
+        Call this periodically — from the SAME thread that called
+        ``start()``, same invariant as every other transport call — from
+        your own idle loop (e.g. between polling for work) to reconnect
+        proactively if the connection died, service pending heartbeat
+        frames, and refresh the liveness heartbeat (see
+        ``health.broker_liveness``) even though no message was delivered.
+        A no-op if the broker is not started.
+        """
+        if self._transport is None:
+            return
+        self._transport.ensure_connected()
+        self._transport.pump(time_limit)
+        self._mark_heartbeat()
+
     # ── Publishing ────────────────────────────────────────────────────────
 
     def publish(

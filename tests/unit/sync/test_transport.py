@@ -1649,6 +1649,35 @@ class TestReconnect:
         assert ensure_called == [True]
 
 
+class TestEnsureConnectedPublicWrapper:
+    """ensure_connected(): idle-pump support -- unlike reconnect(), a no-op
+    when already connected; only reconnects if actually dead."""
+
+    def test_noop_when_already_connected(self) -> None:
+        transport = _make_transport()
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+
+        with patch("pika.BlockingConnection") as mock_conn_2:
+            transport.ensure_connected()
+
+        mock_conn_2.assert_not_called()
+
+    def test_delegates_to_ensure_connected(self) -> None:
+        transport = _make_transport()
+        calls: list[bool] = []
+        transport._ensure_connected = lambda: calls.append(True)  # type: ignore[method-assign]
+
+        transport.ensure_connected()
+
+        assert calls == [True]
+
+
 # ── H2: pump() ────────────────────────────────────────────────────────────
 
 

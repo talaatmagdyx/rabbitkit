@@ -1156,6 +1156,28 @@ def is_healthy() -> bool:
     return app.state == AppState.RUNNING
 ```
 
+**Publish-only `SyncBroker` (no subscribers, never calls `run()`):** nothing
+else drives the connection's I/O loop, so a long idle gap between
+`publish()` calls can get the connection heartbeat-timed-out broker-side —
+the *next* publish would still transparently reconnect, but only reactively.
+Call `broker.pump_idle()` periodically from your own idle loop (same thread
+that called `start()`) to reconnect proactively and keep the liveness
+heartbeat fresh:
+
+```python
+while True:
+    work = queue.get(timeout=1.0)
+    if work is None:
+        broker.pump_idle()  # nothing to publish this tick -- keep the connection alive
+        continue
+    broker.publish(routing_key="orders.created", body=work)
+```
+
+`AsyncBroker` needs no equivalent — its connections are managed by
+`aio_pika.connect_robust()`, which runs its own heartbeat and reconnection
+logic as an independent asyncio task regardless of whether your code is
+actively publishing.
+
 ## Running in Kubernetes
 
 rabbitkit consumers run well in Kubernetes with a small amount of probe and

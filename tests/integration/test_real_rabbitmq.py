@@ -713,6 +713,54 @@ async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
     await broker.stop()
 
 
+async def test_async_signing_and_compression_compose_correctly(rabbitmq_url: str) -> None:
+    """H7: SigningMiddleware + CompressionMiddleware must compose correctly
+    when combined on the same route/broker.
+
+    ``middlewares=[CompressionMiddleware, SigningMiddleware]`` (compression
+    outer, signing inner) is the documented, only-working relative order
+    (H7) — the signature covers content_encoding, which compression itself
+    sets, so signing must run after compression on publish to sign the final
+    value. on_receive then runs in the reverse of registration order on
+    consume (signing verifies before compression decompresses), mirroring
+    compress-then-sign on publish. Proves end-to-end against a real broker:
+    broker.publish() (broker-level middlewares, C3) compresses then signs;
+    the subscriber's route-level middlewares verify then decompress; the
+    handler receives the original, uncompressed body.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import CompressionConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.compression import CompressionMiddleware
+    from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+    compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="h7-integ-secret"))
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config, middlewares=[compression_mw, signing_mw])
+
+    received: list[bytes] = []
+    done = asyncio.Event()
+
+    @broker.subscriber(queue="integ-h7-sign-compress-q", middlewares=[compression_mw, signing_mw])
+    async def handle(body: bytes) -> None:
+        received.append(body)
+        done.set()
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    original = b"order payload for H7 composition test " * 20
+    await broker.publish(MessageEnvelope(routing_key="integ-h7-sign-compress-q", body=original))
+
+    await asyncio.wait_for(done.wait(), timeout=15.0)
+
+    assert received == [original]
+
+    await broker.stop()
+
+
 async def test_async_rpc_request_response(rabbitmq_url: str) -> None:
     """RPC pattern: server echoes body to a named reply queue; client waits.
 

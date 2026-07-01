@@ -28,7 +28,28 @@ class BaseMiddleware:
     # ── Consume-side hooks ───────────────────────────────────────────────
 
     def on_receive(self, message: RabbitMessage) -> None:
-        """Called when a message is received, before processing."""
+        """Called when a message is received, before processing.
+
+        H7 — two things every on_receive override must account for:
+
+        1. Runs in a fixed, flat pre-pass entirely BEFORE consume_scope is
+           entered for ANY middleware on the route. An exception raised here
+           is NOT caught by any middleware's consume_scope — not even
+           RetryMiddleware's — so it is never retry-eligible via the
+           delay-queue mechanism; it settles per the route's AckPolicy using
+           the pipeline's default classifier instead. If your check should be
+           retryable, implement it in consume_scope, not here.
+        2. Runs in REVERSE registration order — the mirror of publish_scope's
+           outer→inner composition — so a receive-side transform that undoes
+           a publish-side one (e.g. decompress undoing compress) runs in the
+           mathematically correct relative order. This does NOT mean any two
+           on_receive-based middlewares can be listed in either order and
+           both work — e.g. SigningMiddleware + CompressionMiddleware only
+           work as ``[CompressionMiddleware, SigningMiddleware]`` (compression
+           outer), because the signature covers content_encoding, a field
+           compression itself sets. See HandlerPipeline._run_consume_sync's
+           docstring for the full explanation.
+        """
 
     async def on_receive_async(self, message: RabbitMessage) -> None:
         """Async variant of on_receive."""

@@ -496,6 +496,22 @@ Middleware is applied as a chain. The outermost middleware runs first on receive
 4. `DeduplicationMiddleware` -- skip duplicates before processing
 5. `RetryMiddleware` -- retry transient failures with delay queues
 6. `CompressionMiddleware` -- decompress before handler, compress on publish
+7. `SigningMiddleware` -- verify after decompress, sign after compress
+
+**`on_receive` (H7)**: `consume_scope`-based middleware (items 2-5 above) runs
+OUTER→INNER on receive, matching registration order -- an exception in any
+of them is caught by an outer middleware's `consume_scope` (e.g.
+`RetryMiddleware`). `CompressionMiddleware`/`SigningMiddleware` do their real
+work in `on_receive`, which runs in a separate, fixed pre-pass entirely
+BEFORE `consume_scope` is entered -- an exception there (bad signature,
+corrupt payload) is settled per the route's `AckPolicy` directly, bypassing
+`RetryMiddleware` even if it's on the same route (deliberate: retrying
+doesn't make a bad signature valid). `on_receive` also runs in the REVERSE
+of registration order (mirroring `publish_scope`'s outer→inner composition),
+which is why `CompressionMiddleware` must be listed BEFORE
+`SigningMiddleware` -- the signature covers `content_encoding`, which
+compression itself sets, so signing must see the final value. See
+`rabbitkit.middleware.signing`'s module docstring for the full explanation.
 
 ## Dependency Injection
 

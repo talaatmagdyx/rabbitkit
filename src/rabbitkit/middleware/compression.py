@@ -2,6 +2,23 @@
 
 Publish side: serialize → compress body → set content_encoding header → transport.publish
 Consume side: transport delivers → check content_encoding → decompress body → deserialize
+
+Combining with SigningMiddleware (H7): list ``CompressionMiddleware`` BEFORE
+``SigningMiddleware`` in ``middlewares=[...]`` — ``[CompressionMiddleware,
+SigningMiddleware]``, compression outer. This is required: SigningMiddleware's
+signature covers ``content_encoding``, a field this middleware's
+``publish_scope`` is what actually sets, so signing must run AFTER
+compression on publish to sign the final value — the reverse order signs
+``content_encoding=None`` and always fails verification. ``on_receive``
+(where decompression happens) runs in the REVERSE of registration order on
+consume — the mirror of ``publish_scope``'s outer→inner composition — so with
+the correct registration order, verification runs before decompression,
+matching compress-then-sign on publish. See
+``rabbitkit.middleware.signing``'s module docstring and
+``HandlerPipeline._run_consume_sync``'s docstring for the full explanation. A
+decompression failure in ``on_receive`` is not retry-eligible — it settles
+per the route's ``AckPolicy`` directly, bypassing any ``RetryMiddleware`` on
+the route.
 """
 
 from __future__ import annotations

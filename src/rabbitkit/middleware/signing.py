@@ -48,6 +48,26 @@ protection. It exists solely for backward compatibility with signers this
 library does not control; prefer the default ``require_freshness=True`` for
 any security-sensitive deployment.
 
+Combining with CompressionMiddleware (H7)
+------------------------------------------
+Use ``middlewares=[CompressionMiddleware(...), SigningMiddleware(...)]`` —
+compression OUTER, signing INNER. This order is required, not a suggestion:
+the signature covers ``content_encoding`` (see above), a field
+``CompressionMiddleware``'s ``publish_scope`` is what actually sets. With
+signing outer (the reverse order), signing would sign
+``content_encoding=None`` (unset at that point) while compression sets it to
+e.g. ``"gzip"`` afterward — the delivered message's ``content_encoding``
+then never matches what was signed, and verification fails
+unconditionally. With the correct order, compression sets
+``content_encoding`` first, signing signs the final value and the compressed
+body, and ``HandlerPipeline`` runs ``on_receive`` hooks in the REVERSE of
+registration order on consume (verify before decompress, mirroring
+compress-then-sign on publish) so the two compose correctly end-to-end. A
+signature/decompression failure in ``on_receive`` is NOT retry-eligible (see
+``HandlerPipeline._run_consume_sync``'s docstring) — it settles per the
+route's ``AckPolicy`` directly, bypassing any ``RetryMiddleware`` on the
+route.
+
 Replay protection
 -----------------
 ``require_freshness`` defaults to ``True``. The consume-time rules are:

@@ -1461,7 +1461,12 @@ def handle_order_notification(body: bytes) -> None:
     ...
 ```
 
-Messages that fail the filter are nacked with `requeue=False` (discarded/DLQ).
+Messages that fail the filter are nacked with `requeue=False`. That relies on
+a dead-letter-exchange to preserve the message — retry-enabled routes and
+routes with a manually-configured `dead_letter_exchange` already have one; a
+filter route with neither gets a `<queue>.dlq` auto-declared and wired
+automatically (with a `RuntimeWarning` noting it), so a filter rejection is
+never silently discarded.
 The filter runs before ACK_FIRST, deserialization, and DI resolution —
 so it is extremely cheap for high-volume routing.
 

@@ -219,6 +219,116 @@ class TestLifecycle:
                 await broker.start(install_signal_handlers=False)
 
 
+# ── H6: filter_fn without a DLX must not silently drop messages ──────────
+
+
+class TestFilterWithoutDLX:
+    """H6: filter_fn rejections nack(requeue=False) — without a DLX RabbitMQ
+    discards them. A filter route with no retry and no manual DLX must get
+    an auto-declared '<queue>.dlq' and a loud warning, not silent loss."""
+
+    def _filter_fn(self, msg: object) -> bool:
+        return True
+
+    @pytest.mark.asyncio
+    async def test_filter_without_retry_or_dlx_warns_and_auto_declares_dlq(self) -> None:
+        broker = AsyncBroker()  # no broker-wide retry
+
+        @broker.subscriber(queue="orders", filter_fn=self._filter_fn)
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        with pytest.warns(RuntimeWarning, match="auto-declared 'orders.dlq'"):
+            await broker._declare_topology()
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        source = next(q for q in declared_queues if q.name == "orders")
+        assert source.dead_letter_exchange == ""
+        assert source.dead_letter_routing_key == "orders.dlq"
+
+        dlq = next(q for q in declared_queues if q.name == "orders.dlq")
+        assert dlq.durable is True
+
+    @pytest.mark.asyncio
+    async def test_filter_with_retry_enabled_does_not_double_declare_dlq(self) -> None:
+        """When retry IS enabled, RetryRouter already provides a DLX — the
+        filter-specific auto-declare path must not also fire."""
+        config = RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,)))
+        broker = AsyncBroker(config)
+
+        @broker.subscriber(queue="orders", filter_fn=self._filter_fn)
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await broker._declare_topology()
+
+        assert not any("auto-declared" in str(w.message) for w in caught)
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        dlqs = [q for q in declared_queues if q.name == "orders.dlq"]
+        assert len(dlqs) == 1, "exactly one orders.dlq must be declared, not two"
+
+    @pytest.mark.asyncio
+    async def test_filter_with_manual_dlx_is_respected_no_warning(self) -> None:
+        """A manually-configured dead_letter_exchange must be left alone —
+        no auto-declare override, no warning."""
+        from rabbitkit.core.topology import RabbitQueue
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(
+            queue=RabbitQueue(name="orders", dead_letter_exchange="my-dlx", dead_letter_routing_key="my-dlq"),
+            filter_fn=self._filter_fn,
+        )
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await broker._declare_topology()
+
+        assert not any("auto-declared" in str(w.message) for w in caught)
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        source = next(q for q in declared_queues if q.name == "orders")
+        assert source.dead_letter_exchange == "my-dlx"
+        assert source.dead_letter_routing_key == "my-dlq"
+        assert not any(q.name == "orders.dlq" for q in declared_queues)
+
+    @pytest.mark.asyncio
+    async def test_no_filter_fn_no_warning_no_extra_dlq(self) -> None:
+        """A route with no filter_fn at all must be entirely unaffected."""
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await broker._declare_topology()
+
+        assert not any("auto-declared" in str(w.message) for w in caught)
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        assert not any(q.name == "orders.dlq" for q in declared_queues)
+
+
 # ── Config ───────────────────────────────────────────────────────────────
 
 

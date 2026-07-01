@@ -221,6 +221,35 @@ class RouteDefinition:
         self.validate_retry_dlx_conflict(broker_retry)
 
 
+def warn_filter_without_dlx(route_name: str, queue_name: str, dlq_name: str) -> None:
+    """Warn that a filter-only route's DLQ was auto-declared (H6).
+
+    ``filter_fn`` returning ``False`` settles the message with
+    ``nack(requeue=False)``. Without a dead-letter-exchange configured on the
+    queue, RabbitMQ just discards a message nacked that way — silent, easy to
+    hit (no retry needed to trigger it, just one filtered message). Retry-
+    enabled routes already get a DLX from ``RetryRouter``; routes with a
+    manually-configured ``dead_letter_exchange`` are respected and left
+    alone. Otherwise the broker auto-declares *dlq_name* and wires the source
+    queue's DLX to it (see ``_declare_topology``) so the message is preserved
+    rather than lost — this warning is informational (the loss is already
+    prevented), not a call to action, but surfaced loudly so the extra queue
+    isn't a surprise.
+    """
+    import warnings
+
+    warnings.warn(
+        f"Route {route_name!r} has filter_fn set but no dead-letter-exchange and "
+        f"retry is disabled. Without one, RabbitMQ silently discards filter-rejected "
+        f"messages (nack(requeue=False) with no DLX). rabbitkit auto-declared "
+        f"{dlq_name!r} and routed rejected messages from {queue_name!r} there. To use "
+        "a different target, set dead_letter_exchange/dead_letter_routing_key on the "
+        "queue yourself.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 # ── Backward-compatible ``consumer_tag`` writes on frozen RouteDefinition ─
 #
 # ``@dataclass(frozen=True, slots=True)`` generates a ``__setattr__`` that

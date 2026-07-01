@@ -36,7 +36,7 @@ from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
-from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.route import RouteDefinition, warn_filter_without_dlx
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.middleware.retry import RetryRouter
@@ -719,6 +719,20 @@ class AsyncBroker:
 
             # Determine retry config early so source queue can include DLQ routing
             retry_config = route.effective_retry_config(self._config.retry)
+            # H6: a filter_fn rejection nack(requeue=False)'s the message; without a
+            # DLX RabbitMQ just discards it. Retry-enabled routes already get one
+            # below; a manually-configured dead_letter_exchange is respected as-is.
+            # Otherwise auto-declare a "<queue>.dlq" DLQ so filter rejections are
+            # preserved even with no retry configured.
+            filter_dlq_name: str | None = None
+            if (
+                retry_config is None
+                and route.filter_fn is not None
+                and route.queue.dead_letter_exchange is None
+            ):
+                filter_dlq_name = f"{route.queue.name}.dlq"
+                warn_filter_without_dlx(route.name, route.queue.name, filter_dlq_name)
+
             if retry_config is not None:
                 retry_router = RetryRouter(retry_config)
                 dlq_name = retry_router.get_dlq_name(route.queue.name)
@@ -731,10 +745,18 @@ class AsyncBroker:
                     dead_letter_exchange="",
                     dead_letter_routing_key=dlq_name,
                 )
+            elif filter_dlq_name is not None:
+                import dataclasses
+
+                source_queue = dataclasses.replace(
+                    route.queue,
+                    dead_letter_exchange="",
+                    dead_letter_routing_key=filter_dlq_name,
+                )
             else:
                 source_queue = route.queue
 
-            # Declare queue (with DLQ routing arguments if retry enabled)
+            # Declare queue (with DLQ routing arguments if retry/filter-DLX applies)
             await self._transport.declare_queue(source_queue)
 
             # Bind queue to exchange
@@ -751,6 +773,8 @@ class AsyncBroker:
                 delay_queues = retry_router.get_delay_queue_definitions(route.queue.name, exchange_name)
                 for delay_queue in delay_queues:
                     await self._transport.declare_queue(delay_queue)
+            elif filter_dlq_name is not None:
+                await self._transport.declare_queue(RabbitQueue(name=filter_dlq_name, durable=True))
 
     async def _start_consumer(self, route: RouteDefinition) -> None:
         """Start consuming for a single route."""

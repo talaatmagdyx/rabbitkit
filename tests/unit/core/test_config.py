@@ -70,6 +70,30 @@ class TestConnectionConfig:
         # vhost path (after port) round-trips too.
         assert unquote(parsed.path.lstrip("/")) == vhost
 
+    def test_repr_masks_password(self) -> None:
+        """L2: repr() must not leak the plaintext password."""
+        config = ConnectionConfig(username="app", password="s3cr3t-p4ssw0rd")
+        r = repr(config)
+        assert "s3cr3t-p4ssw0rd" not in r
+        assert "'***'" in r
+        assert "app" in r  # non-secret fields still shown
+
+    def test_str_masks_password(self) -> None:
+        """str() falls back to __repr__ for a dataclass with no __str__."""
+        config = ConnectionConfig(password="s3cr3t-p4ssw0rd")
+        assert "s3cr3t-p4ssw0rd" not in str(config)
+
+    def test_safe_url_masks_password(self) -> None:
+        """L2: safe_url is safe to log -- url is not."""
+        config = ConnectionConfig(host="rabbit.local", port=5673, username="app", password="secret", vhost="prod")
+        assert config.safe_url == "amqp://app:***@rabbit.local:5673/prod"
+        assert "secret" not in config.safe_url
+        assert config.url == "amqp://app:secret@rabbit.local:5673/prod"  # url still has the real password
+
+    def test_safe_url_default_vhost(self) -> None:
+        config = ConnectionConfig(password="secret")
+        assert config.safe_url == "amqp://guest:***@localhost:5672/%2F"
+
     def test_guest_credentials_warn_for_non_local_host(self, recwarn: pytest.WarningsRecorder) -> None:
         """A guest/guest config against a non-local host emits one UserWarning."""
         import warnings
@@ -427,14 +451,6 @@ class TestBatchPublishConfigValidation:
 
 
 class TestMetricsConfigProperties:
-    def test_handler_duration_seconds_default(self) -> None:
-        cfg = MetricsConfig()
-        assert cfg.handler_duration_seconds == "rabbitkit_handler_duration_seconds"
-
-    def test_handler_errors_total(self) -> None:
-        cfg = MetricsConfig()
-        assert cfg.handler_errors_total == "rabbitkit_handler_errors_total"
-
     def test_messages_acked_total(self) -> None:
         cfg = MetricsConfig()
         assert cfg.messages_acked_total == "rabbitkit_messages_acked_total"

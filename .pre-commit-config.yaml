@@ -1,0 +1,20 @@
+# L17: mirrors the CI "lint" job (.github/workflows/ci.yml) exactly so a
+# local pre-commit failure is never a false negative/positive relative to CI.
+# Install once with `pre-commit install`; runs automatically on `git commit`.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.5
+    hooks:
+      - id: ruff
+        name: ruff check
+        args: [--fix]
+        files: ^(src|tests|benchmarks)/
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict
+        entry: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
+        language: system
+        pass_filenames: false
+        files: ^src/rabbitkit/.*\.py$

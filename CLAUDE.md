@@ -5,8 +5,10 @@
 - `.venv/bin/pytest tests/unit/ -q --tb=short` — run unit tests
 - `.venv/bin/pytest tests/unit/<pkg>/test_<module>.py -v` — run a single test file
 - `.venv/bin/pytest --co -q tests/unit/<pkg>/` — list tests without running
+- `.venv/bin/pytest tests/security/ tests/property/ -q --tb=short` — security regression scenarios + hypothesis property-based tests
 - `.venv/bin/ruff check src/ tests/ benchmarks/` — lint check
 - `.venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports` — type check
+- `pre-commit install` — one-time setup so `.pre-commit-config.yaml` (ruff + mypy) runs on `git commit`
 - `python -m benchmarks` — run pipeline benchmarks
 
 ## Project Layout

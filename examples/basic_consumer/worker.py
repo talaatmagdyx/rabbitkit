@@ -14,7 +14,7 @@ Requirements:
 import asyncio
 
 from rabbitkit import ConnectionConfig, RabbitConfig
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 
 broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig(host="localhost")))
 

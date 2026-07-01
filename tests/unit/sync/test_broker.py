@@ -122,6 +122,48 @@ class TestLifecycle:
                 # Should cancel consumer and close
                 mock_channel.basic_cancel.assert_called_once()
 
+    def test_start_initializes_heartbeat_immediately(self) -> None:
+        """L14: last_heartbeat is set at start(), not left None until the
+        first message/tick -- so a broker wedged from the very start is
+        still caught by health.broker_liveness's staleness check."""
+        broker = SyncBroker()
+        assert broker.last_heartbeat is None
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = MagicMock()
+                broker.start()
+
+        assert broker.last_heartbeat is not None
+
+    def test_transport_io_tick_refreshes_broker_heartbeat(self) -> None:
+        """L14: the transport's per-tick callback is wired to the broker's
+        heartbeat, independent of message delivery."""
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = MagicMock()
+                broker.start()
+
+        assert broker._transport is not None
+        first = broker.last_heartbeat
+        assert first is not None
+
+        with patch("rabbitkit.sync.broker.time") as mock_time:
+            mock_time.monotonic.return_value = first + 100.0
+            broker._transport._fire_io_tick()
+
+        assert broker.last_heartbeat == first + 100.0
+
 
 # ── Config ───────────────────────────────────────────────────────────────
 
@@ -741,6 +783,77 @@ class TestDeclareTopologyEdgeCases:
         # Should not raise — delay queue declared with empty exchange_name
         assert mock_channel.queue_declare.call_count >= 2
 
+    def test_start_with_retry_and_no_confirms_warns(self) -> None:
+        """M4: a retry-enabled route on a broker with confirm_delivery=False
+        must warn -- RetryMiddleware acks the source as soon as its
+        delay-queue republish is SENT (fire-and-forget), not confirmed."""
+        from rabbitkit.core.config import PublisherConfig, RetryConfig
+
+        config = RabbitConfig(
+            retry=RetryConfig(max_retries=1, delays=(5,)),
+            publisher=PublisherConfig(confirm_delivery=False),
+        )
+        broker = SyncBroker(config)
+
+        @broker.subscriber(queue="orders", exchange="events")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+                    broker.start()
+
+    def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
+        """M4: confirm_delivery=True (the default) must not trigger the warning."""
+        import warnings
+
+        from rabbitkit.core.config import RetryConfig
+
+        config = RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,)))
+        broker = SyncBroker(config)
+
+        @broker.subscriber(queue="orders", exchange="events")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    broker.start()  # must not raise (no warning triggered)
+
+    def test_start_with_result_publisher_and_no_confirms_warns(self) -> None:
+        """M4: a route with a @publisher() result forward on a broker with
+        confirm_delivery=False must warn -- the pipeline settles the source
+        as soon as the result publish is SENT, not confirmed."""
+        from rabbitkit.core.config import PublisherConfig
+
+        config = RabbitConfig(publisher=PublisherConfig(confirm_delivery=False))
+        broker = SyncBroker(config)
+
+        @broker.subscriber(queue="orders")
+        @broker.publisher(exchange="results", routing_key="done")
+        def handle(body: bytes) -> str:
+            return "ok"
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+                    broker.start()
+
     def test_wire_retry_skips_route_without_retry(self) -> None:
         """_wire_retry_middleware() installs nothing on a non-retry route."""
         broker = SyncBroker()  # no broker-wide retry
@@ -971,7 +1084,7 @@ class TestStartConsumerEdgeCases:
         # Reset so _start_consumer runs again with our fake
         broker._started = False
         route = broker.routes[0]
-        route.consumer_tag = None
+        route.runtime_state.consumer_tag = None
 
         # Patch pipeline to capture the message
         pipeline_calls = []
@@ -1023,7 +1136,7 @@ class TestStartConsumerEdgeCases:
 
         broker._started = False
         route = broker.routes[0]
-        route.consumer_tag = None
+        route.runtime_state.consumer_tag = None
 
         pipeline_calls = []
 
@@ -1072,7 +1185,7 @@ class TestStartConsumerEdgeCases:
 
         # Reset so _start_consumer re-registers
         route = broker.routes[0]
-        route.consumer_tag = None
+        route.runtime_state.consumer_tag = None
         broker._start_consumer(route)
 
         callback = captured_callback["fn"]

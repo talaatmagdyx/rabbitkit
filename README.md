@@ -293,6 +293,17 @@ publisher = PublisherConfig(
 )
 ```
 
+**`confirm_delivery=False` (M4):** the publish path becomes fire-and-forget
+-- `PublishOutcome.status` is `PublishStatus.SENT`, not `CONFIRMED` (`.ok`
+is still `True` -- it didn't fail, it just wasn't broker-acknowledged). If
+you specifically need to know the broker actually confirmed a publish,
+check `status == PublishStatus.CONFIRMED` directly. A route with retry
+enabled, or a `@publisher()` result forward, on a broker with
+`confirm_delivery=False` gets a `RuntimeWarning` at startup: both settle the
+source message as soon as their internal republish is *sent*, not
+confirmed, so a publish lost in flight right after is a real loss, not just
+a delay.
+
 ### ConsumerConfig
 
 Consumer prefetch and shutdown settings.
@@ -446,6 +457,14 @@ def handle_event(msg: RabbitMessage) -> None:
         msg.nack(requeue=True)
 ```
 
+**MANUAL means the handler owns settlement entirely (M11):** if a handler
+returns without calling `ack()`/`nack()`/`reject()` -- e.g. it intentionally
+hands the message to another task/thread to settle later -- the pipeline
+leaves it unsettled and logs a warning. It does **not** auto-ack on your
+behalf. This matters for at-least-once correctness: if the process crashed
+right after an auto-ack, the message would be gone even though the deferred
+settlement never ran.
+
 ### RabbitMessage
 
 Rich incoming message with transport-aware ack/nack/reject. Key attributes:
@@ -497,6 +516,11 @@ Middleware is applied as a chain. The outermost middleware runs first on receive
 5. `RetryMiddleware` -- retry transient failures with delay queues
 6. `CompressionMiddleware` -- decompress before handler, compress on publish
 7. `SigningMiddleware` -- verify after decompress, sign after compress
+
+**Dedup + Retry (H8)**: items 4-5 above (`DeduplicationMiddleware` outer,
+`RetryMiddleware` inner) are safe in either relative order -- see
+`DeduplicationMiddleware`'s section below for why a naive composition would
+otherwise silently drop a retried message.
 
 **`on_receive` (H7)**: `consume_scope`-based middleware (items 2-5 above) runs
 OUTER→INNER on receive, matching registration order -- an exception in any
@@ -592,6 +616,23 @@ def handle(
 ) -> None:
     print(f"Tenant: {tenant}, Level: {level}, App: {app_name}")
 ```
+
+**Optional values (H10):** by default these markers are required -- a missing
+header/path segment/context key raises `MissingDependencyError` (classified
+PERMANENT, straight to the DLQ). Make one optional either way:
+
+```python
+# Marker owns the default:
+tenant: Annotated[str, Header("x-tenant", default="anonymous")]
+
+# Or the parameter's own Python default (marker has none):
+tenant: Annotated[str | None, Header("x-tenant")] = None
+```
+
+If both are given, the marker's `default=` wins. `Path()` and `Context()`
+accept `default=` the same way. `MissingDependencyError` names the parameter
+and marker directly, so a required-and-missing value is immediately
+actionable instead of looking like a generic `KeyError` from handler code.
 
 ## Middleware
 
@@ -716,6 +757,21 @@ dedup_mw = DeduplicationMiddleware(
     # key_fn=lambda msg: f"custom:{msg.headers['idempotency-key']}",
 )
 ```
+
+**Composing with `RetryMiddleware` (H8):** `RetryMiddleware` swallows a transient
+handler failure (routes it to a delay queue, acks the source) rather than
+raising — so an outer middleware's `call_next(message)` returns normally
+either way, indistinguishable from the handler succeeding. Without special
+handling, `DeduplicationMiddleware(mark_policy="on_success")` listed OUTER of
+`RetryMiddleware` would mark the message processed on the *failed* first
+attempt, silently dropping the actual retry delivery as a duplicate.
+`DeduplicationMiddleware` checks for `rabbitkit.core.types.REQUEUED_FOR_RETRY`
+— the sentinel `RetryMiddleware` returns instead of `None` in this case — and
+skips marking (or, for `mark_policy="on_start"`, retroactively undoes the
+premature mark) so the retry redelivery is correctly processed instead of
+dropped, regardless of which of the two you list first. Any custom
+middleware wrapping a route that may contain a `RetryMiddleware` should
+check for the same sentinel if it has similar "mark as done" side effects.
 
 #### CircuitBreakerMiddleware
 
@@ -960,6 +1016,25 @@ await pool.stop(timeout=30.0)
 
 When `worker_count=1` (default), handlers run inline with no pool overhead.
 
+**Abandoned-handler contract (H12):** `stop_timeout` must exceed your
+slowest handler's expected run time (and should be a few seconds *less*
+than `terminationGracePeriodSeconds` in k8s). A handler still running past
+the deadline is **abandoned, not killed** — Python cannot forcibly stop an
+arbitrary thread, so `SyncWorkerPool`'s daemon thread keeps running in the
+background; `AsyncWorkerPool` cancels the task, which does not guarantee the
+handler reached its own ack/nack (`CancelledError` is a `BaseException` and
+skips past the pipeline's exception handling). Both pools log the abandoned
+delivery's `delivery_tag`/`message_id` so it's traceable; `AsyncWorkerPool`
+additionally nacks (`requeue=True`) any message its cancelled task never
+settled, so redelivery is explicit and immediate rather than depending on
+the implicit requeue that happens when the connection eventually closes.
+Because the original handler may still complete its side effects after
+being abandoned, **handlers must be idempotent under at-least-once
+delivery** regardless of `stop_timeout`. `AsyncWorkerPool.submit()` also
+refuses (nacks) instead of orphaning an unawaited task if it's ever called
+while the pool isn't running (e.g. a stray delivery callback after
+`stop()`).
+
 ## RPC (Request/Response)
 
 ### RPCClient / AsyncRPCClient
@@ -967,7 +1042,7 @@ When `worker_count=1` (default), handlers run inline with no pool overhead.
 Request/response over RabbitMQ using direct reply-to (`amq.rabbitmq.reply-to`).
 
 ```python
-from rabbitkit import RPCClient, RPCTimeoutError
+from rabbitkit.experimental import RPCClient, RPCTimeoutError
 
 # Sync
 client = RPCClient(transport, max_pending=100)
@@ -985,7 +1060,7 @@ finally:
 ```
 
 ```python
-from rabbitkit import AsyncRPCClient
+from rabbitkit.experimental import AsyncRPCClient
 
 # Async
 client = AsyncRPCClient(transport, max_pending=100)
@@ -1206,6 +1281,15 @@ spec:
   `graceful_timeout` + the `preStop` sleep, or Kubernetes SIGKILLs the pod
   mid-message (safe because handlers are idempotent under at-least-once
   delivery, but noisy — so size the grace period generously).
+- **Async without `RabbitApp`:** `await broker.start()` alone installs
+  SIGINT/SIGTERM handlers, but their drain is fire-and-forget -- nothing
+  joins the `stop()` task they schedule, so whether in-flight messages
+  actually finish draining depends on incidental event-loop lifetime
+  (`asyncio.run()` cancels outstanding tasks once the awaited coroutine
+  returns). Use `asyncio.run(broker.run())` instead (H11) -- it awaits the
+  shutdown signal and then `stop()` itself, so the coroutine doesn't return
+  until the drain has actually completed. `broker.request_shutdown()`
+  triggers the same drain from any context (e.g. a failing health check).
 - See `deploy/consumer.yaml` for a full reference manifest.
 
 ## FastAPI Integration
@@ -1525,6 +1609,18 @@ from rabbitkit.core.logging import configure_structlog, LoggingConfig
 configure_structlog(LoggingConfig(render_json=True))
 ```
 
+**Secrets in log output (L16):** rabbitkit's own log events never include
+the message body or `headers` dict — only `message_id`, `routing_key`,
+`queue`, `handler` are bound per message. If your own handler code logs a
+field that looks like a credential (`password`, `token`, `api_key`,
+`authorization`, ...), `LoggingConfig.redact_keys` — a `frozenset[str]`,
+enabled by default via `DEFAULT_REDACT_KEYS` — redacts matching keys
+(case-insensitively, including AMQP-style `x-api-key`) before rendering,
+checked at the top level and one level deep inside nested dict values like
+`headers={...}`. This is a best-effort, key-name-based scrubber, not a
+content/PII scanner. Pass `redact_keys=None` to disable it, or your own
+`frozenset` to customize the key list.
+
 ## Environment-based Configuration
 
 Load `RabbitConfig` from `RABBITMQ_*` environment variables or a `.env` file.
@@ -1798,6 +1894,13 @@ async def handle_order(body: bytes) -> None:
     # Guaranteed exclusive access per order_id
     ...
 ```
+
+**`ttl` has no auto-renewal (L3):** a handler that runs longer than `ttl`
+loses the lock mid-work — a second consumer can then acquire the same key
+and process concurrently. Set `ttl` comfortably above your worst-case
+handler time. For a downstream write that must not be applied twice even if
+the lock is lost, use `lock.fencing_token(key)` and have the downstream
+store reject a token older than the one it already recorded.
 
 If the lock cannot be acquired (another instance holds it), the message is
 nacked with `requeue=True` so it can be retried later.
@@ -2148,6 +2251,17 @@ The shared core has zero transport dependencies. Sync and async adapters are thi
 - **RabbitMQ**: >= 3.12
 - **pika**: >= 1.3, < 2.0
 - **aio-pika**: >= 9.0, < 10.0
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, quality gates, and PR
+guidelines. This project follows the
+[Contributor Covenant](CODE_OF_CONDUCT.md).
+
+## Security
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md) for how to report it
+privately — please do not open a public issue.
 
 ## License
 

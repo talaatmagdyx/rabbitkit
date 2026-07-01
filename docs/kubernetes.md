@@ -112,7 +112,7 @@ When running rabbitkit inside FastAPI, use `rabbitkit_lifespan` to tie the broke
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from rabbitkit import rabbitkit_lifespan
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 
 broker = AsyncBroker(config)
 

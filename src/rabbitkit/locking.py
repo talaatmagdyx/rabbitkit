@@ -100,6 +100,18 @@ class RedisLock:
     delete another owner's lock. The per-acquisition UUID is also exposed as a
     *fencing token* via :attr:`fencing_token` for use in downstream writes that
     need to guard against reordered operations.
+
+    L3 — ``ttl`` has no auto-renewal: if a handler runs longer than ``ttl``,
+    the lock expires while the handler is still working, and a second
+    consumer can acquire the same key and start processing concurrently —
+    the exact condition this lock exists to prevent. There is no watchdog
+    here that periodically extends the TTL. Set ``ttl`` comfortably above
+    your worst-case handler time (including retries/timeouts on the handler
+    side), and for any downstream write that must not be applied twice even
+    under a lost lock, use :meth:`fencing_token` — pass it along with the
+    write and have the downstream store reject a token older than the one it
+    already recorded, so a "lock expired, second holder also wrote" race is
+    caught at the write itself rather than relying on the lock alone.
     """
 
     # Atomic compare-and-delete: only deletes the key if the stored value

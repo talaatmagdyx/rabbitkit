@@ -413,6 +413,67 @@ class TestMiddlewareIntegration:
 
         assert received == ["acme"]
 
+    def test_optional_header_with_default_runs_with_default_when_missing(self) -> None:
+        """H10: Annotated[str | None, Header(...)] = None -- a message
+        missing the header must run the handler with the default, and the
+        message must be acked (processed normally), not rejected."""
+        broker = TestBroker(di_resolver=DIResolver())
+        received: list[str | None] = []
+
+        @broker.subscriber(queue="optional-header-test")
+        def handle(
+            body: bytes,
+            tenant: Annotated[str | None, Header("x-tenant")] = None,
+        ) -> None:
+            received.append(tenant)
+
+        broker.start()
+        broker.publish("optional-header-test", b"data")  # no headers at all
+
+        assert received == [None]
+        assert broker.consumed_messages[-1]._disposition == "acked"
+
+    def test_optional_header_marker_default_runs_with_default_when_missing(self) -> None:
+        """H10: Header(name, default=...) as an alternative to a function
+        default -- same outcome, marker owns the default this time."""
+        broker = TestBroker(di_resolver=DIResolver())
+        received: list[str] = []
+
+        @broker.subscriber(queue="optional-header-marker-default-test")
+        def handle(
+            body: bytes,
+            tenant: Annotated[str, Header("x-tenant", default="anonymous")],
+        ) -> None:
+            received.append(tenant)
+
+        broker.start()
+        broker.publish("optional-header-marker-default-test", b"data")
+
+        assert received == ["anonymous"]
+        assert broker.consumed_messages[-1]._disposition == "acked"
+
+    def test_required_header_missing_rejects_with_typed_error(self) -> None:
+        """H10: required (no default anywhere) + missing -> the message is
+        rejected via the pipeline's normal exception handling (classified
+        PERMANENT, same as before) -- but now driven by a typed
+        MissingDependencyError naming the parameter, not a bare KeyError."""
+        broker = TestBroker(di_resolver=DIResolver())
+        handler_called = False
+
+        @broker.subscriber(queue="required-header-test")
+        def handle(
+            body: bytes,
+            tenant: Annotated[str, Header("x-tenant")],
+        ) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        broker.start()
+        broker.publish("required-header-test", b"data")  # no x-tenant header
+
+        assert not handler_called
+        assert broker.consumed_messages[-1]._disposition == "rejected"
+
     def test_handler_with_context_injection(self) -> None:
         """Context() extracts values from ContextRepo."""
         context_repo = ContextRepo()
@@ -663,11 +724,9 @@ class TestAckPolicies:
     """Integration tests for different ack policies."""
 
     def test_manual_ack_handler_acks(self) -> None:
-        """MANUAL policy: handler can call msg.ack() explicitly.
-
-        Note: the pipeline also acks on success if not already settled,
-        so this tests that the handler's explicit ack is respected (idempotent).
-        """
+        """MANUAL policy: handler calls msg.ack() explicitly and it takes
+        effect. (M11: the pipeline itself never auto-acks on success under
+        MANUAL -- the handler owns settlement entirely.)"""
         broker = TestBroker(di_resolver=DIResolver())
         ack_recorded: list[bool] = []
 
@@ -682,6 +741,24 @@ class TestAckPolicies:
         assert ack_recorded == [True]
         consumed = broker.consumed_messages[0]
         assert consumed._disposition == "acked"
+
+    def test_manual_ack_handler_defers_settlement_stays_pending(self) -> None:
+        """M11: a MANUAL handler that returns WITHOUT settling must be left
+        unsettled -- previously the pipeline auto-acked here, which is a
+        real loss risk for a handler that intentionally defers settlement
+        (e.g. hands the message to another task/thread to ack later) if the
+        process crashes before that deferred ack actually runs."""
+        broker = TestBroker(di_resolver=DIResolver())
+
+        @broker.subscriber(queue="manual-defer-q", ack_policy=AckPolicy.MANUAL)
+        def handle(body: bytes, msg: RabbitMessage) -> None:
+            pass  # intentionally defers settlement -- does not ack here
+
+        broker.start()
+        broker.publish("manual-defer-q", b"data")
+
+        consumed = broker.consumed_messages[0]
+        assert consumed._disposition == "pending"
 
     def test_nack_on_error_success(self) -> None:
         """NACK_ON_ERROR: success -> ack."""
@@ -780,3 +857,63 @@ class TestRouterIntegration:
 
         assert received_a == [b"a-msg"]
         assert received_b == [b"b-msg"]
+
+
+# ── M2: settlement/retry/dead-letter metrics, end-to-end through a broker ──
+
+
+class TestMetricsEndToEnd:
+    """M2: messages_acked/nacked/rejected/retried/dead_lettered_total must
+    actually be emitted through a full broker start()/publish() cycle, not
+    just when calling pipeline internals directly."""
+
+    def test_ack_emits_through_full_broker_cycle(self) -> None:
+        from unittest.mock import MagicMock
+
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = TestBroker()
+
+        @broker.subscriber(queue="metrics-ack-q", middlewares=[MetricsMiddleware(collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker.start()
+        broker.publish("metrics-ack-q", b"data")
+
+        collector.inc_counter.assert_any_call(
+            "rabbitkit_messages_acked_total", {"queue": "metrics-ack-q"}
+        )
+
+    def test_retry_then_dead_letter_emits_through_full_broker_cycle(self) -> None:
+        from unittest.mock import MagicMock
+
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = TestBroker()
+        retry_cfg = RetryConfig(max_retries=1, delays=(5,))
+
+        @broker.subscriber(
+            queue="metrics-retry-q",
+            retry=retry_cfg,
+            middlewares=[MetricsMiddleware(collector)],
+        )
+        def handle(body: bytes) -> None:
+            raise ConnectionResetError("transient outage")  # always fails
+
+        broker.start()
+
+        # First delivery (retry_count=0 < max_retries=1): routed to the delay queue.
+        broker.publish("metrics-retry-q", b"data")
+        collector.inc_counter.assert_any_call(
+            "rabbitkit_messages_retried_total", {"queue": "metrics-retry-q"}
+        )
+
+        # A redelivery already at retry_count=1 (== max_retries): exhausted -> dead-lettered.
+        broker.publish("metrics-retry-q", b"data", headers={"x-rabbitkit-retry-count": 1})
+        collector.inc_counter.assert_any_call(
+            "rabbitkit_messages_dead_lettered_total", {"queue": "metrics-retry-q"}
+        )

@@ -51,6 +51,16 @@ Messages without ``correlation_id``
 -------------------------------------
 If the incoming message has no ``correlation_id``, the result is silently
 discarded (no exception raised).
+
+Non-JSON-native results (H13)
+------------------------------
+Without an explicit ``serializer=``, a return value that ``json.dumps`` can't
+encode natively (a custom class, ``object()``, etc.) raises ``TypeError``
+instead of being silently stringified — pass a ``serializer=`` for types
+JSON can't represent. A handler that returns an exception *instance* as data
+(not by raising it) is stored as an explicit, marked error envelope
+(``{"__rabbitkit_error__": true, "type": ..., "message": ...}``) instead of
+being indistinguishable from a normal string result.
 """
 
 from __future__ import annotations
@@ -75,11 +85,30 @@ class ResultMiddleware(BaseMiddleware):
         self._ttl = ttl
 
     def _serialize(self, result: Any) -> bytes:
+        """Encode a handler's return value for storage.
+
+        H13: no ``default=str`` fallback — a non-JSON-native object (custom
+        class, ``exception``, etc.) raises ``TypeError`` here instead of
+        being silently stringified into a lossy blob indistinguishable from
+        a real result. An exception specifically gets an explicit,
+        marked error envelope (``__rabbitkit_error__``) rather than either
+        of those, since "the handler returned an exception object as data"
+        is a legitimate pattern worth preserving in a decodable, unambiguous
+        shape. Pass an explicit ``serializer=`` to support other
+        non-JSON-native result types.
+        """
         if isinstance(result, bytes):
             return result
         if self._serializer is not None and hasattr(self._serializer, "encode"):
             return self._serializer.encode(result)  # type: ignore[no-any-return]
-        return json.dumps(result, default=str).encode("utf-8")
+        if isinstance(result, BaseException):
+            envelope = {
+                "__rabbitkit_error__": True,
+                "type": type(result).__qualname__,
+                "message": str(result),
+            }
+            return json.dumps(envelope).encode("utf-8")
+        return json.dumps(result).encode("utf-8")
 
     def consume_scope(self, call_next: Any, message: RabbitMessage) -> Any:
         result = call_next(message)

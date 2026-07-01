@@ -54,7 +54,7 @@ pip install rabbitkit[all]      # everything
 from rabbitkit import AsyncBroker, SyncBroker, RabbitConfig
 
 # Alias for the async package
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 
 # Experimental features (may change between releases)
 from rabbitkit.experimental import rpc, locking, dashboard

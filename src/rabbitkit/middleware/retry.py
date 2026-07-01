@@ -19,7 +19,7 @@ from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.errors import ErrorPredicate
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitQueue
-from rabbitkit.core.types import ErrorSeverity, MessageEnvelope
+from rabbitkit.core.types import REQUEUED_FOR_RETRY, ErrorSeverity, MessageEnvelope
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 
@@ -52,6 +52,36 @@ def retry_middleware_insertion_index(middlewares: Sequence[Any]) -> int:
         else:
             break
     return index
+
+
+def warn_retry_without_confirms(route_name: str, *, context: str = "retry") -> None:
+    """Warn when a route republishes internally (retry delay-queue, or a
+    ``@publisher()`` result forward) but its broker publishes with
+    ``PublisherConfig.confirm_delivery=False`` (M4).
+
+    Both ``RetryMiddleware`` and the pipeline's result-publish step (Contract
+    5) settle the SOURCE message as soon as their republish reports
+    ``outcome.ok`` -- with confirms off, that publish reports
+    ``PublishStatus.SENT`` (fire-and-forget, never broker-confirmed) rather
+    than ``CONFIRMED``, and ``.ok`` is True for both. If that SENT publish is
+    actually lost in flight (e.g. a connection drop right after), the source
+    message is still settled -- a real loss, not just a delay.
+    Enable ``confirm_delivery=True`` (the default) on any such broker if
+    this matters for your workload.
+    """
+    import warnings
+
+    what = "retry" if context == "retry" else "a @publisher() result forward"
+    settles = "acks the source message" if context == "retry" else "settles the source message"
+    warnings.warn(
+        f"Route {route_name!r} uses {what} but the broker publishes with "
+        f"confirm_delivery=False. The pipeline {settles} as soon as its internal republish "
+        "is sent, without waiting for a broker confirm -- a publish lost in flight after "
+        "that point is a real loss (the source is already settled). Set "
+        "PublisherConfig(confirm_delivery=True) (the default) if durability here matters.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def warn_retry_middleware_without_topology(route_name: str) -> None:
@@ -94,6 +124,8 @@ class RetryMiddleware(BaseMiddleware):
         publish_fn: Callable[[MessageEnvelope], Any] | None = None,
         publish_async_fn: Callable[[MessageEnvelope], Awaitable[Any]] | None = None,
         predicates: Sequence[ErrorPredicate] = (),
+        metrics_collector: Any | None = None,
+        metrics_config: Any | None = None,
     ) -> None:
         self._config = config
         # predicates run first (True=transient, False=permanent, None=defer to the
@@ -105,6 +137,18 @@ class RetryMiddleware(BaseMiddleware):
         )
         self._publish_fn = publish_fn
         self._publish_async_fn = publish_async_fn
+        # M2: optional -- wired by the broker from a MetricsMiddleware already
+        # present on the same route, so retried/dead-lettered counts are
+        # observable. None (the default) is a no-op; RetryMiddleware itself
+        # has no metrics opinion otherwise.
+        self._metrics_collector = metrics_collector
+        self._metrics_config = metrics_config
+
+    def _record_metric(self, metric_name: str | None, message: RabbitMessage) -> None:
+        if self._metrics_collector is None or metric_name is None:
+            return
+        queue = message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown"
+        self._metrics_collector.inc_counter(metric_name, {"queue": str(queue)})
 
     @property
     def config(self) -> RetryConfig:
@@ -115,24 +159,35 @@ class RetryMiddleware(BaseMiddleware):
         call_next: Callable[[RabbitMessage], Any],
         message: RabbitMessage,
     ) -> Any:
-        """Sync retry scope."""
+        """Sync retry scope.
+
+        H8: on a caught, requeued failure, returns ``REQUEUED_FOR_RETRY``
+        (never ``None``) — see that sentinel's docstring in ``core/types.py``.
+        ``_handle_retry_sync`` either returns normally (requeued: routed to a
+        delay queue, or nacked for immediate redelivery if that publish
+        itself failed) or re-raises (terminal: permanent/exhausted) via
+        ``_mark_terminal_and_raise``, so reaching this ``return`` unambiguously
+        means "requeued" — an outer middleware (e.g. DeduplicationMiddleware)
+        MUST NOT treat this the same as the handler actually succeeding.
+        """
         try:
             return call_next(message)
         except Exception as exc:
             self._handle_retry_sync(exc, message)
-            return None  # only reached if retry succeeded (acked source)
+            return REQUEUED_FOR_RETRY
 
     async def consume_scope_async(
         self,
         call_next: Callable[[RabbitMessage], Awaitable[Any]],
         message: RabbitMessage,
     ) -> Any:
-        """Async retry scope."""
+        """Async retry scope. See :meth:`consume_scope` (H8) for why this
+        returns ``REQUEUED_FOR_RETRY`` rather than ``None``."""
         try:
             return await call_next(message)
         except Exception as exc:
             await self._handle_retry_async(exc, message)
-            return None
+            return REQUEUED_FOR_RETRY
 
     def _handle_retry_sync(self, exc: Exception, message: RabbitMessage) -> None:
         """Handle exception in sync context."""
@@ -145,7 +200,7 @@ class RetryMiddleware(BaseMiddleware):
             return
 
         # Terminal: permanent or exhausted
-        self._mark_terminal_and_raise(exc, classified.severity, retry_count)
+        self._mark_terminal_and_raise(exc, classified.severity, retry_count, message)
 
     async def _handle_retry_async(self, exc: Exception, message: RabbitMessage) -> None:
         """Handle exception in async context."""
@@ -156,7 +211,7 @@ class RetryMiddleware(BaseMiddleware):
             await self._route_to_delay_queue_async(message, retry_count)
             return
 
-        self._mark_terminal_and_raise(exc, classified.severity, retry_count)
+        self._mark_terminal_and_raise(exc, classified.severity, retry_count, message)
 
     def _get_retry_count(self, message: RabbitMessage) -> int:
         """Get current retry count from message headers, clamped to
@@ -255,6 +310,9 @@ class RetryMiddleware(BaseMiddleware):
         if not message.is_settled:
             message.ack()
 
+        if self._metrics_config is not None:
+            self._record_metric(self._metrics_config.messages_retried_total, message)
+
         logger.info(
             "Retrying message (attempt %d/%d): routing_key=%s",
             retry_count + 1,
@@ -281,6 +339,9 @@ class RetryMiddleware(BaseMiddleware):
         if not message.is_settled:
             await message.ack_async()
 
+        if self._metrics_config is not None:
+            self._record_metric(self._metrics_config.messages_retried_total, message)
+
         logger.info(
             "Retrying message (attempt %d/%d): routing_key=%s",
             retry_count + 1,
@@ -293,9 +354,20 @@ class RetryMiddleware(BaseMiddleware):
         exc: Exception,
         severity: ErrorSeverity,
         retry_count: int,
+        message: RabbitMessage,
     ) -> None:
-        """Mark exception as terminal and re-raise."""
+        """Mark exception as terminal and re-raise.
+
+        M2: this is the point where a message is committed to being
+        dead-lettered -- permanent errors dead-letter on the first attempt,
+        exhausted-retry errors dead-letter after ``max_retries`` -- so
+        ``messages_dead_lettered_total`` is recorded here rather than at the
+        actual reject() call (which happens later, in the pipeline's
+        exception handling, and doesn't know WHY the reject is happening).
+        """
         exc._rabbitkit_terminal = True  # type: ignore[attr-defined]
+        if self._metrics_config is not None:
+            self._record_metric(self._metrics_config.messages_dead_lettered_total, message)
         logger.warning(
             "Terminal failure (%s, retries=%d/%d): %s: %s",
             severity.value,
@@ -347,13 +419,28 @@ class RetryRouter:
     def get_delay_queue_definitions(
         self,
         source_queue_name: str,
-        source_exchange_name: str,
+        source_exchange_name: str,  # kept for signature stability (M5) — see docstring
     ) -> list[RabbitQueue]:
         """Generate delay queue definitions for a source queue.
 
         Returns list of RabbitQueue objects for delay queues + DLQ.
         The DLQ is now reachable because ``get_source_queue_dlq_arguments()``
         wires the source queue's x-dead-letter-exchange to it.
+
+        M5: on TTL expiry, a delay queue dead-letters back to the SOURCE
+        QUEUE via the **default exchange** (``x-dead-letter-exchange=""``)
+        with the queue's own name as the routing key — never the source
+        queue's real exchange. On the default exchange a routing key that
+        matches a queue's name always delivers directly to that queue,
+        completely independent of how the queue is actually bound elsewhere.
+        The previous version dead-lettered to ``source_exchange_name``
+        using ``source_queue_name`` as the routing key — for a source queue
+        bound to its real exchange via a topic pattern (e.g.
+        ``orders.*.created``) rather than literally by its own name, that
+        routing key almost never matches the binding, so the retried
+        message silently vanished instead of coming back after the delay.
+        ``source_exchange_name`` is intentionally unused now — kept as a
+        parameter so existing call sites don't need updating.
         """
         queues: list[RabbitQueue] = []
 
@@ -370,7 +457,7 @@ class RetryRouter:
                 durable=True,
                 arguments={
                     "x-message-ttl": delay_ms,
-                    "x-dead-letter-exchange": source_exchange_name,
+                    "x-dead-letter-exchange": "",  # default exchange (M5)
                     "x-dead-letter-routing-key": source_queue_name,
                     "x-queue-type": "classic",  # classic for delay queues
                 },

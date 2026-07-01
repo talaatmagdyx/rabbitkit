@@ -27,6 +27,34 @@ from rabbitkit.core.message import RabbitMessage
 DIRECT_REPLY_TO_QUEUE = "amq.rabbitmq.reply-to"
 
 
+class _RequeuedForRetrySentinel:
+    """Sentinel type for :data:`REQUEUED_FOR_RETRY` (H8)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "REQUEUED_FOR_RETRY"
+
+
+# H8: returned by RetryMiddleware.consume_scope/consume_scope_async instead of
+# ``None`` whenever a handler failure was routed for retry (delay-queue
+# publish, or nack(requeue=True) if that publish itself failed) rather than
+# actually succeeding. RetryMiddleware swallows the handler's exception in
+# this case (by design — an OUTER ExceptionMiddleware must not treat a
+# retry-in-progress as a terminal failure), so from an outer middleware's
+# point of view, ``call_next(message)`` returns normally either way. That is
+# indistinguishable from "the handler ran and returned None" UNLESS the
+# outer middleware checks for this sentinel — which matters concretely for
+# DeduplicationMiddleware(mark_policy="on_success"): without checking, it
+# would mark the message as processed on a failed-then-retried attempt, so
+# the later retry redelivery (same dedup key) is dropped as a duplicate and
+# never actually processed (silent message loss). Any custom middleware
+# wrapping a route that may contain a RetryMiddleware should treat a
+# ``call_next`` result identical to this sentinel (``is REQUEUED_FOR_RETRY``)
+# as "not yet done, expect another delivery" rather than "succeeded."
+REQUEUED_FOR_RETRY = _RequeuedForRetrySentinel()
+
+
 class AppState(str, Enum):
     """Application lifecycle states.
 
@@ -99,6 +127,14 @@ class PublishStatus(str, Enum):
     """Result status of a publish operation."""
 
     CONFIRMED = "confirmed"
+    #: M4: fire-and-forget publish (PublisherConfig.confirm_delivery=False)
+    #: -- written to the socket, but the broker never acknowledged it.
+    #: Distinct from CONFIRMED so code that specifically needs a real
+    #: broker ack (e.g. deciding whether it's safe to ack/discard a source
+    #: message after republishing it, as retry/result publishing do) can
+    #: tell the two apart via ``.status`` instead of being told "confirmed"
+    #: when nothing was actually confirmed.
+    SENT = "sent"
     NACKED = "nacked"
     TIMEOUT = "timeout"
     RETURNED = "returned"
@@ -118,8 +154,17 @@ class PublishOutcome:
 
     @property
     def ok(self) -> bool:
-        """True if the broker confirmed the message."""
-        return self.status == PublishStatus.CONFIRMED
+        """True if the publish did not fail -- CONFIRMED (broker
+        acknowledged it) or SENT (fire-and-forget, confirm_delivery=False --
+        written to the socket but never broker-confirmed).
+
+        M4: if you specifically need to know the broker actually confirmed
+        the message (e.g. before treating a republish as durable enough to
+        settle/discard the original), check ``status ==
+        PublishStatus.CONFIRMED`` directly -- ``.ok`` alone can't
+        distinguish "confirmed" from "sent, unconfirmed."
+        """
+        return self.status in (PublishStatus.CONFIRMED, PublishStatus.SENT)
 
 
 @dataclass(frozen=True, slots=True)

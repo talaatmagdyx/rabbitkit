@@ -89,10 +89,11 @@ class TestRouteDefinitionConstruction:
         route = _make_route(result_publisher=rp)
         assert route.result_publisher is rp
 
-    def test_consumer_tag_mutable(self) -> None:
+    def test_consumer_tag_mutable_via_runtime_state(self) -> None:
+        """L10: the only supported write path is route.runtime_state.consumer_tag."""
         route = _make_route()
         assert route.consumer_tag is None
-        route.consumer_tag = "ctag.1"
+        route.runtime_state.consumer_tag = "ctag.1"
         assert route.consumer_tag == "ctag.1"
 
     def test_with_tags(self) -> None:
@@ -127,21 +128,20 @@ class TestRouteDefinitionConstruction:
         assert route.consumer_tag == "ctag.1"
 
     def test_consumer_tag_property_is_read_only(self) -> None:
-        # ``consumer_tag`` is a property backed by ``runtime_state``. Writes
-        # via ``route.consumer_tag = x`` are supported for backward
-        # compatibility and delegate to ``runtime_state.consumer_tag``.
+        """L10: no monkey-patched __setattr__ back door -- consumer_tag is
+        genuinely read-only on the frozen RouteDefinition. Writing it must
+        raise, not silently delegate to runtime_state."""
         route = _make_route()
-        route.consumer_tag = "ctag.2"
-        assert route.consumer_tag == "ctag.2"
-        assert route.runtime_state.consumer_tag == "ctag.2"
+        with pytest.raises((AttributeError, TypeError)):
+            route.consumer_tag = "ctag.2"  # type: ignore[misc]
 
-    def test_consumer_tag_delete_resets_to_none(self) -> None:
+    def test_consumer_tag_delete_raises(self) -> None:
+        """L10: no delegated delete either -- del route.consumer_tag raises."""
         route = _make_route()
         route.runtime_state.consumer_tag = "ctag.3"
-        assert route.consumer_tag == "ctag.3"
-        del route.consumer_tag
-        assert route.consumer_tag is None
-        assert route.runtime_state.consumer_tag is None
+        with pytest.raises((AttributeError, TypeError)):
+            del route.consumer_tag
+        assert route.consumer_tag == "ctag.3"  # unchanged
 
     def test_default_runtime_state_is_unique_per_instance(self) -> None:
         route_a = _make_route()
@@ -328,12 +328,15 @@ class TestFullValidation:
 
 
 class TestRouteDynamic:
-    def test_delete_consumer_tag_sets_none(self) -> None:
-        """del route.consumer_tag clears the runtime consumer_tag to None."""
+    def test_delete_consumer_tag_raises(self) -> None:
+        """L10: consumer_tag has no deleter -- del route.consumer_tag raises.
+        Resetting it is done via route.runtime_state.consumer_tag = None."""
         route = _make_route()
-        route.consumer_tag = "my-tag"
-        assert route.consumer_tag == "my-tag"
-        del route.consumer_tag
+        route.runtime_state.consumer_tag = "my-tag"
+        with pytest.raises((AttributeError, TypeError)):
+            del route.consumer_tag
+        assert route.consumer_tag == "my-tag"  # unchanged
+        route.runtime_state.consumer_tag = None
         assert route.consumer_tag is None
 
     def test_delete_other_field_raises(self) -> None:

@@ -27,7 +27,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`AsyncBroker` can also be imported as `from rabbitkit.aio import AsyncBroker` — both paths are identical.
+`AsyncBroker` can also be imported as `from rabbitkit.async_ import AsyncBroker` — both paths are identical.
 
 ## Publish a Message
 

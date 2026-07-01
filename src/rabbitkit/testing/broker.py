@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
@@ -33,6 +33,11 @@ from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.serialization.base import Serializer
+
+if TYPE_CHECKING:
+    from rabbitkit.core.router import RabbitRouter
 from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
@@ -87,7 +92,7 @@ class TestBroker:
     def __init__(
         self,
         *,
-        serializer: Any | None = None,
+        serializer: Serializer[Any] | None = None,
         di_resolver: Any | None = None,
         context_repo: Any | None = None,
         publish_outcome: PublishOutcome | None = None,
@@ -121,8 +126,8 @@ class TestBroker:
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
         ack_policy: AckPolicy = AckPolicy.AUTO,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         retry: RetryConfig | RetryDisabled | None = None,
         tags: frozenset[str] | set[str] | None = None,
         description: str = "",
@@ -164,7 +169,7 @@ class TestBroker:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 
-    def include_router(self, router: Any, prefix: str = "") -> None:
+    def include_router(self, router: RabbitRouter, prefix: str = "") -> None:
         """Include routes from a RabbitRouter."""
         self._registry.include_router(router, prefix=prefix)
 
@@ -203,6 +208,7 @@ class TestBroker:
         position rationale (outer of ordinary middlewares, inner of any
         ``ExceptionMiddleware``).
         """
+        from rabbitkit.middleware.metrics import MetricsMiddleware
         from rabbitkit.middleware.retry import (
             RetryMiddleware,
             retry_middleware_insertion_index,
@@ -219,12 +225,20 @@ class TestBroker:
             if has_retry_mw:
                 continue
             index = retry_middleware_insertion_index(route.route_middlewares)
+            # M2: mirror the real brokers -- wire in a route MetricsMiddleware
+            # (if any) so messages_retried_total/dead_lettered_total are
+            # observable through TestBroker too.
+            metrics_mw = next(
+                (mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None
+            )
             route.route_middlewares.insert(
                 index,
                 RetryMiddleware(
                     retry_config,
                     publish_fn=self._retry_publish_sync,
                     publish_async_fn=self._retry_publish_async,
+                    metrics_collector=metrics_mw.collector if metrics_mw else None,
+                    metrics_config=metrics_mw.config if metrics_mw else None,
                 ),
             )
         self._pipeline.clear_caches()

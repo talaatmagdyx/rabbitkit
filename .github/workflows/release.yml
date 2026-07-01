@@ -1,0 +1,49 @@
+# Tag-triggered build-and-publish to PyPI using trusted publishing (OIDC) —
+# no long-lived API token stored as a secret. Configure this once on PyPI:
+# https://pypi.org/manage/project/rabbitkit/settings/publishing/
+# (add a trusted publisher for this repo, workflow file `release.yml`,
+# environment `pypi`), before the first tag push.
+#
+# Trigger: push a tag matching `v*` (e.g. `v1.1.0`) that matches the version
+# in pyproject.toml. Bump `_version.py` AND `pyproject.toml` together (per
+# project convention), commit, then tag.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: twine check
+        run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

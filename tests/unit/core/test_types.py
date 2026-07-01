@@ -75,13 +75,14 @@ class TestErrorSeverity:
 class TestPublishStatus:
     def test_values(self) -> None:
         assert PublishStatus.CONFIRMED == "confirmed"
+        assert PublishStatus.SENT == "sent"
         assert PublishStatus.NACKED == "nacked"
         assert PublishStatus.TIMEOUT == "timeout"
         assert PublishStatus.RETURNED == "returned"
         assert PublishStatus.ERROR == "error"
 
     def test_all_values(self) -> None:
-        assert len(PublishStatus) == 5
+        assert len(PublishStatus) == 6
 
 
 # ── PublishOutcome ────────────────────────────────────────────────────────
@@ -91,6 +92,13 @@ class TestPublishOutcome:
     def test_confirmed_is_ok(self) -> None:
         outcome = PublishOutcome(status=PublishStatus.CONFIRMED)
         assert outcome.ok is True
+
+    def test_sent_is_ok(self) -> None:
+        """M4: SENT (fire-and-forget, confirm_delivery=False) is not a
+        failure -- but is distinct from CONFIRMED via .status."""
+        outcome = PublishOutcome(status=PublishStatus.SENT)
+        assert outcome.ok is True
+        assert outcome.status != PublishStatus.CONFIRMED
 
     def test_nacked_is_not_ok(self) -> None:
         outcome = PublishOutcome(status=PublishStatus.NACKED)

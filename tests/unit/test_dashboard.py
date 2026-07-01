@@ -157,3 +157,34 @@ class TestDashboardAuth:
         with caplog.at_level(logging.WARNING, logger="rabbitkit.dashboard.app"):
             create_dashboard_app(broker, auth_token="s3cr3t")
         assert not any("WITHOUT authentication" in rec.message for rec in caplog.records)
+
+    def test_bearer_check_uses_constant_time_comparison(self) -> None:
+        """M8: the bearer check must use hmac.compare_digest, not a plain
+        string `!=` -- a naive comparison short-circuits on the first
+        mismatched byte, leaking timing information about the token."""
+        import hmac
+        from unittest.mock import patch
+
+        from rabbitkit.dashboard import create_dashboard_app
+
+        broker = _make_mock_broker()
+        app = create_dashboard_app(broker, auth_token="s3cr3t")
+        client = TestClient(app)
+
+        with patch("hmac.compare_digest", wraps=hmac.compare_digest) as spy:
+            resp = client.get("/api/health", headers={"Authorization": "Bearer s3cr3t"})
+
+        assert resp.status_code == 200
+        spy.assert_called_once_with("Bearer s3cr3t", "Bearer s3cr3t")
+
+    def test_bearer_wrong_length_still_rejected(self) -> None:
+        """Sanity check that compare_digest correctly rejects mismatched
+        values regardless of length (not just same-length near-matches)."""
+        from rabbitkit.dashboard import create_dashboard_app
+
+        broker = _make_mock_broker()
+        app = create_dashboard_app(broker, auth_token="s3cr3t")
+        client = TestClient(app)
+
+        resp = client.get("/api/health", headers={"Authorization": "Bearer s3cr3t-but-longer"})
+        assert resp.status_code == 401

@@ -198,6 +198,66 @@ class TestConsumeScopeSync:
         # Falls back to drop semantics: nack(requeue=False)
         msg2._nack_fn.assert_called_once_with(False)
 
+    def test_nack_logs_and_emits_metric(self, caplog: pytest.LogCaptureFixture) -> None:
+        """L5: on_limited='nack' logs at WARNING and, with a metrics_collector
+        wired, increments rate_limit_dropped_total(reason=nack)."""
+        import logging
+
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="nack")
+        mw = RateLimitMiddleware(cfg, metrics_collector=collector, metrics_config=MetricsConfig())
+
+        mw.consume_scope(MagicMock(return_value="ok"), _make_message())  # consumes the token
+
+        with caplog.at_level(logging.WARNING, logger="rabbitkit.middleware.rate_limit"):
+            mw.consume_scope(MagicMock(), _make_message())
+
+        assert any("reason=nack" in r.message for r in caplog.records)
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_rate_limit_dropped_total", {"reason": "nack"}
+        )
+
+    def test_drop_logs_and_emits_metric(self) -> None:
+        """L5: on_limited='drop' increments rate_limit_dropped_total(reason=drop)."""
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="drop")
+        mw = RateLimitMiddleware(cfg, metrics_collector=collector, metrics_config=MetricsConfig())
+
+        mw.consume_scope(MagicMock(return_value="ok"), _make_message())
+        mw.consume_scope(MagicMock(), _make_message())
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_rate_limit_dropped_total", {"reason": "drop"}
+        )
+
+    def test_wait_deadline_exceeded_logs_and_emits_metric(self) -> None:
+        """L5: the 'wait' policy's deadline-exceeded fallback increments
+        rate_limit_dropped_total(reason=wait_deadline_exceeded)."""
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        cfg = RateLimitConfig(max_rate=0.001, burst=1, on_limited="wait")
+        mw = RateLimitMiddleware(cfg, metrics_collector=collector, metrics_config=MetricsConfig())
+        mw._wait_deadline = 0.05
+
+        mw.consume_scope(MagicMock(return_value="ok"), _make_message())
+        mw.consume_scope(MagicMock(), _make_message())
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_rate_limit_dropped_total", {"reason": "wait_deadline_exceeded"}
+        )
+
+    def test_no_metrics_wired_is_noop(self) -> None:
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="drop")
+        mw = RateLimitMiddleware(cfg)
+
+        mw.consume_scope(MagicMock(return_value="ok"), _make_message())
+        mw.consume_scope(MagicMock(), _make_message())  # must not raise
+
     def test_consume_scope_nack_skips_settled(self) -> None:
         """on_limited='nack' does not nack already-settled messages."""
         cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="nack")
@@ -330,3 +390,21 @@ class TestConsumeScopeAsync:
         assert result is None
         assert call_count == 0
         msg2._nack_async_fn.assert_awaited_once_with(False)
+
+    async def test_async_drop_emits_metric(self) -> None:
+        """L5, async variant."""
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        cfg = RateLimitConfig(max_rate=1.0, burst=1, on_limited="drop")
+        mw = RateLimitMiddleware(cfg, metrics_collector=collector, metrics_config=MetricsConfig())
+
+        async def call_next(m: RabbitMessage) -> str:
+            return "ok"
+
+        await mw.consume_scope_async(call_next, _make_message())
+        await mw.consume_scope_async(call_next, _make_message())
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_rate_limit_dropped_total", {"reason": "drop"}
+        )

@@ -199,9 +199,16 @@ class _ReplyRouter:
         if sink.done():
             return
 
-        # L-8: cap reply body size so a runaway/zip-bomb reply can't
-        # materialise a huge buffer in the caller; surface as a
-        # ReplyTooLargeError instead of storing the result.
+        # L-8/L7: this check runs AFTER the transport has already received
+        # and fully buffered the reply body (message.body is a complete
+        # bytes object by the time resolve() is called) -- it does NOT
+        # prevent a huge/zip-bomb reply from being materialized in memory.
+        # It only stops the CALLER from receiving/holding onto an
+        # oversized result: surfaces as a typed ReplyTooLargeError instead
+        # of silently handing back a giant buffer. Enforcing at the AMQP
+        # frame level (rejecting mid-receive, before the body is fully
+        # assembled) would require intercepting delivery inside
+        # pika/aio-pika itself and is not done here.
         if self.max_reply_bytes is not None and len(message.body) > self.max_reply_bytes:
             sink.set_exception(ReplyTooLargeError(cid, len(message.body), self.max_reply_bytes))
             return
@@ -493,6 +500,11 @@ class AsyncRPCClient:
         self._lock = asyncio.Lock()
         self._consuming = False
         self._consumer_tag: str | None = None
+        # L6: guards call()/_ensure_consuming() after close() — mirrors the
+        # sync client's `_closed` guard (see its `_ensure_consuming` for why:
+        # without it, a call() after close() would happily re-register a
+        # consumer on a torn-down transport).
+        self._closed = False
 
     async def call(
         self,
@@ -517,8 +529,13 @@ class AsyncRPCClient:
 
         Raises:
             RPCTimeoutError: If the response is not received within the timeout.
+            RPCClientClosed: If the client was closed (or is closed while waiting).
             RuntimeError: If max_pending calls is exceeded.
         """
+        # L6: refuse to operate after close() instead of silently
+        # re-registering a consumer on a half-torn-down client.
+        if self._closed:
+            raise RPCClientClosed("AsyncRPCClient is closed")
         await self._ensure_consuming()
 
         correlation_id = str(uuid.uuid4())
@@ -562,7 +579,11 @@ class AsyncRPCClient:
     async def close(self) -> None:
         """Close the RPC client and clean up.
 
-        Cancels the reply consumer and resolves all pending calls.
+        Cancels the reply consumer and resolves all pending calls with a
+        typed ``RPCClientClosed`` (L6) — matching the sync client's
+        behavior — so an in-flight caller's ``await future`` raises cleanly
+        instead of a bare ``asyncio.CancelledError`` that could be confused
+        with the caller's own cancellation.
         """
         if self._consumer_tag and self._transport:
             try:
@@ -570,9 +591,12 @@ class AsyncRPCClient:
             except Exception as e:
                 logger.warning("Failed to cancel RPC reply consumer: %s", e)
 
-        # Clean up pending calls
+        # Clean up pending calls. L6: mark closed so subsequent
+        # call()/_ensure_consuming() refuse to re-register a consumer on the
+        # torn-down client.
         async with self._lock:
-            self._router.cancel_all()
+            self._closed = True
+            self._router.close_all(RPCClientClosed("AsyncRPCClient was closed"))
 
         self._consuming = False
         self._consumer_tag = None
@@ -584,6 +608,9 @@ class AsyncRPCClient:
         registering a duplicate consumer on amq.rabbitmq.reply-to (which
         supports exactly one consumer per channel).
         """
+        # L6: refuse to (re-)register a consumer on a closed client.
+        if self._closed:
+            raise RPCClientClosed("AsyncRPCClient is closed")
         async with self._lock:
             if self._consuming:
                 return

@@ -7,16 +7,103 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import typing
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import Annotated, Any, get_args, get_origin
 
-from rabbitkit.core.errors import ConfigurationError
+from rabbitkit.core.errors import ConfigurationError, MissingDependencyError
 from rabbitkit.core.message import RabbitMessage, is_rabbit_message_annotation
 from rabbitkit.di.context import Context, ContextRepo, Header, Path
 from rabbitkit.di.depends import Depends
 
 _logger = logging.getLogger(__name__)
+
+# L11: textual match on a DI marker CALL, used only once real hint resolution
+# (get_type_hints_with_fallback's three attempts) has already failed and we
+# are left with a raw, unresolved string annotation (PEP 563). See
+# get_type_hints_with_fallback and DIResolver.validate_handler.
+_DI_MARKER_CALL_RE = re.compile(r"\b(?:Depends|Header|Path|Context)\(")
+
+
+def get_type_hints_with_fallback(handler: Callable[..., Any]) -> dict[str, Any]:
+    """Resolve ``handler``'s type hints, tolerating ``from __future__ import
+    annotations`` forward references that plain ``typing.get_type_hints()``
+    can't reach on its own.
+
+    When annotations are strings (PEP 563), they need evaluating. For
+    locally-defined handlers (e.g. built by a factory function), the
+    annotated type may live in the enclosing closure rather than the
+    handler's module globals -- plain ``get_type_hints()`` can't see it.
+
+    Strategy, each tried in order, first success wins:
+    1. ``typing.get_type_hints()`` — the common case.
+    2. ``typing.get_type_hints()`` with the handler's closure variables
+       supplied as ``localns`` — resolves closure-scoped forward refs.
+    3. ``inspect.get_annotations(eval_str=True)`` — a different evaluation
+       path that occasionally succeeds where (1)/(2) don't.
+    4. Final fallback: the raw ``inspect.signature()`` annotations, which
+       are still PEP 563 strings if every real attempt above failed (e.g. a
+       forward ref to a name that is genuinely unreachable, such as one only
+       imported under ``if TYPE_CHECKING:``).
+
+    This single implementation backs BOTH :class:`DIResolver` (the actual
+    per-message resolver) and the pipeline's own DI-need detector
+    (``HandlerPipeline._handler_needs_di``) — the two must use identical
+    resolution strength. They used to diverge (the detector had a weaker,
+    2-attempt version without the closure-``localns`` retry), which meant a
+    closure-scoped ``Depends(...)`` annotation could resolve fine here but
+    still be mis-detected as "no DI needed" by the weaker detector, silently
+    binding the marked parameter to the message body instead (L11).
+    """
+    try:
+        return typing.get_type_hints(handler, include_extras=True)
+    except Exception:
+        pass
+
+    localns: dict[str, Any] = {}
+    if hasattr(handler, "__code__") and hasattr(handler, "__closure__"):
+        code = handler.__code__
+        closure = handler.__closure__
+        if closure is not None:
+            for name, cell in zip(code.co_freevars, closure, strict=False):
+                try:
+                    localns[name] = cell.cell_contents
+                except ValueError:  # pragma: no cover
+                    pass  # pragma: no cover
+    try:
+        return typing.get_type_hints(handler, localns=localns, include_extras=True)
+    except Exception:
+        pass
+
+    try:
+        return inspect.get_annotations(handler, eval_str=True)
+    except Exception:
+        pass
+
+    # Final fallback: raw (possibly still-a-string) annotations from signature.
+    sig = inspect.signature(handler)
+    return {
+        name: param.annotation
+        for name, param in sig.parameters.items()
+        if param.annotation is not inspect.Parameter.empty
+    }
+
+
+def _looks_like_unresolved_di_marker(ann: Any) -> bool:
+    """L11: best-effort detection of a DI marker in an annotation that
+    :func:`get_type_hints_with_fallback` could not resolve to a real type
+    (still a raw PEP 563 string after all three real resolution attempts).
+
+    A plain string has no ``__metadata__``, so the structural
+    ``Annotated[...]`` check used everywhere else can't see a marker here —
+    this falls back to a textual match on the marker call syntax
+    (``Depends(``/``Header(``/``Path(``/``Context(``). That's imperfect (an
+    aliased import, e.g. ``from ... import Depends as D``, slips through),
+    but a silent, wrong body-binding of a DI-marked parameter is worse than
+    an occasional false positive turned into a clear registration-time error.
+    """
+    return isinstance(ann, str) and bool(_DI_MARKER_CALL_RE.search(ann))
 
 
 def _is_rabbit_message(ann: Any) -> bool:
@@ -128,51 +215,8 @@ class DIResolver:
         return cached
 
     def _get_type_hints(self, handler: Callable[..., Any]) -> dict[str, Any]:
-        """Get resolved type hints for handler, handling `from __future__ import annotations`.
-
-        When annotations are strings (PEP 563), we need to evaluate them.
-        For locally-defined handlers, typing.get_type_hints() may fail because
-        local variables aren't in the module's global namespace.
-
-        Strategy:
-        1. Try typing.get_type_hints() with include_extras=True
-        2. On failure, try with closure variables as localns
-        3. Final fallback: use inspect.get_annotations with eval_str=True
-        """
-        try:
-            return typing.get_type_hints(handler, include_extras=True)
-        except Exception:
-            pass
-
-        # Attempt 2: try with closure variables as localns
-        localns: dict[str, Any] = {}
-        if hasattr(handler, "__code__") and hasattr(handler, "__closure__"):
-            code = handler.__code__
-            closure = handler.__closure__
-            if closure is not None:
-                for name, cell in zip(code.co_freevars, closure, strict=False):
-                    try:
-                        localns[name] = cell.cell_contents
-                    except ValueError:  # pragma: no cover
-                        pass  # pragma: no cover
-        try:
-            return typing.get_type_hints(handler, localns=localns, include_extras=True)
-        except Exception:
-            pass
-
-        # Attempt 3: use inspect.get_annotations (Python 3.10+)
-        try:
-            return inspect.get_annotations(handler, eval_str=True)
-        except Exception:
-            pass
-
-        # Final fallback: return raw annotations from signature
-        sig = inspect.signature(handler)
-        return {
-            name: param.annotation
-            for name, param in sig.parameters.items()
-            if param.annotation is not inspect.Parameter.empty
-        }
+        """Get resolved type hints for handler. See :func:`get_type_hints_with_fallback`."""
+        return get_type_hints_with_fallback(handler)
 
     def validate_handler(self, handler: Callable[..., Any]) -> None:
         """Validate handler signature at registration time.
@@ -180,6 +224,8 @@ class DIResolver:
         Raises ConfigurationError for:
         - *args or **kwargs
         - Multiple body-like parameters
+        - An annotation that looks like an unresolved DI marker (L11) — see
+          ``_looks_like_unresolved_di_marker``
         """
         sig, hints = self._sig_and_hints(handler)
         body_params: list[str] = []
@@ -193,6 +239,24 @@ class DIResolver:
                 )
 
             ann = hints.get(param_name, inspect.Parameter.empty)
+
+            # L11: get_type_hints_with_fallback() could not resolve this
+            # annotation to a real type (it's still a raw PEP 563 string),
+            # and it textually looks like a DI marker call. Silently
+            # continuing would bind this parameter to the message body
+            # instead of resolving it via the marker — fail fast instead.
+            if _looks_like_unresolved_di_marker(ann):
+                raise ConfigurationError(
+                    f"Handler '{handler.__qualname__}': parameter '{param_name}' has an "
+                    f"annotation ({ann!r}) that looks like it uses a DI marker "
+                    "(Depends/Header/Path/Context) but rabbitkit could not resolve it to "
+                    "a real type. This usually means the annotated type is not reachable "
+                    "from the handler's module globals or enclosing closure -- e.g. it is "
+                    "only imported under `if TYPE_CHECKING:`, or defined somewhere "
+                    "typing.get_type_hints() can't see. Left unresolved, this parameter "
+                    "would silently bind to the message body instead of the marker. Make "
+                    "the annotated type resolvable (e.g. import it unconditionally) to fix."
+                )
 
             # Check if it's a DI-annotated parameter
             if self._has_di_marker(ann):
@@ -248,7 +312,9 @@ class DIResolver:
                 if isinstance(marker, Depends):
                     kwargs[param_name] = self._resolve_depends(marker, depends_cache, scope)
                 else:
-                    kwargs[param_name] = self._resolve_marker(marker, message, context_repo, depends_cache)
+                    kwargs[param_name] = self._resolve_marker_with_fallback(
+                        marker, param, param_name, message, context_repo
+                    )
                 continue
 
             # Rule 2: RabbitMessage type (class or string form)
@@ -289,7 +355,9 @@ class DIResolver:
                 if isinstance(marker, Depends):
                     kwargs[param_name] = await self._resolve_depends_async(marker, depends_cache, scope)
                 else:
-                    kwargs[param_name] = self._resolve_marker(marker, message, context_repo, depends_cache)
+                    kwargs[param_name] = self._resolve_marker_with_fallback(
+                        marker, param, param_name, message, context_repo
+                    )
                 continue
 
             # Rule 2: RabbitMessage type (class or string form)
@@ -326,23 +394,37 @@ class DIResolver:
                     return arg
         return None
 
-    def _resolve_marker(
+    def _resolve_marker_with_fallback(
         self,
-        marker: Depends | Header | Path | Context,
+        marker: Header | Path | Context,
+        param: inspect.Parameter,
+        param_name: str,
         message: RabbitMessage,
         context_repo: ContextRepo | None,
-        depends_cache: dict[int, Any],
     ) -> Any:
-        """Resolve a single DI marker."""
-        if isinstance(marker, Depends):
-            return self._resolve_depends(marker, depends_cache)
-        if isinstance(marker, Header):
-            return self._resolve_header(marker, message)
-        if isinstance(marker, Path):
-            return self._resolve_path(marker, message)
-        if isinstance(marker, Context):
-            return self._resolve_context(marker, context_repo)
-        raise ConfigurationError(f"Unknown DI marker: {marker!r}")
+        """Resolve a Header()/Path()/Context() marker (H10).
+
+        Fallback order when the value is absent from the message:
+        1. The marker's own ``default=`` (checked first, inside
+           ``_resolve_header``/``_resolve_path``/``_resolve_context``).
+        2. The handler parameter's own Python default (checked here).
+        3. Neither present → ``MissingDependencyError`` (PERMANENT).
+
+        ``Depends()`` markers never reach here — both ``resolve()`` and
+        ``resolve_async()`` special-case them before calling this.
+        """
+        try:
+            if isinstance(marker, Header):
+                return self._resolve_header(marker, message, param_name)
+            if isinstance(marker, Path):
+                return self._resolve_path(marker, message, param_name)
+            if isinstance(marker, Context):
+                return self._resolve_context(marker, context_repo, param_name)
+            raise ConfigurationError(f"Unknown DI marker: {marker!r}")  # pragma: no cover - defensive
+        except MissingDependencyError:
+            if param.default is not inspect.Parameter.empty:
+                return param.default
+            raise
 
     def _resolve_depends(self, marker: Depends, cache: dict[int, Any], scope: DependencyScope | None = None) -> Any:
         """Resolve a Depends() marker, with support for sync generator dependencies."""
@@ -394,22 +476,28 @@ class DIResolver:
             cache[dep_id] = result
         return result
 
-    def _resolve_header(self, marker: Header, message: RabbitMessage) -> Any:
-        """Resolve a Header() marker."""
-        if marker.name not in message.headers:
-            raise KeyError(f"Header '{marker.name}' not found in message headers")
-        return message.headers[marker.name]
+    def _resolve_header(self, marker: Header, message: RabbitMessage, param_name: str) -> Any:
+        """Resolve a Header() marker (H10: marker default checked first)."""
+        if marker.name in message.headers:
+            return message.headers[marker.name]
+        if marker.has_default:
+            return marker.default
+        raise MissingDependencyError(repr(marker), param_name)
 
-    def _resolve_path(self, marker: Path, message: RabbitMessage) -> Any:
-        """Resolve a Path() marker."""
-        if marker.segment not in message.path:
-            raise KeyError(f"Path segment '{marker.segment}' not found in message path")
-        return message.path[marker.segment]
+    def _resolve_path(self, marker: Path, message: RabbitMessage, param_name: str) -> Any:
+        """Resolve a Path() marker (H10: marker default checked first)."""
+        if marker.segment in message.path:
+            return message.path[marker.segment]
+        if marker.has_default:
+            return marker.default
+        raise MissingDependencyError(repr(marker), param_name)
 
-    def _resolve_context(self, marker: Context, context_repo: ContextRepo | None) -> Any:
-        """Resolve a Context() marker."""
+    def _resolve_context(self, marker: Context, context_repo: ContextRepo | None, param_name: str) -> Any:
+        """Resolve a Context() marker (H10: marker default checked first)."""
         if context_repo is None:
             raise ConfigurationError("ContextRepo not available for Context() resolution")
-        if not context_repo.has(marker.key):
-            raise KeyError(f"Context key '{marker.key}' not found")
-        return context_repo.get(marker.key)
+        if context_repo.has(marker.key):
+            return context_repo.get(marker.key)
+        if marker.has_default:
+            return marker.default
+        raise MissingDependencyError(repr(marker), param_name)

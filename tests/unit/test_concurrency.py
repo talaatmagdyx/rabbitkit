@@ -278,6 +278,128 @@ class TestAsyncWorkerPool:
         await pool.stop()
 
 
+# ── H12: abandoned handlers are nacked + logged, submit() refuses when stopped ──
+
+
+class TestAsyncWorkerPoolAbandonment:
+    async def test_stop_nacks_abandoned_message_for_redelivery(self) -> None:
+        """H12: a task abandoned at the stop_timeout deadline has its still-
+        unsettled message explicitly nacked (requeue) instead of being left
+        to the implicit requeue-on-connection-close behavior."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        message = _make_message(delivery_tag=42, message_id="abc")
+        nacked: list[bool] = []
+
+        async def real_nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = real_nack
+
+        async def never_finish(msg: RabbitMessage) -> None:
+            await asyncio.sleep(100)
+
+        await pool.submit(never_finish, message)
+        await asyncio.sleep(0.01)
+
+        await pool.stop(timeout=0.05)
+
+        assert nacked == [True]
+        assert message._disposition == "nacked"
+
+    async def test_stop_skips_already_settled_message(self) -> None:
+        """H12: a message that settled itself before the deadline (however
+        that happened) must not be touched again -- no double-settle."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        message = _make_message(delivery_tag=5)
+        message._disposition = "acked"
+
+        async def never_finish(msg: RabbitMessage) -> None:
+            await asyncio.sleep(100)
+
+        await pool.submit(never_finish, message)
+        await asyncio.sleep(0.01)
+
+        nack_calls: list[bool] = []
+        message._nack_async_fn = lambda requeue: nack_calls.append(requeue)  # type: ignore[assignment]
+
+        await pool.stop(timeout=0.05)
+
+        assert nack_calls == []
+        assert message._disposition == "acked"
+
+    async def test_stop_logs_abandoned_delivery_tag(self) -> None:
+        """H12: the abandonment warning names the delivery_tag/message_id,
+        not just a bare count, so operators can correlate it downstream."""
+        from unittest.mock import patch
+
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        message = _make_message(delivery_tag=99, message_id="m-99")
+
+        async def never_finish(msg: RabbitMessage) -> None:
+            await asyncio.sleep(100)
+
+        await pool.submit(never_finish, message)
+        await asyncio.sleep(0.01)
+
+        with patch("rabbitkit.concurrency.logger") as mock_logger:
+            await pool.stop(timeout=0.05)
+
+        assert any(99 in call.args for call in mock_logger.warning.call_args_list)
+
+    async def test_submit_after_stop_nacks_instead_of_orphaning(self) -> None:
+        """H12: submit() called while the pool isn't running (e.g. a stray
+        post-stop() delivery callback) refuses to schedule an unawaited task
+        and instead nacks the message immediately for redelivery."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        await pool.stop()
+
+        message = _make_message(delivery_tag=7)
+        nacked: list[bool] = []
+
+        async def real_nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = real_nack
+
+        called: list[bool] = []
+
+        async def callback(msg: RabbitMessage) -> None:
+            called.append(True)
+
+        await pool.submit(callback, message)
+
+        assert called == []  # handler never ran -- refused, not orphaned
+        assert nacked == [True]
+        assert message._disposition == "nacked"
+        assert pool.pending_count == 0
+
+    async def test_submit_after_stop_already_settled_is_noop(self) -> None:
+        """H12: submit() after stop() for an already-settled message must not
+        attempt a redundant nack (which would raise -- no settlement fn set
+        needed for an already-settled message)."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        await pool.stop()
+
+        message = _make_message()
+        message._disposition = "acked"
+
+        called: list[bool] = []
+
+        async def callback(msg: RabbitMessage) -> None:
+            called.append(True)
+
+        await pool.submit(callback, message)  # must not raise
+        assert called == []
+
+
 # ── WorkerConfig.stop_timeout ────────────────────────────────────────────
 
 
@@ -386,6 +508,34 @@ class TestSyncWorkerPoolTimeout:
         mock_logger.warning.assert_called_once()
         assert "did not complete" in mock_logger.warning.call_args[0][0]
         future.cancel()
+
+    def test_stop_logs_abandoned_delivery_tag_when_submitted_via_pool(self) -> None:
+        """H12: a handler submitted through the public submit() (so its
+        message is tracked) is logged by delivery_tag/message_id -- not just
+        the bare count -- when abandoned past stop_timeout."""
+        import time
+        from unittest.mock import patch
+
+        from rabbitkit.concurrency import SyncWorkerPool
+        from rabbitkit.core.config import WorkerConfig
+
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        started = threading.Event()
+
+        def slow_handler(msg: RabbitMessage) -> None:
+            started.set()
+            time.sleep(5)  # longer than stop timeout
+
+        message = _make_message(delivery_tag=123, message_id="sync-abandon")
+        pool.submit(slow_handler, message)
+        started.wait(timeout=1.0)
+
+        with patch("rabbitkit.concurrency.logger") as mock_logger:
+            pool.stop(timeout=0.05)
+
+        assert any(123 in call.args for call in mock_logger.warning.call_args_list)
 
     def test_pending_count_when_executor_is_none(self) -> None:
         """Line 108: pending_count returns 0 when pool not started."""

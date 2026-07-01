@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -37,9 +37,14 @@ from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition, warn_filter_without_dlx
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.retry import RetryRouter
+from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors
 from rabbitkit.sync.transport import SyncTransport
+
+if TYPE_CHECKING:
+    from rabbitkit.core.router import RabbitRouter
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -63,10 +68,10 @@ class SyncBroker:
         self,
         config: RabbitConfig | None = None,
         *,
-        serializer: Any | None = None,
+        serializer: Serializer[Any] | None = None,
         di_resolver: Any | None = None,
         context_repo: Any | None = None,
-        middlewares: list[Any] | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
     ) -> None:
         self._config = config or RabbitConfig()
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -78,7 +83,7 @@ class SyncBroker:
         # set the full list via this constructor param — mutating it in place
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
-        self._publish_middlewares: list[Any] = middlewares or []
+        self._publish_middlewares: list[BaseMiddleware] = middlewares or []
         # Private mutable view of consumer config — brokers may apply a
         # prefetch override derived from WorkerConfig.prefetch_per_worker.
         # Stored separately so the caller's frozen RabbitConfig is never mutated.
@@ -95,6 +100,12 @@ class SyncBroker:
         self._worker_pool: SyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
+
+        # L14: liveness heartbeat (see health.broker_liveness). Read by
+        # health.py via duck-typed attribute access (no formal HealthProvider
+        # method for it). None until start() -- see the start() docstring for
+        # why it's set there rather than only on delivery/tick.
+        self.last_heartbeat: float | None = None
 
         # Bounded graceful drain (C-2): track inline in-flight handlers so
         # stop() can wait for them to finish (up to graceful_timeout) instead
@@ -133,7 +144,7 @@ class SyncBroker:
         return self._config
 
     @property
-    def publish_middlewares(self) -> list[Any]:
+    def publish_middlewares(self) -> list[BaseMiddleware]:
         """Middlewares applied to every ``broker.publish()`` call (e.g. signing).
 
         Set via the constructor's ``middlewares=`` param. See the comment on
@@ -164,14 +175,14 @@ class SyncBroker:
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
         ack_policy: AckPolicy = AckPolicy.AUTO,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         retry: RetryConfig | RetryDisabled | None = None,
         tags: frozenset[str] | set[str] | None = None,
         description: str = "",
         name: str | None = None,
         prefetch_count: int | None = None,
-        filter_fn: Any | None = None,
+        filter_fn: Callable[[RabbitMessage], bool] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -197,7 +208,7 @@ class SyncBroker:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 
-    def include_router(self, router: Any, prefix: str = "") -> None:
+    def include_router(self, router: RabbitRouter, prefix: str = "") -> None:
         """Include routes from a RabbitRouter."""
         self._registry.include_router(router, prefix=prefix)
 
@@ -211,9 +222,19 @@ class SyncBroker:
         3. Declare retry topology (delay queues, DLQ)
         4. Optionally create a worker pool for concurrent processing
         5. Start consuming from all registered queues
+
+        L14: ``last_heartbeat`` is initialized here (not left ``None`` until
+        the first message/tick) so a broker that is wedged from the very
+        start -- before it ever processes a message or a
+        ``start_consuming()`` loop iteration -- is still caught by
+        :func:`health.broker_liveness`'s staleness check, instead of
+        bypassing it entirely (a ``None`` heartbeat is treated as "no
+        signal available" there, which previously meant "always alive").
         """
         if self._started:
             return
+
+        self.last_heartbeat = time.monotonic()
 
         # Configure structured logging if enabled
         if self._config.logging is not None:
@@ -232,6 +253,7 @@ class SyncBroker:
         )
 
         self._transport.connect()
+        self._transport.on_io_tick(self._mark_heartbeat)
 
         # Wire an opt-in FlowController's blocked/unblocked callbacks to the
         # transport now that it exists (C-6).
@@ -614,10 +636,12 @@ class SyncBroker:
         if self._transport is None:
             return
 
+        from rabbitkit.middleware.metrics import MetricsMiddleware
         from rabbitkit.middleware.retry import (
             RetryMiddleware,
             retry_middleware_insertion_index,
             warn_retry_middleware_without_topology,
+            warn_retry_without_confirms,
         )
 
         wired = False
@@ -633,11 +657,29 @@ class SyncBroker:
                 continue
             if has_retry_mw:
                 continue
+            if not self._config.publisher.confirm_delivery:
+                warn_retry_without_confirms(route.name)  # M4
             index = retry_middleware_insertion_index(route.route_middlewares)
+            # M2: wire in an existing route MetricsMiddleware (if any) so
+            # messages_retried_total/dead_lettered_total are observable.
+            metrics_mw = next(
+                (mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None
+            )
             route.route_middlewares.insert(
-                index, RetryMiddleware(retry_config, publish_fn=self._transport.publish)
+                index,
+                RetryMiddleware(
+                    retry_config,
+                    publish_fn=self._transport.publish,
+                    metrics_collector=metrics_mw.collector if metrics_mw else None,
+                    metrics_config=metrics_mw.config if metrics_mw else None,
+                ),
             )
             wired = True
+
+        if not self._config.publisher.confirm_delivery:
+            for route in self._registry.routes:
+                if route.result_publisher is not None:
+                    warn_retry_without_confirms(route.name, context="result")  # M4
 
         if wired:
             # Drop any middleware chains cached before the retry mw was installed.
@@ -722,6 +764,17 @@ class SyncBroker:
             elif filter_dlq_name is not None:
                 self._transport.declare_queue(RabbitQueue(name=filter_dlq_name, durable=True))
 
+    def _mark_heartbeat(self) -> None:
+        """Refresh the liveness heartbeat (I-4/L14).
+
+        Called both per delivered message (``on_message`` below) and once
+        per ``start_consuming()`` I/O loop tick (wired via
+        ``transport.on_io_tick`` in :meth:`start`) -- the latter is what
+        keeps a healthy but message-idle consumer from being mistaken for a
+        wedged one by :func:`health.broker_liveness`.
+        """
+        self.last_heartbeat = time.monotonic()
+
     def _start_consumer(self, route: RouteDefinition) -> None:
         """Start consuming for a single route."""
         if self._transport is None:
@@ -734,9 +787,7 @@ class SyncBroker:
             """Process incoming message through the pipeline."""
             # Track inline in-flight so stop() can drain gracefully (C-2).
             self._in_flight_inc()
-            # Heartbeat for liveness wedge detection (I-4): updated on every
-            # delivery so broker_liveness can fail when the I/O loop stalls.
-            self.last_heartbeat = time.monotonic()
+            self._mark_heartbeat()
             try:
                 # Set the original queue in headers for retry routing
                 if "x-rabbitkit-original-queue" not in message.headers:

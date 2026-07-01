@@ -11,12 +11,18 @@ Features:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
+from rabbitkit.serialization.base import Serializer
+
+if TYPE_CHECKING:
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.middleware.base import BaseMiddleware
 
 
 class RabbitRouter:
@@ -41,8 +47,8 @@ class RabbitRouter:
         self,
         prefix: str = "",
         exchange: RabbitExchange | str | None = None,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         tags: frozenset[str] | set[str] | None = None,
     ) -> None:
         self._prefix = prefix
@@ -57,7 +63,7 @@ class RabbitRouter:
         return self._prefix
 
     @property
-    def routes(self) -> list[Any]:
+    def routes(self) -> list[RouteDefinition]:
         return self._registry.routes
 
     def subscriber(
@@ -66,14 +72,14 @@ class RabbitRouter:
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
         ack_policy: AckPolicy = AckPolicy.AUTO,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         retry: RetryConfig | RetryDisabled | None = None,
         tags: frozenset[str] | set[str] | None = None,
         description: str = "",
         name: str | None = None,
         prefetch_count: int | None = None,
-        filter_fn: Callable[[Any], bool] | None = None,
+        filter_fn: Callable[[RabbitMessage], bool] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber on this router.
 

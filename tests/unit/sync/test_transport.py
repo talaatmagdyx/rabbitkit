@@ -170,6 +170,58 @@ class TestTopology:
 
         channel.queue_declare.assert_not_called()
 
+    def test_declare_queue_precondition_failed_raises_configuration_error(self) -> None:
+        """M6: a 406 PRECONDITION_FAILED (e.g. an ops-created queue with
+        different arguments) must raise a typed ConfigurationError naming
+        the conflicting queue -- not an opaque pika channel-closed error."""
+        import pika
+
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        channel.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(
+            406, "PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'orders'"
+        )
+
+        queue = RabbitQueue(name="orders")
+        with pytest.raises(ConfigurationError, match="orders") as exc_info:
+            transport.declare_queue(queue)
+
+        assert "PRECONDITION_FAILED" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, pika.exceptions.ChannelClosedByBroker)
+
+    def test_declare_queue_other_channel_closed_reraises(self) -> None:
+        """M6: a non-406 channel closure is not this middleware's concern --
+        must propagate as-is, not be swallowed or misreported."""
+        import pika
+
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        channel.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(
+            403, "ACCESS_REFUSED - queue name not allowed"
+        )
+
+        queue = RabbitQueue(name="orders")
+        with pytest.raises(pika.exceptions.ChannelClosedByBroker):
+            transport.declare_queue(queue)
+
+    def test_declare_exchange_precondition_failed_raises_configuration_error(self) -> None:
+        """M6: same as the queue case, for exchange declaration."""
+        import pika
+
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        channel.exchange_declare.side_effect = pika.exceptions.ChannelClosedByBroker(
+            406, "PRECONDITION_FAILED - inequivalent arg 'type' for exchange 'events'"
+        )
+
+        exchange = RabbitExchange(name="events")
+        with pytest.raises(ConfigurationError, match="events"):
+            transport.declare_exchange(exchange)
+
     def test_bind_queue(self) -> None:
         transport = _make_transport()
         channel = self._connect_transport(transport)
@@ -1087,6 +1139,19 @@ class TestBlockedUnblockedCallbacksSync:
         transport = _make_transport()
         transport._pika_unblocked(None)  # should not raise
 
+    def test_is_blocked_tracked_without_any_callback(self) -> None:
+        """L15: is_blocked reflects connection.blocked/unblocked frames even
+        with zero on_blocked/on_unblocked callbacks registered -- health.py
+        reads this directly when no FlowController is wired."""
+        transport = _make_transport()
+        assert transport.is_blocked is False
+
+        transport._pika_blocked(None)
+        assert transport.is_blocked is True
+
+        transport._pika_unblocked(None)
+        assert transport.is_blocked is False
+
 
 # ── sync context manager ──────────────────────────────────────────────────
 
@@ -1378,6 +1443,56 @@ class TestStartConsuming:
         transport.start_consuming()
 
         assert call_count == 1
+        assert transport._consuming is False
+
+    def test_on_io_tick_fires_once_per_loop_iteration(self) -> None:
+        """L14: on_io_tick callbacks fire once per process_data_events() call,
+        not once per delivered message -- the liveness-heartbeat hook."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        consumer_ch = MagicMock()
+        consumer_ch.is_open = True
+        transport._consumer_channels["q1"] = consumer_ch
+
+        tick_count = 0
+
+        def process_twice(time_limit: float) -> None:
+            nonlocal tick_count
+            if tick_count >= 1:
+                transport._consumer_channels.clear()
+
+        transport._connection.process_data_events = process_twice
+
+        def on_tick() -> None:
+            nonlocal tick_count
+            tick_count += 1
+
+        transport.on_io_tick(on_tick)
+        transport.start_consuming()
+
+        assert tick_count == 2  # two loop iterations before the channel clears
+
+    def test_on_io_tick_callback_exception_does_not_break_loop(self) -> None:
+        """L14: a raising io_tick callback is caught -- never breaks the I/O loop."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        consumer_ch = MagicMock()
+        consumer_ch.is_open = True
+        transport._consumer_channels["q1"] = consumer_ch
+
+        def process_one(time_limit: float) -> None:
+            transport._consumer_channels.clear()
+
+        transport._connection.process_data_events = process_one
+
+        def bad_tick() -> None:
+            raise RuntimeError("boom")
+
+        transport.on_io_tick(bad_tick)
+        transport.start_consuming()  # must not raise
+
         assert transport._consuming is False
 
 

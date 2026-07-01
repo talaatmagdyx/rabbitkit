@@ -32,6 +32,25 @@ MESSAGES_PUBLISHED_TOTAL = MetricsConfig().published_total
 MESSAGE_PUBLISH_SECONDS = MetricsConfig().publish_seconds
 
 
+def _queue_label(message: RabbitMessage) -> str:
+    """Return the ``queue`` label value for a consumed message (M3).
+
+    Prefers the BOUND queue name (``x-rabbitkit-original-queue``, set by
+    the broker's ``on_message`` wrapper before any middleware runs) over the
+    message's routing key. A topic/``Path()`` routing key that embeds an ID,
+    tenant, or other per-message value is unbounded — using it directly as a
+    Prometheus label creates one time series per distinct value ever seen
+    (cardinality explosion), and the label was misnamed besides (it's a
+    routing key, not a queue). Falls back to ``routing_key`` only when the
+    header is absent — e.g. a message built directly in a test rather than
+    delivered through a real broker/``TestBroker`` consume path.
+    """
+    original_queue = message.headers.get("x-rabbitkit-original-queue")
+    if original_queue:
+        return str(original_queue)
+    return message.routing_key or "unknown"
+
+
 # ── Protocol ─────────────────────────────────────────────────────────────
 
 
@@ -143,6 +162,40 @@ class MetricsMiddleware(BaseMiddleware):
         self._collector = collector
         self._cfg = config or MetricsConfig()
 
+    @property
+    def collector(self) -> MetricsCollector | None:
+        """The configured collector (None in no-op mode). Read by
+        ``HandlerPipeline``/``RetryMiddleware`` to emit settlement/retry
+        metrics they observe but this middleware itself cannot (M2) --
+        settlement happens in the pipeline's own ack-orchestration code,
+        outside this middleware's ``consume_scope``."""
+        return self._collector
+
+    @property
+    def config(self) -> MetricsConfig:
+        return self._cfg
+
+    def record_settlement(self, message: RabbitMessage, disposition: str) -> None:
+        """Emit the ack/nack/reject counter for a settled message (M2).
+
+        ``consume_scope``/``consume_scope_async`` only wrap handler
+        execution -- final settlement (ack/nack/reject per AckPolicy) is
+        decided by the pipeline's own ack-orchestration code, which runs
+        AFTER this middleware's wrapped call returns. ``HandlerPipeline``
+        calls this directly once a route's message is settled, if a
+        ``MetricsMiddleware`` is present on that route.
+        """
+        if self._collector is None:
+            return
+        name = {
+            "acked": self._cfg.messages_acked_total,
+            "nacked": self._cfg.messages_nacked_total,
+            "rejected": self._cfg.messages_rejected_total,
+        }.get(disposition)
+        if name is None:
+            return  # pragma: no cover - defensive, disposition is always one of the three
+        self._collector.inc_counter(name, {"queue": _queue_label(message)})
+
     # ── Consume-side ──────────────────────────────────────────────────
 
     def consume_scope(
@@ -154,7 +207,7 @@ class MetricsMiddleware(BaseMiddleware):
         if self._collector is None:
             return call_next(message)
 
-        queue = message.routing_key or "unknown"
+        queue = _queue_label(message)
         start = time.monotonic()
         try:
             result = call_next(message)
@@ -190,7 +243,7 @@ class MetricsMiddleware(BaseMiddleware):
         if self._collector is None:
             return await call_next(message)
 
-        queue = message.routing_key or "unknown"
+        queue = _queue_label(message)
         start = time.monotonic()
         try:
             result = await call_next(message)

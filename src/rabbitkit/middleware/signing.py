@@ -221,9 +221,25 @@ class TTLSetNonceCache:
     """Default in-memory nonce seen-set with TTL eviction.
 
     Thread-safe (a single lock guards the dict). Bounded to ``max_entries``
-    nonces; when full, expired entries are reclaimed first and, if still too
-    large, the oldest 10% are evicted (LRU-ish, relying on dict insertion order).
-    Expiry is lazy — checked on each lookup and opportunistically during GC.
+    nonces; when full, expired entries are reclaimed first. Expiry is lazy —
+    checked on each lookup and opportunistically during GC.
+
+    L4: an entry that is still within its TTL (genuinely live — a nonce
+    that was legitimately seen recently and remains within the replay
+    window) is **never** evicted to make room. Previously, once full, the
+    oldest 10% were evicted by insertion order regardless of whether they
+    had actually expired — an attacker could flood unique nonces to push a
+    target's live entry out of the set, then replay that nonce successfully
+    (it looks unseen again once evicted). Now, if the set is still at
+    capacity after reclaiming expired entries (i.e. genuinely full of live,
+    unexpired nonces — a flood, or ``max_entries`` sized too small for your
+    throughput x ``max_skew``), the new nonce is conservatively treated as
+    "not first-seen" (rejected) rather than evicting a live entry to make
+    room — the caller sees the same outcome as an actual replay (fail
+    closed under pressure, never silently let a live entry become
+    replayable). Size ``max_entries`` from your expected throughput x
+    ``max_skew`` to avoid hitting this in normal operation; a shared
+    ``RedisNonceCache`` sidesteps the bound entirely.
     """
 
     def __init__(self, max_entries: int = 100_000) -> None:
@@ -248,12 +264,18 @@ class TTLSetNonceCache:
                 # Drop expired entries first (cheap-ish pass over the dict).
                 for k in [k for k, exp in self._entries.items() if exp <= now]:
                     del self._entries[k]
-                # If still at/over capacity, evict the oldest 10% (insertion order).
+                # L4: still full after reclaiming expired entries means the
+                # set is genuinely full of LIVE nonces — never evict one of
+                # those to make room (that would let it be replayed once
+                # evicted). Reject the new nonce instead (fail closed).
                 if len(self._entries) >= self._max_entries:
-                    drop = max(1, len(self._entries) // 10)
-                    for _ in range(drop):
-                        k = next(iter(self._entries))
-                        del self._entries[k]
+                    logger.warning(
+                        "TTLSetNonceCache at capacity (%d) with no expired entries to reclaim; "
+                        "rejecting new nonce rather than evicting a live one. Size max_entries "
+                        "from throughput x max_skew, or use a shared RedisNonceCache.",
+                        self._max_entries,
+                    )
+                    return False
 
             self._entries[nonce] = expiry
             return True

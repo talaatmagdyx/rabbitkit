@@ -435,7 +435,48 @@ class TestAsyncRPCClient:
         assert client._consumer_tag is None
 
     @pytest.mark.asyncio
-    async def test_close_cancels_pending_futures(self) -> None:
+    async def test_close_sets_closed_flag(self) -> None:
+        """L6: close() marks the client closed."""
+        transport = AsyncMock()
+        client = AsyncRPCClient(transport)
+        assert client._closed is False
+
+        await client.close()
+
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_call_after_close_raises_rpc_client_closed(self) -> None:
+        """L6: call() after close() must refuse immediately -- not
+        re-register a consumer on a torn-down transport."""
+        transport = AsyncMock()
+        client = AsyncRPCClient(transport)
+        await client.close()
+
+        with pytest.raises(RPCClientClosed, match="closed"):
+            await client.call("rpc.queue", b"test", timeout=0.05)
+
+        # Must never have attempted to register a consumer.
+        transport.consume.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_consuming_after_close_raises_rpc_client_closed(self) -> None:
+        """L6: _ensure_consuming() itself refuses after close(), not just call()."""
+        transport = AsyncMock()
+        client = AsyncRPCClient(transport)
+        await client.close()
+
+        with pytest.raises(RPCClientClosed, match="closed"):
+            await client._ensure_consuming()
+
+        transport.consume.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_resolves_pending_futures_with_rpc_client_closed(self) -> None:
+        """L6: close() must resolve pending futures with a typed
+        RPCClientClosed, not a bare CancelledError -- so an in-flight
+        caller's `await future` raises something distinguishable from the
+        caller's own cancellation."""
         transport = AsyncMock()
         client = AsyncRPCClient(transport)
 
@@ -446,7 +487,10 @@ class TestAsyncRPCClient:
         await client.close()
 
         assert client._router.pending_count() == 0
-        assert future.cancelled()
+        assert future.done()
+        assert not future.cancelled()
+        with pytest.raises(RPCClientClosed):
+            future.result()
 
     @pytest.mark.asyncio
     async def test_late_reply_discarded(self) -> None:

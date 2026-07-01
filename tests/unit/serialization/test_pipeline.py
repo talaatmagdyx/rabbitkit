@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
+import pytest
+
 from rabbitkit.serialization.pipeline import (
     DataclassDecoder,
     JsonParser,
@@ -64,6 +66,29 @@ class TestJsonParser:
         parser = JsonParser()
         result = parser.parse(b'{"a": 1}', content_type="application/json")
         assert result == {"a": 1}
+
+
+# ── M7: JsonParser max_parse_bytes size cap ──────────────────────────────
+
+
+class TestJsonParserMaxParseBytes:
+    def test_default_cap_is_64mb_not_none(self) -> None:
+        parser = JsonParser()
+        assert parser._max_parse_bytes == 64 * 1024 * 1024
+
+    def test_oversized_input_raises(self) -> None:
+        parser = JsonParser(max_parse_bytes=16)
+        with pytest.raises(ValueError, match="max_parse_bytes"):
+            parser.parse(b'{"x": "this is way longer than sixteen bytes"}')
+
+    def test_within_cap_parses(self) -> None:
+        parser = JsonParser(max_parse_bytes=100)
+        assert parser.parse(b'{"a": 1}') == {"a": 1}
+
+    def test_explicit_none_opts_out_of_cap(self) -> None:
+        parser = JsonParser(max_parse_bytes=None)
+        big = b'{"x": "' + b"a" * 100_000 + b'"}'
+        assert parser.parse(big)["x"] == "a" * 100_000
 
 
 # ── PydanticDecoder ──────────────────────────────────────────────────────
@@ -158,6 +183,68 @@ class TestDataclassDecoder:
         decoder = DataclassDecoder()
         result = decoder.encode(Order)
         assert result is Order
+
+    def test_decode_drops_unknown_extra_key(self) -> None:
+        """H14: an extra key not on the dataclass is dropped, not a raw
+        TypeError from the constructor -- keeps a producer that adds a new
+        field from turning every message into a DLQ-bound decode failure."""
+
+        @dataclass
+        class Order:
+            id: int
+            name: str
+
+        decoder = DataclassDecoder()
+        result = decoder.decode({"id": 1, "name": "test", "extra": "unused"}, Order)
+
+        assert isinstance(result, Order)
+        assert result.id == 1
+        assert result.name == "test"
+        assert not hasattr(result, "extra")
+
+    def test_decode_wrong_typed_field_passes_through_unchecked(self) -> None:
+        """H14: no type validation/coercion -- documented, not a raw
+        TypeError. A qty: int field silently receives the string "3"."""
+
+        @dataclass
+        class Order:
+            qty: int
+
+        decoder = DataclassDecoder()
+        result = decoder.decode({"qty": "3"}, Order)
+
+        assert isinstance(result, Order)
+        assert result.qty == "3"  # not coerced to int -- documented behavior
+
+    def test_decode_extra_key_and_wrong_typed_field_together(self) -> None:
+        """H14's exact test spec: an extra key AND a wrong-typed field in the
+        same payload -- documented behavior (extra dropped, type unchecked),
+        not a raw TypeError."""
+
+        @dataclass
+        class Order:
+            qty: int
+
+        decoder = DataclassDecoder()
+        result = decoder.decode({"qty": "3", "extra": "unused"}, Order)
+
+        assert isinstance(result, Order)
+        assert result.qty == "3"
+        assert not hasattr(result, "extra")
+
+    def test_decode_missing_required_field_raises_typed_error(self) -> None:
+        """H14: a genuinely wrong shape still raises, but names the target
+        dataclass instead of a bare constructor TypeError."""
+
+        @dataclass
+        class Order:
+            id: int
+            name: str
+
+        decoder = DataclassDecoder()
+
+        with pytest.raises(TypeError, match="Cannot decode into Order"):
+            decoder.decode({"id": 1}, Order)
 
 
 # ── RawDecoder ───────────────────────────────────────────────────────────

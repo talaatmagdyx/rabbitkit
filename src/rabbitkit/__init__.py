@@ -1,8 +1,9 @@
 """rabbitkit — Production-grade RabbitMQ toolkit."""
 
-from rabbitkit import aio, experimental
+from rabbitkit import experimental
 from rabbitkit._version import __version__
 from rabbitkit.async_.batch import AsyncBatchPublisher
+from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.asyncapi import AsyncAPIGeneratorConfig, generate_asyncapi_doc, generate_asyncapi_json
 from rabbitkit.concurrency import AsyncWorkerPool, SyncWorkerPool
 from rabbitkit.core.app import AppState, RabbitApp
@@ -27,8 +28,8 @@ from rabbitkit.core.config import (
     SSLConfig,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError, ConfigurationError
-from rabbitkit.core.logging import LoggingConfig, configure_structlog
+from rabbitkit.core.errors import BackpressureError, ConfigurationError, MissingDependencyError
+from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.router import RabbitRouter
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
@@ -43,7 +44,6 @@ from rabbitkit.core.types import (
     QueueType,
     TopologyMode,
 )
-from rabbitkit.dashboard import create_dashboard_app
 from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
 from rabbitkit.di.resolver import DependencyScope
 from rabbitkit.dlq import DLQInspector
@@ -60,7 +60,6 @@ from rabbitkit.health import (
 )
 from rabbitkit.highload.backpressure import FlowController
 from rabbitkit.highload.batch import BatchAcker, BatchPublisher
-from rabbitkit.locking import DistributedLock, LockMiddleware, RedisLock
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
@@ -72,11 +71,7 @@ from rabbitkit.middleware.metrics import (
     start_metrics_server,
 )
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
-from rabbitkit.middleware.signing import InvalidSignatureError, SigningConfig, SigningMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
-from rabbitkit.results.backend import RedisResultBackend, ResultBackend
-from rabbitkit.results.middleware import ResultMiddleware
-from rabbitkit.rpc import AsyncRPCClient, RPCClient, RPCTimeoutError
 from rabbitkit.serialization.pipeline import (
     DataclassDecoder,
     JsonParser,
@@ -86,16 +81,17 @@ from rabbitkit.serialization.pipeline import (
     RawDecoder,
     SerializationPipeline,
 )
-from rabbitkit.streams import StreamConsumerConfig, StreamOffset, StreamOffsetType
+from rabbitkit.sync.broker import SyncBroker
 
 __all__ = [
+    "DEFAULT_REDACT_KEYS",
     "RETRY_DISABLED",
     "AckMessage",
     "AckPolicy",
     "AppState",
     "AsyncAPIGeneratorConfig",
     "AsyncBatchPublisher",
-    "AsyncRPCClient",
+    "AsyncBroker",
     "AsyncWorkerPool",
     "BackpressureConfig",
     "BackpressureError",
@@ -120,16 +116,13 @@ __all__ = [
     "DeduplicationMiddleware",
     "DependencyScope",
     "Depends",
-    "DistributedLock",
     "ErrorSeverity",
     "ExchangeType",
     "FlowController",
     "Header",
     "HealthCheckConfig",
     "HealthStatus",
-    "InvalidSignatureError",
     "JsonParser",
-    "LockMiddleware",
     "LoggingConfig",
     "ManagementConfig",
     "MessageDecoder",
@@ -138,6 +131,7 @@ __all__ = [
     "MetricsCollector",
     "MetricsConfig",
     "MetricsMiddleware",
+    "MissingDependencyError",
     "NackMessage",
     "Path",
     "PoolConfig",
@@ -147,8 +141,6 @@ __all__ = [
     "PublisherConfig",
     "PydanticDecoder",
     "QueueType",
-    "RPCClient",
-    "RPCTimeoutError",
     "RabbitApp",
     "RabbitConfig",
     "RabbitExchange",
@@ -159,28 +151,19 @@ __all__ = [
     "RateLimitConfig",
     "RateLimitMiddleware",
     "RawDecoder",
-    "RedisLock",
-    "RedisResultBackend",
     "RejectMessage",
-    "ResultBackend",
-    "ResultMiddleware",
     "RetryConfig",
     "RetryDisabled",
     "SSLConfig",
     "SecurityConfig",
     "SerializationPipeline",
-    "SigningConfig",
-    "SigningMiddleware",
     "SocketConfig",
-    "StreamConsumerConfig",
-    "StreamOffset",
-    "StreamOffsetType",
+    "SyncBroker",
     "SyncWorkerPool",
     "TopologyMode",
     "TracedConsumerMiddleware",
     "WorkerConfig",
     "__version__",
-    "aio",
     "broker_health_check",
     "broker_health_check_async",
     "broker_liveness",
@@ -188,7 +171,6 @@ __all__ = [
     "broker_readiness",
     "broker_readiness_async",
     "configure_structlog",
-    "create_dashboard_app",
     "experimental",
     "generate_asyncapi_doc",
     "generate_asyncapi_json",

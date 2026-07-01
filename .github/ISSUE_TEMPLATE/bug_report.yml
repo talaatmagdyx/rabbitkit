@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a bug in rabbitkit
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please do **not** use
+        this template for security vulnerabilities — see
+        [SECURITY.md](https://github.com/talaatmagdy/rabbitkit/blob/main/SECURITY.md)
+        instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: rabbitkit version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - sync (pika)
+        - async (aio-pika)
+        - both / not transport-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including any stack trace.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        A minimal script or `TestBroker`-based test that reproduces the
+        issue. This is the single most useful thing you can provide.
+      render: python
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, RabbitMQ version (if transport-related).
+      placeholder: |
+        - Python: 3.12.2
+        - OS: Ubuntu 22.04
+        - RabbitMQ: 3.13 (if applicable)
+    validations:
+      required: false

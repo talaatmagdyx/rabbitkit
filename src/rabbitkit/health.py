@@ -51,6 +51,7 @@ class BrokerHealthResult:
     consumer_count: int = 0
     route_count: int = 0
     worker_pool_pending: int = 0
+    blocked: bool = False
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -153,6 +154,30 @@ def _get_worker_pool_pending(broker: Any) -> int:
     return 0
 
 
+def _get_is_blocked(broker: Any, transport: Any) -> bool:
+    """L15: True if the connection is currently blocked by broker-side flow
+    control (e.g. a memory/disk alarm). This is orthogonal to
+    ``connected`` -- an open connection can be blocked while still
+    reporting connected, since ``connection.blocked`` is a soft
+    publish-side flow-control notification, not a disconnect.
+
+    Checks the opt-in ``FlowController`` first
+    (``broker.flow_controller.is_blocked``); falls back to the transport's
+    own passive blocked-state tracking so this is visible even without an
+    explicit ``FlowController`` wired in.
+    """
+    fc = getattr(broker, "flow_controller", None)
+    if fc is not None:
+        is_blocked = getattr(fc, "is_blocked", _MISSING)
+        if is_blocked is not _MISSING:
+            return bool(is_blocked)
+    if transport is not None:
+        is_blocked = getattr(transport, "is_blocked", _MISSING)
+        if is_blocked is not _MISSING:
+            return bool(is_blocked)
+    return False
+
+
 def _get_last_heartbeat(broker: Any) -> float | None:
     hb = _get(broker, "last_heartbeat", "_last_heartbeat", None)
     if hb is None:
@@ -174,8 +199,9 @@ def broker_health_check(
 
     Returns:
         BrokerHealthResult with status:
-        - HEALTHY: started, connected, all consumers active
-        - DEGRADED: started but some consumers missing or pool backlog high
+        - HEALTHY: started, connected, not blocked, all consumers active
+        - DEGRADED: started but connection blocked (L15), consumers missing,
+          or pool backlog high
         - UNHEALTHY: not started or not connected
     """
     cfg = config or HealthCheckConfig()
@@ -200,6 +226,11 @@ def broker_health_check(
             details={"reason": "transport not connected"},
         )
 
+    # L15: a connection can be blocked (broker memory/disk alarm pausing
+    # publishes) while still reporting connected -- check this before the
+    # route/consumer checks below since it's the more actionable root cause.
+    blocked = _get_is_blocked(broker, transport)
+
     # Check routes and consumers
     route_count = _get_route_count(broker)
     consumer_count = _get_consumer_count(broker, transport)
@@ -208,9 +239,14 @@ def broker_health_check(
     worker_pool_pending = _get_worker_pool_pending(broker)
 
     # Determine status
-    if consumer_count < route_count:
+    if blocked:
         status = HealthStatus.DEGRADED
-        details: dict[str, Any] = {"reason": f"only {consumer_count}/{route_count} consumers active"}
+        details: dict[str, Any] = {
+            "reason": "connection blocked by broker flow control (memory/disk alarm); publishes will stall"
+        }
+    elif consumer_count < route_count:
+        status = HealthStatus.DEGRADED
+        details = {"reason": f"only {consumer_count}/{route_count} consumers active"}
     elif worker_pool_pending > cfg.pending_threshold:
         status = HealthStatus.DEGRADED
         details = {"reason": f"worker pool backlog: {worker_pool_pending}"}
@@ -225,6 +261,7 @@ def broker_health_check(
         consumer_count=consumer_count,
         route_count=route_count,
         worker_pool_pending=worker_pool_pending,
+        blocked=blocked,
         details=details,
     )
 
@@ -356,15 +393,20 @@ def broker_readiness(broker: HealthProvider | Any, config: HealthCheckConfig | N
             properties) or a legacy broker exposing private attributes.
         config: Optional :class:`HealthCheckConfig` to tune thresholds.
 
-    Requires: health check not UNHEALTHY, transport connected, and every
-    registered route has an active (live) consumer. Use this for
-    load-balancer / ingress gating; use :func:`broker_liveness` for restart
-    decisions.
+    Requires: health check not UNHEALTHY, transport connected, connection
+    not blocked by broker flow control (L15), and every registered route
+    has an active (live) consumer. Use this for load-balancer / ingress
+    gating; use :func:`broker_liveness` for restart decisions.
     """
     result = broker_health_check(broker, config=config)
     if result.status == HealthStatus.UNHEALTHY:
         return False
     if not result.connected:
+        return False
+    # L15: a blocked connection can't publish -- not ready for traffic even
+    # though it's technically still "connected" and may still have live
+    # consumers.
+    if result.blocked:
         return False
     # M-SRE3: every route must have a live consumer. The health check already
     # verified transport connectivity above.

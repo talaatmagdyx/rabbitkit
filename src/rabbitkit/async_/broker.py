@@ -13,11 +13,12 @@ Graceful shutdown:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -39,7 +40,12 @@ from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition, warn_filter_without_dlx
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.retry import RetryRouter
+from rabbitkit.serialization.base import Serializer
+
+if TYPE_CHECKING:
+    from rabbitkit.core.router import RabbitRouter
 
 logger = structlog.stdlib.get_logger(__name__)
 
@@ -59,15 +65,20 @@ class AsyncBroker:
         await broker.start()
     """
 
+    # L14: liveness heartbeat tick interval -- well under any reasonable
+    # health.broker_liveness(wedged_timeout=...) so idle-but-healthy periods
+    # never spuriously trip liveness.
+    _HEARTBEAT_INTERVAL: float = 5.0
+
     def __init__(
         self,
         config: RabbitConfig | None = None,
         *,
-        serializer: Any | None = None,
+        serializer: Serializer[Any] | None = None,
         di_resolver: Any | None = None,
         context_repo: Any | None = None,
         batch_config: BatchPublishConfig | None = None,
-        middlewares: list[Any] | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
     ) -> None:
         self._config = config or RabbitConfig()
         # Private mutable view of consumer config — brokers may apply a
@@ -91,7 +102,7 @@ class AsyncBroker:
         # set the full list via this constructor param — mutating it in place
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
-        self._publish_middlewares: list[Any] = middlewares or []
+        self._publish_middlewares: list[BaseMiddleware] = middlewares or []
 
         self._batch_config = batch_config
         self._batch_publisher: Any | None = None  # BatchPublisher, started lazily in start()
@@ -99,6 +110,12 @@ class AsyncBroker:
         self._worker_pool: AsyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
+
+        # L14: liveness heartbeat (see health.broker_liveness). None until
+        # start() -- see the start() docstring for why it's set there rather
+        # than only on delivery/tick.
+        self.last_heartbeat: float | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         # I-16: optional callback invoked from the signal handler so an embedding
         # RabbitApp's shutdown event is also set (prevents the double-install hang
         # where the broker's handler overwrites the app's). Wire
@@ -119,6 +136,14 @@ class AsyncBroker:
         self._installed_loop_handlers = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
+        # H11: shutdown event awaited by run() so the drain triggered by a
+        # signal (or request_shutdown()) is joined instead of fire-and-forget.
+        # _run_waiting is True only while run() is actually awaiting the
+        # event, so a signal received under bare start() usage still falls
+        # back to the pre-H11 fire-and-forget stop() task.
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+        self._run_waiting = False
+
     @property
     def flow_controller(self) -> Any | None:
         """Optional FlowController used to throttle the publish path."""
@@ -135,6 +160,39 @@ class AsyncBroker:
         if self._in_flight_cond is None:
             self._in_flight_cond = asyncio.Condition()
         return self._in_flight_cond
+
+    def _mark_heartbeat(self) -> None:
+        """Refresh the liveness heartbeat (I-4/L14).
+
+        Called both per delivered message (``on_message`` in
+        :meth:`_start_consumer`) and periodically by ``_heartbeat_loop`` --
+        the latter is what keeps a healthy but message-idle consumer from
+        being mistaken for a wedged one by :func:`health.broker_liveness`.
+        """
+        self.last_heartbeat = time.monotonic()
+
+    async def _heartbeat_loop(self) -> None:
+        """L14: periodic liveness heartbeat -- the async analogue of the sync
+        broker's per-``start_consuming()``-tick heartbeat.
+
+        aio-pika has no exposed manual I/O-loop-tick to hook (unlike pika's
+        ``process_data_events``); this task ticking on its own interval is
+        itself the liveness signal instead -- if the event loop were
+        genuinely wedged (blocked, not just disconnected), this task would
+        not get scheduled and the heartbeat would correctly go stale. A
+        transient disconnect during reconnect is intentionally NOT
+        distinguished from "healthy but idle" here: ``broker_liveness``
+        documents that a transient disconnect is not itself a liveness
+        failure, and a reconnect attempt completes well within
+        ``wedged_timeout`` in practice -- only a reconnect loop stuck for the
+        full timeout window would (correctly) trip liveness.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+                self._mark_heartbeat()
+        except asyncio.CancelledError:
+            pass
 
     async def _in_flight_inc(self) -> None:
         async with self._ensure_inflight_cond():
@@ -153,7 +211,7 @@ class AsyncBroker:
         return self._config
 
     @property
-    def publish_middlewares(self) -> list[Any]:
+    def publish_middlewares(self) -> list[BaseMiddleware]:
         """Middlewares applied to every ``broker.publish()`` call (e.g. signing).
 
         Set via the constructor's ``middlewares=`` param. See the comment on
@@ -184,14 +242,14 @@ class AsyncBroker:
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
         ack_policy: AckPolicy = AckPolicy.AUTO,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         retry: RetryConfig | RetryDisabled | None = None,
         tags: frozenset[str] | set[str] | None = None,
         description: str = "",
         name: str | None = None,
         prefetch_count: int | None = None,
-        filter_fn: Any | None = None,
+        filter_fn: Callable[[RabbitMessage], bool] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -217,7 +275,7 @@ class AsyncBroker:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 
-    def include_router(self, router: Any, prefix: str = "") -> None:
+    def include_router(self, router: RabbitRouter, prefix: str = "") -> None:
         """Include routes from a RabbitRouter."""
         self._registry.include_router(router, prefix=prefix)
 
@@ -241,9 +299,19 @@ class AsyncBroker:
         trapped so the common ``await broker.start()`` pattern drains gracefully
         instead of hard-dying (H-SRE5). Pass ``False`` when an outer lifecycle
         manager (e.g. ``RabbitApp``) owns signal handling.
+
+        L14: ``last_heartbeat`` is initialized here (not left ``None`` until
+        the first message/tick) so a broker that is wedged from the very
+        start -- before it ever processes a message or a periodic heartbeat
+        tick -- is still caught by :func:`health.broker_liveness`'s
+        staleness check, instead of bypassing it entirely (a ``None``
+        heartbeat is treated as "no signal available" there, which
+        previously meant "always alive").
         """
         if self._started:
             return
+
+        self.last_heartbeat = time.monotonic()
 
         # Configure structured logging if enabled
         if self._config.logging is not None:
@@ -353,14 +421,54 @@ class AsyncBroker:
         for route in self._registry.routes:
             await self._start_consumer(route)
 
+        # L14: periodic liveness heartbeat -- keeps a healthy, message-idle
+        # consumer from going stale between deliveries. See _heartbeat_loop.
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
+
         self._started = True
         logger.info(
             "AsyncBroker started with %d routes",
             len(self._registry.routes),
         )
 
+        # H11: clear any shutdown request left over from a previous
+        # start()/stop() cycle so run() doesn't return immediately.
+        self._shutdown_event.clear()
+
         if install_signal_handlers:
             self._install_signal_handlers()
+
+    async def run(self, worker_config: WorkerConfig | None = None) -> None:
+        """Start, wait for a shutdown signal, then stop (H11).
+
+        ``await broker.start()`` alone installs signal handlers whose drain is
+        fire-and-forget — nothing joins the ``stop()`` task they create, so
+        whether in-flight messages actually finish draining depends on
+        incidental event-loop lifetime (e.g. it can be cut short by
+        ``asyncio.run()`` cancelling outstanding tasks once the awaited
+        coroutine returns). ``run()`` is the direct-use equivalent of
+        ``RabbitApp.run_async()``: it does not return until the drain
+        triggered by SIGINT/SIGTERM (or :meth:`request_shutdown`) has fully
+        completed, so awaiting it end-to-end guarantees in-flight messages are
+        settled before the process exits::
+
+            broker = AsyncBroker(config)
+
+            @broker.subscriber(queue="orders")
+            async def handle_order(body: bytes) -> None: ...
+
+            asyncio.run(broker.run())
+
+        Use plain ``start()``/``stop()`` instead when an outer lifecycle
+        manager (``RabbitApp``) owns the run loop.
+        """
+        await self.start(worker_config=worker_config)
+        self._run_waiting = True
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            self._run_waiting = False
+            await self.stop()
 
     def _install_signal_handlers(self) -> None:
         """Install portable SIGINT/SIGTERM handlers that drain via stop() (H-SRE5).
@@ -388,10 +496,19 @@ class AsyncBroker:
                 except (ValueError, OSError):  # pragma: no cover - not main thread
                     pass
 
+    def _trigger_shutdown(self) -> None:
+        """Set the shutdown event so an in-progress ``run()`` joins the drain
+        (H11). If nothing is awaiting it via ``run()``, falls back to the
+        pre-H11 fire-and-forget ``stop()`` task so bare ``await
+        broker.start()`` usage still drains on signal.
+        """
+        self._shutdown_event.set()
+        if not self._run_waiting and self._loop is not None:
+            self._loop.create_task(self.stop())
+
     def _on_signal(self) -> None:
         logger.info("Received shutdown signal; initiating graceful drain")
-        if self._loop is not None:
-            self._loop.create_task(self.stop())
+        self._trigger_shutdown()
         if self.on_app_shutdown is not None:
             try:
                 self.on_app_shutdown()
@@ -401,12 +518,20 @@ class AsyncBroker:
     def _on_signal_sync(self, signum: int, frame: Any) -> None:  # pragma: no cover
         logger.info("Received shutdown signal %d", signum)
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(lambda: self._loop.create_task(self.stop()))  # type: ignore[union-attr]
+            self._loop.call_soon_threadsafe(self._trigger_shutdown)
         if self.on_app_shutdown is not None:
             try:
                 self.on_app_shutdown()
             except Exception:  # pragma: no cover
                 logger.warning("on_app_shutdown callback raised", exc_info=True)
+
+    def request_shutdown(self) -> None:
+        """Request a graceful shutdown from any context — e.g. a failing
+        health check or a management command (H11). Equivalent to receiving
+        SIGINT/SIGTERM: if ``run()`` is awaiting shutdown it performs the
+        drain; otherwise this schedules a fire-and-forget ``stop()``.
+        """
+        self._trigger_shutdown()
 
     def _restore_signal_handlers(self) -> None:
         if self._loop is not None and self._installed_loop_handlers:
@@ -476,6 +601,13 @@ class AsyncBroker:
 
         effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
         deadline = None if effective is None else time.monotonic() + effective
+
+        # L14: stop the periodic heartbeat first, alongside cancelling consumers.
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+            self._heartbeat_task = None
 
         # Cancel all consumers FIRST — stop new deliveries before draining
         # anything, so nothing new arrives while the pool/in-flight drain runs.
@@ -668,10 +800,12 @@ class AsyncBroker:
         if self._transport is None:
             return
 
+        from rabbitkit.middleware.metrics import MetricsMiddleware
         from rabbitkit.middleware.retry import (
             RetryMiddleware,
             retry_middleware_insertion_index,
             warn_retry_middleware_without_topology,
+            warn_retry_without_confirms,
         )
 
         wired = False
@@ -687,11 +821,31 @@ class AsyncBroker:
                 continue
             if has_retry_mw:
                 continue
+            if not self._config.publisher.confirm_delivery:
+                warn_retry_without_confirms(route.name)  # M4
             index = retry_middleware_insertion_index(route.route_middlewares)
+            # M2: if a MetricsMiddleware is already on this route, wire it into
+            # RetryMiddleware too so messages_retried_total/dead_lettered_total
+            # are observable (RetryMiddleware settles messages the pipeline
+            # itself never sees settle, so it must record these itself).
+            metrics_mw = next(
+                (mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None
+            )
             route.route_middlewares.insert(
-                index, RetryMiddleware(retry_config, publish_async_fn=self._transport.publish)
+                index,
+                RetryMiddleware(
+                    retry_config,
+                    publish_async_fn=self._transport.publish,
+                    metrics_collector=metrics_mw.collector if metrics_mw else None,
+                    metrics_config=metrics_mw.config if metrics_mw else None,
+                ),
             )
             wired = True
+
+        if not self._config.publisher.confirm_delivery:
+            for route in self._registry.routes:
+                if route.result_publisher is not None:
+                    warn_retry_without_confirms(route.name, context="result")  # M4
 
         if wired:
             # Drop any middleware chains cached before the retry mw was installed.
@@ -788,9 +942,7 @@ class AsyncBroker:
             """Process incoming message through the pipeline."""
             # Track inline in-flight so stop() can drain gracefully (C-2).
             await self._in_flight_inc()
-            # Heartbeat for liveness wedge detection (I-4): updated on every
-            # delivery so broker_liveness can fail when the I/O loop stalls.
-            self.last_heartbeat = time.monotonic()
+            self._mark_heartbeat()
             try:
                 # Set the original queue in headers for retry routing
                 if "x-rabbitkit-original-queue" not in message.headers:

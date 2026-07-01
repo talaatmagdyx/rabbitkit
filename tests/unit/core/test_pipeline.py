@@ -117,6 +117,120 @@ class TestAutoAckPolicy:
         reject_fn.assert_called_once_with(False)
 
 
+# ── M2: settlement metrics emission ──────────────────────────────────────
+
+
+class TestSettlementMetricsEmission:
+    def test_ack_emits_messages_acked_total(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware
+
+        collector = MagicMock(spec=MetricsCollector)
+        metrics_mw = MetricsMiddleware(collector)
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler, route_middlewares=[metrics_mw])
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        collector.inc_counter.assert_any_call("rabbitkit_messages_acked_total", {"queue": "orders.created"})
+
+    def test_nack_emits_messages_nacked_total(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware
+
+        collector = MagicMock(spec=MetricsCollector)
+        metrics_mw = MetricsMiddleware(collector)
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            raise ConnectionResetError("lost connection")
+
+        route = _make_route(handler=handler, route_middlewares=[metrics_mw])
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        collector.inc_counter.assert_any_call("rabbitkit_messages_nacked_total", {"queue": "orders.created"})
+
+    def test_reject_emits_messages_rejected_total(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware
+
+        collector = MagicMock(spec=MetricsCollector)
+        metrics_mw = MetricsMiddleware(collector)
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            raise ValueError("bad data")
+
+        route = _make_route(handler=handler, route_middlewares=[metrics_mw])
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        collector.inc_counter.assert_any_call("rabbitkit_messages_rejected_total", {"queue": "orders.created"})
+
+    def test_filter_rejection_emits_messages_nacked_total(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware
+
+        collector = MagicMock(spec=MetricsCollector)
+        metrics_mw = MetricsMiddleware(collector)
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler, route_middlewares=[metrics_mw], filter_fn=lambda m: False)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        collector.inc_counter.assert_any_call("rabbitkit_messages_nacked_total", {"queue": "orders.created"})
+
+    def test_no_metrics_middleware_is_noop(self) -> None:
+        """No MetricsMiddleware on the route -- must not raise."""
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)  # must not raise
+
+    def test_manual_policy_pending_disposition_emits_nothing(self) -> None:
+        """M2: a MANUAL handler that never settles has disposition=pending --
+        nothing final to report yet, so no metric is emitted."""
+        from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware
+
+        collector = MagicMock(spec=MetricsCollector)
+        metrics_mw = MetricsMiddleware(collector)
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass  # MANUAL: never calls msg.ack()/nack()/reject()
+
+        route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL, route_middlewares=[metrics_mw])
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        settlement_calls = [
+            c
+            for c in collector.inc_counter.call_args_list
+            if c.args[0]
+            in (
+                "rabbitkit_messages_acked_total",
+                "rabbitkit_messages_nacked_total",
+                "rabbitkit_messages_rejected_total",
+            )
+        ]
+        assert settlement_calls == []
+
+
 # ── MANUAL ack policy ───────────────────────────────────────────────────
 
 
@@ -134,6 +248,43 @@ class TestManualAckPolicy:
         # MANUAL: pipeline does not auto-ack after success
         # Verify pipeline runs without error for MANUAL mode
         pipeline.process_sync(route, msg, publish_fn=None)
+
+    def test_success_without_manual_settlement_stays_pending(self) -> None:
+        """M11: a MANUAL handler that returns without calling ack()/nack()/
+        reject() must be left unsettled -- NOT auto-acked. Auto-acking here
+        contradicted "handler owns settlement" and risked loss if the
+        handler deferred settlement to run later (e.g. another thread) and
+        the process crashed before that deferred call happened."""
+        msg = _make_message()
+        ack_fn, nack_fn, reject_fn = _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass  # never settles
+
+        route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        assert msg._disposition == "pending"
+        ack_fn.assert_not_called()
+        nack_fn.assert_not_called()
+        reject_fn.assert_not_called()
+
+    def test_success_with_manual_ack_is_respected(self) -> None:
+        """A MANUAL handler that DOES call ack() itself must have that ack
+        take effect -- the pipeline must not interfere."""
+        msg = _make_message()
+        ack_fn, _, _ = _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            msg.ack()
+
+        route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg)
+
+        ack_fn.assert_called_once()
+        assert msg._disposition == "acked"
 
     def test_exception_in_manual_re_raises(self) -> None:
         msg = _make_message()
@@ -492,6 +643,26 @@ class TestAsyncPipeline:
 
         assert msg._disposition == "pending"
 
+    @pytest.mark.asyncio
+    async def test_async_manual_success_without_settlement_stays_pending(self) -> None:
+        """M11, async: a MANUAL handler that returns without settling must
+        be left unsettled -- NOT auto-acked."""
+        msg = _make_message()
+        ack_fn = MagicMock()
+        msg._ack_async_fn = AsyncMock()
+        msg._ack_fn = ack_fn
+
+        async def handler(body: bytes) -> None:
+            pass  # never settles
+
+        route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
+        pipeline = HandlerPipeline()
+        await pipeline.process_async(route, msg)
+
+        assert msg._disposition == "pending"
+        ack_fn.assert_not_called()
+        msg._ack_async_fn.assert_not_called()
+
 
 # ── Helpers for async settlement ─────────────────────────────────────────
 
@@ -800,6 +971,58 @@ class TestResultPublishingFailure:
             await pipeline.process_async(route, msg, publish_fn=publish_fn)
 
         assert any("Result publish failed" in str(call) for call in warning_calls)
+
+    def test_sync_publish_failure_on_redelivered_message_logs_error(self) -> None:
+        """L1: a result-publish failure on an already-redelivered message
+        (i.e. this exact nack+requeue is repeating) escalates to ERROR
+        instead of WARNING, so a sustained publish outage is loud."""
+        msg = _make_message(redelivered=True)
+        _wire_sync(msg)
+
+        failed_outcome = PublishOutcome(status=PublishStatus.ERROR)
+        publish_fn = MagicMock(return_value=failed_outcome)
+
+        def handler(body: bytes) -> bytes:
+            return b"result"
+
+        rp = ResultPublisher(exchange="out", routing_key="result")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        error_calls: list[tuple] = []
+        with patch("rabbitkit.core.pipeline.logger") as mock_logger:
+            mock_logger.warning = MagicMock(side_effect=AssertionError("should not warn"))
+            mock_logger.error = MagicMock(side_effect=lambda *a, **kw: error_calls.append(a))
+            pipeline.process_sync(route, msg, publish_fn=publish_fn)
+
+        assert any("Result publish failed" in str(call) for call in error_calls)
+        assert any("already redelivered" in str(call) for call in error_calls)
+
+    async def test_async_publish_failure_on_redelivered_message_logs_error(self) -> None:
+        """Async variant of the L1 redelivery-escalation test above."""
+        msg = _make_message(redelivered=True)
+        _wire_async(msg)
+
+        failed_outcome = PublishOutcome(status=PublishStatus.ERROR)
+
+        async def publish_fn(envelope: MessageEnvelope) -> PublishOutcome:
+            return failed_outcome
+
+        def handler(body: bytes) -> bytes:
+            return b"result"
+
+        rp = ResultPublisher(exchange="out", routing_key="result")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        error_calls: list[tuple] = []
+        with patch("rabbitkit.core.pipeline.logger") as mock_logger:
+            mock_logger.warning = MagicMock(side_effect=AssertionError("should not warn"))
+            mock_logger.error = MagicMock(side_effect=lambda *a, **kw: error_calls.append(a))
+            await pipeline.process_async(route, msg, publish_fn=publish_fn)
+
+        assert any("Result publish failed" in str(call) for call in error_calls)
+        assert any("already redelivered" in str(call) for call in error_calls)
 
 
 # ── _build_result_envelope with result_publisher (line 391) ──────────────
@@ -1662,14 +1885,16 @@ class TestAsyncStrategyDirectCalls:
     """Direct calls to async strategy classes (lines 143-144, 155-156, 167, 170-174)."""
 
     @pytest.mark.asyncio
-    async def test_manual_async_on_success_acks_unsettled(self) -> None:
-        """Lines 143-144: _ManualStrategyAsync.on_success acks when unsettled."""
+    async def test_manual_async_on_success_leaves_unsettled(self) -> None:
+        """M11: _ManualStrategyAsync.on_success must NOT ack when unsettled
+        -- MANUAL means the handler owns settlement entirely."""
         from rabbitkit.core.pipeline import _ManualStrategyAsync
 
         msg = _make_message()
         ack, _, _ = _wire_async(msg)
         await _ManualStrategyAsync().on_success(msg)
-        ack.assert_called_once()
+        ack.assert_not_called()
+        assert msg._disposition == "pending"
 
     @pytest.mark.asyncio
     async def test_nack_on_error_async_on_success_acks_unsettled(self) -> None:

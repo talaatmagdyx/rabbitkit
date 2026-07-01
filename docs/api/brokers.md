@@ -8,13 +8,17 @@ The broker is the main entry point. It wires the registry, pipeline, and transpo
 # Recommended — top-level re-export
 from rabbitkit import AsyncBroker, SyncBroker
 
-# rabbitkit.aio is a clean alias for rabbitkit.async_
-from rabbitkit.aio import AsyncBroker
+# Also fine — canonical submodule path
+from rabbitkit.async_ import AsyncBroker
+from rabbitkit.sync import SyncBroker
 
 # Full path
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.sync.broker import SyncBroker
 ```
+
+`rabbitkit.aio` is a deprecated alias for `rabbitkit.async_` — importing it
+emits a `DeprecationWarning`; use `rabbitkit.async_` instead.
 
 ## AsyncBroker
 

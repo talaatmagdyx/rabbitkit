@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
 
@@ -21,13 +21,33 @@ class JSONSerializer:
     (e.g. ``datetime``, ``Decimal``) instead of silently coercing them via
     ``str()``. Pass ``coerce_unknown_to_str=True`` to restore the legacy
     ``default=str`` coercion behaviour.
+
+    H14 — decoding into a stdlib dataclass does **no type validation or
+    coercion**: a field declared ``qty: int`` silently receives whatever
+    JSON type was actually present if the producer sent the wrong type.
+    Unknown keys in the payload are dropped rather than raising. Use a
+    Pydantic model as ``target_type`` (or a msgspec-based serializer)
+    instead of a stdlib dataclass for untrusted input where wrong-typed
+    fields must be rejected.
     """
 
-    def __init__(self, *, coerce_unknown_to_str: bool = False, max_parse_bytes: int | None = None) -> None:
+    #: M7: sane non-None default (64 MiB, matching
+    #: ``CompressionMiddleware``'s ``max_decompressed_size`` default) so an
+    #: uncompressed body is bounded out of the box. Pass ``max_parse_bytes=None``
+    #: to opt out (unbounded) if you've already sized this elsewhere.
+    _DEFAULT_MAX_PARSE_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        coerce_unknown_to_str: bool = False,
+        max_parse_bytes: int | None = _DEFAULT_MAX_PARSE_BYTES,
+    ) -> None:
         self._coerce = coerce_unknown_to_str
-        # Optional defense-in-depth cap on the input size before json.loads
-        # (the compression middleware already caps decompressed output; this
-        # bounds the case where compression is off and a large body arrives).
+        # Defense-in-depth cap on the input size before json.loads (M7) — the
+        # compression middleware already caps decompressed output; this
+        # bounds the case where compression is off and a large body arrives
+        # directly. Defaults to a sane non-None value rather than "off".
         self._max_parse_bytes = max_parse_bytes
 
     def _check_size(self, data: bytes) -> None:
@@ -83,11 +103,19 @@ class JSONSerializer:
             parsed = json.loads(data)
             return target_type.model_validate(parsed)
 
-        # Dataclass
+        # Dataclass (H14: no type validation/coercion -- see DataclassDecoder
+        # in serialization/pipeline.py for the full contract this mirrors.
+        # Unknown keys are dropped rather than raising; a genuinely wrong
+        # shape raises TypeError naming the target dataclass.)
         if is_dataclass(target_type):
             parsed = json.loads(data)
             if isinstance(parsed, dict):
-                return target_type(**parsed)
+                known_fields = {f.name for f in fields(target_type)}
+                filtered = {k: v for k, v in parsed.items() if k in known_fields}
+                try:
+                    return target_type(**filtered)
+                except TypeError as exc:
+                    raise TypeError(f"Cannot decode into {target_type.__name__}: {exc}") from exc
             return parsed
 
         # Fallback: json.loads

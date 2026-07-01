@@ -565,6 +565,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above `dependencies = [...]` in `[project]`, which TOML parses as
   `project.urls.dependencies` (a table swallowing the next key), breaking
   the build; fixed by moving `[project.urls]` after `[project.optional-dependencies]`.
+- **No SBOM (software bill of materials) generation in CI (§B OSS-readiness
+  checklist item, not tied to a numbered finding)** — `security.yml`'s
+  `pip-audit` job now also exports a CycloneDX JSON SBOM (`pip-audit
+  --format=cyclonedx-json`, reusing the tool already installed for the
+  vulnerability audit rather than adding a new dependency) and uploads it
+  as a build artifact, generated only after the audit step passes.
 - **Delay-queue dead-letter used the source exchange + queue name as the
   redelivery routing key — silently dropped retries for topic-bound queues
   (M5, medium)** — `RetryRouter.get_delay_queue_definitions()` set a delay

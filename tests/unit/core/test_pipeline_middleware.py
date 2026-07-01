@@ -202,3 +202,214 @@ class TestChainCaching:
         # closure object is the same — verify the cache entry is stable).
         assert calls.count("mw") == 2
         assert len(pipeline._consume_chain_cache) == 1
+
+
+# ── H7: on_receive ordering and exception-interception semantics ─────────
+
+
+def _on_receive_probe(order: list[str], name: str) -> BaseMiddleware:
+    class _M(BaseMiddleware):
+        def on_receive(self, message: Any) -> None:
+            order.append(name)
+
+        async def on_receive_async(self, message: Any) -> None:
+            order.append(name)
+
+    return _M()
+
+
+def _publish_through_middlewares(middlewares: list[Any], envelope: MessageEnvelope) -> MessageEnvelope:
+    """Apply middlewares' publish_scope OUTER→INNER (mirrors the pipeline's
+    own composition — see HandlerPipeline._compose_publish_sync): the first
+    item in the list transforms first, its result is what the next
+    middleware transforms, and so on. Returns the final transformed envelope."""
+
+    def call_next(env: MessageEnvelope) -> MessageEnvelope:
+        return env  # innermost "publish step" — just hand back the envelope
+
+    for mw in reversed(middlewares):
+        nxt = call_next
+
+        def wrapped(env: MessageEnvelope, _mw: Any = mw, _nxt: Any = nxt) -> MessageEnvelope:
+            return _mw.publish_scope(_nxt, env)  # type: ignore[no-any-return]
+
+        call_next = wrapped
+
+    return call_next(envelope)
+
+
+def test_on_receive_runs_in_reverse_registration_order() -> None:
+    """H7: on_receive hooks run in the REVERSE of middlewares=[...]'s
+    registration order — the mirror of publish_scope's outer→inner
+    composition — unlike consume_scope, which runs OUTER→INNER (forward),
+    already covered by test_sync_middlewares_execute_outer_to_inner above."""
+    order: list[str] = []
+    broker = TestBroker()
+
+    @broker.subscriber(queue="q", middlewares=[_on_receive_probe(order, "A"), _on_receive_probe(order, "B")])
+    def handler(body: bytes) -> None:
+        pass
+
+    broker.start()
+    broker.publish("q", b"{}")
+
+    assert order == ["B", "A"]
+
+
+async def test_on_receive_async_runs_in_reverse_registration_order() -> None:
+    order: list[str] = []
+    broker = TestBroker()
+
+    @broker.subscriber(queue="q", middlewares=[_on_receive_probe(order, "A"), _on_receive_probe(order, "B")])
+    async def handler(body: bytes) -> None:
+        pass
+
+    broker.start()
+    await broker.publish_async("q", b"{}")
+
+    assert order == ["B", "A"]
+
+
+class TestSigningCompressionComposition:
+    """H7: the canonical, working order is CompressionMiddleware OUTER (listed
+    first), SigningMiddleware INNER (listed second) —
+    ``middlewares=[compression_mw, signing_mw]``. This is NOT arbitrary:
+    SigningMiddleware's signature covers ``content_encoding`` (H3), which
+    CompressionMiddleware's publish_scope is what actually SETS — if signing
+    runs first (outer), it signs ``content_encoding=None`` (unset at that
+    point) while compression sets it to e.g. "gzip" afterward, so the
+    delivered message's content_encoding never matches what was signed and
+    verification always fails, regardless of the on_receive ordering fix
+    below. Compression outer / signing inner is the only order where signing
+    sees the FINAL content_encoding it needs to sign correctly.
+
+    Making on_receive run in REVERSE registration order (this fix's other
+    half) is what makes even the correct order work at all: without it,
+    on_receive ran in the same (forward) order as publish_scope's apply
+    order, so decompression would run BEFORE verification instead of after —
+    verifying against the wrong (already-decompressed) bytes. Both halves of
+    the fix are required together for the canonical order to actually work.
+    """
+
+    SECRET = "h7-test-secret"
+
+    def _make_middlewares(self) -> tuple[Any, Any]:
+        from rabbitkit.core.config import CompressionConfig
+        from rabbitkit.middleware.compression import CompressionMiddleware
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key=self.SECRET, require_freshness=True))
+        compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+        return signing_mw, compression_mw
+
+    def _round_trip(self, middlewares: list[Any]) -> tuple[list[bytes], Any]:
+        """Publish `original` through *middlewares* (outer→inner), then feed
+        the resulting wire envelope through the SAME middlewares (as route
+        middlewares) on the consume side. Returns (bodies the handler saw,
+        the settled RabbitMessage) — process_sync catches on_receive/handler
+        exceptions internally and settles the message rather than
+        re-raising, so callers check disposition, not a raised exception."""
+        from rabbitkit.core.message import RabbitMessage
+        from rabbitkit.core.registry import SubscriberRegistry
+        from rabbitkit.core.types import AckPolicy
+
+        original = MessageEnvelope(routing_key="q", body=b"hello world " * 50, exchange="")
+        wire = _publish_through_middlewares(middlewares, original)
+
+        received_bodies: list[bytes] = []
+        reg = SubscriberRegistry()
+
+        @reg.subscriber(queue="q", middlewares=middlewares, ack_policy=AckPolicy.AUTO)
+        def handle(body: bytes) -> None:
+            received_bodies.append(body)
+
+        route = reg.routes[0]
+        pipeline = HandlerPipeline()
+
+        message = RabbitMessage(
+            body=wire.body,
+            headers=dict(wire.headers),
+            routing_key=wire.routing_key,
+            exchange=wire.exchange,
+            content_encoding=wire.content_encoding,
+            reply_to=wire.reply_to,
+        )
+        message._ack_fn = lambda: None
+        message._nack_fn = lambda requeue=True: None
+        message._reject_fn = lambda requeue=False: None
+
+        pipeline.process_sync(route, message)
+        return received_bodies, message
+
+    def test_compress_outer_sign_inner_composes_correctly(self) -> None:
+        """The canonical, documented order: compression outer, signing inner."""
+        signing_mw, compression_mw = self._make_middlewares()
+        received, message = self._round_trip([compression_mw, signing_mw])
+        assert received == [b"hello world " * 50]
+        assert message._disposition == "acked"
+
+    def test_sign_outer_compress_inner_fails_verification(self) -> None:
+        """The WRONG (undocumented) order fails predictably, not silently —
+        signing captures content_encoding=None (compression hasn't run yet),
+        but the delivered message has content_encoding="gzip" (compression
+        already ran on publish), so verification always fails. Pinning the
+        canonical order (see the class docstring) means this failure mode is
+        documented and avoidable rather than a mystery. process_sync catches
+        the InvalidSignatureError internally (see
+        test_on_receive_exception_bypasses_retry_middleware) rather than
+        raising it, so the handler simply never runs and the message rejects."""
+        signing_mw, compression_mw = self._make_middlewares()
+        received, message = self._round_trip([signing_mw, compression_mw])
+        assert received == []
+        assert message._disposition == "rejected"
+
+
+def test_on_receive_exception_bypasses_retry_middleware() -> None:
+    """H7's exact regression spec: Route [retry_mw, failing_signing_mw] — a
+    signing verification failure must NOT be routed through
+    RetryMiddleware's delay-queue mechanism. on_receive hooks run in a flat
+    pre-pass entirely before consume_scope is entered, so RetryMiddleware's
+    consume_scope (which wraps call_next in a try/except) never sees this
+    exception — it settles per the route's AckPolicy directly instead."""
+    from unittest.mock import MagicMock
+
+    from rabbitkit.core.config import RetryConfig
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.core.registry import SubscriberRegistry
+    from rabbitkit.core.types import AckPolicy
+    from rabbitkit.middleware.retry import RetryMiddleware
+    from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+    retry_published: list[MessageEnvelope] = []
+    retry_mw = RetryMiddleware(
+        RetryConfig(max_retries=3, delays=(5, 30, 120)),
+        publish_fn=lambda env: retry_published.append(env),
+    )
+    # No signature header on the incoming message + reject_unsigned=True ->
+    # on_receive raises InvalidSignatureError.
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="s3cr3t", reject_unsigned=True))
+
+    reg = SubscriberRegistry()
+
+    @reg.subscriber(queue="q", middlewares=[retry_mw, signing_mw], ack_policy=AckPolicy.AUTO)
+    def handle(body: bytes) -> None:
+        raise AssertionError("handler must never run when on_receive rejects the message")
+
+    route = reg.routes[0]
+    pipeline = HandlerPipeline()
+
+    message = RabbitMessage(body=b"unsigned-payload", routing_key="q", headers={})
+    message._ack_fn = MagicMock()
+    message._nack_fn = MagicMock()
+    message._reject_fn = MagicMock()
+
+    pipeline.process_sync(route, message)
+
+    # Explicitly NOT routed through retry: RetryMiddleware's delay-queue
+    # publish was never invoked, since its consume_scope never ran.
+    assert retry_published == []
+    # Settled per AckPolicy's default classifier instead (InvalidSignatureError
+    # falls to unknown_policy=PERMANENT) -> reject(requeue=False), not acked.
+    assert message._disposition == "rejected"
+    message._reject_fn.assert_called_once_with(False)
+    message._ack_fn.assert_not_called()

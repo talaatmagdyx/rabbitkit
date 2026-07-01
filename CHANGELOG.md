@@ -260,6 +260,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validated against a real broker: a filter that rejects every message on a
   route with no retry now reliably lands the rejected body in the
   auto-declared DLQ instead of vanishing.
+- **`on_receive` hooks ran in a flat pre-pass, breaking documented
+  outer→inner composition (H7, high)** — every route middleware's
+  `on_receive`/`on_receive_async` ran in a single flat loop entirely BEFORE
+  `consume_scope` was ever entered. Two concrete problems: (a) an exception
+  raised in `on_receive` (e.g. `SigningMiddleware` verification,
+  `CompressionMiddleware` decompression) was never seen by any middleware's
+  `consume_scope` — not even `RetryMiddleware`'s — so it could never be
+  routed through the retry delay-queue mechanism, regardless of whether the
+  route had retry configured; (b) the pre-pass ran in the SAME (forward)
+  order as `publish_scope`'s outer→inner apply order, so a receive-side
+  "undo" (decompress) was checked against a body/metadata state that never
+  matched what was actually transformed at publish time — combining
+  `SigningMiddleware` + `CompressionMiddleware` always failed verification,
+  in either registration order. Fixed (b) by running `on_receive` hooks in
+  the REVERSE of `middlewares=[...]`'s registration order — the mathematical
+  mirror of `publish_scope`'s composition, so a receive-side undo always
+  runs relative to the correct publish-side apply. This alone is not
+  sufficient for `SigningMiddleware` + `CompressionMiddleware` specifically:
+  because the signature covers `content_encoding` (H3), a field
+  `CompressionMiddleware` itself sets, only ONE relative order actually
+  works — `middlewares=[CompressionMiddleware, SigningMiddleware]`
+  (compression outer, signing inner) — now pinned and documented loudly in
+  both middlewares' module docstrings and `HandlerPipeline`'s docstring, with
+  the reverse order's predictable failure mode also documented and tested
+  rather than being a silent mystery. (a) is intentionally NOT
+  architecturally changed — an `on_receive` failure means "this delivery is
+  untrustworthy or unreadable," not "the handler failed," so retrying
+  wouldn't make a bad signature or corrupt payload become valid; it settles
+  per the route's `AckPolicy` using the pipeline's default classifier
+  instead, which is now documented as the defined (not accidental) behavior
+  and covered by a test asserting a signing failure on a
+  `[retry_mw, failing_signing_mw]` route is explicitly NOT routed through
+  retry's delay-queue mechanism. Validated against a real broker: the
+  canonical compression-then-signing order round-trips correctly end-to-end;
+  reverting the on_receive-ordering fix reproduces the original failure
+  (message never reaches the handler).
 
 ### Performance
 

@@ -488,12 +488,60 @@ class HandlerPipeline:
         ``route.route_middlewares`` is the outermost wrapper. Each middleware's
         ``consume_scope(call_next, message)`` wraps the next; the innermost
         ``call_next`` deserializes + resolves + invokes the handler.
+
+        H7 — on_receive ordering and exception semantics (READ THIS before
+        combining SigningMiddleware/CompressionMiddleware or writing your own
+        on_receive-based transform):
+
+        * on_receive hooks run in a FIXED, FLAT pre-pass — entirely BEFORE the
+          consume_scope chain is entered. An exception raised here is NEVER
+          seen by any middleware's consume_scope (RetryMiddleware included):
+          it propagates straight to process_sync's own exception handler,
+          which settles the message per the route's AckPolicy using the
+          pipeline's default classifier — NOT RetryMiddleware's classifier
+          or predicates, and NEVER via RetryMiddleware's delay-queue routing.
+          A signing/decompression failure is not retried; it typically
+          rejects straight to the DLQ. This is deliberate (an on_receive
+          failure means "this delivery is untrustworthy or unreadable," not
+          "the handler failed" — retrying doesn't make a bad signature or a
+          corrupt payload become valid) and unlikely to change; if you need a
+          retry-eligible on_receive-style check, put it in ``consume_scope``
+          instead, where it participates in the same chain as everything else.
+        * on_receive hooks run in REVERSE registration order — deliberately
+          the mirror of publish_scope's OUTER→INNER composition order, so a
+          receive-side "undo" (e.g. decompress) always runs relative to a
+          publish-side "apply" (e.g. compress) in the mathematically correct
+          order regardless of what's paired with what. Concretely: for
+          ``middlewares=[A, B]``, publish applies A's transform then B's (A
+          outer, B inner); on_receive runs B's hook then A's — the reverse —
+          so whichever transform was applied LAST on publish is undone FIRST
+          on receive. Before this fix, on_receive ran in the SAME (forward)
+          order as publish_scope's apply order, so a receive-side hook always
+          ran against a body/metadata state that had already been
+          (or not yet been) transformed by the OTHER middleware — never
+          matching what that middleware actually needs.
+        * This fix does NOT make ``middlewares=[SigningMiddleware,
+          CompressionMiddleware]`` order-independent — only ONE relative
+          order works: ``middlewares=[CompressionMiddleware,
+          SigningMiddleware]`` (compression outer, signing inner). Reason:
+          SigningMiddleware's signature covers ``content_encoding`` (H3),
+          which is a field CompressionMiddleware's ``publish_scope`` is what
+          actually *sets*. If signing runs first (outer), it necessarily
+          signs ``content_encoding=None`` (unset at that point) while
+          compression sets it to e.g. ``"gzip"`` afterward — the delivered
+          message's ``content_encoding`` then never matches what was signed,
+          and verification fails unconditionally, independent of the
+          on_receive reordering above. Compression outer / signing inner is
+          the only order where signing sees the FINAL ``content_encoding``
+          it needs to sign correctly. See
+          ``tests/unit/core/test_pipeline_middleware.py::TestSigningCompressionComposition``
+          for a worked example of both the working and the failing order.
         """
         middlewares = route.route_middlewares
         if not middlewares:
             return self._invoke_handler_sync(route, message)
 
-        for mw in middlewares:
+        for mw in reversed(middlewares):
             mw.on_receive(message)
 
         # M-P1: cache the composed chain per route — closures are allocated once
@@ -518,12 +566,14 @@ class HandlerPipeline:
         return chain(message)
 
     async def _run_consume_async(self, route: RouteDefinition, message: RabbitMessage) -> Any:
-        """Async variant of :meth:`_run_consume_sync`."""
+        """Async variant of :meth:`_run_consume_sync` — see its docstring
+        (H7) for on_receive's ordering and exception-interception semantics,
+        which apply identically here."""
         middlewares = route.route_middlewares
         if not middlewares:
             return await self._invoke_handler_async(route, message)
 
-        for mw in middlewares:
+        for mw in reversed(middlewares):
             await mw.on_receive_async(message)
 
         chain = self._consume_chain_async_cache.get(id(route))

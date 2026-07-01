@@ -251,6 +251,107 @@ class TestRetryTerminal:
         assert not msg.is_settled
 
 
+# ── H5: retry-count header is producer-spoofable — clamp + no negative rk ─
+
+
+class TestRetryCountSpoofing:
+    """H5: a producer-supplied x-rabbitkit-retry-count header must not be
+    able to force unbounded retries (negative value) or skip straight to the
+    DLQ (huge value) beyond what max_retries allows."""
+
+    def test_negative_retry_count_clamps_to_zero_and_retries_normally(self) -> None:
+        """H5 exact spec: x-rabbitkit-retry-count = -5 must clamp to 0, not
+        produce a negative delay-queue routing key, and route to the FIRST
+        delay queue like a fresh message — not reset to unbounded retries."""
+        published: list[MessageEnvelope] = []
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+
+        msg = _make_message(headers={"x-rabbitkit-retry-count": -5, "x-rabbitkit-original-queue": "orders-queue"})
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("lost")
+
+        mw.consume_scope(failing_handler, msg)
+
+        assert len(published) == 1
+        # attempt = clamped retry_count(0) + 1 = 1 -> a real, declared delay
+        # queue, never "...retry.-4" or similar.
+        assert published[0].routing_key == "orders-queue.retry.1"
+        assert "retry.-" not in published[0].routing_key
+        assert published[0].headers["x-rabbitkit-retry-count"] == 1
+        assert msg._disposition == "acked"
+
+    def test_huge_retry_count_clamps_to_max_retries_and_routes_terminal(self) -> None:
+        """H5 exact spec: x-rabbitkit-retry-count = 10**9 must clamp to
+        max_retries and be treated as exhausted (terminal), not silently
+        accepted as a valid attempt count."""
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        mw = RetryMiddleware(config)
+
+        msg = _make_message(
+            headers={"x-rabbitkit-retry-count": 10**9, "x-rabbitkit-original-queue": "orders-queue"}
+        )
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("still failing")
+
+        with pytest.raises(ConnectionResetError) as exc_info:
+            mw.consume_scope(failing_handler, msg)
+
+        assert getattr(exc_info.value, "_rabbitkit_terminal", False) is True
+
+    def test_get_retry_count_clamps_negative_to_zero(self) -> None:
+        config = RetryConfig(max_retries=4)
+        mw = RetryMiddleware(config)
+        msg = _make_message(headers={"x-rabbitkit-retry-count": -5})
+        assert mw._get_retry_count(msg) == 0
+
+    def test_get_retry_count_clamps_huge_value_to_max_retries(self) -> None:
+        config = RetryConfig(max_retries=4)
+        mw = RetryMiddleware(config)
+        msg = _make_message(headers={"x-rabbitkit-retry-count": 10**9})
+        assert mw._get_retry_count(msg) == 4
+
+    def test_get_retry_count_within_range_unchanged(self) -> None:
+        config = RetryConfig(max_retries=4)
+        mw = RetryMiddleware(config)
+        msg = _make_message(headers={"x-rabbitkit-retry-count": 2})
+        assert mw._get_retry_count(msg) == 2
+
+    def test_get_retry_count_missing_header_defaults_to_zero(self) -> None:
+        config = RetryConfig(max_retries=4)
+        mw = RetryMiddleware(config)
+        msg = _make_message(headers={})
+        assert mw._get_retry_count(msg) == 0
+
+    def test_get_retry_count_non_numeric_header_treated_as_zero(self) -> None:
+        """A garbage (non-numeric) header must not crash the pipeline — it
+        degrades to 0 rather than raising ValueError inside error handling."""
+        config = RetryConfig(max_retries=4)
+        mw = RetryMiddleware(config)
+        msg = _make_message(headers={"x-rabbitkit-retry-count": "not-a-number"})
+        assert mw._get_retry_count(msg) == 0
+
+    def test_non_numeric_header_does_not_crash_consume_scope(self) -> None:
+        """End-to-end: a garbage header must not raise from inside the retry
+        middleware itself while handling the original exception."""
+        published: list[MessageEnvelope] = []
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        msg = _make_message(
+            headers={"x-rabbitkit-retry-count": "garbage", "x-rabbitkit-original-queue": "orders-queue"}
+        )
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("lost")
+
+        mw.consume_scope(failing_handler, msg)  # must not raise
+
+        assert len(published) == 1
+        assert published[0].routing_key == "orders-queue.retry.1"
+
+
 # ── RetryMiddleware — classification ─────────────────────────────────────
 
 

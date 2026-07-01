@@ -1093,7 +1093,17 @@ async def handle(body: bytes) -> None:
 
 **Replay protection:** The middleware includes a bounded `TTLSetNonceCache` (100k entries,
 `OrderedDict`-based O(1) LRU eviction). A captured signed message cannot be replayed —
-the nonce is rejected as a duplicate.
+the nonce is rejected as a duplicate. **This cache is per-process** — in any
+multi-process/multi-pod deployment, use `nonce_cache=RedisNonceCache(redis.Redis(...))`
+(`from rabbitkit.middleware.signing import RedisNonceCache`) so the seen-set is
+shared across every process; a `RuntimeWarning` is emitted if you don't.
+
+**What's covered:** the default signature covers `exchange`, `routing_key`,
+`content_encoding`, and `reply_to` in addition to `timestamp`/`nonce`/`body` —
+not just the body. A captured message re-published under a different routing
+key, an RPC reply redirected via `reply_to`, or `content_encoding` flipped to
+hit a different decompression path all fail verification. Other headers are
+not covered — don't use freeform headers for security-critical routing.
 
 ---
 

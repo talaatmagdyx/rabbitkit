@@ -297,6 +297,80 @@ async def test_async_message_headers_preserved(rabbitmq_url: str) -> None:
     await broker.stop()
 
 
+async def test_async_broker_publish_applies_signing_middleware(rabbitmq_url: str) -> None:
+    """C3: broker.publish() must apply broker-level middlewares (e.g. signing).
+
+    Before the C3 fix, publish_scope only fired for handler-RESULT publishing
+    (Contract 5) — broker.publish(), the primary producer API, went straight to
+    the transport with no middleware applied at all, so a SigningMiddleware
+    configured on the broker never signed anything sent via broker.publish().
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+    received_headers: dict[str, Any] = {}
+    done = asyncio.Event()
+
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config, middlewares=[signing_mw])
+
+    @broker.subscriber(queue="integ-signed-publish-q")
+    async def handle(body, msg) -> None:  # type: ignore[no-untyped-def]
+        assert isinstance(msg, RabbitMessage)
+        received_headers.update(msg.headers)
+        done.set()
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(
+        MessageEnvelope(routing_key="integ-signed-publish-q", body=b"order-payload")
+    )
+
+    await asyncio.wait_for(done.wait(), timeout=15.0)
+
+    assert "x-rabbitkit-signature" in received_headers
+    assert "x-rabbitkit-sign-timestamp" in received_headers
+    assert "x-rabbitkit-sign-nonce" in received_headers
+    await broker.stop()
+
+
+@pytest.mark.parametrize("confirm_delivery", [True, False])
+async def test_async_mandatory_publish_to_nonexistent_binding_returns_returned(
+    rabbitmq_url: str, confirm_delivery: bool
+) -> None:
+    """H1: an unroutable mandatory=True publish must report RETURNED, never CONFIRMED.
+
+    Regardless of the broker's global ``confirm_delivery`` setting, publishing
+    with ``mandatory=True`` to a routing key with no matching queue/binding
+    must surface as ``PublishStatus.RETURNED`` — never silently CONFIRMED.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import PublisherConfig
+    from rabbitkit.core.types import MessageEnvelope, PublishStatus
+
+    config = _make_async_config(
+        rabbitmq_url, publisher=PublisherConfig(confirm_delivery=confirm_delivery)
+    )
+    broker = AsyncBroker(config=config)
+    await broker.start()
+
+    outcome = await broker.publish(
+        MessageEnvelope(
+            routing_key="integ-nonexistent-queue-h1",
+            body=b"should-be-returned",
+            mandatory=True,
+        )
+    )
+
+    assert outcome.status == PublishStatus.RETURNED
+    assert not outcome.ok
+    await broker.stop()
+
+
 async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
     """A TRANSIENT failure is retried through the delay queue, then dead-lettered.
 
@@ -344,6 +418,86 @@ async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
     await broker.stop()
 
 
+async def test_async_retry_count_header_spoofing_clamped(rabbitmq_url: str) -> None:
+    """H5: a producer-supplied x-rabbitkit-retry-count header must not let an
+    attacker force unbounded retries (negative value) or skip straight to
+    the DLQ (huge value), against a real broker.
+
+    A huge spoofed count must clamp to max_retries and dead-letter on the
+    very first delivery (no retry actually happens). A negative spoofed
+    count must clamp to 0 and retry through the real, DECLARED retry.1 delay
+    queue — before the H5 fix this would target a non-existent
+    ``...retry.-4`` queue on the default exchange and be silently dropped
+    (the source message acked, the retry never seen again).
+
+    Uses -999 rather than -5 for the negative case: unrelated to this fix,
+    ``pamqp`` (aio_pika's AMQP table encoder) cannot encode small negative
+    ints (-128..-1) as a header value at all — ``pamqp.encode.table_integer``
+    raises ``struct.error: 'B' format requires 0 <= number <= 255`` for e.g.
+    -5, because it picks an unsigned-byte encoding for values in that range
+    regardless of sign. -999 falls outside that broken range and encodes
+    fine; the retry-count clamping logic under test does not care about the
+    exact negative value. The unit tests cover -5 directly since they never
+    go through real AMQP wire encoding.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import RetryConfig
+    from rabbitkit.core.types import MessageEnvelope
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+    retry_cfg = RetryConfig(max_retries=2, delays=(1, 1))
+
+    huge_call_count = 0
+    huge_dead_lettered = asyncio.Event()
+
+    @broker.subscriber(queue="integ-h5-huge-q", retry=retry_cfg)
+    async def handle_huge(body: bytes) -> None:
+        nonlocal huge_call_count
+        huge_call_count += 1
+        raise TimeoutError("transient outage")
+
+    @broker.subscriber(queue="integ-h5-huge-q.dlq")
+    async def on_huge_dlq(body: bytes) -> None:
+        huge_dead_lettered.set()
+
+    neg_call_count = 0
+    neg_retried = asyncio.Event()
+
+    @broker.subscriber(queue="integ-h5-neg-q", retry=retry_cfg)
+    async def handle_neg(body: bytes) -> None:
+        nonlocal neg_call_count
+        neg_call_count += 1
+        if neg_call_count >= 2:
+            neg_retried.set()
+        raise TimeoutError("transient outage")
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(
+        MessageEnvelope(
+            routing_key="integ-h5-huge-q",
+            body=b"huge-spoof",
+            headers={"x-rabbitkit-retry-count": 10**9},
+        )
+    )
+    await asyncio.wait_for(huge_dead_lettered.wait(), timeout=20.0)
+    assert huge_call_count == 1, "a spoofed huge retry count must skip straight to the DLQ, not retry"
+
+    await broker.publish(
+        MessageEnvelope(
+            routing_key="integ-h5-neg-q",
+            body=b"neg-spoof",
+            headers={"x-rabbitkit-retry-count": -999},
+        )
+    )
+    await asyncio.wait_for(neg_retried.wait(), timeout=20.0)
+    assert neg_call_count == 2, "a spoofed negative retry count must still retry normally, not be dropped"
+
+    await broker.stop()
+
+
 async def test_async_worker_pool_concurrent_messages(rabbitmq_url: str) -> None:
     """Multiple messages are processed concurrently via WorkerConfig(worker_count=4)."""
     from rabbitkit.async_.broker import AsyncBroker
@@ -376,15 +530,92 @@ async def test_async_worker_pool_concurrent_messages(rabbitmq_url: str) -> None:
     await broker.stop()
 
 
-async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
-    """Gzip-compressed message body published and received correctly.
+async def test_async_stop_drains_cleanly_under_load(rabbitmq_url: str) -> None:
+    """C5: stop() cancels consumers before draining the worker pool, so no
+    message is orphaned when many are still in flight or queued at shutdown
+    time.
 
-    The pipeline does NOT auto-call middleware on_receive hooks, so the
-    subscriber receives the compressed body.  This test verifies:
-    1. The CompressionMiddleware correctly compresses the body via transform_envelope().
-    2. The compressed message is delivered successfully over the wire.
-    3. The subscriber receives the compressed bytes (as AMQP payload).
-    4. Manual decompression via CompressionMiddleware.decompress() recovers the original.
+    Before the fix, the pool drained first while the consumer stayed active
+    for the whole (potentially graceful_timeout-long) wait — a message
+    delivered in that window was submitted via AsyncWorkerPool.submit(),
+    which creates a task unconditionally and would never be awaited once
+    stop() had already cleared _tasks: an orphaned, never-settled delivery,
+    redelivered (or lost) later.
+
+    stop() is called deliberately early (before all messages finish), so
+    plenty are still queued/in-flight. Anything left in the queue after
+    cancellation (never delivered to this consumer at all) is drained by a
+    follow-up consumer. Every published body must be processed by EITHER
+    consumer — none permanently lost. (Duplicates are acceptable under
+    at-least-once; C5's guarantee is against permanent loss/orphaning.)
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import PoolConfig, WorkerConfig
+    from rabbitkit.core.types import MessageEnvelope
+
+    num_messages = 30
+    processed_first: list[bytes] = []
+
+    config = _make_async_config(rabbitmq_url, pool=PoolConfig(channel_pool_size=16))
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue="integ-shutdown-q")
+    async def handle(body: bytes) -> None:
+        await asyncio.sleep(0.05)  # slow enough that many stay queued/in-flight
+        processed_first.append(body)
+
+    await broker.start(worker_config=WorkerConfig(worker_count=4))
+    await asyncio.sleep(0.3)
+
+    for i in range(num_messages):
+        await broker.publish(MessageEnvelope(routing_key="integ-shutdown-q", body=f"m{i}".encode()))
+
+    # Stop promptly — don't wait for completion — so the shutdown-ordering
+    # path is genuinely exercised (many messages still queued/in-flight).
+    await asyncio.sleep(0.15)
+    await broker.stop(timeout=15.0)
+
+    # Drain anything left in the queue (cancelled before delivery) with a
+    # follow-up consumer — proves nothing was silently lost.
+    processed_second: list[bytes] = []
+    done2 = asyncio.Event()
+
+    broker2 = AsyncBroker(config=config)
+
+    @broker2.subscriber(queue="integ-shutdown-q")
+    async def handle2(body: bytes) -> None:
+        processed_second.append(body)
+        if len(processed_first) + len(processed_second) >= num_messages:
+            done2.set()
+
+    await broker2.start()
+    if len(processed_first) < num_messages:
+        try:
+            await asyncio.wait_for(done2.wait(), timeout=10.0)
+        except TimeoutError:
+            pass
+    await broker2.stop()
+
+    all_processed = processed_first + processed_second
+    assert set(all_processed) == {f"m{i}".encode() for i in range(num_messages)}, (
+        f"expected all {num_messages} messages processed, got "
+        f"{len(processed_first)} (first) + {len(processed_second)} (follow-up) = "
+        f"{len(set(all_processed))} unique"
+    )
+
+
+async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
+    """C4: CompressionMiddleware, once wired via publish_scope_async, compresses
+    on broker.publish() and decompresses automatically via on_receive_async —
+    no manual transform_envelope()/decompress() calls needed by the caller.
+
+    Two queues prove both halves against a real broker:
+    - integ-compress-raw-q (no middleware): receives the RAW wire bytes,
+      proving broker.publish() actually compressed the body (not a silent
+      no-op — this is exactly the defect C4 reported: nothing compressed
+      anything on the standard paths).
+    - integ-compress-decoded-q (middleware attached): on_receive_async
+      decompresses automatically; the handler sees the ORIGINAL body.
     """
     import gzip
 
@@ -393,40 +624,44 @@ async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
     from rabbitkit.core.types import MessageEnvelope
     from rabbitkit.middleware.compression import CompressionMiddleware
 
-    received_raw: list[bytes] = []
-    done = asyncio.Event()
-
-    config = _make_async_config(rabbitmq_url)
-    broker = AsyncBroker(config=config)
+    raw_received: list[bytes] = []
+    decoded_received: list[bytes] = []
+    raw_done = asyncio.Event()
+    decoded_done = asyncio.Event()
 
     compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+    config = _make_async_config(rabbitmq_url)
+    # Broker-level middleware (C3) compresses every broker.publish() call.
+    broker = AsyncBroker(config=config, middlewares=[compression_mw])
 
-    @broker.subscriber(queue="integ-compress-q")
-    async def handle(body: bytes) -> None:
-        received_raw.append(body)
-        done.set()
+    @broker.subscriber(queue="integ-compress-raw-q")
+    async def handle_raw(body: bytes) -> None:
+        raw_received.append(body)
+        raw_done.set()
+
+    @broker.subscriber(queue="integ-compress-decoded-q", middlewares=[compression_mw])
+    async def handle_decoded(body: bytes) -> None:
+        decoded_received.append(body)
+        decoded_done.set()
 
     await broker.start()
     await asyncio.sleep(0.3)
 
     original = b"hello world - compressed payload for integration test roundtrip"
-    compressed_envelope = compression_mw.transform_envelope(
-        MessageEnvelope(routing_key="integ-compress-q", body=original)
-    )
-    # Sanity-check: body is actually compressed
-    assert compressed_envelope.body != original
-    assert compressed_envelope.content_encoding == "gzip"
+    await broker.publish(MessageEnvelope(routing_key="integ-compress-raw-q", body=original))
+    await broker.publish(MessageEnvelope(routing_key="integ-compress-decoded-q", body=original))
 
-    await broker.publish(compressed_envelope)
+    await asyncio.wait_for(raw_done.wait(), timeout=15.0)
+    await asyncio.wait_for(decoded_done.wait(), timeout=15.0)
 
-    await asyncio.wait_for(done.wait(), timeout=15.0)
+    # broker.publish() actually compressed the body on the wire.
+    assert raw_received[0] != original
+    assert gzip.decompress(raw_received[0]) == original
 
-    assert len(received_raw) == 1
-    # Received body is the compressed bytes (pipeline doesn't auto-decompress)
-    assert received_raw[0] != original  # it's still compressed on arrival
-    # Decompress manually to recover original
-    decompressed = gzip.decompress(received_raw[0])
-    assert decompressed == original
+    # The consume-side middleware decompressed automatically — the handler
+    # never saw compressed bytes.
+    assert decoded_received == [original]
+
     await broker.stop()
 
 
@@ -687,6 +922,199 @@ def test_sync_worker_pool_concurrent_acks(rabbitmq_url: str) -> None:
     assert sorted(processed) == sorted(f"m{i}".encode() for i in range(num_messages))
 
 
+def test_sync_stop_drains_cleanly_under_load(rabbitmq_url: str) -> None:
+    """C5: stop() cancels consumers before draining the worker pool, so no
+    message is orphaned when many are still in flight or queued at shutdown
+    time.
+
+    Before the fix, the pool drained first while the consumer stayed active
+    for the whole (potentially graceful_timeout-long) wait — a message
+    delivered in that window was submitted to a pool already mid-shutdown:
+    SyncWorkerPool.submit() either raises RuntimeError (uncaught, propagating
+    into pika's callback machinery) or, once .stop() had fully returned,
+    silently ran the handler inline on the pika I/O thread — either way never
+    cleanly settled before disconnect().
+
+    stop() is called deliberately early (before all messages finish), so
+    plenty are still queued/in-flight. Anything left in the queue after
+    cancellation (never delivered to this consumer at all) is drained by a
+    follow-up consumer. Every published body must be processed by EITHER
+    consumer — none permanently lost. (Duplicates are acceptable under
+    at-least-once; C5's guarantee is against permanent loss/orphaning.)
+
+    Delivery is driven by manually pumping ``process_data_events`` on the
+    calling thread rather than a background ``start_consuming()`` thread:
+    pika's ``BlockingConnection`` is not thread-safe, and ``cancel_consumer()``
+    (called by ``stop()``) is not marshaled onto an owner thread the way
+    publish/ack/nack are — calling ``stop()`` from a different thread than the
+    one pumping the connection corrupts shared connection state (a separate,
+    pre-existing gap, not this fix's concern). Single-threaded pumping keeps
+    the test itself thread-safe while still exercising real worker-thread
+    concurrency (the pool's own daemon threads run independently).
+    """
+    from rabbitkit.core.config import WorkerConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.sync.broker import SyncBroker
+
+    num_messages = 30
+    processed_first: list[bytes] = []
+    lock = threading.Lock()
+
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config)
+
+    @broker.subscriber(queue="sync-shutdown-q")
+    def handle(body: bytes) -> None:
+        time.sleep(0.05)  # slow enough that many stay queued/in-flight
+        with lock:
+            processed_first.append(body)
+
+    broker.start(worker_config=WorkerConfig(worker_count=4))
+
+    for i in range(num_messages):
+        broker.publish(MessageEnvelope(routing_key="sync-shutdown-q", body=f"m{i}".encode()))
+
+    assert broker._transport is not None
+    # worker_count>1 means handler execution (and its ack) runs on a pool
+    # thread, not this pumping thread. _run_on_io_thread only marshals a
+    # cross-thread ack back to the owner thread when _ever_consumed/
+    # _owner_ident are set (normally done by start_consuming(), H2: matters
+    # regardless of the current _consuming value); set them manually so pool
+    # threads' acks correctly marshal back here instead of racing this
+    # thread's own process_data_events() calls.
+    broker._transport._ever_consumed = True
+    broker._transport._owner_ident = threading.get_ident()
+
+    # Pump briefly — leave plenty of messages queued/in-flight when stop() is
+    # called, so the shutdown-ordering path is genuinely exercised.
+    pump_deadline = time.monotonic() + 0.3
+    while time.monotonic() < pump_deadline:
+        broker._transport._connection.process_data_events(time_limit=0.05)
+
+    # A short deadline is deliberate: nothing is pumping process_data_events()
+    # during this wait (single-threaded test), so in-flight workers whose ack
+    # needs cross-thread marshaling cannot complete until pumping resumes —
+    # they get abandoned once the deadline elapses ("disconnecting anyway"),
+    # exactly like a real bounded graceful shutdown under load. That's the
+    # scenario being proven safe: the follow-up consumer below must recover
+    # every abandoned message, none permanently lost.
+    broker.stop(timeout=1.0)
+
+    # Drain anything left in the queue (cancelled before delivery) with a
+    # follow-up consumer — proves nothing was silently lost.
+    processed_second: list[bytes] = []
+
+    broker2 = SyncBroker(config=config)
+
+    @broker2.subscriber(queue="sync-shutdown-q")
+    def handle2(body: bytes) -> None:
+        processed_second.append(body)
+
+    broker2.start()
+    if len(processed_first) < num_messages:
+        assert broker2._transport is not None
+        deadline2 = time.monotonic() + 10.0
+        while (
+            len(processed_first) + len(processed_second) < num_messages
+            and time.monotonic() < deadline2
+        ):
+            broker2._transport._connection.process_data_events(time_limit=0.2)
+    broker2.stop()
+
+    all_processed = processed_first + processed_second
+    assert set(all_processed) == {f"m{i}".encode() for i in range(num_messages)}, (
+        f"expected all {num_messages} messages processed, got "
+        f"{len(processed_first)} (first) + {len(processed_second)} (follow-up) = "
+        f"{len(set(all_processed))} unique"
+    )
+
+
+def test_sync_sigterm_mid_flight_drain_acks_run_on_owner_thread(rabbitmq_url: str) -> None:
+    """H2: worker-pool acks marshaled during a SIGTERM-style drain must
+    execute on the transport's OWNER thread — never inline, cross-thread, on
+    the worker thread that finished the handler.
+
+    Before the fix, ``_run_on_io_thread`` fell back to running the ack
+    inline whenever the consume loop had merely stopped PUMPING
+    (``not self._consuming``) — true for the entire window between
+    ``stop_consuming()`` (cancels consumers, like ``_on_sigterm``'s daemon
+    thread) and ``SyncBroker.stop()``'s worker-pool drain completing. A
+    worker thread finishing its handler in that window would call
+    ``channel.basic_ack()`` directly, unsynchronized with any other worker
+    thread acking on the same shared consumer channel — the exact race this
+    test proves is gone.
+
+    Drives ``start_consuming()``/``stop()`` on one background thread (mirrors
+    ``SyncBroker.run()``'s own thread-affinity contract — see ``pump()``'s and
+    ``_wait_in_flight()``'s docstrings), and triggers the drain from the main
+    thread via ``stop_consuming()`` (the same call ``_on_sigterm``'s daemon
+    thread makes), exactly mirroring real SIGTERM handling without needing an
+    actual OS signal.
+    """
+    from rabbitkit.core.config import WorkerConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.sync.broker import SyncBroker
+
+    num_messages = 20
+    processed: list[bytes] = []
+    lock = threading.Lock()
+    ack_thread_idents: list[int] = []
+
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config)
+
+    @broker.subscriber(queue="h2-sigterm-drain-q")
+    def handle(body: bytes) -> None:
+        time.sleep(0.05)  # slow enough that several stay in-flight at drain time
+        with lock:
+            processed.append(body)
+
+    broker.start(worker_config=WorkerConfig(worker_count=4))
+
+    # Instrument the REAL pika consumer channel's basic_ack so we can observe
+    # exactly which thread issues each AMQP ack frame.
+    assert broker._transport is not None
+    consumer_channel = broker._transport._consumer_channels["h2-sigterm-drain-q"]
+    original_basic_ack = consumer_channel.basic_ack
+
+    def spy_basic_ack(*args: Any, **kwargs: Any) -> Any:
+        ack_thread_idents.append(threading.get_ident())
+        return original_basic_ack(*args, **kwargs)
+
+    consumer_channel.basic_ack = spy_basic_ack
+
+    for i in range(num_messages):
+        broker.publish(MessageEnvelope(routing_key="h2-sigterm-drain-q", body=f"m{i}".encode()))
+
+    owner_ident_holder: list[int] = []
+    drain_done = threading.Event()
+
+    def run_and_drain() -> None:
+        owner_ident_holder.append(threading.get_ident())
+        assert broker._transport is not None
+        broker._transport.start_consuming()  # exits once stop_consuming() below runs
+        broker.stop(timeout=10.0)  # deliberately on THIS (owner) thread
+        drain_done.set()
+
+    t = threading.Thread(target=run_and_drain, daemon=True)
+    t.start()
+
+    time.sleep(0.15)  # let some messages flow; several remain in-flight/queued
+    broker._transport.stop_consuming()  # like _on_sigterm's daemon thread
+
+    assert drain_done.wait(timeout=15.0), "stop() did not complete in time"
+    t.join(timeout=5.0)
+
+    with lock:
+        n_processed = len(processed)
+    assert n_processed > 0, "no messages were processed before the drain"
+    # The core H2 assertion: every ack that happened at all ran on the
+    # thread that owns the connection — never on one of the pool's worker
+    # threads, regardless of whether it acked before or during the drain.
+    assert ack_thread_idents, "expected at least one ack to have been issued"
+    assert set(ack_thread_idents) == {owner_ident_holder[0]}
+
+
 def test_sync_recover_consumers_resubscribes(rabbitmq_url: str) -> None:
     """SyncBroker._recover_consumers() re-declares topology and re-subscribes
     on a fresh connection (H1 recovery path).
@@ -772,6 +1200,77 @@ def test_sync_message_headers(rabbitmq_url: str) -> None:
     assert len(received_headers) == 1
     assert received_headers[0].get("x-source") == "sync-test"
     assert received_headers[0].get("x-count") == "42"
+
+
+def test_sync_broker_publish_applies_signing_middleware(rabbitmq_url: str) -> None:
+    """C3: broker.publish() must apply broker-level middlewares (e.g. signing).
+
+    Sync counterpart of test_async_broker_publish_applies_signing_middleware —
+    see that test's docstring for the defect this guards against.
+    """
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+    from rabbitkit.sync.broker import SyncBroker
+
+    received_headers: list[dict[str, Any]] = []
+
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config, middlewares=[signing_mw])
+
+    @broker.subscriber(queue="sync-signed-publish-q")
+    def handle(body, msg) -> None:  # type: ignore[no-untyped-def]
+        assert isinstance(msg, RabbitMessage)
+        received_headers.append(dict(msg.headers))
+
+    broker.start()
+
+    broker.publish(MessageEnvelope(routing_key="sync-signed-publish-q", body=b"order-payload"))
+
+    assert broker._transport is not None
+    deadline = time.monotonic() + 5.0
+    while not received_headers and time.monotonic() < deadline:
+        broker._transport._connection.process_data_events(time_limit=0.2)
+
+    broker.stop()
+
+    assert len(received_headers) == 1
+    assert "x-rabbitkit-signature" in received_headers[0]
+    assert "x-rabbitkit-sign-timestamp" in received_headers[0]
+    assert "x-rabbitkit-sign-nonce" in received_headers[0]
+
+
+@pytest.mark.parametrize("confirm_delivery", [True, False])
+def test_sync_mandatory_publish_to_nonexistent_binding_returns_returned(
+    rabbitmq_url: str, confirm_delivery: bool
+) -> None:
+    """H1: sync counterpart — unroutable mandatory=True must report RETURNED.
+
+    See test_async_mandatory_publish_to_nonexistent_binding_returns_returned's
+    docstring for the defect this guards against. Sync and async must agree.
+    """
+    from rabbitkit.core.config import PublisherConfig
+    from rabbitkit.core.types import MessageEnvelope, PublishStatus
+    from rabbitkit.sync.broker import SyncBroker
+
+    config = _make_sync_config(
+        rabbitmq_url, publisher=PublisherConfig(confirm_delivery=confirm_delivery)
+    )
+    broker = SyncBroker(config=config)
+    broker.start()
+
+    outcome = broker.publish(
+        MessageEnvelope(
+            routing_key="sync-nonexistent-queue-h1",
+            body=b"should-be-returned",
+            mandatory=True,
+        )
+    )
+
+    assert outcome.status == PublishStatus.RETURNED
+    assert not outcome.ok
+    broker.stop()
 
 
 def test_sync_error_handling(rabbitmq_url: str) -> None:

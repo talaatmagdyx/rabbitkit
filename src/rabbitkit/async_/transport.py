@@ -94,6 +94,14 @@ class AsyncTransportImpl:
         self._fast_publish_channel: Any | None = None
         self._fast_channel_lock: asyncio.Lock = asyncio.Lock()
 
+        # H1: dedicated, always-confirmed channel for mandatory=True publishes,
+        # independent of confirm_delivery. Detecting an unroutable Basic.Return
+        # reliably requires BOTH publisher confirms AND on_return_raises=True —
+        # neither the fast channel (no confirms at all) nor the regular pool
+        # (confirms follow confirm_delivery, which may be False) guarantee that.
+        self._mandatory_publish_channel: Any | None = None
+        self._mandatory_channel_lock: asyncio.Lock = asyncio.Lock()
+
         # Backpressure callbacks (FlowController registers here). Each is a
         # zero-arg callable; aio-pika's blocked/unblocked frames are adapted.
         self._blocked_callbacks: list[Callable[[], None]] = []
@@ -198,6 +206,14 @@ class AsyncTransportImpl:
                     pass
             self._fast_publish_channel = None
 
+            # Close the dedicated mandatory-publish channel (H1)
+            if self._mandatory_publish_channel is not None and not self._mandatory_publish_channel.is_closed:
+                try:
+                    await self._mandatory_publish_channel.close()
+                except Exception:  # pragma: no cover — best effort close, network errors only
+                    pass
+            self._mandatory_publish_channel = None
+
             await self._conn_pool.close_all()
         except Exception as e:
             logger.warning("Error during disconnect: %s", e)
@@ -283,6 +299,34 @@ class AsyncTransportImpl:
             self._fast_publish_channel = await conn.channel(publisher_confirms=False)
             return self._fast_publish_channel
 
+    async def _get_mandatory_channel(self) -> Any:
+        """Return the dedicated always-confirmed channel for mandatory=True
+        publishes, (re)opening if needed.
+
+        H1: ``on_return_raises=True`` makes an unroutable ``Basic.Return``
+        raise ``aio_pika.exceptions.PublishError`` (caught by
+        :meth:`_publish_on_channel` and mapped to ``PublishStatus.RETURNED``)
+        instead of silently resolving the confirmation with the returned
+        message — indistinguishable from success otherwise. This channel is
+        used for every ``mandatory=True`` publish regardless of the broker's
+        ``confirm_delivery`` setting, since reliable return detection needs
+        confirms + on_return_raises unconditionally.
+        """
+        ch = self._mandatory_publish_channel
+        if ch is not None and not ch.is_closed:
+            return ch
+        async with self._mandatory_channel_lock:
+            ch = self._mandatory_publish_channel
+            if ch is not None and not ch.is_closed:  # pragma: no cover — concurrent path
+                return ch
+            conn = self._conn_pool._publisher_connection
+            if conn is None:
+                raise RuntimeError("Publisher connection is not available")
+            self._mandatory_publish_channel = await conn.channel(
+                publisher_confirms=True, on_return_raises=True
+            )
+            return self._mandatory_publish_channel
+
     def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
         """Build an aio_pika.Message from a MessageEnvelope."""
         import aio_pika
@@ -310,7 +354,20 @@ class AsyncTransportImpl:
         Used by BatchPublisher to publish many messages on one channel and
         gather all confirms concurrently — one pool acquire/release for N
         messages instead of N separate round-trips.
+
+        H1: a ``mandatory=True`` publish that the broker cannot route raises
+        ``aio_pika.exceptions.PublishError`` when the channel has
+        ``on_return_raises=True`` (only true for channels obtained via
+        :meth:`_get_mandatory_channel` — regular pool/fast channels default to
+        ``on_return_raises=False`` and would otherwise resolve the confirmation
+        with the returned message instead of raising, indistinguishable from
+        success). Mapped to ``PublishStatus.RETURNED`` so callers keying off
+        ``outcome.ok`` correctly treat it as a failed publish. A broker-side
+        ``Basic.Nack`` (not a return) raises the more generic
+        ``DeliveryError`` and maps to ``PublishStatus.NACKED``.
         """
+        import aio_pika.exceptions
+
         message = self._build_aio_message(envelope)
         exchange = (
             await channel.get_exchange(envelope.exchange, ensure=False)
@@ -337,6 +394,31 @@ class AsyncTransportImpl:
                 routing_key=envelope.routing_key,
                 error=e,
             )
+        except aio_pika.exceptions.PublishError as e:
+            logger.warning(
+                "Publish returned as unroutable (mandatory=True, no matching binding): "
+                "exchange=%s routing_key=%s",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return PublishOutcome(
+                status=PublishStatus.RETURNED,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=e,
+            )
+        except aio_pika.exceptions.DeliveryError as e:
+            logger.warning(
+                "Publish nacked by broker: exchange=%s routing_key=%s",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return PublishOutcome(
+                status=PublishStatus.NACKED,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=e,
+            )
         return PublishOutcome(
             status=PublishStatus.CONFIRMED,
             exchange=envelope.exchange,
@@ -357,6 +439,12 @@ class AsyncTransportImpl:
         reply consumer — instead. RabbitMQ requires this exact channel
         affinity for direct reply-to; publishing on a different channel raises
         "PRECONDITION_FAILED - fast reply consumer does not exist".
+
+        H1: a ``mandatory=True`` envelope (that isn't a direct reply-to
+        request) always publishes via the dedicated always-confirmed channel
+        from :meth:`_get_mandatory_channel`, regardless of ``confirm_delivery``
+        — see that method's docstring for why neither the fast nor the regular
+        pool channel can reliably report an unroutable ``Basic.Return``.
         """
         try:
             if not self._connected:
@@ -366,6 +454,10 @@ class AsyncTransportImpl:
                 channel = self._reply_to_channel
                 if not channel.is_closed:
                     return await self._publish_on_channel(channel, envelope)
+
+            if envelope.mandatory:
+                channel = await self._get_mandatory_channel()
+                return await self._publish_on_channel(channel, envelope)
 
             if not self._confirm_delivery:
                 # Fast path: persistent channel, no confirm wait, no pool overhead

@@ -262,6 +262,86 @@ class TestTransformEnvelope:
         assert result.app_id == "my-app"
 
 
+# ── C4: publish_scope / publish_scope_async — the actual wiring point ────
+
+
+class TestPublishScope:
+    """C4: before this, transform_envelope() had no caller — attaching
+    CompressionMiddleware to a route or broker.publish_middlewares compressed
+    nothing. publish_scope/publish_scope_async are the pipeline's actual
+    integration point (see core/pipeline.py compose_*_publish_sync/_async)."""
+
+    def test_publish_scope_compresses_above_threshold(self) -> None:
+        config = CompressionConfig(algorithm="gzip", threshold=10)
+        mw = CompressionMiddleware(config)
+        body = b"hello world " * 100
+        envelope = MessageEnvelope(routing_key="rk", body=body)
+
+        captured: list[MessageEnvelope] = []
+
+        def call_next(env: MessageEnvelope) -> str:
+            captured.append(env)
+            return "outcome"
+
+        result = mw.publish_scope(call_next, envelope)
+
+        assert result == "outcome"
+        assert len(captured) == 1
+        assert captured[0].content_encoding == "gzip"
+        assert gzip.decompress(captured[0].body) == body
+
+    def test_publish_scope_passes_through_below_threshold(self) -> None:
+        config = CompressionConfig(algorithm="gzip", threshold=1024)
+        mw = CompressionMiddleware(config)
+        envelope = MessageEnvelope(routing_key="rk", body=b"small")
+
+        captured: list[MessageEnvelope] = []
+
+        def call_next(env: MessageEnvelope) -> str:
+            captured.append(env)
+            return "outcome"
+
+        mw.publish_scope(call_next, envelope)
+
+        assert captured[0] is envelope  # unmodified — below threshold
+
+    @pytest.mark.asyncio
+    async def test_publish_scope_async_compresses_above_threshold(self) -> None:
+        config = CompressionConfig(algorithm="gzip", threshold=10)
+        mw = CompressionMiddleware(config)
+        body = b"hello world " * 100
+        envelope = MessageEnvelope(routing_key="rk", body=body)
+
+        captured: list[MessageEnvelope] = []
+
+        async def call_next(env: MessageEnvelope) -> str:
+            captured.append(env)
+            return "outcome"
+
+        result = await mw.publish_scope_async(call_next, envelope)
+
+        assert result == "outcome"
+        assert len(captured) == 1
+        assert captured[0].content_encoding == "gzip"
+        assert gzip.decompress(captured[0].body) == body
+
+    @pytest.mark.asyncio
+    async def test_publish_scope_async_passes_through_below_threshold(self) -> None:
+        config = CompressionConfig(algorithm="gzip", threshold=1024)
+        mw = CompressionMiddleware(config)
+        envelope = MessageEnvelope(routing_key="rk", body=b"small")
+
+        captured: list[MessageEnvelope] = []
+
+        async def call_next(env: MessageEnvelope) -> str:
+            captured.append(env)
+            return "outcome"
+
+        await mw.publish_scope_async(call_next, envelope)
+
+        assert captured[0] is envelope  # unmodified — below threshold
+
+
 # ── default config ───────────────────────────────────────────────────────
 
 

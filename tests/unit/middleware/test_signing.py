@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +14,7 @@ from rabbitkit.core.types import MessageEnvelope
 from rabbitkit.middleware.signing import (
     InvalidSignatureError,
     NonceCache,
+    RedisNonceCache,
     SigningConfig,
     SigningMiddleware,
     TTLSetNonceCache,
@@ -143,13 +145,20 @@ class TestPublishScope:
         assert SigningMiddleware._NONCE_HEADER in signed_env.headers
         ts = float(signed_env.headers[SigningMiddleware._TIMESTAMP_HEADER])
         nonce = signed_env.headers[SigningMiddleware._NONCE_HEADER]
-        expected_sig = mw._compute_fresh_signature(ts, nonce, envelope.body)
+        expected_sig = mw._compute_fresh_signature(
+            ts,
+            nonce,
+            envelope.body,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+            content_encoding=envelope.content_encoding,
+            reply_to=envelope.reply_to,
+        )
         assert signed_env.headers[cfg.header_name] == expected_sig
-        # message_id is used as the nonce when present, else a generated uuid hex
-        if envelope.message_id is not None:
-            assert nonce == envelope.message_id
-        else:
-            assert isinstance(nonce, str) and len(nonce) == 32
+        # H4: the nonce is always a fresh random value, independent of
+        # message_id (never reused/predictable via a caller-supplied id).
+        assert isinstance(nonce, str) and len(nonce) == 32
+        assert nonce != envelope.message_id
 
     def test_publish_scope_preserves_existing_headers(self) -> None:
         """Existing headers are preserved when signature is added."""
@@ -192,7 +201,15 @@ class TestPublishScopeAsync:
         assert SigningMiddleware._NONCE_HEADER in signed_env.headers
         ts = float(signed_env.headers[SigningMiddleware._TIMESTAMP_HEADER])
         nonce = signed_env.headers[SigningMiddleware._NONCE_HEADER]
-        expected_sig = mw._compute_fresh_signature(ts, nonce, envelope.body)
+        expected_sig = mw._compute_fresh_signature(
+            ts,
+            nonce,
+            envelope.body,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+            content_encoding=envelope.content_encoding,
+            reply_to=envelope.reply_to,
+        )
         assert signed_env.headers[cfg.header_name] == expected_sig
 
 
@@ -308,7 +325,11 @@ class TestOnReceive:
 
 class TestReplayProtection:
     def _fresh_message(self, mw: SigningMiddleware, body: bytes, *, timestamp: float, nonce: str) -> RabbitMessage:
-        sig = mw._compute_fresh_signature(timestamp, nonce, body)
+        # Matches _make_message()'s routing_key default ("test.rk") and
+        # exchange/content_encoding/reply_to defaults ("" / None / None) so
+        # the H3 route-bound signature verifies against the message actually
+        # constructed below.
+        sig = mw._compute_fresh_signature(timestamp, nonce, body, routing_key="test.rk")
         return _make_message(
             body=body,
             headers={
@@ -464,6 +485,122 @@ class TestReplayProtection:
             mw.on_receive(msg)
 
 
+# ── H3: signature is bound to routing metadata, not just the body ───────
+
+
+class TestRouteBoundSignature:
+    """H3: the fresh signature must cover exchange, routing_key,
+    content_encoding, and reply_to — not just timestamp/nonce/body — so a
+    captured, validly-signed message cannot be re-routed, have its RPC reply
+    redirected, or have its decompression path flipped without invalidating
+    the signature."""
+
+    def _signed_envelope(self, mw: SigningMiddleware, call_next: MagicMock, **kwargs: object) -> MessageEnvelope:
+        envelope = _make_envelope(**kwargs)
+        mw.publish_scope(call_next, envelope)
+        signed_env = call_next.call_args[0][0]
+        assert isinstance(signed_env, MessageEnvelope)
+        return signed_env
+
+    def _delivered_message_from_envelope(self, signed_env: MessageEnvelope) -> RabbitMessage:
+        """Simulate the transport building a RabbitMessage from a delivered
+        envelope — same body/headers/routing metadata, as a real consumer
+        would receive it."""
+        return _make_message(
+            body=signed_env.body,
+            headers=dict(signed_env.headers),
+            exchange=signed_env.exchange,
+            routing_key=signed_env.routing_key,
+            content_encoding=signed_env.content_encoding,
+            reply_to=signed_env.reply_to,
+        )
+
+    def test_signed_message_verifies_unmodified(self) -> None:
+        """Sanity baseline: an untouched signed message must still verify."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(
+            mw, call_next, routing_key="order.refund", exchange="orders", reply_to="reply.q"
+        )
+        msg = self._delivered_message_from_envelope(signed_env)
+        mw.on_receive(msg)  # should not raise
+
+    def test_mutated_routing_key_rejected(self) -> None:
+        """H3 failure scenario: a captured order.refund re-published under a
+        different routing key (e.g. order.approve) with the same
+        body+signature+timestamp+nonce must fail verification."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(mw, call_next, routing_key="order.refund")
+        msg = self._delivered_message_from_envelope(signed_env)
+        msg.routing_key = "order.approve"  # attacker re-routes the captured message
+        with pytest.raises(InvalidSignatureError, match="verification failed"):
+            mw.on_receive(msg)
+
+    def test_mutated_exchange_rejected(self) -> None:
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(mw, call_next, exchange="orders")
+        msg = self._delivered_message_from_envelope(signed_env)
+        msg.exchange = "orders-shadow"
+        with pytest.raises(InvalidSignatureError, match="verification failed"):
+            mw.on_receive(msg)
+
+    def test_mutated_reply_to_rejected(self) -> None:
+        """H3: redirecting an RPC reply via reply_to must fail verification."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(mw, call_next, reply_to="amq.rabbitmq.reply-to.original")
+        msg = self._delivered_message_from_envelope(signed_env)
+        msg.reply_to = "amq.rabbitmq.reply-to.attacker"
+        with pytest.raises(InvalidSignatureError, match="verification failed"):
+            mw.on_receive(msg)
+
+    def test_mutated_content_encoding_rejected(self) -> None:
+        """H3: flipping content_encoding to hit a different decompression
+        path must fail verification."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(mw, call_next, content_encoding="gzip")
+        msg = self._delivered_message_from_envelope(signed_env)
+        msg.content_encoding = "identity"
+        with pytest.raises(InvalidSignatureError, match="verification failed"):
+            mw.on_receive(msg)
+
+    def test_different_consumer_instance_rejects_rerouted_replay(self) -> None:
+        """H3's exact failure scenario end-to-end: a second, independent
+        SigningMiddleware instance (a different consumer with its own
+        in-memory nonce cache — so the nonce cache alone can't catch this)
+        must still reject a re-routed captured message on signature grounds
+        alone."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        sender_mw = SigningMiddleware(cfg)
+        call_next = MagicMock(return_value="ok")
+        signed_env = self._signed_envelope(sender_mw, call_next, routing_key="order.refund")
+        msg = self._delivered_message_from_envelope(signed_env)
+        msg.routing_key = "order.approve"
+
+        # A different consumer instance -> its own nonce cache has never
+        # seen this nonce, so only the route-bound signature can catch this.
+        receiver_mw = SigningMiddleware(cfg)
+        with pytest.raises(InvalidSignatureError, match="verification failed"):
+            receiver_mw.on_receive(msg)
+
+    def test_canonical_route_delimiter_prevents_field_splicing(self) -> None:
+        """Different (exchange, routing_key) splits that concatenate to the
+        same string without a delimiter must NOT produce the same signature."""
+        cfg = SigningConfig(secret_key=SECRET)
+        mw = SigningMiddleware(cfg)
+        sig_a = mw._compute_fresh_signature(1.0, "n", b"x", exchange="ab", routing_key="c")
+        sig_b = mw._compute_fresh_signature(1.0, "n", b"x", exchange="a", routing_key="bc")
+        assert sig_a != sig_b
+
+
 # ── TTLSetNonceCache / NonceCache protocol ───────────────────────────────
 
 
@@ -564,3 +701,193 @@ class TestTTLSetNonceCache:
         # After eviction of 10% (1 entry) + insertion of "overflow",
         # the size should be at most max_entries.
         assert len(cache._entries) <= 10
+
+
+# ── H4: shared/multi-process replay protection ────────────────────────────
+
+
+class _FakeSyncRedis:
+    """Minimal duck-typed stand-in for redis-py's synchronous ``redis.Redis``,
+    implementing only the atomic ``SET NX EX`` semantics RedisNonceCache
+    relies on: ``set(key, value, nx=True, ex=ttl)`` returns True the first
+    time a key is set and None (falsy) on every subsequent call while the key
+    is still "live" — a real Redis TTL expiry is not simulated since no test
+    here waits out a TTL."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.calls: list[tuple[str, str, bool, int]] = []
+
+    def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> bool | None:
+        self.calls.append((key, value, nx, ex or 0))
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+
+class TestRedisNonceCache:
+    def test_first_seen_returns_true(self) -> None:
+        redis_client = _FakeSyncRedis()
+        cache = RedisNonceCache(redis_client)
+        assert cache.seen("nonce-1", ttl=60.0) is True
+
+    def test_replay_returns_false(self) -> None:
+        redis_client = _FakeSyncRedis()
+        cache = RedisNonceCache(redis_client)
+        assert cache.seen("nonce-1", ttl=60.0) is True
+        assert cache.seen("nonce-1", ttl=60.0) is False
+
+    def test_uses_atomic_set_nx_ex(self) -> None:
+        """The underlying call must be a single atomic SET NX EX, not a
+        separate GET-then-SET (which would race across processes)."""
+        redis_client = _FakeSyncRedis()
+        cache = RedisNonceCache(redis_client)
+        cache.seen("nonce-1", ttl=42.0)
+        assert redis_client.calls == [(cache._key("nonce-1"), "1", True, 42)]
+
+    def test_key_prefix_applied(self) -> None:
+        redis_client = _FakeSyncRedis()
+        cache = RedisNonceCache(redis_client, key_prefix="myapp:nonce:")
+        cache.seen("abc", ttl=60.0)
+        assert "myapp:nonce:abc" in redis_client.store
+
+    def test_ttl_floored_to_at_least_one_second(self) -> None:
+        """A sub-1s ttl must not produce ex=0, which Redis rejects."""
+        redis_client = _FakeSyncRedis()
+        cache = RedisNonceCache(redis_client)
+        cache.seen("nonce-1", ttl=0.4)
+        assert redis_client.calls[0][3] == 1
+
+    def test_protocol_satisfied(self) -> None:
+        def _use(cache: NonceCache) -> bool:
+            return cache.seen("x", 1.0)
+
+        assert _use(RedisNonceCache(_FakeSyncRedis())) is True
+
+
+class TestMultiWorkerReplayGap:
+    """H4's exact test spec: two middleware instances with separate default
+    (in-memory) caches must NOT catch a replay across them — documenting the
+    gap the finding describes — while a shared RedisNonceCache does."""
+
+    def test_default_in_memory_caches_do_not_share_replay_state(self) -> None:
+        """Documents the gap: pod A signs+verifies, pod B (a different
+        process, hence a different SigningMiddleware/cache instance) receives
+        the exact same captured message and does NOT reject it, because its
+        own in-memory nonce cache never saw the nonce."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        with pytest.warns(RuntimeWarning, match="in-memory"):
+            pod_a = SigningMiddleware(cfg)
+        with pytest.warns(RuntimeWarning, match="in-memory"):
+            pod_b = SigningMiddleware(cfg)
+
+        call_next = MagicMock(return_value="ok")
+        envelope = _make_envelope(routing_key="payments.charge")
+        pod_a.publish_scope(call_next, envelope)
+        signed_env = call_next.call_args[0][0]
+        msg = _make_message(
+            body=signed_env.body,
+            headers=dict(signed_env.headers),
+            routing_key=signed_env.routing_key,
+        )
+
+        pod_a.on_receive(msg)  # original consumer: accepted, nonce recorded locally
+
+        # The SAME captured message replayed against a different process
+        # ("pod B") with its own, separate in-memory cache: NOT rejected.
+        # This is the H4 gap — it is not a bug in this test, it demonstrates
+        # why the in-memory default is insufficient across processes.
+        pod_b.on_receive(msg)  # does not raise
+
+    def test_shared_redis_cache_catches_the_same_replay(self) -> None:
+        """The same scenario, but both processes share a RedisNonceCache
+        (as if pointed at the same Redis instance) — the replay IS caught."""
+        shared_redis = _FakeSyncRedis()
+        cfg = SigningConfig(
+            secret_key=SECRET,
+            require_freshness=True,
+            nonce_cache=RedisNonceCache(shared_redis),
+        )
+        pod_a = SigningMiddleware(cfg)
+        pod_b = SigningMiddleware(cfg)  # different instance, SAME shared cache
+
+        call_next = MagicMock(return_value="ok")
+        envelope = _make_envelope(routing_key="payments.charge")
+        pod_a.publish_scope(call_next, envelope)
+        signed_env = call_next.call_args[0][0]
+        msg = _make_message(
+            body=signed_env.body,
+            headers=dict(signed_env.headers),
+            routing_key=signed_env.routing_key,
+        )
+
+        pod_a.on_receive(msg)  # accepted, nonce recorded in shared Redis
+
+        with pytest.raises(InvalidSignatureError, match="Replay detected"):
+            pod_b.on_receive(msg)  # same nonce, different process -> caught
+
+
+class TestDefaultInMemoryCacheWarning:
+    """H4: construction-time warning when the risky combination (default
+    in-memory cache + require_freshness=True) is left in place."""
+
+    def test_warns_with_default_cache_and_require_freshness(self) -> None:
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True)
+        with pytest.warns(RuntimeWarning, match="multi-process"):
+            SigningMiddleware(cfg)
+
+    def test_no_warning_with_explicit_nonce_cache(self) -> None:
+        cfg = SigningConfig(
+            secret_key=SECRET,
+            require_freshness=True,
+            nonce_cache=RedisNonceCache(_FakeSyncRedis()),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            SigningMiddleware(cfg)  # must not raise/warn
+
+    def test_no_warning_when_require_freshness_false(self) -> None:
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            SigningMiddleware(cfg)  # must not raise/warn
+
+
+class TestNonceIndependentOfMessageId:
+    """H4: the nonce must always be a fresh random value, never derived from
+    (or equal to) the caller-supplied message_id."""
+
+    def test_nonce_differs_from_message_id(self) -> None:
+        cfg = SigningConfig(secret_key=SECRET)
+        mw = SigningMiddleware(cfg)
+        envelope = _make_envelope(message_id="stable-id-reused-across-retries")
+
+        call_next = MagicMock(return_value="ok")
+        mw.publish_scope(call_next, envelope)
+        signed_env = call_next.call_args[0][0]
+
+        nonce = signed_env.headers[SigningMiddleware._NONCE_HEADER]
+        assert nonce != "stable-id-reused-across-retries"
+
+    def test_two_publishes_with_same_message_id_get_different_nonces(self) -> None:
+        """A retried publish reusing the same message_id must still get a
+        fresh nonce each time (an attacker/bug reusing message_id must not
+        be able to force nonce reuse)."""
+        cfg = SigningConfig(secret_key=SECRET)
+        mw = SigningMiddleware(cfg)
+        envelope = _make_envelope(message_id="same-id")
+
+        call_next = MagicMock(return_value="ok")
+        mw.publish_scope(call_next, envelope)
+        nonce_1 = call_next.call_args[0][0].headers[SigningMiddleware._NONCE_HEADER]
+        mw.publish_scope(call_next, envelope)
+        nonce_2 = call_next.call_args[0][0].headers[SigningMiddleware._NONCE_HEADER]
+
+        assert nonce_1 != nonce_2
+
+
+class TestMaxSkewDefaultTightened:
+    def test_default_max_skew_is_60_seconds(self) -> None:
+        cfg = SigningConfig(secret_key=SECRET)
+        assert cfg.max_skew == 60.0

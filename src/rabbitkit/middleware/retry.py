@@ -159,8 +159,37 @@ class RetryMiddleware(BaseMiddleware):
         self._mark_terminal_and_raise(exc, classified.severity, retry_count)
 
     def _get_retry_count(self, message: RabbitMessage) -> int:
-        """Get current retry count from message headers."""
-        return int(message.headers.get(self._config.retry_header, 0))
+        """Get current retry count from message headers, clamped to
+        ``[0, max_retries]`` (H5).
+
+        The header is read verbatim from an inbound AMQP message — nothing
+        distinguishes a value written by this middleware's own delay-queue
+        round trip from one set directly by an untrusted producer (there is
+        no broker-side attestation of provenance for a plain header). Without
+        clamping, a producer could set it negative (``attempt = retry_count +
+        1`` in :meth:`_build_retry_envelope` would then be <= 0, producing a
+        delay-queue routing key like ``...retry.-4`` that was never declared
+        — the retry publish silently targets a non-existent queue and the
+        message is lost rather than retried) or absurdly large (forcing every
+        message straight to the DLQ, skipping retries entirely). Clamping
+        makes ``max_retries`` an enforced ceiling regardless of what the
+        header claims, independent of its configured value being read from a
+        trusted or untrusted source. A malformed (non-numeric) header value
+        is treated the same as missing (0) rather than raising, so a garbage
+        header degrades to "start of the retry sequence" instead of crashing
+        the pipeline.
+
+        For a broker-enforced backstop on top of this (e.g. against a
+        misbehaving consumer that never expires/dead-letters a message),
+        prefer quorum source queues with ``x-delivery-limit`` — see
+        ``docs/retry-and-dlq.md``.
+        """
+        raw = message.headers.get(self._config.retry_header, 0)
+        try:
+            retry_count = int(raw)
+        except (TypeError, ValueError):
+            retry_count = 0
+        return max(0, min(retry_count, self._config.max_retries))
 
     def _compute_delay(self, retry_count: int) -> int:
         """Compute delay for this retry attempt (with jitter)."""

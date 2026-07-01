@@ -67,6 +67,7 @@ class AsyncBroker:
         di_resolver: Any | None = None,
         context_repo: Any | None = None,
         batch_config: BatchPublishConfig | None = None,
+        middlewares: list[Any] | None = None,
     ) -> None:
         self._config = config or RabbitConfig()
         # Private mutable view of consumer config — brokers may apply a
@@ -80,6 +81,17 @@ class AsyncBroker:
             di_resolver=di_resolver,
             context_repo=context_repo,
         )
+
+        # C3: middlewares applied to every broker.publish() call — the primary
+        # producer API. Distinct from @subscriber(middlewares=[...]), which
+        # only wraps a route's HANDLER-RESULT publishes (Contract 5); without
+        # this, e.g. SigningMiddleware never signed anything published via
+        # broker.publish() directly. The composed chain is cached by this
+        # list's identity (see HandlerPipeline.compose_broker_publish_async), so
+        # set the full list via this constructor param — mutating it in place
+        # after the first publish() call would silently reuse the stale
+        # pre-mutation chain.
+        self._publish_middlewares: list[Any] = middlewares or []
 
         self._batch_config = batch_config
         self._batch_publisher: Any | None = None  # BatchPublisher, started lazily in start()
@@ -139,6 +151,16 @@ class AsyncBroker:
     @property
     def config(self) -> RabbitConfig:
         return self._config
+
+    @property
+    def publish_middlewares(self) -> list[Any]:
+        """Middlewares applied to every ``broker.publish()`` call (e.g. signing).
+
+        Set via the constructor's ``middlewares=`` param. See the comment on
+        ``self._publish_middlewares`` for why reassigning (not mutating) is
+        required to change this after construction.
+        """
+        return self._publish_middlewares
 
     @property
     def routes(self) -> list[RouteDefinition]:
@@ -429,10 +451,23 @@ class AsyncBroker:
                 )
 
     async def stop(self, timeout: float | None = None) -> None:
-        """Stop the broker - stop pool, cancel consumers, drain, disconnect.
+        """Stop the broker - cancel consumers, drain pool, drain in-flight, disconnect.
 
         ``timeout`` defaults to ``ConsumerConfig.graceful_timeout`` (C-2). The
         whole sequence is bounded by an overall deadline.
+
+        C5: consumers are cancelled FIRST, before the worker pool is drained.
+        Draining the pool before cancelling left the consumer active for the
+        entire (potentially graceful_timeout-long) drain wait — a message
+        delivered in that window was submitted via ``AsyncWorkerPool.submit()``,
+        which creates a task unconditionally (it never checks ``_running``) and
+        adds it to ``_tasks``. If that submit happens after ``.stop()`` already
+        cleared ``_tasks``, the new task is never awaited by anything — an
+        orphaned background task racing the event loop's shutdown, with the
+        message never cleanly settled before ``disconnect()``, so it is
+        redelivered (duplicate-processing risk) on the next connection.
+        Cancelling first stops new deliveries outright, so the pool only ever
+        drains work that was already in flight.
         """
         if not self._started:
             return
@@ -442,17 +477,19 @@ class AsyncBroker:
         effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
         deadline = None if effective is None else time.monotonic() + effective
 
-        # Stop worker pool first (let in-flight tasks finish), bounded by deadline.
-        if self._worker_pool is not None:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            await self._worker_pool.stop(timeout=remaining)
-            self._worker_pool = None
-
-        # Cancel all consumers (stop new deliveries before draining).
+        # Cancel all consumers FIRST — stop new deliveries before draining
+        # anything, so nothing new arrives while the pool/in-flight drain runs.
         assert self._transport is not None
         for route in self._registry.routes:
             if route.consumer_tag:
                 await self._transport.cancel_consumer(route.consumer_tag)
+
+        # Drain the worker pool (let in-flight pooled tasks finish), bounded by
+        # the outer deadline.
+        if self._worker_pool is not None:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            await self._worker_pool.stop(timeout=remaining)
+            self._worker_pool = None
 
         # Drain inline in-flight handlers (C-2).
         await self._wait_in_flight(deadline)
@@ -509,6 +546,13 @@ class AsyncBroker:
         = fc``), a publish slot is acquired/released around the transport publish
         so backpressure/rate-limiting applies to the hot path. Without a
         controller this is a plain pass-through.
+
+        When ``middlewares=[...]`` was passed to the constructor, each
+        middleware's ``publish_scope_async`` wraps this call (e.g.
+        ``SigningMiddleware`` signs the envelope) — see ``publish_middlewares``.
+        Middleware wraps OUTSIDE both flow control and batching, so a
+        middleware-transformed envelope is what gets rate-limited/batched, and
+        what actually reaches the wire.
         """
         if envelope is None:
             import json as _json
@@ -540,20 +584,27 @@ class AsyncBroker:
             else self._transport.publish
         )
 
-        fc = self._flow_controller
-        if fc is not None:
-            if not await fc.acquire_async():
-                return PublishOutcome(
-                    status=PublishStatus.ERROR,
-                    exchange=envelope.exchange,
-                    routing_key=envelope.routing_key,
-                    error=BackpressureError("publish dropped by backpressure policy"),
-                )
-            try:
-                return await publish_fn(envelope)  # type: ignore[no-any-return]
-            finally:
-                await fc.release_async()
-        return await publish_fn(envelope)  # type: ignore[no-any-return]
+        async def do_publish(env: MessageEnvelope) -> PublishOutcome:
+            fc = self._flow_controller
+            if fc is not None:
+                if not await fc.acquire_async():
+                    return PublishOutcome(
+                        status=PublishStatus.ERROR,
+                        exchange=env.exchange,
+                        routing_key=env.routing_key,
+                        error=BackpressureError("publish dropped by backpressure policy"),
+                    )
+                try:
+                    return await publish_fn(env)  # type: ignore[no-any-return]
+                finally:
+                    await fc.release_async()
+            return await publish_fn(env)  # type: ignore[no-any-return]
+
+        if self._publish_middlewares:
+            chain = self._pipeline.compose_broker_publish_async(self._publish_middlewares)
+            outcome: PublishOutcome = await chain(envelope, do_publish)
+            return outcome
+        return await do_publish(envelope)
 
     async def request(
         self,

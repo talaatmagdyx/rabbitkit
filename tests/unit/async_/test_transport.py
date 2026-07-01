@@ -302,6 +302,102 @@ class TestPublish:
         assert not outcome.ok
         assert outcome.status == PublishStatus.ERROR
 
+    @pytest.mark.asyncio
+    async def test_publish_mandatory_uses_dedicated_confirm_channel(self) -> None:
+        """H1: mandatory=True routes through _get_mandatory_channel() — always
+        publisher_confirms=True + on_return_raises=True — regardless of the
+        transport's own confirm_delivery setting, so an unroutable return is
+        reliably detectable."""
+        transport = _make_transport(confirm_delivery=False)
+        channel = await self._connect_transport(transport)
+
+        mock_exchange = AsyncMock()
+        channel.get_exchange = AsyncMock(return_value=mock_exchange)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex", mandatory=True)
+
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            outcome = await transport.publish(envelope)
+
+        assert outcome.ok
+        mock_exchange.publish.assert_called_once()
+        transport._conn_pool._publisher_connection.channel.assert_any_call(
+            publisher_confirms=True, on_return_raises=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_publish_unroutable_mandatory_returns_returned_status(self) -> None:
+        """H1: aio_pika.exceptions.PublishError (broker returned the message —
+        no matching binding) must map to PublishStatus.RETURNED, not the
+        generic ERROR."""
+        import aio_pika.exceptions
+
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_exchange = AsyncMock()
+        mock_exchange.publish.side_effect = aio_pika.exceptions.PublishError.__new__(
+            aio_pika.exceptions.PublishError
+        )
+        channel.get_exchange = AsyncMock(return_value=mock_exchange)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex", mandatory=True)
+
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            outcome = await transport.publish(envelope)
+
+        assert not outcome.ok
+        assert outcome.status == PublishStatus.RETURNED
+        assert outcome.error is not None
+
+    @pytest.mark.asyncio
+    async def test_publish_nacked_by_broker_returns_nacked_status(self) -> None:
+        """H1: a plain aio_pika.exceptions.DeliveryError (broker Basic.Nack,
+        not a return) must map to PublishStatus.NACKED, not the generic ERROR."""
+        import aio_pika.exceptions
+
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_exchange = AsyncMock()
+        mock_exchange.publish.side_effect = aio_pika.exceptions.DeliveryError.__new__(
+            aio_pika.exceptions.DeliveryError
+        )
+        channel.get_exchange = AsyncMock(return_value=mock_exchange)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex")
+
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            outcome = await transport.publish(envelope)
+
+        assert not outcome.ok
+        assert outcome.status == PublishStatus.NACKED
+        assert outcome.error is not None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_mandatory_publish_channel(self) -> None:
+        """The dedicated mandatory-publish channel must be closed and reset
+        on disconnect(), matching the fast-channel cleanup."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        channel.get_exchange = AsyncMock(return_value=AsyncMock())
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex", mandatory=True)
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            await transport.publish(envelope)
+
+        assert transport._mandatory_publish_channel is not None
+        channel.is_closed = False
+
+        await transport.disconnect()
+
+        assert transport._mandatory_publish_channel is None
+        channel.close.assert_called()
+
 
 # ── Consume ──────────────────────────────────────────────────────────────
 
@@ -1145,6 +1241,31 @@ class TestGetFastChannel:
 
         with pytest.raises(RuntimeError, match="Publisher connection is not available"):
             await transport._get_fast_channel()
+
+
+# ── _get_mandatory_channel (H1) ──────────────────────────────────────────
+
+
+class TestGetMandatoryChannel:
+    @pytest.mark.asyncio
+    async def test_get_mandatory_channel_reuses_existing_open_channel(self) -> None:
+        """Line 317: _get_mandatory_channel() returns existing open channel."""
+        transport = _make_transport()
+        existing_ch = MagicMock()
+        existing_ch.is_closed = False
+        transport._mandatory_publish_channel = existing_ch
+
+        ch = await transport._get_mandatory_channel()
+        assert ch is existing_ch
+
+    @pytest.mark.asyncio
+    async def test_get_mandatory_channel_raises_when_no_publisher_connection(self) -> None:
+        """Line 324: _get_mandatory_channel() raises RuntimeError when no conn."""
+        transport = _make_transport()
+        transport._conn_pool._publisher_connection = None
+
+        with pytest.raises(RuntimeError, match="Publisher connection is not available"):
+            await transport._get_mandatory_channel()
 
 
 # ── _publish_on_channel timeout ───────────────────────────────────────────

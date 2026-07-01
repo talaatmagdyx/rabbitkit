@@ -232,6 +232,16 @@ class HandlerPipeline:
         self._publish_chain_async_cache: dict[
             int, Callable[[MessageEnvelope, Callable[[MessageEnvelope], Awaitable[PublishOutcome]]], Awaitable[Any]]
         ] = {}
+        # C3: broker-level publish middleware chains — keyed by id(middlewares),
+        # the SAME list object a broker stores once at construction (see
+        # compose_broker_publish_sync/_async). Separate from the route-keyed
+        # caches above because broker.publish() is not route-scoped.
+        self._broker_publish_chain_cache: dict[
+            int, Callable[[MessageEnvelope, Callable[[MessageEnvelope], PublishOutcome]], Any]
+        ] = {}
+        self._broker_publish_chain_async_cache: dict[
+            int, Callable[[MessageEnvelope, Callable[[MessageEnvelope], Awaitable[PublishOutcome]]], Awaitable[Any]]
+        ] = {}
 
     def clear_caches(self) -> None:
         """Drop all per-route caches.
@@ -247,11 +257,88 @@ class HandlerPipeline:
         that case the stale entries (keyed by the old ``id``) would otherwise
         linger. Call this on reconnect/restart to reclaim them — the next
         message rebuilds the chain lazily.
+
+        Does NOT clear the broker-level publish chain caches
+        (``_broker_publish_chain_cache`` / ``_broker_publish_chain_async_cache``)
+        — those are keyed by the broker's ``publish_middlewares`` list, which is
+        set once at construction and never mutated in place, so they cannot go
+        stale the way route-keyed caches can.
         """
         self._consume_chain_cache.clear()
         self._consume_chain_async_cache.clear()
         self._publish_chain_cache.clear()
         self._publish_chain_async_cache.clear()
+
+    def compose_broker_publish_sync(
+        self,
+        middlewares: list[Any],
+    ) -> Callable[[MessageEnvelope, Callable[[MessageEnvelope], PublishOutcome]], Any]:
+        """Compose broker-level ``publish_scope`` middlewares into a reusable chain.
+
+        Unlike :meth:`_compose_publish_sync` (which wraps a route's
+        HANDLER-RESULT publishes per Contract 5), this wraps ``broker.publish()``
+        itself — the primary producer API — so middleware such as signing or
+        tracing actually applies to direct publishes, not just replies/results.
+
+        Cached by ``id(middlewares)``: callers must pass the SAME list object on
+        every call (e.g. a broker stores it once at construction) for the cache
+        to hit — see :meth:`clear_caches`.
+        """
+        cached = self._broker_publish_chain_cache.get(id(middlewares))
+        if cached is not None:
+            return cached
+
+        def leaf(env: MessageEnvelope, fn: Callable[[MessageEnvelope], PublishOutcome]) -> Any:
+            return fn(env)
+
+        chain: Callable[[MessageEnvelope, Callable[[MessageEnvelope], PublishOutcome]], Any] = leaf
+        for mw in reversed(middlewares):
+            nxt = chain
+
+            def wrapped(
+                env: MessageEnvelope,
+                fn: Callable[[MessageEnvelope], PublishOutcome],
+                _mw: Any = mw,
+                _nxt: Any = nxt,
+            ) -> Any:
+                return _mw.publish_scope(lambda e: _nxt(e, fn), env)
+
+            chain = wrapped
+        self._broker_publish_chain_cache[id(middlewares)] = chain
+        return chain
+
+    def compose_broker_publish_async(
+        self,
+        middlewares: list[Any],
+    ) -> Callable[[MessageEnvelope, Callable[[MessageEnvelope], Awaitable[PublishOutcome]]], Awaitable[Any]]:
+        """Async variant of :meth:`compose_broker_publish_sync`."""
+        cached = self._broker_publish_chain_async_cache.get(id(middlewares))
+        if cached is not None:
+            return cached
+
+        async def leaf(
+            env: MessageEnvelope,
+            fn: Callable[[MessageEnvelope], Awaitable[PublishOutcome]],
+        ) -> Any:
+            return await fn(env)
+
+        chain: Callable[[MessageEnvelope, Callable[[MessageEnvelope], Awaitable[PublishOutcome]]], Awaitable[Any]] = (
+            leaf
+        )
+        for mw in reversed(middlewares):
+            nxt = chain
+
+            async def wrapped(
+                env: MessageEnvelope,
+                fn: Callable[[MessageEnvelope], Awaitable[PublishOutcome]],
+                _mw: Any = mw,
+                _nxt: Any = nxt,
+            ) -> Any:
+                return await _mw.publish_scope_async(lambda e: _nxt(e, fn), env)
+
+            chain = wrapped
+        self._broker_publish_chain_async_cache[id(middlewares)] = chain
+        return chain
 
     def process_sync(
         self,

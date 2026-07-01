@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -209,6 +210,7 @@ class TestSyncConnectionPool:
             security_config=SecurityConfig(),
         )
         import builtins
+
         real_import = builtins.__import__
 
         def import_blocker(name: str, *args, **kwargs):
@@ -252,6 +254,7 @@ class TestSyncChannelPoolEdgeCases:
         # after acquire() starts blocking on self._pool.get().
         def release_after_delay() -> None:
             import time
+
             time.sleep(0.05)
             pool._pool.put_nowait(ready_channel)
 
@@ -317,3 +320,225 @@ class TestSyncChannelPoolEdgeCases:
         # Should not raise
         pool.close_all()
         assert pool.created_count == 0
+
+
+# ── I-6: acquire() must decrement _created on a closed pooled channel ──────
+
+
+class TestSyncChannelPoolCreatedLeak:
+    """I-6: pulling a closed channel from the pool must not inflate _created."""
+
+    def test_acquire_closed_pooled_channel_decrements_created(self) -> None:
+        """A closed channel found in the pool is discarded and _created is
+        decremented before a fresh channel is created, so the count stays
+        consistent (regression for the acquire() _created leak)."""
+        mock_conn = MagicMock()
+
+        closed_channel = MagicMock()
+        closed_channel.is_open = False
+
+        fresh_channel = MagicMock()
+        fresh_channel.is_open = True
+        mock_conn.channel.return_value = fresh_channel
+
+        pool = SyncChannelPool(mock_conn, pool_size=5)
+
+        # Pre-load the pool with a closed channel and pretend it was created.
+        pool._pool.put_nowait(closed_channel)
+        pool._created = 1
+
+        # acquire() pulls the closed channel, decrements _created, then creates
+        # a fresh one (incrementing back to 1).
+        ch = pool.acquire()
+        assert ch is fresh_channel
+        assert pool.created_count == 1  # not 2 — the stale slot was reclaimed
+        mock_conn.channel.assert_called_once_with()
+
+    def test_acquire_closed_then_open_keeps_created_consistent(self) -> None:
+        """Repeated acquire/release with a closed channel in the pool does not
+        monotonically grow _created."""
+        mock_conn = MagicMock()
+
+        closed_channel = MagicMock()
+        closed_channel.is_open = False
+
+        fresh_channel = MagicMock()
+        fresh_channel.is_open = True
+        mock_conn.channel.return_value = fresh_channel
+
+        pool = SyncChannelPool(mock_conn, pool_size=5)
+        pool._pool.put_nowait(closed_channel)
+        pool._created = 1
+
+        ch1 = pool.acquire()  # discards closed, creates fresh
+        assert pool.created_count == 1
+        pool.release(ch1)  # back in pool, _created stays 1
+        assert pool.created_count == 1
+        ch2 = pool.acquire()  # reuses the released open channel
+        assert ch2 is fresh_channel
+        assert pool.created_count == 1  # no inflation
+
+
+# ── perf-M-2: sync channel creation must not happen under the pool lock ──────
+
+
+class TestSyncChannelPoolCreateOutsideLock:
+    """perf-M-2: ``acquire()`` creates the AMQP channel OUTSIDE the pool lock so
+    concurrent acquires don't serialize on the network round-trip during
+    warmup/refill.
+    """
+
+    def test_concurrent_acquire_does_not_serialize_on_channel_creation(self) -> None:
+        import threading
+        import time
+
+        in_flight = 0
+        max_concurrent = 0
+        guard = threading.Lock()
+
+        def channel(*args: object, **kwargs: object) -> Any:
+            nonlocal in_flight, max_concurrent
+            with guard:
+                in_flight += 1
+                max_concurrent = max(max_concurrent, in_flight)
+            time.sleep(0.05)  # simulate a network round-trip
+            with guard:
+                in_flight -= 1
+            ch = MagicMock()
+            ch.is_open = True
+            return ch
+
+        conn = MagicMock()
+        conn.channel = channel
+        pool = SyncChannelPool(conn, pool_size=5)
+
+        results: list[Any] = []
+        barrier = threading.Barrier(5)
+
+        def acquire_one() -> None:
+            barrier.wait()
+            results.append(pool.acquire())
+
+        threads = [threading.Thread(target=acquire_one) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        assert len(results) == 5
+        assert pool.created_count == 5
+        assert max_concurrent > 1, "channel creation was serialized under the pool lock"
+
+    def test_acquire_creation_failure_returns_reserved_slot(self) -> None:
+        """If channel() raises, the reserved _created slot is returned."""
+        calls = 0
+
+        def channel(*args: object, **kwargs: object) -> Any:
+            nonlocal calls
+            calls += 1
+            raise ConnectionError("broker refused channel")
+
+        conn = MagicMock()
+        conn.channel = channel
+        pool = SyncChannelPool(conn, pool_size=3, acquire_timeout=0.2)
+
+        with pytest.raises(ConnectionError):
+            pool.acquire()
+
+        assert pool.created_count == 0
+        assert calls == 1
+
+
+# ── SyncChannelPool uncovered lines 114-115, 121-123, 150-154, 162-168 ────
+
+
+class TestSyncChannelPoolUncoveredLines:
+    """Tests to cover the remaining uncovered lines in SyncChannelPool."""
+
+    def test_acquire_timeout_raises_when_pool_exhausted(self) -> None:
+        """Lines 114-115: queue.Empty from pool.get(timeout=...) raises TimeoutError."""
+        mock_conn = MagicMock()
+        # Pool size=1, pre-fill _created=1 so no new channel can be created.
+        # Pool queue is empty so get_nowait raises Empty → falls into blocking path.
+        # Use a tiny acquire_timeout so the blocking get() times out quickly.
+        pool = SyncChannelPool(mock_conn, pool_size=1, acquire_timeout=0.05)
+        pool._created = 1  # pretend the one slot is checked out; pool queue is empty
+
+        with pytest.raises(TimeoutError, match="Timed out after"):
+            pool.acquire()
+
+    def test_acquire_stale_channel_after_blocking_wait_recurses(self) -> None:
+        """Lines 121-123: stale (closed) channel returned from blocking get() triggers
+        decrement + recurse. After decrement, _created < pool_size so the recursive
+        acquire() creates a fresh channel via connection.channel()."""
+        import threading
+
+        fresh_channel = MagicMock()
+        fresh_channel.is_open = True
+
+        mock_conn = MagicMock()
+        mock_conn.channel.return_value = fresh_channel
+
+        pool = SyncChannelPool(mock_conn, pool_size=2, acquire_timeout=5.0)
+        # Pretend both slots are allocated so the first get_nowait raises Empty
+        # and we fall into the blocking-wait path (pool queue is empty, _created==2).
+        pool._created = 2
+
+        stale_channel = MagicMock()
+        stale_channel.is_open = False
+
+        def release_stale() -> None:
+            import time
+
+            time.sleep(0.05)
+            # Put the closed/stale channel so blocking get() returns it.
+            # The code then decrements _created (2→1) and recurses.
+            # In the recursive call: _created(1) < pool_size(2) → creates fresh_channel.
+            pool._pool.put_nowait(stale_channel)
+
+        t = threading.Thread(target=release_stale, daemon=True)
+        t.start()
+
+        result = pool.acquire()
+        t.join(timeout=5.0)
+
+        assert result is fresh_channel
+        mock_conn.channel.assert_called_once()
+
+    def test_acquire_ctx_context_manager(self) -> None:
+        """Lines 150-154: acquire_ctx() yields a channel and releases it on exit."""
+        mock_conn = MagicMock()
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_conn.channel.return_value = mock_channel
+
+        pool = SyncChannelPool(mock_conn, pool_size=5)
+
+        with pool.acquire_ctx() as ch:
+            assert ch is mock_channel
+            # Channel is currently in _in_use
+            assert ch in pool._in_use
+
+        # After context exit, channel is released back to the pool
+        assert ch not in pool._in_use
+        assert pool.size == 1  # returned to pool
+
+    def test_close_all_closes_in_use_channels(self) -> None:
+        """Lines 162-168: close_all() closes channels that are currently checked out."""
+        mock_conn = MagicMock()
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_conn.channel.return_value = mock_channel
+
+        pool = SyncChannelPool(mock_conn, pool_size=5)
+
+        # Acquire a channel so it lands in _in_use
+        ch = pool.acquire()
+        assert ch in pool._in_use
+
+        # close_all() should close the in-use channel
+        pool.close_all()
+
+        mock_channel.close.assert_called()
+        assert pool.created_count == 0
+        assert len(pool._in_use) == 0

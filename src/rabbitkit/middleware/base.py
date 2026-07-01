@@ -82,3 +82,23 @@ class BaseMiddleware:
     ) -> Any:
         """Wrap outgoing publish (async). Must call await call_next(envelope)."""
         return await call_next(envelope)
+
+
+class NoOpMiddleware(BaseMiddleware):
+    """Null Object middleware — zero-overhead pass-through.
+
+    Use as a default when no middleware is configured, eliminating
+    ``if collector is None: return call_next(...)`` branches on the hot path.
+    """
+
+    def consume_scope(self, call_next: Any, message: Any) -> Any:
+        return call_next(message)
+
+    async def consume_scope_async(self, call_next: Any, message: Any) -> Any:
+        return await call_next(message)
+
+    def publish_scope(self, call_next: Any, envelope: Any) -> Any:
+        return call_next(envelope)
+
+    async def publish_scope_async(self, call_next: Any, envelope: Any) -> Any:
+        return await call_next(envelope)

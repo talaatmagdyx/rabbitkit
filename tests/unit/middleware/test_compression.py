@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import gzip
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -290,3 +293,346 @@ class TestGetZstdMissing:
         with patch.dict(sys.modules, {"zstandard": None}):
             with pytest.raises(ImportError, match="zstandard is required"):
                 _get_zstd()
+
+
+# ── context reuse + size cap ─────────────────────────────────────────────
+
+
+class TestContextReuse:
+    @pytest.fixture(autouse=True)
+    def _check_zstd(self) -> None:
+        pytest.importorskip("zstandard")
+
+    def test_zstd_compressor_reused_within_thread(self) -> None:
+        """The same ZstdCompressor instance is reused across compress() calls in a thread."""
+        mw = CompressionMiddleware(CompressionConfig(algorithm="zstd", threshold=10, level=3))
+        mw.compress(b"x" * 100)
+        cctx1 = mw._get_cctx()
+        mw.compress(b"y" * 100)
+        cctx2 = mw._get_cctx()
+        assert cctx1 is cctx2  # reused within the same thread, not recreated
+
+    def test_zstd_decompressor_reused_within_thread(self) -> None:
+        """The same ZstdDecompressor instance is reused across decompress() calls in a thread."""
+        import zstandard
+
+        mw = CompressionMiddleware(CompressionConfig(algorithm="zstd", threshold=10, level=3))
+        cctx = zstandard.ZstdCompressor()
+        mw.decompress(cctx.compress(b"hello world " * 10), "zstd")
+        dctx1 = mw._get_dctx()
+        mw.decompress(cctx.compress(b"another payload " * 10), "zstd")
+        dctx2 = mw._get_dctx()
+        assert dctx1 is dctx2
+
+
+# ── streaming zip-bomb guard (I-2) ────────────────────────────────────────
+
+
+class TestStreamingBombGuard:
+    def test_gzip_bomb_raises_before_oom(self) -> None:
+        """A small compressed payload that decompresses huge raises ValueError
+        and never materialises the full decompressed output."""
+        # 1 byte repeated ~5 MB — compresses to a few KB.
+        bomb = b"\x00" * (5 * 1024 * 1024)
+        compressed = gzip.compress(bomb)
+        assert len(compressed) < 1024 * 1024  # small on the wire
+        mw = CompressionMiddleware(max_decompressed_size=1024 * 1024)  # 1 MB cap
+        with pytest.raises(ValueError, match="max_decompressed_size"):
+            mw.decompress(compressed, "gzip")
+
+    def test_gzip_within_cap_decompresses(self) -> None:
+        """A normal payload within the cap decompresses correctly."""
+        mw = CompressionMiddleware(max_decompressed_size=4096)
+        original = b"x" * 2048
+        compressed = gzip.compress(original)
+        result = mw.decompress(compressed, "gzip")
+        assert result == original
+
+    def test_gzip_cap_boundary_oversized_raises(self) -> None:
+        """A payload exceeding the cap by one byte raises exactly at the boundary."""
+        cap = 4096
+        mw = CompressionMiddleware(max_decompressed_size=cap)
+        original = b"x" * (cap + 1)
+        compressed = gzip.compress(original)
+        with pytest.raises(ValueError, match="max_decompressed_size"):
+            mw.decompress(compressed, "gzip")
+
+    def test_gzip_cap_boundary_at_cap_decompresses(self) -> None:
+        """A payload exactly at the cap decompresses."""
+        cap = 4096
+        mw = CompressionMiddleware(max_decompressed_size=cap)
+        original = b"x" * cap
+        compressed = gzip.compress(original)
+        result = mw.decompress(compressed, "gzip")
+        assert result == original
+
+    def test_zstd_bomb_raises_before_oom(self) -> None:
+        """zstd zip-bomb raises before materialising a huge output."""
+        zstandard = pytest.importorskip("zstandard")
+        bomb = b"\x00" * (5 * 1024 * 1024)
+        cctx = zstandard.ZstdCompressor()
+        compressed = cctx.compress(bomb)
+        assert len(compressed) < 1024 * 1024
+        mw = CompressionMiddleware(max_decompressed_size=1024 * 1024)
+        with pytest.raises(ValueError, match="max_decompressed_size"):
+            mw.decompress(compressed, "zstd")
+
+    def test_zstd_within_cap_decompresses(self) -> None:
+        zstandard = pytest.importorskip("zstandard")
+        mw = CompressionMiddleware(max_decompressed_size=4096)
+        original = b"x" * 2048
+        compressed = zstandard.ZstdCompressor().compress(original)
+        result = mw.decompress(compressed, "zstd")
+        assert result == original
+
+    @pytest.mark.asyncio
+    async def test_async_gzip_bomb_raises(self) -> None:
+        """A gzip bomb on the async path raises (offloaded, not on the loop)."""
+        bomb = b"\x00" * (5 * 1024 * 1024)
+        compressed = gzip.compress(bomb)
+        mw = CompressionMiddleware(max_decompressed_size=1024 * 1024)
+        msg = _make_message(body=compressed, content_encoding="gzip")
+        with pytest.raises(ValueError, match="max_decompressed_size"):
+            await mw.on_receive_async(msg)
+
+
+# ── zstd thread-safety (I-8) ──────────────────────────────────────────────
+
+
+class TestZstdThreadSafety:
+    @pytest.fixture(autouse=True)
+    def _check_zstd(self) -> None:
+        pytest.importorskip("zstandard")
+
+    @pytest.mark.parametrize("n_threads", [1, 2, 4, 8])
+    def test_concurrent_compress_round_trips(self, n_threads: int) -> None:
+        """Compressing from many threads concurrently produces outputs that all
+        decompress back to the input — no corruption from shared (non-thread-safe)
+        zstd contexts because each thread gets its own via threading.local()."""
+        config = CompressionConfig(algorithm="zstd", threshold=10, level=3)
+        mw = CompressionMiddleware(config)
+        payloads = [bytes([i % 256]) * (200 + i * 17) for i in range(50)]
+
+        results: dict[int, list[tuple[bytes, str | None]]] = {}
+
+        def worker(tid: int) -> None:
+            out: list[tuple[bytes, str | None]] = []
+            for p in payloads:
+                out.append(mw.compress(p))
+            results[tid] = out
+
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            list(pool.map(worker, range(n_threads)))
+
+        # Every compressed payload must decompress back to the original.
+        import zstandard
+
+        dctx = zstandard.ZstdDecompressor()
+        for tid, compressed_list in results.items():
+            assert len(compressed_list) == len(payloads)
+            for (data, enc), original in zip(compressed_list, payloads, strict=True):
+                assert enc == "zstd"
+                assert dctx.decompress(data) == original, f"corruption from thread {tid}"
+
+    def test_each_thread_gets_isolated_context(self) -> None:
+        """Different threads get distinct ZstdCompressor instances (threading.local)."""
+        mw = CompressionMiddleware(CompressionConfig(algorithm="zstd", threshold=10, level=3))
+        seen: list[object] = []
+        barrier = threading.Barrier(2)
+
+        def worker() -> None:
+            barrier.wait()
+            seen.append(mw._get_cctx())
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert len(seen) == 2
+        assert seen[0] is not seen[1]  # isolated per thread
+
+
+# ── async offload behaviour ──────────────────────────────────────────────
+
+
+class TestAsyncOffload:
+    @pytest.mark.asyncio
+    async def test_async_offloads_large_bodies(self) -> None:
+        """Bodies above the offload threshold are decompressed via to_thread."""
+        mw = CompressionMiddleware()
+        original = b"hello world " * 5000  # > 64KB
+        compressed = gzip.compress(original)
+        msg = _make_message(body=compressed, content_encoding="gzip")
+        await mw.on_receive_async(msg)
+        assert msg.body == original
+
+    @pytest.mark.asyncio
+    async def test_async_small_encoded_body_still_correct(self) -> None:
+        """A small-on-the-wire encoded body decompresses correctly (offloaded or inline)."""
+        mw = CompressionMiddleware()
+        original = b"hello world " * 10  # well below 64KB
+        compressed = gzip.compress(original)
+        msg = _make_message(body=compressed, content_encoding="gzip")
+        await mw.on_receive_async(msg)
+        assert msg.body == original
+
+    @pytest.mark.asyncio
+    async def test_async_no_encoding_noop(self) -> None:
+        """No content_encoding → on_receive_async is a no-op."""
+        mw = CompressionMiddleware()
+        msg = _make_message(body=b"raw data")
+        await mw.on_receive_async(msg)
+        assert msg.body == b"raw data"
+
+
+# ── decompression size cap (kept from prior suite) ───────────────────────
+
+
+class TestDecompressionSizeCap:
+    def test_oversized_gzip_decompression_raises(self) -> None:
+        """Decompressing a payload above max_decompressed_size raises ValueError."""
+        mw = CompressionMiddleware(max_decompressed_size=1024)
+        original = b"x" * 4096
+        compressed = gzip.compress(original)
+        with pytest.raises(ValueError, match="max_decompressed_size"):
+            mw.decompress(compressed, "gzip")
+
+    def test_within_cap_decompresses(self) -> None:
+        """Payloads at or below the cap decompress normally."""
+        mw = CompressionMiddleware(max_decompressed_size=4096)
+        original = b"x" * 2048
+        compressed = gzip.compress(original)
+        result = mw.decompress(compressed, "gzip")
+        assert result == original
+
+
+# ── zstd _get_dctx TypeError fallback (lines 83-84) ─────────────────────
+
+
+class TestZstdDctxTypeErrorFallback:
+    def test_older_zstandard_without_max_window_size(self) -> None:
+        """Lines 83-84: if ZstdDecompressor raises TypeError on max_window_size,
+        fall back to ZstdDecompressor() with no kwargs."""
+        zstandard = pytest.importorskip("zstandard")
+
+        mw = CompressionMiddleware()
+
+        real_decompressor_cls = zstandard.ZstdDecompressor
+        call_count = 0
+
+        def patched_decompressor(**kwargs: object) -> object:
+            nonlocal call_count
+            call_count += 1
+            if "max_window_size" in kwargs:
+                raise TypeError("unexpected keyword argument 'max_window_size'")
+            return real_decompressor_cls()
+
+        with patch("zstandard.ZstdDecompressor", side_effect=patched_decompressor):
+            dctx = mw._get_dctx()
+
+        assert dctx is not None
+        assert call_count == 2  # first with kwarg (TypeError), second without
+
+
+# ── gzip streaming: empty chunk + no tail exit (lines 131) ───────────────
+
+
+class TestGzipStreamingEmptyChunk:
+    def test_empty_chunk_and_tail_breaks_loop(self) -> None:
+        """Line 131: when decompress() returns b'' and unconsumed_tail is b''
+        and eof is False, the loop breaks to avoid spinning."""
+
+        class _StubDecomp:
+            """Fake decompressobj that returns empty on first decompress, then eof."""
+
+            def __init__(self) -> None:
+                self._calls = 0
+                self.eof = False
+                self.unconsumed_tail: bytes = b""
+
+            def decompress(self, data: bytes, max_length: int) -> bytes:
+                self._calls += 1
+                # On first call return empty with no tail and eof=False → triggers line 131
+                return b""
+
+            def flush(self) -> bytes:
+                return b""
+
+        stub = _StubDecomp()
+        mw = CompressionMiddleware()
+        with patch("zlib.decompressobj", return_value=stub):
+            result = mw._decompress_gzip_streaming(b"dummy")
+
+        assert result == b""
+
+    def test_flush_over_cap_raises(self) -> None:
+        """Line 134: when flush() returns data that pushes len(out) over the cap,
+        ValueError is raised."""
+        cap = 10
+
+        class _StubDecompFlush:
+            """Fake decompressobj where flush returns data exceeding the cap."""
+
+            def __init__(self) -> None:
+                self.eof = False
+                self.unconsumed_tail: bytes = b""
+
+            def decompress(self, data: bytes, max_length: int) -> bytes:
+                # Return empty immediately so loop breaks via line 131
+                return b""
+
+            def flush(self) -> bytes:
+                # Return data large enough to exceed the cap
+                return b"x" * (cap + 1)
+
+        stub = _StubDecompFlush()
+        mw = CompressionMiddleware(max_decompressed_size=cap)
+        with patch("zlib.decompressobj", return_value=stub):
+            with pytest.raises(ValueError, match="max_decompressed_size"):
+                mw._decompress_gzip_streaming(b"dummy")
+
+
+# ── zstd streaming size cap + ZstdError (lines 159, 162-167) ────────────
+
+
+class TestZstdStreamingZstdError:
+    def test_size_cap_exceeded_raises_value_error(self) -> None:
+        """Line 159: reader.read() returns data that exceeds max_decompressed_size.
+
+        Mocks the stream reader to return a chunk larger than the cap so the
+        `if len(out) > self._max_decompressed_size` branch fires at line 158-161.
+        """
+        pytest.importorskip("zstandard")
+
+        cap = 10
+        mw = CompressionMiddleware(max_decompressed_size=cap)
+
+        mock_reader = MagicMock()
+        # First read returns data exceeding the cap; second read would return b""
+        mock_reader.read.side_effect = [b"x" * (cap + 1), b""]
+
+        mock_dctx = MagicMock()
+        mock_dctx.stream_reader.return_value = mock_reader
+
+        with patch.object(mw, "_get_dctx", return_value=mock_dctx):
+            with pytest.raises(ValueError, match="max_decompressed_size"):
+                mw._decompress_zstd_streaming(b"some data")
+
+    def test_zstd_error_during_read_raises_value_error(self) -> None:
+        """Lines 162-167: ZstdError raised by stream_reader.read() is caught and
+        re-raised as ValueError."""
+        zstandard = pytest.importorskip("zstandard")
+
+        mw = CompressionMiddleware()
+
+        mock_reader = MagicMock()
+        mock_reader.read.side_effect = zstandard.ZstdError("frame too large")
+
+        mock_dctx = MagicMock()
+        mock_dctx.stream_reader.return_value = mock_reader
+
+        with patch.object(mw, "_get_dctx", return_value=mock_dctx):
+            with pytest.raises(ValueError, match="max_decompressed_size"):
+                mw._decompress_zstd_streaming(b"some data")

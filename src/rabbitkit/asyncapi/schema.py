@@ -6,7 +6,7 @@ import dataclasses
 import inspect
 from typing import Any, get_type_hints
 
-from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.message import is_rabbit_message_annotation
 
 
 def get_handler_body_type(handler: Any) -> type | None:
@@ -31,7 +31,7 @@ def get_handler_body_type(handler: Any) -> type | None:
         ann = hints.get(name, param.annotation)
         if ann is inspect.Parameter.empty:
             continue
-        if ann is RabbitMessage:
+        if is_rabbit_message_annotation(ann):
             continue
         # Skip Annotated types (DI markers)
         if getattr(ann, "__metadata__", None) is not None:

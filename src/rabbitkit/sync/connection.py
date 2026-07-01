@@ -70,6 +70,9 @@ def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
+    # Defense in depth: never negotiate below TLS 1.2.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
     # check_hostname must be disabled BEFORE setting verify_mode=CERT_NONE
     # (Python 3.12+ raises ValueError otherwise)
     if cert_reqs == ssl.CERT_NONE:
@@ -79,6 +82,19 @@ def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
 
     if ssl_config.ca_certs:
         ctx.load_verify_locations(ssl_config.ca_certs)
+    elif cert_reqs == ssl.CERT_REQUIRED:
+        # No explicit CA bundle configured — fall back to the system trust
+        # store so verification actually succeeds against broker certs
+        # signed by a well-known CA. Without this, CERT_REQUIRED + no ca_certs
+        # silently leaves the context with zero trusted CAs → every handshake
+        # fails. Guarded so the explicit-ca_certs path above is unchanged.
+        try:
+            ctx.load_default_certs()
+        except Exception:  # pragma: no cover — best effort, platform-dependent
+            try:
+                ctx.set_default_verify_paths()
+            except Exception:  # pragma: no cover
+                pass
 
     if ssl_config.certfile:
         ctx.load_cert_chain(
@@ -102,10 +118,7 @@ def make_pika_connection_params(
     try:
         import pika
     except ImportError:
-        raise ImportError(
-            "pika is required for sync transport. "
-            "Install it with: pip install rabbitkit[sync]"
-        ) from None
+        raise ImportError("pika is required for sync transport. Install it with: pip install rabbitkit[sync]") from None
 
     # SSL context
     ssl_context = build_ssl_context(security.ssl)

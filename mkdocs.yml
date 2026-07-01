@@ -1,0 +1,145 @@
+# MkDocs configuration for rabbitkit API documentation.
+#
+# Generate HTML docs:
+#   pip install mkdocs mkdocs-material mkdocstrings[python]
+#   mkdocs serve    # http://127.0.0.1:8000
+#   mkdocs build    # → site/ directory
+
+site_name: rabbitkit
+site_description: Production-grade RabbitMQ toolkit for Python — sync & async, decorator routing, middleware, retry, DI, RPC.
+site_url: https://github.com/talaatmagdy/rabbitkit
+repo_url: https://github.com/talaatmagdy/rabbitkit
+repo_name: talaatmagdy/rabbitkit
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - scheme: default
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: JetBrains Mono
+  icon:
+    logo: material/rabbit
+  favicon: assets/favicon.png
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - Overview: guide/overview.md
+      - Getting Started: guide/getting-started.md
+      - Full Guide: guide/full-guide.md
+      - Retry Architecture: rabbitmq-retry-architecture.md
+  - API Reference:
+      - Brokers: api/brokers.md
+      - Configuration: api/config.md
+      - Routing: api/routing.md
+      - Messages & Settlement: api/messages.md
+      - Middleware: api/middleware.md
+      - Dependency Injection: api/di.md
+      - Serialization: api/serialization.md
+      - High-Load: api/highload.md
+      - RPC: api/rpc.md
+      - Health Checks: api/health.md
+      - Locking: api/locking.md
+      - Streams: api/streams.md
+      - Management API: api/management.md
+      - Dashboard: api/dashboard.md
+      - AsyncAPI: api/asyncapi.md
+      - Results: api/results.md
+      - Testing: api/testing.md
+      - CLI: api/cli.md
+      - FastAPI: api/fastapi.md
+      - Core Internals: api/core.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            # Docstring style
+            docstring_style: google
+            # Show source code
+            show_source: true
+            # Show type annotations
+            show_type_hints: true
+            # Show signature
+            show_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            # Members
+            members_order: source
+            show_root_heading: true
+            show_root_full_path: false
+            show_category_heading: true
+            show_docstring_description: true
+            show_docstring_attributes: true
+            show_docstring_functions: true
+            show_docstring_classes: true
+            show_docstring_modules: true
+            show_docstring_examples: true
+            show_docstring_raises: true
+            show_docstring_returns: true
+            show_docstring_other: true
+            # Headings
+            heading_level: 2
+            # Inheritance
+            show_inheritance_diagram: false
+            show_subclasses: true
+            # Cross-references
+            crossref_type: short
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - attr_list
+  - md_in_html
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/talaatmagdy/rabbitkit
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/rabbitkit/
+
+extra_css:
+  - css/extra.css

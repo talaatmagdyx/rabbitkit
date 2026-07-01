@@ -46,7 +46,6 @@ With Management API integration (adds live queue stats)::
     mgmt = RabbitManagementClient(
         ManagementConfig(url="http://rabbitmq:15672", username="admin", password="secret")
     )
-    app = create_dashboard_app(broker, management_client=mgmt)
 
 With MetricsCollector (adds throughput / latency metrics from MetricsMiddleware)::
 
@@ -54,7 +53,6 @@ With MetricsCollector (adds throughput / latency metrics from MetricsMiddleware)
     from rabbitkit.dashboard import create_dashboard_app
 
     collector = MetricsCollector()
-    app = create_dashboard_app(broker, metrics_collector=collector)
 
 Health status values
 --------------------
@@ -71,26 +69,36 @@ Health status values
 
 from __future__ import annotations
 
+import logging
 from html import escape
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def create_dashboard_app(
     broker: Any,
     *,
-    management_client: Any | None = None,
-    metrics_collector: Any | None = None,
+    auth_token: str | None = None,
 ) -> Any:
     """Create an ASGI dashboard application.
 
-    SECURITY: this app has NO authentication and exposes broker topology
-    (queue/exchange names, consumer counts). Mount it behind authn (OIDC/reverse
-    proxy) and restrict it to an internal network — never expose it publicly.
+    SECURITY: by default this app has NO authentication and exposes broker
+    topology (queue/exchange names, consumer counts). Mount it behind authn
+    (OIDC/reverse proxy) and restrict it to an internal network — never expose
+    it publicly.
+
+    For a lightweight built-in guard, pass ``auth_token``: when set, every
+    route requires an ``Authorization: Bearer <auth_token>`` header and
+    returns ``401`` otherwise. When unset (default), all requests pass through
+    and a startup warning is logged reminding you not to expose the dashboard
+    publicly.
 
     Args:
         broker: A rabbitkit broker instance (SyncBroker or AsyncBroker).
-        management_client: Optional RabbitManagementClient for queue stats.
-        metrics_collector: Optional MetricsCollector for metrics.
+        auth_token: Optional bearer token. When set, all routes require
+            ``Authorization: Bearer <auth_token>``. When None, the dashboard
+            runs unauthenticated (a startup warning is emitted).
 
     Returns:
         A Starlette application.
@@ -100,7 +108,9 @@ def create_dashboard_app(
     """
     try:
         from starlette.applications import Starlette
-        from starlette.responses import HTMLResponse, JSONResponse
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request  # noqa: TC002  # lazy optional import
+        from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
         from starlette.routing import Route
     except ImportError:  # pragma: no cover
         raise ImportError(  # pragma: no cover
@@ -108,6 +118,16 @@ def create_dashboard_app(
         ) from None
 
     from rabbitkit.health import broker_health_check
+
+    if auth_token is None:
+        logger.warning("Dashboard running WITHOUT authentication — do not expose publicly")
+
+    class _BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next: Any) -> Response:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {auth_token}":
+                return PlainTextResponse("Unauthorized", status_code=401)
+            return await call_next(request)  # type: ignore[no-any-return]
 
     async def index(request: Any) -> Any:
         routes_count = len(broker.routes)
@@ -140,25 +160,29 @@ th {{ background: #f5f5f5; }}
 
     async def api_health(request: Any) -> Any:
         health = broker_health_check(broker)
-        return JSONResponse({
-            "status": health.status.value,
-            "started": health.started,
-            "connected": health.connected,
-            "consumer_count": health.consumer_count,
-            "route_count": health.route_count,
-        })
+        return JSONResponse(
+            {
+                "status": health.status.value,
+                "started": health.started,
+                "connected": health.connected,
+                "consumer_count": health.consumer_count,
+                "route_count": health.route_count,
+            }
+        )
 
     async def api_routes(request: Any) -> Any:
         routes = []
         for r in broker.routes:
-            routes.append({
-                "name": r.name,
-                "queue": r.queue.name,
-                "exchange": r.exchange.name if r.exchange else "",
-                "ack_policy": r.ack_policy.value,
-                "tags": sorted(r.tags) if r.tags else [],
-                "description": r.description,
-            })
+            routes.append(
+                {
+                    "name": r.name,
+                    "queue": r.queue.name,
+                    "exchange": r.exchange.name if r.exchange else "",
+                    "ack_policy": r.ack_policy.value,
+                    "tags": sorted(r.tags) if r.tags else [],
+                    "description": r.description,
+                }
+            )
         return JSONResponse(routes)
 
     app = Starlette(
@@ -168,4 +192,6 @@ th {{ background: #f5f5f5; }}
             Route("/api/routes", api_routes),
         ],
     )
+    if auth_token is not None:
+        app.add_middleware(_BearerAuthMiddleware)
     return app

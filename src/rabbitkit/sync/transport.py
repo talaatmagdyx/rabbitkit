@@ -13,6 +13,7 @@ TopologyMode: respected in declare_exchange/declare_queue/bind_queue.
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 import uuid
@@ -23,7 +24,9 @@ from typing import Any, TypeVar
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SocketConfig
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
 from rabbitkit.core.types import (
+    DIRECT_REPLY_TO_QUEUE,
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
@@ -53,19 +56,71 @@ class SyncTransport:
         security_config: SecurityConfig | None = None,
         topology_mode: TopologyMode = TopologyMode.AUTO_DECLARE,
         confirm_delivery: bool = True,
+        confirm_timeout: float = 5.0,
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._socket_config = socket_config or SocketConfig()
         self._security_config = security_config or SecurityConfig()
         self._topology_mode = topology_mode
+        self._topo = TopologyDispatcher(topology_mode)
         self._confirm_delivery = confirm_delivery
+        # I-10: bound the publish+confirm wait so a missing confirm cannot stall
+        # a worker forever. Brokers should pass ``config.publisher.confirm_timeout``
+        # here; the default is a sane fallback.
+        self._confirm_timeout = float(confirm_timeout)
 
         self._connection: Any = None  # pika.BlockingConnection
-        self._channel: Any = None  # pika.channel.Channel
+        self._channel: Any = None  # pika.channel.Channel (publisher/topology)
         self._connected = False
         self._consumer_tags: dict[str, str] = {}  # queue_name → consumer_tag
         self._owner_ident: int | None = None  # thread that owns the connection
         self._consuming = False  # True while the I/O loop is running
+
+        # Per-queue consumer channels (H-SRE1): each queue gets its own channel
+        # so per-queue basic_qos does not overwrite other consumers and fair
+        # dispatch is preserved. The publisher/topology channel stays separate.
+        self._consumer_channels: dict[str, Any] = {}
+
+        # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
+        # consume(declare=False), cleared on cancel/disconnect). RabbitMQ's
+        # direct reply-to requires the reply consumer and the corresponding
+        # request publish to happen on the SAME channel (a publish on a
+        # different channel raises "PRECONDITION_FAILED - fast reply consumer
+        # does not exist") — publish() checks this to route RPC requests
+        # correctly without RPCClient needing to know about channels at all.
+        self._reply_to_channel: Any = None
+
+        # Backpressure callbacks (FlowController registers here). Each is a
+        # zero-arg callable; pika's blocked/unblocked frames are adapted to it.
+        self._blocked_callbacks: list[Callable[[], None]] = []
+        self._unblocked_callbacks: list[Callable[[], None]] = []
+
+        # Reconnect bound (H-SRE4): never retry forever. Hardcoded sane default;
+        # the broker may override via attribute if desired.
+        self.max_reconnect_attempts: int = 0  # 0 == use the time-bounded default below
+        self._reconnect_total_timeout: float = 300.0
+
+    def on_blocked(self, callback: Callable[[], None]) -> None:
+        """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
+        self._blocked_callbacks.append(callback)
+
+    def on_unblocked(self, callback: Callable[[], None]) -> None:
+        """Register a connection-unblocked callback (e.g. FlowController.on_unblocked)."""
+        self._unblocked_callbacks.append(callback)
+
+    def _pika_blocked(self, _connection: Any, *_args: Any) -> None:
+        for cb in list(self._blocked_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never let a cb break the I/O loop
+                logger.exception("blocked callback raised")
+
+    def _pika_unblocked(self, _connection: Any, *_args: Any) -> None:
+        for cb in list(self._unblocked_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover
+                logger.exception("unblocked callback raised")
 
     def connect(self) -> None:
         """Establish connection to RabbitMQ."""
@@ -76,8 +131,7 @@ class SyncTransport:
             import pika
         except ImportError:
             raise ImportError(
-                "pika is required for sync transport. "
-                "Install it with: pip install rabbitkit[sync]"
+                "pika is required for sync transport. Install it with: pip install rabbitkit[sync]"
             ) from None
 
         params = make_pika_connection_params(
@@ -93,14 +147,29 @@ class SyncTransport:
         )
 
         self._connection = pika.BlockingConnection(params)
+        # Publisher/topology channel (confirm_delivery for publisher confirms).
         self._channel = self._connection.channel()
-
         if self._confirm_delivery:
             self._channel.confirm_delivery()
+
+        # Register connection blocked/unblocked callbacks (C-6) so a
+        # FlowController can throttle publishes when RabbitMQ raises an alarm.
+        try:
+            self._connection.add_on_connection_blocked_callback(self._pika_blocked)
+            self._connection.add_on_connection_unblocked_callback(self._pika_unblocked)
+        except Exception:  # pragma: no cover — older pika may lack these
+            logger.debug("Could not register blocked/unblocked callbacks")
 
         self._connected = True
         self._owner_ident = threading.get_ident()
         logger.info("Connected to RabbitMQ")
+
+    def __enter__(self) -> SyncTransport:
+        self.connect()
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.disconnect()
 
     def disconnect(self) -> None:
         """Close connection to RabbitMQ."""
@@ -108,6 +177,16 @@ class SyncTransport:
             return
 
         try:
+            # Close per-queue consumer channels first
+            for ch in list(self._consumer_channels.values()):
+                try:
+                    if ch.is_open:
+                        ch.close()
+                except Exception:  # pragma: no cover — best effort
+                    pass
+            self._consumer_channels.clear()
+            self._consumer_tags = {}
+
             if self._channel and self._channel.is_open:
                 self._channel.close()
             if self._connection and self._connection.is_open:
@@ -117,6 +196,7 @@ class SyncTransport:
         finally:
             self._connection = None
             self._channel = None
+            self._reply_to_channel = None
             self._connected = False
             self._owner_ident = None
             logger.info("Disconnected from RabbitMQ")
@@ -135,8 +215,29 @@ class SyncTransport:
         except Exception:
             return False
 
+    @property
+    def has_open_channels(self) -> bool:
+        """True when at least one consumer channel is open and all are open.
+
+        Transport-contract attribute (I-5) consumed by
+        :func:`rabbitkit.health._transport_consumers_alive`: when this is
+        ``False``, registered ``consumer_tag``s are treated as stale and the
+        health/readiness probes drop the consumer count. Backed by
+        ``self._consumer_channels`` so it reflects the per-queue channels
+        actually held by this transport.
+        """
+        channels = self._consumer_channels
+        return bool(channels) and all(ch.is_open for ch in channels.values())
+
     def _ensure_connected(self) -> None:
-        """Ensure connection is established, reconnecting if needed."""
+        """Ensure connection is established, reconnecting if needed.
+
+        Uses exponential backoff with full jitter (H-SRE3) to avoid the
+        thundering-herd problem when many clients reconnect at once, and is
+        bounded by a total-time/attempt cap (H-SRE4) so the loop can never
+        retry forever — on exhaustion it raises so the broker's run() recovery
+        can decide what to do.
+        """
         if self.is_connected():
             return
 
@@ -145,25 +246,47 @@ class SyncTransport:
         max_backoff = self._connection_config.reconnect_backoff_max
         connection_errors = get_connection_errors()
 
+        # Bounded reconnect: never infinite (H-SRE4). Hardcoded sane defaults.
+        max_attempts = self.max_reconnect_attempts or 30
+        total_deadline = time.monotonic() + self._reconnect_total_timeout
+        attempts = 0
+
         while True:
             try:
                 self.connect()
                 return
             except connection_errors as e:
+                attempts += 1
+                # Full jitter: sleep a random fraction of the current backoff to
+                # spread reconnects across clients (H-SRE3).
+                sleep_for = random.uniform(0.0, backoff)  # noqa: S311
                 logger.warning(
-                    "Connection failed, retrying in %.1fs: %s",
-                    backoff,
+                    "Connection failed, retrying in %.2fs (attempt %d): %s",
+                    sleep_for,
+                    attempts,
                     e,
                 )
-                time.sleep(backoff)
+                time.sleep(sleep_for)
                 backoff = min(backoff * 2, max_backoff)
+                if attempts >= max_attempts or time.monotonic() >= total_deadline:
+                    logger.critical(
+                        "Reconnect attempts exhausted after %d tries / %.0fs; giving up",
+                        attempts,
+                        self._reconnect_total_timeout,
+                    )
+                    raise
 
     def reconnect(self) -> None:
         """Force a fresh connection + channel (used by consumer recovery)."""
         self.disconnect()
         self._ensure_connected()
 
-    def _run_on_io_thread(self, fn: Callable[[], _T]) -> _T:
+    def _run_on_io_thread(
+        self,
+        fn: Callable[[], _T],
+        *,
+        timeout: float = 30.0,
+    ) -> _T:
         """Run a channel operation on the connection's I/O thread.
 
         pika's BlockingConnection is NOT thread-safe: every basic_* call must
@@ -172,19 +295,27 @@ class SyncTransport:
         loop via add_callback_threadsafe and block for its result/exception.
         When already on the owner thread (single worker / publisher), or when
         no consume loop is running to drain callbacks, run inline.
+
+        *timeout* bounds the wait for the I/O loop to drain the callback (R-3):
+        on expiry we raise ``TimeoutError`` AND mark the callback cancelled so a
+        late drain (after the caller has already nacked+requeued and moved on)
+        becomes a no-op instead of settling an already-redelivered message.
         """
-        if (
-            not self._consuming
-            or self._owner_ident is None
-            or threading.get_ident() == self._owner_ident
-        ):
+        if not self._consuming or self._owner_ident is None or threading.get_ident() == self._owner_ident:
             return fn()
 
         result: list[_T] = []
         error: list[BaseException] = []
         done = threading.Event()
+        # R-3: set when the caller gives up waiting, so a later _cb drain is a
+        # no-op rather than settling an already-redelivered message.
+        cancelled = threading.Event()
 
         def _cb() -> None:
+            if cancelled.is_set():
+                # The caller already timed out and moved on (nack+requeue).
+                # Running fn() now could double-settle, so drop the late callback.
+                return
             try:
                 result.append(fn())
             except BaseException as exc:  # re-raised on the caller thread
@@ -192,10 +323,19 @@ class SyncTransport:
             finally:
                 done.set()
 
-        # ponytail: blocks until the I/O loop drains the callback; a dead loop
-        # is handled one level up by consumer recovery, not a timeout here.
+        # ponytail: blocks until the I/O loop drains the callback. Bound the
+        # wait so a stalled/dead I/O loop can't pin the worker thread forever —
+        # on expiry we raise TimeoutError so the pipeline exception handler can
+        # nack+requeue and the worker is freed. 30s is well beyond any healthy
+        # round-trip (H-P7); the publish path passes a tighter bound (I-10).
+        io_stall_timeout = timeout
         self._connection.add_callback_threadsafe(_cb)
-        done.wait()
+        if not done.wait(timeout=io_stall_timeout):
+            cancelled.set()
+            raise TimeoutError(
+                f"Timed out after {io_stall_timeout}s waiting for the pika I/O "
+                "loop to drain a cross-thread callback (connection stalled?)"
+            )
         if error:
             raise error[0]
         return result[0]
@@ -204,9 +344,28 @@ class SyncTransport:
         """Publish a message to RabbitMQ.
 
         Returns PublishOutcome with status indicating success/failure.
+
+        A request with ``reply_to=DIRECT_REPLY_TO_QUEUE`` (RPCClient's direct
+        reply-to requests) is routed onto ``self._reply_to_channel`` — the same
+        channel that registered the reply consumer — rather than the default
+        publisher channel. RabbitMQ requires this exact channel affinity for
+        direct reply-to; publishing on a different channel raises
+        "PRECONDITION_FAILED - fast reply consumer does not exist".
         """
         self._ensure_connected()
 
+        channel = self._channel
+        if (
+            envelope.reply_to == DIRECT_REPLY_TO_QUEUE
+            and self._reply_to_channel is not None
+            and self._reply_to_channel.is_open
+        ):
+            channel = self._reply_to_channel
+
+        return self._publish_on_channel(channel, envelope)
+
+    def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+        """Publish *envelope* on a specific already-open channel."""
         try:
             import pika
 
@@ -228,14 +387,21 @@ class SyncTransport:
             if envelope.timestamp:
                 properties.timestamp = int(envelope.timestamp.timestamp())
 
+            # I-10: bound the publish+confirm wait by confirm_timeout so a
+            # missing confirm cannot stall the worker forever. pika's
+            # BlockingChannel confirm is synchronous on the owner thread, so
+            # the bound here is the cross-thread marshal timeout; on the owner
+            # thread basic_publish runs inline (the I/O loop drives the confirm).
+            publish_timeout = min(30.0, self._confirm_timeout)
             self._run_on_io_thread(
-                lambda: self._channel.basic_publish(
+                lambda: channel.basic_publish(
                     exchange=envelope.exchange,
                     routing_key=envelope.routing_key,
                     body=envelope.body,
                     properties=properties,
                     mandatory=envelope.mandatory,
-                )
+                ),
+                timeout=publish_timeout,
             )
 
             return PublishOutcome(
@@ -258,26 +424,47 @@ class SyncTransport:
         queue: str,
         callback: Callable[[RabbitMessage], None],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
         """Start consuming from a queue.
 
-        Returns the consumer tag.
+        Each queue gets its OWN channel so per-queue ``basic_qos`` is isolated
+        and no longer overwrites other consumers' prefetch (H-SRE1). The
+        publisher/topology channel stays separate. Returns the consumer tag.
+
+        ``no_ack=True`` starts a no-ack consumer: the broker auto-acks on
+        delivery, and the built ``RabbitMessage`` is not wired with settlement
+        functions (there is nothing to ack/nack/reject). The sync path never
+        declares the queue here regardless of ``declare`` (declaration is the
+        caller's responsibility via ``declare_queue()``); when ``declare=False``
+        and ``queue == DIRECT_REPLY_TO_QUEUE``, this consumer's channel is also
+        remembered as ``self._reply_to_channel`` so :meth:`publish` can route
+        matching requests onto the SAME channel — required by RabbitMQ's direct
+        reply-to (see :meth:`publish`).
         """
         self._ensure_connected()
 
-        self._channel.basic_qos(prefetch_count=prefetch)
+        # Dedicated channel per consumer queue for isolated QoS / fair dispatch.
+        consumer_channel = self._connection.channel()
+        consumer_channel.basic_qos(prefetch_count=prefetch)
+        self._consumer_channels[queue] = consumer_channel
+
+        if not declare and queue == DIRECT_REPLY_TO_QUEUE:
+            self._reply_to_channel = consumer_channel
 
         consumer_tag = f"rabbitkit.{uuid.uuid4()}"
 
         def on_message(ch: Any, method: Any, properties: Any, body: bytes) -> None:
             """Internal pika callback — builds RabbitMessage and calls user callback."""
-            message = self._build_message(method, properties, body)
+            message = self._build_message(ch, method, properties, body, no_ack=no_ack)
             callback(message)
 
-        self._channel.basic_consume(
+        consumer_channel.basic_consume(
             queue=queue,
             on_message_callback=on_message,
-            auto_ack=False,
+            auto_ack=no_ack,
             consumer_tag=consumer_tag,
         )
 
@@ -287,14 +474,15 @@ class SyncTransport:
 
     def declare_exchange(self, exchange: RabbitExchange) -> None:
         """Declare an exchange on RabbitMQ."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        action = self._topo.exchange_action(exchange)
+        if action is TopoAction.SKIP:
             return
 
         self._ensure_connected()
 
         kwargs = exchange.to_declare_kwargs()
 
-        if self._topology_mode == TopologyMode.PASSIVE_ONLY or exchange.passive:
+        if action is TopoAction.PASSIVE:
             self._channel.exchange_declare(
                 exchange=kwargs["exchange"],
                 passive=True,
@@ -304,14 +492,15 @@ class SyncTransport:
 
     def declare_queue(self, queue: RabbitQueue) -> None:
         """Declare a queue on RabbitMQ."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        action = self._topo.queue_action(queue)
+        if action is TopoAction.SKIP:
             return
 
         self._ensure_connected()
 
         kwargs = queue.to_declare_kwargs()
 
-        if self._topology_mode == TopologyMode.PASSIVE_ONLY or queue.passive:
+        if action is TopoAction.PASSIVE:
             self._channel.queue_declare(
                 queue=kwargs["queue"],
                 passive=True,
@@ -321,7 +510,7 @@ class SyncTransport:
 
     def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
         """Bind a queue to an exchange."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        if self._topo.binding_action() is TopoAction.SKIP:
             return
 
         self._ensure_connected()
@@ -340,7 +529,7 @@ class SyncTransport:
         arguments: dict[str, Any] | None = None,
     ) -> None:
         """Bind an exchange to another exchange (exchange-to-exchange binding)."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        if self._topo.binding_action() is TopoAction.SKIP:
             return
 
         self._ensure_connected()
@@ -357,31 +546,96 @@ class SyncTransport:
         if not self.is_connected():
             return
 
+        # Find the queue whose channel owns this consumer_tag (per-consumer
+        # channels - H-SRE1), cancel on THAT channel, then drop it.
+        queue_name: str | None = None
+        for q, tag in self._consumer_tags.items():
+            if tag == consumer_tag:
+                queue_name = q
+                break
+
+        if queue_name is None:
+            return
+
+        channel = self._consumer_channels.get(queue_name)
         try:
-            self._channel.basic_cancel(consumer_tag=consumer_tag)
+            if channel is not None and channel.is_open:
+                channel.basic_cancel(consumer_tag=consumer_tag)
         except Exception as e:
             logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
-
-        # Remove from tracking
-        self._consumer_tags = {
-            q: t for q, t in self._consumer_tags.items() if t != consumer_tag
-        }
+        finally:
+            try:
+                if channel is not None and channel.is_open:
+                    channel.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+            self._consumer_tags.pop(queue_name, None)
+            self._consumer_channels.pop(queue_name, None)
+            if channel is self._reply_to_channel:
+                self._reply_to_channel = None
 
     def start_consuming(self) -> None:
-        """Start the pika consume loop (blocking)."""
+        """Start the pika consume loop (blocking).
+
+        Drives the connection's I/O loop directly via ``process_data_events`` so
+        consumers on ANY channel (the per-queue ``_consumer_channels`` from H-SRE1)
+        are processed. pika's ``channel.start_consuming()`` only loops while *that*
+        channel has consumers, which would exit immediately for the publisher
+        channel under the per-consumer-channel design — so we must not use it.
+        """
         self._ensure_connected()
         self._consuming = True
+        self._owner_ident = threading.get_ident()
         try:
-            self._channel.start_consuming()
+            while self._consuming:
+                # process_data_events drains ALL channels' consumers + queued
+                # add_callback_threadsafe callbacks (acks from worker threads).
+                self._connection.process_data_events(time_limit=1.0)
+                # Safety: if no consumers are registered, exit (avoids looping
+                # forever in tests/embeds that call start_consuming without a
+                # consumer). Real consumers are cancelled by stop_consuming which
+                # sets _consuming=False.
+                if not self._consumer_channels:
+                    break
         except KeyboardInterrupt:
-            self._channel.stop_consuming()
+            self._stop_all_consumers()
         finally:
             self._consuming = False
 
+    def _stop_all_consumers(self) -> None:
+        """Stop consuming on the publisher channel and every consumer channel.
+
+        Also clears ``self._consuming`` so the ``start_consuming`` I/O loop exits.
+        """
+        self._consuming = False
+        for ch in [self._channel, *self._consumer_channels.values()]:
+            try:
+                if ch is not None and ch.is_open:
+                    ch.stop_consuming()
+            except Exception:  # pragma: no cover - best effort during shutdown
+                logger.warning("stop_consuming raised on a channel", exc_info=True)
+
     def stop_consuming(self) -> None:
-        """Stop the pika consume loop."""
-        if self._channel and self._channel.is_open:
-            self._channel.stop_consuming()
+        """Stop the pika consume loop (safe to call from any thread).
+
+        pika's ``BlockingChannel.stop_consuming`` is not thread-safe and must run
+        on the connection-owning I/O thread. Route through ``_run_on_io_thread``
+        (I-17): when called cross-thread during an active consume loop (e.g. the
+        SIGTERM daemon thread), marshal via ``add_callback_threadsafe``; when
+        called inline (single-threaded / test / not consuming), run directly.
+        On a stalled I/O loop we do NOT fall back to an inline cross-thread call
+        (that would be the unsafe pika call I-17 prevents) — the broker's run()
+        loop / k8s SIGKILL + redelivery backstop handles a true stall.
+        """
+        if not self.is_connected():
+            return
+        try:
+            self._run_on_io_thread(self._stop_all_consumers, timeout=5.0)
+        except TimeoutError:
+            logger.warning(
+                "stop_consuming marshal timed out (I/O loop stalled); "
+                "leaving settlement to broker recovery / redelivery"
+            )
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 
@@ -391,12 +645,10 @@ class SyncTransport:
         Used by DLQInspector for peek/replay. Returns None if the queue is empty.
         """
         self._ensure_connected()
-        method, properties, body = self._run_on_io_thread(
-            lambda: self._channel.basic_get(queue=queue, auto_ack=False)
-        )
+        method, properties, body = self._run_on_io_thread(lambda: self._channel.basic_get(queue=queue, auto_ack=False))
         if method is None:
             return None
-        return self._build_message(method, properties, body)
+        return self._build_message(self._channel, method, properties, body)
 
     def purge_queue(self, queue: str) -> int:
         """Purge all messages from a queue. Returns the number of messages purged."""
@@ -406,8 +658,21 @@ class SyncTransport:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _build_message(self, method: Any, properties: Any, body: bytes) -> RabbitMessage:
-        """Build RabbitMessage from pika delivery."""
+    def _build_message(
+        self, channel: Any, method: Any, properties: Any, body: bytes, *, no_ack: bool = False
+    ) -> RabbitMessage:
+        """Build RabbitMessage from a pika delivery.
+
+        ``channel`` is the pika channel the delivery arrived on (per-consumer
+        channel for consume, publisher/topology channel for basic_get); sync
+        settlement (ack/nack/reject) is wired to THAT channel so it stays on the
+        correct I/O thread (H-SRE1).
+
+        ``no_ack=True`` (delivery came from a no-ack consumer) skips wiring
+        settlement functions entirely — the broker already auto-acked the
+        delivery, and a manual ``basic_ack``/``basic_nack``/``basic_reject`` on it
+        would be a protocol violation.
+        """
         # pika carries the AMQP timestamp as a Unix int (seconds); surface it as a
         # tz-aware datetime to match the publish side. Was never populated before.
         ts = properties.timestamp
@@ -430,27 +695,24 @@ class SyncTransport:
             consumer_tag=getattr(method, "consumer_tag", None),  # absent on basic_get (Basic.GetOk)
         )
 
-        # Wire sync settlement functions
-        channel = self._channel
+        if no_ack:
+            # Broker already auto-acked this delivery — leave settlement
+            # functions unset so ack()/nack()/reject() raise (RabbitMessage's
+            # existing "no settlement fn set" guard) instead of issuing an
+            # invalid basic_ack/nack/reject against a no-ack delivery. Callers
+            # that only read the message (e.g. RPCClient's reply handler,
+            # which never settles) are unaffected.
+            return message
 
+        # Wire sync settlement functions to the channel that owns this delivery.
         def ack_fn() -> None:
-            self._run_on_io_thread(
-                lambda: channel.basic_ack(delivery_tag=method.delivery_tag)
-            )
+            self._run_on_io_thread(lambda: channel.basic_ack(delivery_tag=method.delivery_tag))
 
         def nack_fn(requeue: bool = True) -> None:
-            self._run_on_io_thread(
-                lambda: channel.basic_nack(
-                    delivery_tag=method.delivery_tag, requeue=requeue
-                )
-            )
+            self._run_on_io_thread(lambda: channel.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue))
 
         def reject_fn(requeue: bool = False) -> None:
-            self._run_on_io_thread(
-                lambda: channel.basic_reject(
-                    delivery_tag=method.delivery_tag, requeue=requeue
-                )
-            )
+            self._run_on_io_thread(lambda: channel.basic_reject(delivery_tag=method.delivery_tag, requeue=requeue))
 
         message._ack_fn = ack_fn
         message._nack_fn = nack_fn

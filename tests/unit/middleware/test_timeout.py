@@ -132,3 +132,61 @@ class TestTimeoutMiddlewareAsync:
         with pytest.raises(HandlerTimeoutError) as exc_info:
             await mw.consume_scope_async(slow, msg)
         assert exc_info.value.timeout_seconds == 0.1
+
+
+# ── sync abandon observability + on_timeout (M-S4) ──────────────────────
+
+
+class TestSyncAbandonObservability:
+    def test_sync_abandon_increments_counter_and_logs_critical(self) -> None:
+        from unittest.mock import patch
+
+        mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=0.1))
+        msg = _make_message()
+
+        def slow_handler(m: RabbitMessage) -> str:
+            time.sleep(1.0)
+            return "late"
+
+        with patch("rabbitkit.middleware.timeout.logger") as mock_logger:
+            with pytest.raises(HandlerTimeoutError):
+                mw.consume_scope(slow_handler, msg)
+
+        assert mw.abandoned_threads == 1
+        mock_logger.critical.assert_called_once()
+        assert "abandoned" in mock_logger.critical.call_args[0][0]
+
+    def test_on_timeout_callback_invoked_on_abandon(self) -> None:
+        calls: list[tuple] = []
+
+        def on_timeout(m: RabbitMessage, seconds: float) -> None:
+            calls.append((m, seconds))
+
+        mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=0.1), on_timeout=on_timeout)
+        msg = _make_message()
+
+        def slow_handler(m: RabbitMessage) -> str:
+            time.sleep(1.0)
+            return "late"
+
+        with pytest.raises(HandlerTimeoutError):
+            mw.consume_scope(slow_handler, msg)
+
+        assert len(calls) == 1
+        assert calls[0][0] is msg
+        assert calls[0][1] == 0.1
+        assert mw.abandoned_threads == 1
+
+    @pytest.mark.asyncio
+    async def test_async_clean_cancellation_does_not_abandon(self) -> None:
+        mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=0.1))
+        msg = _make_message()
+
+        async def slow(m: RabbitMessage) -> str:
+            await asyncio.sleep(1.0)
+            return "late"
+
+        with pytest.raises(HandlerTimeoutError):
+            await mw.consume_scope_async(slow, msg)
+        # Async path cancels cleanly — no thread abandoned.
+        assert mw.abandoned_threads == 0

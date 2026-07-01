@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -147,6 +147,76 @@ class TestLifecycle:
 
             # Should declare: 1 main queue + 2 delay queues + 1 DLQ = 4
             assert mock_transport.declare_queue.call_count == 4
+
+            # C1: retry config must ALSO install RetryMiddleware, not just topology.
+            from rabbitkit.middleware.retry import RetryMiddleware
+
+            route = broker.routes[0]
+            assert any(isinstance(m, RetryMiddleware) for m in route.route_middlewares), (
+                "retry=RetryConfig(...) must install RetryMiddleware on the route"
+            )
+
+    @pytest.mark.asyncio
+    async def test_wire_retry_skips_route_without_retry(self) -> None:
+        """_wire_retry_middleware() installs nothing on a non-retry route."""
+        broker = AsyncBroker()  # no broker-wide retry
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start(install_signal_handlers=False)
+
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        route = broker.routes[0]
+        assert not any(isinstance(m, RetryMiddleware) for m in route.route_middlewares)
+
+    @pytest.mark.asyncio
+    async def test_wire_retry_respects_user_supplied_middleware(self) -> None:
+        """_wire_retry_middleware() does not double-wire a user RetryMiddleware."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=2, delays=(5, 30)))
+        config = RabbitConfig(retry=RetryConfig(max_retries=2, delays=(5, 30)))
+        broker = AsyncBroker(config)
+
+        @broker.subscriber(queue="orders", middlewares=[user_mw])
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start(install_signal_handlers=False)
+
+        route = broker.routes[0]
+        retry_mws = [m for m in route.route_middlewares if isinstance(m, RetryMiddleware)]
+        assert retry_mws == [user_mw]
+
+    @pytest.mark.asyncio
+    async def test_wire_retry_warns_on_middleware_without_topology(self) -> None:
+        """A manual RetryMiddleware without retry= warns (no topology declared)."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=2, delays=(5, 30)))
+        broker = AsyncBroker()  # NOTE: no broker-wide retry
+
+        @broker.subscriber(queue="orders", middlewares=[user_mw])  # NOTE: no retry=
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with pytest.warns(RuntimeWarning, match="no retry topology was declared"):
+                await broker.start(install_signal_handlers=False)
 
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -311,7 +381,7 @@ class TestAsyncBrokerWorkerPool:
             )
 
         # prefetch_count should now be 4 * 5 = 20
-        assert broker.config.consumer.prefetch_count == 20
+        assert broker.consumer_config.prefetch_count == 20
 
         # The consume call should have used the overridden prefetch
         mock_transport.consume.assert_called_once()
@@ -554,6 +624,7 @@ class TestLoggingConfig:
                 ):
                     # Re-import to ensure the inner import in start() gets patched
                     import sys
+
                     # Patch at the location used by the lazy import inside start()
                     with patch.dict(
                         sys.modules,
@@ -624,14 +695,17 @@ class TestWorkerPoolWarning:
 
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
             import warnings
+
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 await broker.start(worker_config=WorkerConfig(worker_count=5))
 
         runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
-        assert len(runtime_warnings) == 1
-        assert "channel_pool_size" in str(runtime_warnings[0].message)
-        assert "worker_count" in str(runtime_warnings[0].message)
+        # The worker_count > channel_pool_size warning must be among them. (A
+        # separate confirm_delivery/pool-size hint may also fire here - that's fine.)
+        assert len(runtime_warnings) >= 1
+        warning_messages = [str(w.message) for w in runtime_warnings]
+        assert any("channel_pool_size" in m and "worker_count" in m for m in warning_messages)
 
     async def test_no_warning_when_worker_count_equals_pool_size(self) -> None:
         """No RuntimeWarning when worker_count <= channel_pool_size."""
@@ -648,6 +722,7 @@ class TestWorkerPoolWarning:
 
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
             import warnings
+
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 await broker.start(worker_config=WorkerConfig(worker_count=5))
@@ -811,6 +886,17 @@ class TestStartConsumerGuard:
         # Should not raise
         await broker._start_consumer(route)
 
+    def test_wire_retry_middleware_noop_when_no_transport(self) -> None:
+        """_wire_retry_middleware() returns early when _transport is None."""
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        assert broker._transport is None
+        broker._wire_retry_middleware()  # should not raise
+
 
 # ── on_message callback coverage ───────────────────────────────────────
 
@@ -941,3 +1027,501 @@ class TestOnMessageCallback:
                 await captured_callback(msg)
 
                 mock_submit.assert_called_once()
+
+
+# ── I-16: signal-handler ownership (on_app_shutdown) ──────────────────────
+
+
+class TestSignalHandlerOwnership:
+    async def test_on_app_shutdown_called_from_signal_handler(self) -> None:
+        """I-16: the broker's signal handler invokes on_app_shutdown so an
+        embedding RabbitApp's shutdown event is also set (prevents the
+        double-install hang where the broker's handler overwrites the app's)."""
+        broker = AsyncBroker()
+        called: list[bool] = []
+        broker.on_app_shutdown = lambda: called.append(True)
+        # Simulate the loop being available and _on_signal firing.
+        import asyncio
+
+        broker._loop = asyncio.get_running_loop()
+        broker._on_signal()
+        # The stop task is created; the callback fires synchronously.
+        assert called == [True]
+
+
+# ── BatchPublisher auto-cap and over-subscription warning ─────────────────────
+
+
+class TestBatchPublisherAutoCap:
+    def _make_mock_transport(self) -> AsyncMock:
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.declare_exchange = AsyncMock()
+        mock_transport.bind_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+        mock_transport.cancel_consumer = AsyncMock()
+        mock_transport.disconnect = AsyncMock()
+        return mock_transport
+
+    @pytest.mark.asyncio
+    async def test_auto_workers_capped_at_half_pool_size(self) -> None:
+        """flush_workers=0: auto-formula result is capped at pool_size // 2
+        so at least half the channels remain for retry/direct publishes."""
+        from rabbitkit.core.config import BatchPublishConfig, PoolConfig
+
+        # pool_size=10, auto = min(16, 1000//100) = 10, safe = min(10, 10//2) = 5
+        config = RabbitConfig(pool=PoolConfig(channel_pool_size=10))
+        broker = AsyncBroker(config, batch_config=BatchPublishConfig(flush_workers=0))
+
+        captured: list[Any] = []
+
+        class CapturingPublisher:
+            def __init__(self, transport: Any, cfg: Any) -> None:
+                captured.append(cfg)
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+            async def publish(self, envelope: Any) -> Any:  # pragma: no cover
+                pass
+
+        mock_transport = self._make_mock_transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with patch("rabbitkit.async_.batch.AsyncBatchPublisher", new=CapturingPublisher):
+                await broker.start()
+                await broker.stop()
+
+        assert len(captured) == 1
+        assert captured[0].flush_workers == 5  # capped at 10 // 2
+
+    @pytest.mark.asyncio
+    async def test_explicit_workers_over_half_pool_emits_warning(self) -> None:
+        """flush_workers > pool_size // 2 emits a RuntimeWarning about potential deadlock."""
+        from rabbitkit.core.config import BatchPublishConfig, PoolConfig
+
+        # flush_workers=6 > 10 // 2 = 5
+        config = RabbitConfig(pool=PoolConfig(channel_pool_size=10))
+        broker = AsyncBroker(
+            config,
+            batch_config=BatchPublishConfig(flush_workers=6, batch_size=100, max_in_flight=1000),
+        )
+
+        class NoOpPublisher:
+            def __init__(self, transport: Any, cfg: Any) -> None:
+                pass
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+            async def publish(self, envelope: Any) -> Any:  # pragma: no cover
+                pass
+
+        mock_transport = self._make_mock_transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with patch("rabbitkit.async_.batch.AsyncBatchPublisher", new=NoOpPublisher):
+                import warnings
+
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    await broker.start()
+                    await broker.stop()
+
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert any(
+            "flush_workers" in str(w.message) and "channel_pool_size" in str(w.message)
+            for w in runtime_warnings
+        ), f"Expected flush_workers/channel_pool_size RuntimeWarning, got: {[str(w.message) for w in runtime_warnings]}"
+
+    @pytest.mark.asyncio
+    async def test_explicit_workers_at_half_pool_no_warning(self) -> None:
+        """flush_workers == pool_size // 2 is within safe bounds — no warning."""
+        from rabbitkit.core.config import BatchPublishConfig, PoolConfig
+
+        # flush_workers=5 == 10 // 2 = 5 — safe
+        config = RabbitConfig(pool=PoolConfig(channel_pool_size=10))
+        broker = AsyncBroker(
+            config,
+            batch_config=BatchPublishConfig(flush_workers=5, batch_size=100, max_in_flight=1000),
+        )
+
+        class NoOpPublisher:
+            def __init__(self, transport: Any, cfg: Any) -> None:
+                pass
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+            async def publish(self, envelope: Any) -> Any:  # pragma: no cover
+                pass
+
+        mock_transport = self._make_mock_transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with patch("rabbitkit.async_.batch.AsyncBatchPublisher", new=NoOpPublisher):
+                import warnings
+
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    await broker.start()
+                    await broker.stop()
+
+        flush_worker_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, RuntimeWarning) and "flush_workers" in str(w.message)
+        ]
+        assert flush_worker_warnings == []
+
+
+# ── flow_controller property ──────────────────────────────────────────────
+
+
+class TestAsyncFlowControllerProperty:
+    """Tests for flow_controller property getter/setter in AsyncBroker."""
+
+    @pytest.mark.asyncio
+    async def test_flow_controller_getter_returns_none_initially(self) -> None:
+        broker = AsyncBroker()
+        assert broker.flow_controller is None
+
+    @pytest.mark.asyncio
+    async def test_flow_controller_setter_wires_transport(self) -> None:
+        """Setting flow_controller after start wires on_blocked/on_unblocked (lines 117-120)."""
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+        mock_transport.on_blocked = MagicMock()
+        mock_transport.on_unblocked = MagicMock()
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        fc = FlowController()
+        broker.flow_controller = fc
+
+        mock_transport.on_blocked.assert_called_with(fc.on_blocked)
+        mock_transport.on_unblocked.assert_called_with(fc.on_unblocked)
+
+    @pytest.mark.asyncio
+    async def test_flow_controller_wired_in_start(self) -> None:
+        """flow_controller pre-set before start is wired during start() (lines 245-247)."""
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        fc = FlowController()
+        broker.flow_controller = fc  # set before start
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+        mock_transport.on_blocked = MagicMock()
+        mock_transport.on_unblocked = MagicMock()
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        mock_transport.on_blocked.assert_called_with(fc.on_blocked)
+        mock_transport.on_unblocked.assert_called_with(fc.on_unblocked)
+
+
+# ── _on_signal ────────────────────────────────────────────────────────────
+
+
+class TestAsyncOnSignal:
+    """Tests for _on_signal (lines 365-373)."""
+
+    @pytest.mark.asyncio
+    async def test_on_signal_creates_stop_task(self) -> None:
+        """_on_signal creates a stop task when _loop is set."""
+        import asyncio
+
+        broker = AsyncBroker()
+        broker._loop = asyncio.get_running_loop()
+        broker._on_signal()
+        # Give the event loop a chance to schedule; on_signal is synchronous
+        # so create_task was called.
+        await asyncio.sleep(0)  # yield once; stop task runs and exits (not started)
+
+    @pytest.mark.asyncio
+    async def test_on_signal_calls_on_app_shutdown(self) -> None:
+        """_on_signal invokes on_app_shutdown if set."""
+        import asyncio
+
+        broker = AsyncBroker()
+        broker._loop = asyncio.get_running_loop()
+        called: list[bool] = []
+        broker.on_app_shutdown = lambda: called.append(True)
+        broker._on_signal()
+        assert called == [True]
+
+
+# ── async _wait_in_flight deadline ────────────────────────────────────────
+
+
+class TestAsyncWaitInFlightDeadline:
+    """Tests for async _wait_in_flight deadline warning (lines 405-421)."""
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_logs_warning_past_deadline(self) -> None:
+        import time
+
+        broker = AsyncBroker()
+        broker._in_flight = 1
+        deadline = time.monotonic() - 1.0  # already past
+        with patch("rabbitkit.async_.broker.logger") as mock_logger:
+            await broker._wait_in_flight(deadline)
+        mock_logger.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_returns_immediately_when_zero(self) -> None:
+        import time
+
+        broker = AsyncBroker()
+        broker._in_flight = 0
+        await broker._wait_in_flight(time.monotonic() + 10.0)
+
+
+# ── async publish() kwargs form ───────────────────────────────────────────
+
+
+class TestAsyncPublishKwargsForm:
+    """Tests for async publish() kwargs form (lines 510-520)."""
+
+    async def _start_broker(self) -> AsyncBroker:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+        mock_transport.publish = AsyncMock(
+            return_value=PublishOutcome(status=PublishStatus.CONFIRMED)
+        )
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        return broker
+
+    @pytest.mark.asyncio
+    async def test_publish_body_none(self) -> None:
+        """body=None → raw_body=b''."""
+        broker = await self._start_broker()
+        await broker.publish(body=None, routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b""
+
+    @pytest.mark.asyncio
+    async def test_publish_body_bytes(self) -> None:
+        """body=bytes → raw_body=body."""
+        broker = await self._start_broker()
+        await broker.publish(body=b"raw", routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b"raw"
+
+    @pytest.mark.asyncio
+    async def test_publish_body_str(self) -> None:
+        """body=str → raw_body=body.encode()."""
+        broker = await self._start_broker()
+        await broker.publish(body="hello", routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b"hello"
+
+    @pytest.mark.asyncio
+    async def test_publish_body_dict(self) -> None:
+        """body=dict → raw_body=json.dumps(body).encode()."""
+        import json
+
+        broker = await self._start_broker()
+        await broker.publish(body={"key": "value"}, routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert json.loads(call_args.body) == {"key": "value"}
+
+
+# ── async publish() with FlowController ──────────────────────────────────
+
+
+class TestAsyncPublishWithFlowController:
+    """Tests for async publish() with FlowController (lines 541-551)."""
+
+    async def _start_broker(self) -> AsyncBroker:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+        # on_blocked/on_unblocked are sync registration calls, not coroutines
+        mock_transport.on_blocked = MagicMock()
+        mock_transport.on_unblocked = MagicMock()
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        return broker
+
+    @pytest.mark.asyncio
+    async def test_publish_dropped_by_backpressure(self) -> None:
+        """fc.acquire_async() returns False → publish returns ERROR outcome."""
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = await self._start_broker()
+        fc = FlowController(BackpressureConfig(on_blocked="drop"))
+        fc.on_blocked()  # block so acquire_async() returns False immediately
+        broker.flow_controller = fc
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"test")
+        outcome = await broker.publish(envelope)
+        assert outcome.status == PublishStatus.ERROR
+
+    @pytest.mark.asyncio
+    async def test_publish_succeeds_with_flow_controller(self) -> None:
+        """fc.acquire_async() returns True → publishes and releases the slot."""
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = await self._start_broker()
+        fc = FlowController()
+        broker.flow_controller = fc
+
+        expected = PublishOutcome(status=PublishStatus.CONFIRMED)
+        broker._transport.publish = AsyncMock(return_value=expected)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"test")
+        outcome = await broker.publish(envelope)
+        assert outcome.status == PublishStatus.CONFIRMED
+        assert fc.in_flight == 0  # slot released after publish
+
+
+# ── _wait_in_flight with deadline=None (lines 407-408) ───────────────────────
+
+
+class TestAsyncWaitInFlightNoDeadline:
+    """Lines 407-408: _wait_in_flight with deadline=None must wait for the
+    condition to be notified (by _in_flight_dec) before returning."""
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_no_deadline_waits_for_dec(self) -> None:
+        """deadline=None: the coroutine must block until _in_flight reaches 0
+        via _in_flight_dec(), which notifies the condition."""
+        import asyncio
+
+        broker = AsyncBroker()
+        broker._in_flight = 1
+        # Initialise the condition in the running loop (must happen before
+        # _wait_in_flight is called, because asyncio.Condition is loop-bound).
+        broker._ensure_inflight_cond()
+
+        async def decrement_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            await broker._in_flight_dec()
+
+        dec_task = asyncio.create_task(decrement_after_delay())
+        await broker._wait_in_flight(None)
+        await dec_task
+
+        assert broker._in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_no_deadline_loop_decrements_multiple(self) -> None:
+        """deadline=None with multiple in-flight: keeps waiting until all done."""
+        import asyncio
+
+        broker = AsyncBroker()
+        broker._in_flight = 2
+        broker._ensure_inflight_cond()
+
+        async def dec_all() -> None:
+            await asyncio.sleep(0.02)
+            await broker._in_flight_dec()
+            await asyncio.sleep(0.02)
+            await broker._in_flight_dec()
+
+        dec_task = asyncio.create_task(dec_all())
+        await broker._wait_in_flight(None)
+        await dec_task
+
+        assert broker._in_flight == 0
+
+
+# ── _wait_in_flight with deadline that has not expired (lines 415-419) ───────
+
+
+class TestAsyncWaitInFlightDeadlineNotExpired:
+    """Lines 415-419: _wait_in_flight with a deadline that hasn't expired must
+    wait for cond.wait() and break on TimeoutError when the deadline passes."""
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_deadline_not_expired_resolves_via_dec(self) -> None:
+        """When deadline is in the future and _in_flight_dec() fires before it
+        expires, _wait_in_flight returns without the TimeoutError branch."""
+        import asyncio
+        import time
+
+        broker = AsyncBroker()
+        broker._in_flight = 1
+        broker._ensure_inflight_cond()
+
+        async def dec_soon() -> None:
+            await asyncio.sleep(0.02)
+            await broker._in_flight_dec()
+
+        dec_task = asyncio.create_task(dec_soon())
+        # Give plenty of time — condition should be notified before deadline.
+        deadline = time.monotonic() + 5.0
+        await broker._wait_in_flight(deadline)
+        await dec_task
+
+        assert broker._in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_in_flight_deadline_expires_breaks_out(self) -> None:
+        """When the deadline expires before _in_flight reaches 0, the loop
+        hits the TimeoutError branch (lines 418-419) and breaks out."""
+        import time
+
+        broker = AsyncBroker()
+        broker._in_flight = 1
+        broker._ensure_inflight_cond()
+
+        # Deadline already very close — will expire while cond.wait() blocks.
+        deadline = time.monotonic() + 0.05
+
+        # Nobody decrements in_flight, so the timeout fires.
+        with patch("rabbitkit.async_.broker.logger"):
+            await broker._wait_in_flight(deadline)
+
+        # in_flight still 1 — drained via timeout, not via dec.
+        assert broker._in_flight == 1

@@ -486,3 +486,53 @@ class TestIncludeRouterEdgeCases:
 
         with pytest.raises(DuplicateRouteError, match="shared-queue"):
             reg.include_router(router)
+
+
+# ── DLX cycle detection (M-C6) ────────────────────────────────────────────
+
+
+class TestDLXCycleDetection:
+    def test_two_queue_dlx_cycle_raises(self) -> None:
+        """A 2-queue DLX loop (A→B→A) is rejected at registration time."""
+        reg = _make_registry()
+
+        @reg.subscriber(
+            queue=RabbitQueue(name="qa", dead_letter_exchange="xb"),
+            exchange=RabbitExchange(name="xa"),
+        )
+        def handle_a(msg: object) -> None:
+            pass
+
+        with pytest.raises(ConfigurationError, match="Dead-letter-exchange cycle"):
+            @reg.subscriber(
+                queue=RabbitQueue(name="qb", dead_letter_exchange="xa"),
+                exchange=RabbitExchange(name="xb"),
+            )
+            def handle_b(msg: object) -> None:
+                pass
+
+    def test_no_cycle_when_dlx_is_sink(self) -> None:
+        """A DLX pointing at an exchange with no bound queue (sink) is fine."""
+        reg = _make_registry()
+
+        @reg.subscriber(
+            queue=RabbitQueue(name="qa", dead_letter_exchange="external-dlx"),
+            exchange=RabbitExchange(name="xa"),
+        )
+        def handle_a(msg: object) -> None:
+            pass
+
+        # external-dlx has no route bound to it → sink, no cycle
+        assert len(reg.routes) == 1
+
+    def test_self_loop_raises(self) -> None:
+        """A queue that dead-letters back to its own bound exchange loops."""
+        reg = _make_registry()
+
+        with pytest.raises(ConfigurationError, match="Dead-letter-exchange cycle"):
+            @reg.subscriber(
+                queue=RabbitQueue(name="qa", dead_letter_exchange="xa"),
+                exchange=RabbitExchange(name="xa"),
+            )
+            def handle_a(msg: object) -> None:
+                pass

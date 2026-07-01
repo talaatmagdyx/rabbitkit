@@ -1,0 +1,139 @@
+# Reference Kubernetes manifest for a rabbitkit consumer.
+#
+# This is an example, not a Helm chart — copy and adapt to your environment.
+# It demonstrates the production-ready patterns documented in the README's
+# "Running in Kubernetes" section:
+#   - liveness (process-alive) vs readiness (broker-connected) probes
+#   - startupProbe so slow startup isn't killed by liveness
+#   - terminationGracePeriodSeconds + preStop for graceful drain
+#   - a PodDisruptionBudget to survive node drains
+#   - env from Secret + ConfigMap (no secrets baked into the image)
+#
+# Adjust replicas, resources, image, and the health/metrics endpoint paths to
+# match your consumer.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-credentials
+type: Opaque
+stringData:
+  # Replace with your real credentials (or use an external secret operator).
+  RABBITMQ_USER: "myapp"
+  RABBITMQ_PASSWORD: "CHANGE-ME"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitkit-config
+data:
+  RABBITMQ_HOST: "rabbitmq.production.svc.cluster.local"
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_VHOST: "/production"
+  # Fail fast on a blocked connection instead of stalling for minutes.
+  # Matches ConnectionConfig.blocked_connection_timeout default.
+  RABBITMQ_BLOCKED_CONNECTION_TIMEOUT: "60"
+  # Consumer tuning (mirrors ConsumerConfig defaults).
+  # NOTE: these only take effect when the app builds config via RabbitSettings
+  # (env_prefix="RABBITMQ_"); raw RabbitConfig users set these on ConsumerConfig.
+  RABBITMQ_PREFETCH_COUNT: "10"
+  RABBITMQ_GRACEFUL_TIMEOUT: "30"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-consumer
+  labels:
+    app: order-consumer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-consumer
+  template:
+    metadata:
+      labels:
+        app: order-consumer
+    spec:
+      # Must exceed graceful_timeout (30s) + the preStop sleep (10s) + margin.
+      # If Kubernetes SIGKILLs the pod mid-message you get a noisy redelivery
+      # (safe because handlers are idempotent), so size this generously.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: consumer
+          image: myregistry/order-consumer:0.7.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http-health
+              containerPort: 8080
+          # Credentials come from the Secret, non-secret config from the ConfigMap.
+          envFrom:
+            - secretRef:
+                name: rabbitmq-credentials
+            - configMapRef:
+                name: rabbitkit-config
+          # Liveness vs readiness distinction (see README):
+          #   - liveness: cheap process-alive check. Do NOT bind it to the broker
+          #     connection, or a transient broker outage kills every pod at once.
+          #   - readiness: broker-connected + consumers active (broker_health_check).
+          # These endpoints must be served by your app (e.g. obskit build_health_router wrapping broker_liveness/broker_readiness).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http-health
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http-health
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http-health
+            periodSeconds: 10
+            failureThreshold: 3
+          # Let the endpoint de-register (readiness=false) and in-flight handlers
+          # start draining before the SIGTERM path completes.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # Security: run as non-root, read-only root filesystem where possible.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # The image ships a non-root user; mount a writable tmpdir for things
+          # like pytest caches / logs if readOnlyRootFilesystem is enabled.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-consumer-pdb
+spec:
+  # Keep at least one consumer up during voluntary disruptions (node drains,
+  # cluster autoscaler). Tune to your availability requirements.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: order-consumer

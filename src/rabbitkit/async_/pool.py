@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+from contextlib import asynccontextmanager
 from typing import Any
 
-from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+from rabbitkit.async_.connection import get_connection_errors, make_aio_pika_connect_kwargs
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,9 @@ class AsyncChannelPool:
         self._pool: asyncio.Queue[Any] = asyncio.Queue(maxsize=pool_size)
         self._lock = asyncio.Lock()
         self._created = 0
+        # Channels currently checked out by callers; closed in close_all() so they
+        # are not orphaned if a caller forgets to release (leak detection).
+        self._in_use: set[Any] = set()
 
     async def acquire(self) -> Any:
         """Acquire a channel from the pool.
@@ -56,20 +61,47 @@ class AsyncChannelPool:
         try:
             channel = self._pool.get_nowait()
             if not channel.is_closed:
+                async with self._lock:
+                    self._in_use.add(channel)
                 return channel
-            # Channel is closed, create a new one
+            # I-6: a pooled channel was found closed — it still counted
+            # against _created when it was released, so decrement before
+            # discarding it (otherwise acquire() leaks a slot each time a
+            # closed-idle channel is pulled from the pool).
+            async with self._lock:
+                self._created = max(0, self._created - 1)
         except asyncio.QueueEmpty:
             pass
 
+        # perf-M-2: create the channel OUTSIDE the lock (network round-trip) so
+        # concurrent acquire() calls don't serialize on channel creation during
+        # warmup/refill. The slot is reserved atomically under the lock (so we
+        # never over-create); the channel-open I/O happens outside the lock, and
+        # we re-acquire only to publish _in_use. If creation fails, the reserved
+        # slot is returned. The I-6 closed-idle decrement above stays under the
+        # lock.
         async with self._lock:
             if self._created < self._pool_size:
-                channel = await self._connection.channel(
-                    publisher_confirms=self._publisher_confirms
-                )
+                need_create = True
                 self._created += 1
+            else:
+                need_create = False
+
+        if need_create:
+            try:
+                channel = await self._connection.channel(publisher_confirms=self._publisher_confirms)
+            except BaseException:
+                # creation failed — give the reserved slot back.
+                async with self._lock:
+                    self._created = max(0, self._created - 1)
+                raise
+            async with self._lock:
+                self._in_use.add(channel)
                 return channel
 
-        # Pool exhausted — wait with timeout to avoid deadlocks
+        # Pool exhausted — wait with timeout to avoid deadlocks. R-timeout:
+        # ``asyncio.timeout`` (3.11+) replaces ``asyncio.wait_for`` to avoid
+        # the wrapper-task overhead.
         logger.warning(
             "Channel pool exhausted (pool_size=%d, created=%d). "
             "Waiting up to %.1fs for a channel to be released. "
@@ -78,12 +110,26 @@ class AsyncChannelPool:
             self._created,
             self._acquire_timeout,
         )
-        return await asyncio.wait_for(
-            self._pool.get(), timeout=self._acquire_timeout
-        )
+        try:
+            async with asyncio.timeout(self._acquire_timeout):
+                channel = await self._pool.get()
+        except TimeoutError:
+            raise TimeoutError(
+                f"Timed out after {self._acquire_timeout}s waiting for a channel "
+                f"from the pool (pool_size={self._pool_size})."
+            ) from None
+        if channel.is_closed:
+            async with self._lock:
+                self._created = max(0, self._created - 1)
+            return await self.acquire()
+        async with self._lock:
+            self._in_use.add(channel)
+        return channel
 
     async def release(self, channel: Any) -> None:
         """Release a channel back to the pool."""
+        async with self._lock:
+            self._in_use.discard(channel)
         if not channel.is_closed:
             try:
                 self._pool.put_nowait(channel)
@@ -99,8 +145,34 @@ class AsyncChannelPool:
         async with self._lock:
             self._created = max(0, self._created - 1)
 
+    @asynccontextmanager
+    async def acquire_ctx(self) -> Any:
+        """Async context manager for acquire/release — prevents leaks.
+
+        Usage::
+
+            async with pool.acquire_ctx() as ch:
+                await ch.publish(...)
+        """
+        channel = await self.acquire()
+        try:
+            yield channel
+        finally:
+            await self.release(channel)
+
     async def close_all(self) -> None:
-        """Close all channels in the pool."""
+        """Close all channels in the pool, including checked-out ones."""
+        async with self._lock:
+            in_use = list(self._in_use)
+            self._in_use.clear()
+        for channel in in_use:
+            try:
+                if not channel.is_closed:
+                    await channel.close()
+            except Exception:  # pragma: no cover — best effort
+                pass
+            async with self._lock:
+                self._created = max(0, self._created - 1)
         while not self._pool.empty():
             try:
                 channel = self._pool.get_nowait()
@@ -156,9 +228,11 @@ class AsyncConnectionPool:
         self._consumer_connection: Any | None = None
         self._publisher_channel_pool: AsyncChannelPool | None = None
         self._lock = asyncio.Lock()
+        self._prewarmed = False
 
     async def connect(self) -> None:
         """Establish publisher and consumer connections eagerly."""
+        do_prewarm = False
         async with self._lock:
             if self._publisher_connection is None:
                 self._publisher_connection = await self._create_connection()
@@ -170,6 +244,19 @@ class AsyncConnectionPool:
                 )
             if self._consumer_connection is None:
                 self._consumer_connection = await self._create_connection()
+            if self._pool_config.prewarm_channels and not self._prewarmed:
+                self._prewarmed = True
+                do_prewarm = True
+
+        if do_prewarm and self._publisher_channel_pool is not None:
+            pool = self._publisher_channel_pool
+            channels = await asyncio.gather(
+                *(pool.acquire() for _ in range(self._pool_config.channel_pool_size)),
+                return_exceptions=True,
+            )
+            for ch in channels:
+                if not isinstance(ch, BaseException):
+                    await pool.release(ch)
 
     async def get_publisher_connection(self) -> Any:
         """Get a connection dedicated for publishing.
@@ -233,12 +320,35 @@ class AsyncConnectionPool:
             import aio_pika
         except ImportError:
             raise ImportError(
-                "aio-pika is required for async transport. "
-                "Install it with: pip install rabbitkit[async]"
+                "aio-pika is required for async transport. Install it with: pip install rabbitkit[async]"
             ) from None
 
         kwargs = make_aio_pika_connect_kwargs(
             self._connection_config,
             self._security_config,
         )
-        return await aio_pika.connect_robust(**kwargs)
+
+        # H-SRE3: connect_robust handles reconnects AFTER the first connection
+        # with a FIXED interval, so a fleet of clients starting at once thunder
+        # the broker. Apply an outer retry with full jitter for the INITIAL
+        # connect only; bounded so we never spin forever.
+        backoff = self._connection_config.reconnect_backoff_base
+        max_backoff = self._connection_config.reconnect_backoff_max
+        connection_errors = get_connection_errors()
+        max_attempts = 30
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await aio_pika.connect_robust(**kwargs)
+            except connection_errors as e:
+                if attempt == max_attempts:
+                    raise
+                sleep_for = random.uniform(0.0, backoff)  # noqa: S311
+                logger.warning(
+                    "aio-pika initial connect failed (attempt %d), retrying in %.2fs: %s",
+                    attempt,
+                    sleep_for,
+                    e,
+                )
+                await asyncio.sleep(sleep_for)
+                backoff = min(backoff * 2, max_backoff)
+        raise RuntimeError("unreachable")  # pragma: no cover

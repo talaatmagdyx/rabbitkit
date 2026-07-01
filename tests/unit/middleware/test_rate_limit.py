@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -159,8 +159,8 @@ class TestConsumeScopeSync:
         msg2._nack_fn.assert_called_once_with(False)
 
     def test_consume_scope_wait_when_limited(self) -> None:
-        """on_limited='wait' sleeps then processes."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="wait")
+        """on_limited='wait' sleeps then processes once a token is acquired."""
+        cfg = RateLimitConfig(max_rate=1000.0, burst=1, on_limited="wait")
         mw = RateLimitMiddleware(cfg)
 
         # Exhaust the bucket
@@ -168,17 +168,35 @@ class TestConsumeScopeSync:
         call_next = MagicMock(return_value="ok")
         mw.consume_scope(call_next, msg1)
 
-        # Second message should wait
+        # Second message should wait ~1ms (real sleep) then acquire a token.
         msg2 = _make_message()
         call_next2 = MagicMock(return_value="waited")
 
-        with patch("rabbitkit.middleware.rate_limit.time.sleep") as mock_sleep:
-            result = mw.consume_scope(call_next2, msg2)
+        result = mw.consume_scope(call_next2, msg2)
 
-        mock_sleep.assert_called_once()
-        assert mock_sleep.call_args[0][0] > 0
         call_next2.assert_called_once_with(msg2)
         assert result == "waited"
+
+    def test_consume_scope_wait_no_token_falls_back_to_drop(self) -> None:
+        """on_limited='wait' with no token within deadline drops (handler NOT called)."""
+        cfg = RateLimitConfig(max_rate=0.001, burst=1, on_limited="wait")
+        mw = RateLimitMiddleware(cfg)
+        mw._wait_deadline = 0.05  # very short deadline
+
+        # Exhaust the single-token bucket.
+        msg1 = _make_message()
+        mw.consume_scope(MagicMock(return_value="ok"), msg1)
+
+        # Second message: token refills far too slowly within 50ms deadline.
+        msg2 = _make_message()
+        call_next2 = MagicMock(return_value="should-not-reach")
+
+        result = mw.consume_scope(call_next2, msg2)
+
+        assert result is None
+        call_next2.assert_not_called()
+        # Falls back to drop semantics: nack(requeue=False)
+        msg2._nack_fn.assert_called_once_with(False)
 
     def test_consume_scope_nack_skips_settled(self) -> None:
         """on_limited='nack' does not nack already-settled messages."""
@@ -267,8 +285,8 @@ class TestConsumeScopeAsync:
 
     @pytest.mark.asyncio
     async def test_consume_scope_async_wait(self) -> None:
-        """Async variant waits when limited with on_limited='wait'."""
-        cfg = RateLimitConfig(max_rate=100.0, burst=1, on_limited="wait")
+        """Async variant waits then processes once a token is acquired."""
+        cfg = RateLimitConfig(max_rate=1000.0, burst=1, on_limited="wait")
         mw = RateLimitMiddleware(cfg)
 
         msg1 = _make_message()
@@ -283,8 +301,32 @@ class TestConsumeScopeAsync:
         async def call_next2(m: RabbitMessage) -> str:
             return "waited"
 
-        with patch("rabbitkit.middleware.rate_limit.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            result = await mw.consume_scope_async(call_next2, msg2)
-
-        mock_sleep.assert_awaited_once()
+        result = await mw.consume_scope_async(call_next2, msg2)
         assert result == "waited"
+
+    @pytest.mark.asyncio
+    async def test_consume_scope_async_wait_no_token_falls_back_to_drop(self) -> None:
+        """Async 'wait' with no token within deadline drops (handler NOT called)."""
+        cfg = RateLimitConfig(max_rate=0.001, burst=1, on_limited="wait")
+        mw = RateLimitMiddleware(cfg)
+        mw._wait_deadline = 0.05
+
+        msg1 = _make_message()
+
+        async def call_next(m: RabbitMessage) -> str:
+            return "ok"
+
+        await mw.consume_scope_async(call_next, msg1)
+
+        msg2 = _make_message()
+        call_count = 0
+
+        async def call_next2(m: RabbitMessage) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "should-not-reach"
+
+        result = await mw.consume_scope_async(call_next2, msg2)
+        assert result is None
+        assert call_count == 0
+        msg2._nack_async_fn.assert_awaited_once_with(False)

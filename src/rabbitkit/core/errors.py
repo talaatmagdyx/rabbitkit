@@ -20,12 +20,9 @@ from rabbitkit.core.types import ClassifiedError, ErrorSeverity
 
 # Generic (stdlib) error categories — transport layers extend these
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-    ConnectionResetError,
-    BrokenPipeError,
-    ConnectionAbortedError,
     TimeoutError,
-    EOFError,
-    OSError,
+    EOFError,  # NOT an OSError subclass — must be listed explicitly
+    OSError,  # covers ConnectionResetError, BrokenPipeError, ConnectionAbortedError
 )
 
 PERMANENT_ERRORS: tuple[type[BaseException], ...] = (
@@ -115,6 +112,19 @@ def classify_error(
         original=exc,
         reason=f"unknown error classified as {unknown_policy.value}: {type(exc).__name__}",
     )
+
+
+# ── Configuration error (single canonical location) ─────────────────────
+
+
+class ConfigurationError(Exception):
+    """Raised for invalid configuration detected at registration time.
+
+    Single canonical class for all registration-time misconfigurations (route
+    conflicts, invalid handler signatures, bad retry/ack combinations). Both
+    ``core/route.py`` and ``di/resolver.py`` raise this; tests/users can catch
+    one type regardless of import source.
+    """
 
 
 # ── Backpressure error ───────────────────────────────────────────────────

@@ -194,9 +194,7 @@ class TestSyncBrokerWorkerPool:
     def test_worker_pool_stops_on_broker_stop(self) -> None:
         """Pool stop() called before consumer cancel."""
         broker = self._make_broker_with_route()
-        mock_channel = self._start_broker(
-            broker, worker_config=WorkerConfig(worker_count=4)
-        )
+        mock_channel = self._start_broker(broker, worker_config=WorkerConfig(worker_count=4))
 
         pool = broker.worker_pool
         assert pool is not None
@@ -237,7 +235,7 @@ class TestSyncBrokerWorkerPool:
         )
 
         # prefetch_count should now be 4 * 5 = 20
-        assert broker.config.consumer.prefetch_count == 20
+        assert broker.consumer_config.prefetch_count == 20
 
         # The consume call should have used the overridden prefetch
         consume_call = mock_channel.basic_consume.call_args
@@ -416,8 +414,7 @@ class TestLoggingConfig:
         """start() calls configure_structlog when config.logging is set."""
         from rabbitkit.core.logging import LoggingConfig
 
-        config = RabbitConfig()
-        config.logging = LoggingConfig(render_json=False)
+        config = RabbitConfig(logging=LoggingConfig(render_json=False))
         broker = SyncBroker(config)
 
         @broker.subscriber(queue="orders")
@@ -612,9 +609,7 @@ class TestPublishRequestEdgeCases:
 
         # RPCClient was created and call() invoked
         mock_rpc_class.assert_called_once_with(broker._transport)
-        mock_rpc_instance.call.assert_called_once_with(
-            "rk", b"body", timeout=1.0, exchange="ex", headers=None
-        )
+        mock_rpc_instance.call.assert_called_once_with("rk", b"body", timeout=1.0, exchange="ex", headers=None)
         # Client is cached
         assert broker._rpc_client is mock_rpc_instance
 
@@ -665,12 +660,22 @@ class TestDeclareTopologyEdgeCases:
         assert broker._transport is None
         broker._declare_topology()  # should not raise
 
+    def test_wire_retry_middleware_noop_when_no_transport(self) -> None:
+        """_wire_retry_middleware() returns early when _transport is None."""
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        assert broker._transport is None
+        broker._wire_retry_middleware()  # should not raise
+
     def test_declare_topology_with_retry_config(self) -> None:
         """_declare_topology() declares DLQ topology when retry is configured."""
         from rabbitkit.core.config import RetryConfig
 
-        config = RabbitConfig()
-        config.retry = RetryConfig(max_retries=2, delays=(5, 30))
+        config = RabbitConfig(retry=RetryConfig(max_retries=2, delays=(5, 30)))
         broker = SyncBroker(config)
 
         @broker.subscriber(queue="orders", exchange="events")
@@ -689,12 +694,19 @@ class TestDeclareTopologyEdgeCases:
         # (at minimum 4 declare calls)
         assert mock_channel.queue_declare.call_count >= 3
 
+        # C1: retry config must ALSO install RetryMiddleware, not just topology.
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        route = broker.routes[0]
+        assert any(isinstance(m, RetryMiddleware) for m in route.route_middlewares), (
+            "retry=RetryConfig(...) must install RetryMiddleware on the route"
+        )
+
     def test_declare_topology_retry_no_exchange(self) -> None:
         """_declare_topology() handles retry config without exchange."""
         from rabbitkit.core.config import RetryConfig
 
-        config = RabbitConfig()
-        config.retry = RetryConfig(max_retries=1, delays=(5,))
+        config = RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,)))
         broker = SyncBroker(config)
 
         @broker.subscriber(queue="no-exchange-queue")
@@ -711,6 +723,73 @@ class TestDeclareTopologyEdgeCases:
 
         # Should not raise — delay queue declared with empty exchange_name
         assert mock_channel.queue_declare.call_count >= 2
+
+    def test_wire_retry_skips_route_without_retry(self) -> None:
+        """_wire_retry_middleware() installs nothing on a non-retry route."""
+        broker = SyncBroker()  # no broker-wide retry
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        route = broker.routes[0]
+        assert not any(isinstance(m, RetryMiddleware) for m in route.route_middlewares)
+
+    def test_wire_retry_respects_user_supplied_middleware(self) -> None:
+        """_wire_retry_middleware() does not double-wire a user RetryMiddleware."""
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=2, delays=(5, 30)))
+        config = RabbitConfig(retry=RetryConfig(max_retries=2, delays=(5, 30)))
+        broker = SyncBroker(config)
+
+        @broker.subscriber(queue="orders", middlewares=[user_mw])
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        route = broker.routes[0]
+        retry_mws = [m for m in route.route_middlewares if isinstance(m, RetryMiddleware)]
+        assert retry_mws == [user_mw]
+
+    def test_wire_retry_warns_on_middleware_without_topology(self) -> None:
+        """A manual RetryMiddleware without retry= warns (no topology declared)."""
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=2, delays=(5, 30)))
+        broker = SyncBroker()  # NOTE: no broker-wide retry
+
+        @broker.subscriber(queue="orders", middlewares=[user_mw])  # NOTE: no retry=
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                with pytest.warns(RuntimeWarning, match="no retry topology was declared"):
+                    broker.start()
 
 
 # ── _start_consumer edge cases ────────────────────────────────────────────
@@ -891,8 +970,7 @@ class TestWorkerCountWarning:
         """RuntimeWarning emitted when worker_count > channel_pool_size."""
         from rabbitkit.core.config import PoolConfig
 
-        config = RabbitConfig()
-        config.pool = PoolConfig(channel_pool_size=2)
+        config = RabbitConfig(pool=PoolConfig(channel_pool_size=2))
         broker = SyncBroker(config)
 
         @broker.subscriber(queue="orders")
@@ -915,3 +993,395 @@ class TestWorkerCountWarning:
         assert any(issubclass(warning.category, RuntimeWarning) for warning in w)
         warning_messages = [str(warning.message) for warning in w]
         assert any("worker_count" in msg and "channel_pool_size" in msg for msg in warning_messages)
+
+
+# ── flow_controller property ──────────────────────────────────────────────
+
+
+class TestFlowControllerProperty:
+    """Tests for flow_controller property getter/setter."""
+
+    def test_flow_controller_getter_returns_none_initially(self) -> None:
+        """flow_controller property returns None before any assignment."""
+        broker = SyncBroker()
+        assert broker.flow_controller is None
+
+    def test_flow_controller_setter_no_transport(self) -> None:
+        """Setting flow_controller before start stores it; no wiring yet."""
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+        fc = FlowController()
+        broker.flow_controller = fc
+        assert broker.flow_controller is fc
+
+    def test_flow_controller_setter_wires_transport(self) -> None:
+        """Setting flow_controller after start wires on_blocked/on_unblocked."""
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        # Replace transport with a mock that tracks on_blocked/on_unblocked calls
+        mock_transport = MagicMock()
+        broker._transport = mock_transport
+
+        fc = FlowController()
+        broker.flow_controller = fc
+
+        mock_transport.on_blocked.assert_called_once_with(fc.on_blocked)
+        mock_transport.on_unblocked.assert_called_once_with(fc.on_unblocked)
+
+
+# ── flow_controller wired on start() ─────────────────────────────────────
+
+
+class TestFlowControllerWiredOnStart:
+    """flow_controller wired in start() when pre-set (lines 217-219)."""
+
+    def test_flow_controller_wired_after_start(self) -> None:
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        fc = FlowController()
+        broker.flow_controller = fc  # set before start
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                with patch.object(broker, "_start_consumer"):
+                    broker.start()
+
+        # flow_controller survives start and transport was wired
+        assert broker.flow_controller is fc
+
+
+# ── _wait_in_flight deadline ──────────────────────────────────────────────
+
+
+class TestWaitInFlightDeadline:
+    """Tests for _wait_in_flight deadline warning path (lines 294-303)."""
+
+    def test_wait_in_flight_logs_warning_when_still_in_flight(self) -> None:
+        import time
+
+        broker = SyncBroker()
+        # Set in_flight > 0 so the while loop runs
+        broker._in_flight = 1
+        # Use a past deadline so the wait immediately times out
+        deadline = time.monotonic() - 1.0
+        with patch("rabbitkit.sync.broker.logger") as mock_logger:
+            broker._wait_in_flight(deadline)
+        mock_logger.warning.assert_called()
+
+    def test_wait_in_flight_returns_immediately_when_zero(self) -> None:
+        import time
+
+        broker = SyncBroker()
+        broker._in_flight = 0
+        # Should return immediately with a far future deadline
+        broker._wait_in_flight(time.monotonic() + 10.0)
+
+
+# ── _on_sigterm handler ───────────────────────────────────────────────────
+
+
+class TestOnSigterm:
+    """Tests for _on_sigterm handler."""
+
+    def test_on_sigterm_with_no_transport_returns_early(self) -> None:
+        """_on_sigterm returns immediately when _transport is None."""
+        broker = SyncBroker()
+        broker._transport = None
+        # Should not raise and should not create a thread
+        broker._on_sigterm(15, None)
+        assert broker._sigterm_thread is None
+
+    def test_on_sigterm_starts_drain_thread(self) -> None:
+        """_on_sigterm starts a daemon thread that calls stop_consuming."""
+        broker = SyncBroker()
+        mock_transport = MagicMock()
+        broker._transport = mock_transport
+
+        broker._on_sigterm(15, None)
+
+        assert broker._sigterm_thread is not None
+        broker._sigterm_thread.join(timeout=2.0)
+
+        mock_transport.stop_consuming.assert_called_once()
+
+
+# ── run() connection error recovery ──────────────────────────────────────
+
+
+class TestRunConnectionRecovery:
+    """Tests for run() connection error recovery (lines 411-413)."""
+
+    def test_run_recovers_on_connection_error(self) -> None:
+        """run() calls _recover_consumers on pika connection error."""
+        import pika.exceptions
+
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        assert broker._transport is not None
+
+        call_count: list[int] = [0]
+
+        def start_consuming_side_effect() -> None:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise pika.exceptions.AMQPConnectionError("connection lost")
+            # Second call: clean exit (stop_consuming was called elsewhere)
+
+        broker._transport.start_consuming = MagicMock(side_effect=start_consuming_side_effect)
+        with patch.object(broker, "_recover_consumers") as mock_recover:
+            broker.run()
+
+        mock_recover.assert_called_once()
+
+
+# ── publish() kwargs form ─────────────────────────────────────────────────
+
+
+class TestPublishKwargsForm:
+    """Tests for publish() kwargs form (lines 455-465)."""
+
+    def _start_broker(self) -> SyncBroker:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+
+        broker._transport.publish = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        return broker
+
+    def test_publish_body_none(self) -> None:
+        """body=None → raw_body=b''."""
+        broker = self._start_broker()
+        broker.publish(body=None, routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b""
+
+    def test_publish_body_bytes(self) -> None:
+        """body=bytes → raw_body=body."""
+        broker = self._start_broker()
+        broker.publish(body=b"raw", routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b"raw"
+
+    def test_publish_body_str(self) -> None:
+        """body=str → raw_body=body.encode()."""
+        broker = self._start_broker()
+        broker.publish(body="hello", routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert call_args.body == b"hello"
+
+    def test_publish_body_dict(self) -> None:
+        """body=dict → raw_body=json.dumps(body).encode()."""
+        import json
+
+        broker = self._start_broker()
+        broker.publish(body={"key": "value"}, routing_key="rk")
+        call_args = broker._transport.publish.call_args[0][0]
+        assert json.loads(call_args.body) == {"key": "value"}
+
+
+# ── publish() with FlowController ────────────────────────────────────────
+
+
+class TestPublishWithFlowController:
+    """Tests for publish() with FlowController (lines 479-490)."""
+
+    def _start_broker(self) -> SyncBroker:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        return broker
+
+    def test_publish_dropped_by_backpressure(self) -> None:
+        """fc.acquire() returns False → publish returns ERROR outcome."""
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.core.types import PublishStatus
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = self._start_broker()
+        fc = FlowController(BackpressureConfig(on_blocked="drop"))
+        fc.on_blocked()  # block so acquire() returns False immediately
+        broker.flow_controller = fc
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"test")
+        outcome = broker.publish(envelope)
+        assert outcome.status == PublishStatus.ERROR
+
+    def test_publish_succeeds_with_flow_controller(self) -> None:
+        """fc.acquire() returns True → publishes and releases the slot."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = self._start_broker()
+        fc = FlowController()
+        broker.flow_controller = fc
+
+        expected = PublishOutcome(status=PublishStatus.CONFIRMED)
+        broker._transport.publish = MagicMock(return_value=expected)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"test")
+        outcome = broker.publish(envelope)
+        assert outcome.status == PublishStatus.CONFIRMED
+        assert fc.in_flight == 0  # slot released after publish
+
+
+# ── _recover_consumers ────────────────────────────────────────────────────
+
+
+class TestRecoverConsumers:
+    """Tests for _recover_consumers (lines 519-524)."""
+
+    def test_recover_consumers_reconnects_and_redeclares(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        with patch.object(broker._transport, "reconnect") as mock_reconnect:
+            with patch.object(broker, "_declare_topology") as mock_declare:
+                with patch.object(broker, "_start_consumer") as mock_start:
+                    broker._recover_consumers()
+
+        mock_reconnect.assert_called_once()
+        mock_declare.assert_called_once()
+        mock_start.assert_called_once()
+
+    def test_recover_consumers_noop_when_no_transport(self) -> None:
+        broker = SyncBroker()
+        broker._transport = None
+        # Should not raise
+        broker._recover_consumers()
+
+
+# ── _wait_in_flight lines 296-297, 301 ───────────────────────────────────
+
+
+class TestWaitInFlightUncoveredLines:
+    """Tests for _wait_in_flight() lines 296-297 (deadline=None) and 301 (deadline with wait)."""
+
+    def test_wait_in_flight_deadline_none_waits_for_notify(self) -> None:
+        """Lines 296-297: deadline=None path — wait() blocks until in_flight reaches 0.
+
+        We set in_flight=1, then a background thread calls _in_flight_dec()
+        which notifies the condition. _wait_in_flight(deadline=None) must
+        return without logging a warning.
+        """
+        import threading
+        import time
+
+        broker = SyncBroker()
+        broker._in_flight = 1
+
+        def decrement_after_delay() -> None:
+            time.sleep(0.05)
+            broker._in_flight_dec()
+
+        t = threading.Thread(target=decrement_after_delay, daemon=True)
+        t.start()
+
+        with patch("rabbitkit.sync.broker.logger") as mock_logger:
+            broker._wait_in_flight(deadline=None)
+
+        t.join(timeout=2.0)
+
+        # No warning should have been logged — in_flight reached 0
+        mock_logger.warning.assert_not_called()
+        assert broker._in_flight == 0
+
+    def test_wait_in_flight_with_future_deadline_waits_for_notify(self) -> None:
+        """Line 301: deadline set in the future — wait(timeout=remaining) is called.
+
+        We set in_flight=1, set a deadline 5s in the future, and have a
+        background thread call _in_flight_dec() quickly. The method must
+        return (having hit the while-loop's notify path) without warning.
+        """
+        import threading
+        import time
+
+        broker = SyncBroker()
+        broker._in_flight = 1
+        deadline = time.monotonic() + 5.0  # far future so we don't time out
+
+        def decrement_after_delay() -> None:
+            time.sleep(0.05)
+            broker._in_flight_dec()
+
+        t = threading.Thread(target=decrement_after_delay, daemon=True)
+        t.start()
+
+        with patch("rabbitkit.sync.broker.logger") as mock_logger:
+            broker._wait_in_flight(deadline=deadline)
+
+        t.join(timeout=2.0)
+
+        # in_flight is 0, so no warning
+        mock_logger.warning.assert_not_called()
+        assert broker._in_flight == 0

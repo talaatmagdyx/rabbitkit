@@ -12,6 +12,9 @@ Graceful shutdown:
 
 from __future__ import annotations
 
+import signal
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -20,18 +23,20 @@ import structlog
 
 from rabbitkit.concurrency import SyncWorkerPool
 from rabbitkit.core.config import (
+    ConsumerConfig,
     RabbitConfig,
     RetryConfig,
     RetryDisabled,
     WorkerConfig,
 )
+from rabbitkit.core.errors import BackpressureError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome
+from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.middleware.retry import RetryRouter
 from rabbitkit.sync.connection import get_connection_errors
 from rabbitkit.sync.transport import SyncTransport
@@ -63,6 +68,10 @@ class SyncBroker:
         context_repo: Any | None = None,
     ) -> None:
         self._config = config or RabbitConfig()
+        # Private mutable view of consumer config — brokers may apply a
+        # prefetch override derived from WorkerConfig.prefetch_per_worker.
+        # Stored separately so the caller's frozen RabbitConfig is never mutated.
+        self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
         self._pipeline = HandlerPipeline(
@@ -76,6 +85,38 @@ class SyncBroker:
         self._started = False
         self._rpc_client: Any | None = None
 
+        # Bounded graceful drain (C-2): track inline in-flight handlers so
+        # stop() can wait for them to finish (up to graceful_timeout) instead
+        # of disconnecting mid-handler. R-Condition: a threading.Condition
+        # replaces the prior Event+int+manual set/clear; ``_in_flight`` stays
+        # a plain int for backward-compat reads (health checks).
+        self._in_flight = 0
+        self._in_flight_cond = threading.Condition()
+
+        # Optional publish-side flow control (C-6). Opt-in via the
+        # flow_controller setter; when set, publish() acquires/releases a
+        # slot around transport.publish().
+        self._flow_controller: Any | None = None
+
+        # Signal-handler bookkeeping (C-1).
+        self._original_handlers: dict[int, Any] = {}
+        self._sigterm_thread: threading.Thread | None = None
+
+    @property
+    def flow_controller(self) -> Any | None:
+        """Optional FlowController used to throttle the publish path."""
+        return self._flow_controller
+
+    @flow_controller.setter
+    def flow_controller(self, value: Any | None) -> None:
+        self._flow_controller = value
+        # Wire the controller's blocked/unblocked callbacks to the transport if
+        # it is already up (registration before start() is also fine: start()
+        # wires them after constructing the transport).
+        if self._transport is not None and value is not None:
+            self._transport.on_blocked(value.on_blocked)
+            self._transport.on_unblocked(value.on_unblocked)
+
     @property
     def config(self) -> RabbitConfig:
         return self._config
@@ -88,6 +129,11 @@ class SyncBroker:
     def worker_pool(self) -> SyncWorkerPool | None:
         """Return the worker pool (if configured)."""
         return self._worker_pool
+
+    @property
+    def consumer_config(self) -> ConsumerConfig:
+        """Effective consumer config (may reflect WorkerConfig.prefetch override)."""
+        return self._consumer_config
 
     # ── Registration (decorator API) ──────────────────────────────────────
 
@@ -161,12 +207,42 @@ class SyncBroker:
             security_config=self._config.security,
             topology_mode=self._config.topology_mode,
             confirm_delivery=self._config.publisher.confirm_delivery,
+            confirm_timeout=self._config.publisher.confirm_timeout,
         )
 
         self._transport.connect()
 
+        # Wire an opt-in FlowController's blocked/unblocked callbacks to the
+        # transport now that it exists (C-6).
+        if self._flow_controller is not None:
+            self._transport.on_blocked(self._flow_controller.on_blocked)
+            self._transport.on_unblocked(self._flow_controller.on_unblocked)
+
+        # M-P5: a small publisher channel pool caps concurrent confirms. Warn
+        # when confirms are on and the pool is small relative to expected
+        # concurrency (kept as a non-fatal hint; default unchanged).
+        if self._config.publisher.confirm_delivery:
+            pool_size = self._config.pool.channel_pool_size
+            # Publisher concurrency ~ worker_count (handlers that publish) or 1.
+            expected = worker_config.worker_count if worker_config and worker_config.worker_count > 1 else 1
+            if pool_size < max(4, expected):
+                import warnings
+
+                warnings.warn(
+                    f"confirm_delivery=True with channel_pool_size={pool_size} "
+                    f"(expected publisher concurrency ~{expected}). Concurrent confirms "
+                    "are capped by the pool size; increase PoolConfig.channel_pool_size "
+                    "if publish throughput matters.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         # Declare topology
         self._declare_topology()
+
+        # Install RetryMiddleware on retry-enabled routes (topology alone does
+        # not retry — the middleware routes failures into the delay queues).
+        self._wire_retry_middleware()
 
         # Create worker pool if requested
         if worker_config is not None and worker_config.worker_count > 1:
@@ -175,6 +251,7 @@ class SyncBroker:
             # block until acquire_timeout, risking deadlock under load.
             if worker_config.worker_count > self._config.pool.channel_pool_size:
                 import warnings
+
                 warnings.warn(
                     f"worker_count={worker_config.worker_count} exceeds "
                     f"channel_pool_size={self._config.pool.channel_pool_size}. "
@@ -185,10 +262,9 @@ class SyncBroker:
                 )
             # Override prefetch_count if prefetch_per_worker is set
             if worker_config.prefetch_per_worker is not None:
-                self._config.consumer = replace(
+                self._consumer_config = replace(
                     self._config.consumer,
-                    prefetch_count=worker_config.worker_count
-                    * worker_config.prefetch_per_worker,
+                    prefetch_count=worker_config.worker_count * worker_config.prefetch_per_worker,
                 )
             self._worker_pool = SyncWorkerPool(config=worker_config)
             self._worker_pool.start()
@@ -203,21 +279,66 @@ class SyncBroker:
             len(self._registry.routes),
         )
 
-    def stop(self) -> None:
-        """Stop the broker — stop pool, cancel consumers, disconnect."""
+    def _in_flight_inc(self) -> None:
+        with self._in_flight_cond:
+            self._in_flight += 1
+
+    def _in_flight_dec(self) -> None:
+        with self._in_flight_cond:
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            if self._in_flight == 0:
+                self._in_flight_cond.notify_all()
+
+    def _wait_in_flight(self, deadline: float | None) -> None:
+        """Wait for inline in-flight handlers to finish (bounded by deadline)."""
+        with self._in_flight_cond:
+            if self._in_flight == 0:
+                return
+            while self._in_flight > 0:
+                if deadline is None:
+                    self._in_flight_cond.wait()
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                self._in_flight_cond.wait(timeout=remaining)
+            if self._in_flight > 0:
+                logger.warning(
+                    "SyncBroker.stop: %d in-flight handler(s) still running after "
+                    "graceful drain deadline; disconnecting anyway",
+                    self._in_flight,
+                )
+
+    def stop(self, timeout: float | None = None) -> None:
+        """Stop the broker - stop pool, cancel consumers, drain, disconnect.
+
+        ``timeout`` defaults to ``ConsumerConfig.graceful_timeout`` (C-2). The
+        whole stop sequence is bounded by an overall deadline: cancel consumers,
+        wait for in-flight inline handlers to reach 0 (or the deadline), then
+        disconnect. The worker-pool stop path is also bounded by this deadline.
+        """
         if not self._started:
             return
 
-        # Stop worker pool first (let in-flight tasks finish)
+        effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
+        deadline = None if effective is None else time.monotonic() + effective
+
+        # Stop worker pool first (let in-flight tasks finish), bounded by the
+        # outer deadline.
         if self._worker_pool is not None:
-            self._worker_pool.stop()
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._worker_pool.stop(timeout=remaining)
             self._worker_pool = None
 
-        # Cancel all consumers
+        # Cancel all consumers (stop new deliveries before draining).
         assert self._transport is not None
         for route in self._registry.routes:
             if route.consumer_tag:
                 self._transport.cancel_consumer(route.consumer_tag)
+
+        # Drain inline in-flight handlers (C-2).
+        self._wait_in_flight(deadline)
 
         # Close RPC client if used
         if self._rpc_client is not None:
@@ -231,18 +352,56 @@ class SyncBroker:
         self._started = False
         logger.info("SyncBroker stopped")
 
+    def _install_sigterm_handler(self) -> None:
+        """Install a SIGTERM handler that breaks the pika consume loop (C-1).
+
+        pika's BlockingConnection is not signal-safe, so the handler spawns a
+        short-lived daemon thread that calls ``transport.stop_consuming()``.
+        Only installed when running in the main thread; failures are ignored.
+        """
+        try:
+            self._original_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, self._on_sigterm)
+        except (ValueError, OSError):  # pragma: no cover - not in main thread - best effort
+            logger.debug("SIGTERM handler not installed (not in main thread)")
+
+    def _restore_signal_handlers(self) -> None:
+        for sig, prev in self._original_handlers.items():
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):  # pragma: no cover
+                pass
+        self._original_handlers.clear()
+
+    def _on_sigterm(self, signum: int, frame: Any) -> None:
+        logger.info("Received SIGTERM; initiating graceful drain")
+        # pika BlockingConnection is not signal-safe: do the stop on a thread.
+        transport = self._transport
+        if transport is None:
+            return
+
+        def _drain() -> None:
+            try:
+                transport.stop_consuming()
+            except Exception:  # pragma: no cover - best effort
+                logger.warning("stop_consuming raised during SIGTERM drain", exc_info=True)
+
+        self._sigterm_thread = threading.Thread(target=_drain, name="rabbitkit-sigterm", daemon=True)
+        self._sigterm_thread.start()
+
     def run(self, worker_config: WorkerConfig | None = None) -> None:
         """Start and run the blocking consume loop.
 
-        Blocks until KeyboardInterrupt or stop() is called. Recovers from
-        connection drops by reconnecting, re-declaring topology, and
-        re-subscribing all consumers — pika's BlockingConnection has no
+        Blocks until SIGINT/SIGTERM or stop() is called. Installs a SIGTERM
+        handler (C-1) so k8s pod termination drains instead of hard-killing.
+        Recovers from connection drops by reconnecting, re-declaring topology,
+        and re-subscribing all consumers - pika's BlockingConnection has no
         built-in recovery, so without this a single blip kills the consumer.
 
         ``worker_config`` is forwarded to :meth:`start`, so a multi-worker
         consumer (``worker_count > 1``) also gets the recovery loop.
         """
         self.start(worker_config=worker_config)
+        self._install_sigterm_handler()
         connection_errors = get_connection_errors()
         try:
             while True:
@@ -250,21 +409,89 @@ class SyncBroker:
                     if self._transport is None:
                         break
                     self._transport.start_consuming()
-                    break  # clean stop_consuming() → exit
+                    break  # clean stop_consuming() -> exit
                 except KeyboardInterrupt:
                     break
                 except connection_errors as exc:
                     logger.warning("consumer connection lost; recovering", error=str(exc))
                     self._recover_consumers()
         finally:
+            self._restore_signal_handlers()
             self.stop()
 
     # ── Publishing ────────────────────────────────────────────────────────
 
-    def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
-        """Publish a message envelope."""
+    def publish(
+        self,
+        envelope: MessageEnvelope | None = None,
+        *,
+        exchange: str = "",
+        routing_key: str = "",
+        body: bytes | str | dict[str, Any] | None = None,
+        headers: dict[str, Any] | None = None,
+        content_type: str = "application/json",
+        correlation_id: str | None = None,
+        reply_to: str | None = None,
+    ) -> PublishOutcome:
+        """Publish a message.
+
+        Accepts either a pre-built ``MessageEnvelope`` or individual kwargs::
+
+            # Envelope form (full control):
+            broker.publish(MessageEnvelope(routing_key="orders.created", body=b"..."))
+
+            # Kwargs form (convenient):
+            broker.publish(
+                exchange="orders",
+                routing_key="orders.created",
+                body={"order_id": 123},
+                headers={"x-tenant": "acme"},
+            )
+
+        When ``body`` is a dict or str it is JSON-encoded automatically.
+
+        When an opt-in ``FlowController`` is configured (``broker.flow_controller
+        = fc``), a publish slot is acquired before and released after the
+        transport publish so backpressure/rate-limiting applies to the hot path.
+        Without a controller this is a plain pass-through.
+        """
+        if envelope is None:
+            import json as _json
+
+            if body is None:
+                raw_body = b""
+            elif isinstance(body, bytes):
+                raw_body = body
+            elif isinstance(body, str):
+                raw_body = body.encode()
+            else:
+                raw_body = _json.dumps(body).encode()
+            envelope = MessageEnvelope(
+                routing_key=routing_key,
+                body=raw_body,
+                exchange=exchange,
+                headers=headers or {},
+                content_type=content_type,
+                correlation_id=correlation_id,
+                reply_to=reply_to,
+            )
+
         if self._transport is None:
             raise RuntimeError("Broker not started. Call start() first.")
+        fc = self._flow_controller
+        if fc is not None:
+            if not fc.acquire():
+                # Dropped by backpressure policy (drop/timeout). Do not publish.
+                return PublishOutcome(
+                    status=PublishStatus.ERROR,
+                    exchange=envelope.exchange,
+                    routing_key=envelope.routing_key,
+                    error=BackpressureError("publish dropped by backpressure policy"),
+                )
+            try:
+                return self._transport.publish(envelope)
+            finally:
+                fc.release()
         return self._transport.publish(envelope)
 
     def request(
@@ -287,9 +514,7 @@ class SyncBroker:
             from rabbitkit.rpc import RPCClient
 
             self._rpc_client = RPCClient(self._transport)
-        return self._rpc_client.call(
-            routing_key, body, timeout=timeout, exchange=exchange, headers=headers
-        )
+        return self._rpc_client.call(routing_key, body, timeout=timeout, exchange=exchange, headers=headers)
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -301,6 +526,59 @@ class SyncBroker:
         self._declare_topology()
         for route in self._registry.routes:
             self._start_consumer(route)
+
+    def _wire_retry_middleware(self) -> None:
+        """Install ``RetryMiddleware`` on routes whose retry is enabled.
+
+        ``_declare_topology`` declares the retry/DLQ *topology* (delay queues +
+        source-queue DLX), but the ``RetryMiddleware`` that actually routes a
+        failed message into the delay queues must also run in the route's
+        middleware chain. Without it, ``retry=RetryConfig(...)`` would build the
+        topology while transient failures ``nack(requeue=True)`` in a hot loop —
+        the delay queues would never receive anything and ``max_retries`` would
+        never be enforced. This wires both halves from the single retry switch
+        (``RabbitConfig.retry`` / ``@subscriber(retry=...)``).
+
+        Placed outer of ordinary user middlewares (e.g. ``TimeoutMiddleware``) so
+        retry can classify and re-queue exceptions they raise, but inner of any
+        ``ExceptionMiddleware`` (the documented true-outermost layer) — see
+        :func:`rabbitkit.middleware.retry.retry_middleware_insertion_index`.
+
+        Idempotent: routes that already carry a ``RetryMiddleware`` — supplied
+        explicitly via ``middlewares=[...]`` or auto-wired on a previous start —
+        are left untouched (no double-retry, no stacking on reconnect).
+        """
+        if self._transport is None:
+            return
+
+        from rabbitkit.middleware.retry import (
+            RetryMiddleware,
+            retry_middleware_insertion_index,
+            warn_retry_middleware_without_topology,
+        )
+
+        wired = False
+        for route in self._registry.routes:
+            retry_config = route.effective_retry_config(self._config.retry)
+            has_retry_mw = any(isinstance(mw, RetryMiddleware) for mw in route.route_middlewares)
+            if retry_config is None:
+                if has_retry_mw:
+                    # Half-configured: a RetryMiddleware runs but no retry topology
+                    # was declared, so its delay-queue publishes target non-existent
+                    # queues and are silently dropped. Surface it loudly.
+                    warn_retry_middleware_without_topology(route.name)
+                continue
+            if has_retry_mw:
+                continue
+            index = retry_middleware_insertion_index(route.route_middlewares)
+            route.route_middlewares.insert(
+                index, RetryMiddleware(retry_config, publish_fn=self._transport.publish)
+            )
+            wired = True
+
+        if wired:
+            # Drop any middleware chains cached before the retry mw was installed.
+            self._pipeline.clear_caches()
 
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -330,6 +608,7 @@ class SyncBroker:
                 # Re-declare source queue with x-dead-letter fields so RabbitMQ
                 # automatically routes nacked/rejected messages to the DLQ.
                 import dataclasses
+
                 source_queue = dataclasses.replace(
                     route.queue,
                     dead_letter_exchange="",
@@ -352,9 +631,7 @@ class SyncBroker:
             # Declare retry/DLQ topology if retry is enabled
             if retry_config is not None:
                 exchange_name = route.exchange.name if route.exchange else ""
-                delay_queues = retry_router.get_delay_queue_definitions(
-                    route.queue.name, exchange_name
-                )
+                delay_queues = retry_router.get_delay_queue_definitions(route.queue.name, exchange_name)
                 for delay_queue in delay_queues:
                     self._transport.declare_queue(delay_queue)
 
@@ -368,18 +645,26 @@ class SyncBroker:
 
         def on_message(message: RabbitMessage) -> None:
             """Process incoming message through the pipeline."""
-            # Set the original queue in headers for retry routing
-            if "x-rabbitkit-original-queue" not in message.headers:
-                message.headers["x-rabbitkit-original-queue"] = route.queue.name
+            # Track inline in-flight so stop() can drain gracefully (C-2).
+            self._in_flight_inc()
+            # Heartbeat for liveness wedge detection (I-4): updated on every
+            # delivery so broker_liveness can fail when the I/O loop stalls.
+            self.last_heartbeat = time.monotonic()
+            try:
+                # Set the original queue in headers for retry routing
+                if "x-rabbitkit-original-queue" not in message.headers:
+                    message.headers["x-rabbitkit-original-queue"] = route.queue.name
 
-            # Populate named routing-key segments for Path() DI
-            message.path = extract_path(message.routing_key, route.queue.routing_key)
+                # Populate named routing-key segments for Path() DI
+                message.path = extract_path(message.routing_key, route.queue.routing_key)
 
-            self._pipeline.process_sync(
-                route,
-                message,
-                publish_fn=transport.publish,
-            )
+                self._pipeline.process_sync(
+                    route,
+                    message,
+                    publish_fn=transport.publish,
+                )
+            finally:
+                self._in_flight_dec()
 
         if pool is not None:
 
@@ -390,10 +675,10 @@ class SyncBroker:
         else:
             callback = on_message
 
-        effective_prefetch = route.prefetch_count or self._config.consumer.prefetch_count
+        effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
         consumer_tag = self._transport.consume(
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
         )
-        route.consumer_tag = consumer_tag
+        route.runtime_state.consumer_tag = consumer_tag

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import typing
+from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +14,7 @@ from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.route import ResultPublisher, RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.di import Depends
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -829,6 +832,57 @@ class TestBuildResultEnvelope:
         envelope = pipeline._build_result_envelope(route, msg, b"some-body")
         assert envelope is None
 
+    def test_build_result_envelope_envelope_no_destination_warns(self) -> None:
+        """Core-Low-1: a handler returning a MessageEnvelope with no
+        result_publisher and no reply_to → None, and a warning is emitted.
+        """
+        from unittest.mock import patch
+
+        route = _make_route(result_publisher=None)
+        pipeline = HandlerPipeline()
+        msg = _make_message()
+        user_env = MessageEnvelope(routing_key="ignored", body=b"body", exchange="")
+
+        warning_calls: list[tuple] = []
+        with patch("rabbitkit.core.pipeline.logger") as mock_logger:
+            mock_logger.warning = MagicMock(side_effect=lambda *a, **kw: warning_calls.append(a))
+            envelope = pipeline._build_result_envelope(route, msg, user_env)
+
+        assert envelope is None
+        assert any("result dropped" in str(call) for call in warning_calls)
+
+
+class TestMessageEnvelopeNoDestinationAcked:
+    """Core-Low-1: a handler returning a MessageEnvelope with no destination is
+    still acked (no behavior change) and a warning is logged for observability.
+    """
+
+    def test_sync_envelope_no_destination_acked_and_warned(self) -> None:
+        msg = _make_message()
+        ack_fn, _, _ = _wire_sync(msg)
+
+        def handler(body: bytes) -> MessageEnvelope:
+            return MessageEnvelope(routing_key="ignored", body=b"result", exchange="")
+
+        route = _make_route(handler=handler, result_publisher=None)
+        pipeline = HandlerPipeline()
+        # A publish_fn must be supplied so _build_result_envelope is actually
+        # invoked (otherwise _publish_result_sync short-circuits on publish_fn
+        # is None). It never gets called because the envelope is dropped.
+        publish_fn = MagicMock()  # never called: envelope is dropped (no destination)
+
+        warning_calls: list[tuple] = []
+        with patch("rabbitkit.core.pipeline.logger") as mock_logger:
+            mock_logger.warning = MagicMock(side_effect=lambda *a, **kw: warning_calls.append(a))
+            pipeline.process_sync(route, msg, publish_fn=publish_fn)
+
+        # publish_fn is NOT called — the envelope was dropped (no destination).
+        publish_fn.assert_not_called()
+        # The message is still acked — no behavior change, just observability.
+        ack_fn.assert_called_once()
+        assert msg._disposition == "acked"
+        assert any("result dropped" in str(call) for call in warning_calls)
+
 
 # ── _serialize_result paths (lines 422-432) ──────────────────────────────
 
@@ -1012,7 +1066,6 @@ class TestDeserializeBody:
         mock_serializer.decode.assert_not_called()
         assert msg._disposition == "acked"
 
-
     def test_sync_already_settled_logs_warning(self) -> None:
         """Lines 443-445: message already settled before exception — logs warning, no re-raise."""
         msg = _make_message()
@@ -1101,3 +1154,706 @@ class TestPublishResultNoPublishFn:
 
         # Should return without error
         await pipeline._publish_result_async(route, msg, b"result", None)
+
+
+# ── DI generator teardown in the auto-DI path (Core-C8) ────────────────────
+# Regression: a handler using Annotated[..., Depends(gen_factory)] with NO
+# explicit di_resolver must still tear down generator dependencies (run their
+# post-yield cleanup). Before the fix the auto-DI path never created a
+# DependencyScope, so generators leaked (cleanup never ran).
+#
+# The dependency factories are module-level so the pipeline's marker-detection
+# (``typing.get_type_hints``) can resolve the stringified annotations —
+# closure-captured factories would be invisible to the auto-DI detector.
+
+_auto_di_cleaned: list[bool] = []
+
+
+def _auto_di_db() -> typing.Iterator[str]:
+    yield "db-session"
+    _auto_di_cleaned.append(True)  # post-yield teardown
+
+
+def _auto_di_broken() -> None:
+    raise RuntimeError("dependency unavailable")
+
+
+class TestAutoDIGeneratorTeardown:
+    def test_auto_di_generator_teardown_runs(self) -> None:
+        """A generator dependency is torn down in the auto-DI (no-resolver) path."""
+        _auto_di_cleaned.clear()
+
+        def handler(body: bytes, db: Annotated[str, Depends(_auto_di_db)]) -> None:
+            assert db == "db-session"
+
+        pipeline = HandlerPipeline()  # NO explicit di_resolver → auto-DI path
+        msg = _make_message()
+        _wire_sync(msg)
+        route = _make_route(handler=handler)
+
+        pipeline.process_sync(route, msg)
+
+        assert _auto_di_cleaned == [True], "generator teardown did not run in auto-DI path"
+        assert msg.is_settled is True  # success → acked
+
+    def test_auto_di_factory_raise_still_closes_earlier_generators(self) -> None:
+        """When a later dependency factory raises during resolution, generators
+        opened earlier in the same call are still closed (teardown runs).
+        """
+        _auto_di_cleaned.clear()
+
+        def handler(
+            body: bytes,
+            db: Annotated[str, Depends(_auto_di_db)],
+            bad: Annotated[None, Depends(_auto_di_broken)],
+        ) -> None:
+            pass
+
+        pipeline = HandlerPipeline()  # auto-DI path
+        msg = _make_message()
+        _wire_sync(msg)
+        route = _make_route(handler=handler)
+
+        # Resolution raises (_auto_di_broken), so the handler never runs; the
+        # finally block must still close the generator opened earlier.
+        pipeline.process_sync(route, msg)
+
+        assert _auto_di_cleaned == [True], "earlier generator was not closed on resolution failure"
+        # The message is settled by the pipeline's exception handler (AUTO → reject)
+        assert msg.is_settled is True
+
+    async def test_async_auto_di_generator_teardown_runs(self) -> None:
+        """Async auto-DI path also tears down sync generator dependencies."""
+        _auto_di_cleaned.clear()
+
+        async def handler(body: bytes, db: Annotated[str, Depends(_auto_di_db)]) -> None:
+            assert db == "db-session"
+
+        pipeline = HandlerPipeline()  # auto-DI path
+        msg = _make_message()
+        _wire_async(msg)
+        route = _make_route(handler=handler)
+
+        await pipeline.process_async(route, msg)
+
+        assert _auto_di_cleaned == [True], "generator teardown did not run in async auto-DI path"
+        assert msg.is_settled is True
+
+
+# ── I-14: handler returning a MessageEnvelope preserves user fields ──────
+
+
+class TestBuildResultEnvelopePreservesUserFields:
+    """I-14: a handler returning a ``MessageEnvelope`` no longer silently drops
+    all fields except ``body``. The user's headers/message_id/content_type/
+    priority/expiration/etc. are preserved via ``dataclasses.replace``; only the
+    precedence-driven destination is merged in.
+    """
+
+    def test_envelope_result_with_result_publisher_preserves_headers_priority(self) -> None:
+        msg = _make_message()
+        _wire_sync(msg)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> MessageEnvelope:
+            return MessageEnvelope(
+                routing_key="user-key",
+                body=b"payload",
+                headers={"k": "v"},
+                priority=5,
+                content_type="application/x-custom",
+                expiration="30000",
+            )
+
+        rp = ResultPublisher(exchange="out-ex", routing_key="out-key")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg, publish_fn=publish_fn)
+
+        publish_fn.assert_called_once()
+        env = publish_fn.call_args[0][0]
+        # Precedence-driven destination overrides exchange/routing_key ONLY.
+        assert env.exchange == "out-ex"
+        assert env.routing_key == "out-key"
+        # User fields preserved (the bug used to drop these).
+        assert env.body == b"payload"
+        assert env.headers == {"k": "v"}
+        assert env.priority == 5
+        assert env.content_type == "application/x-custom"
+        assert env.expiration == "30000"
+
+    def test_envelope_result_with_reply_to_preserves_fields_sets_correlation(self) -> None:
+        msg = _make_message(reply_to="amq.rabbitmq.reply-to", correlation_id="corr-9")
+        _wire_sync(msg)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> MessageEnvelope:
+            return MessageEnvelope(
+                routing_key="user-key",
+                body=b"resp",
+                headers={"h": "1"},
+                priority=3,
+            )
+
+        rp = ResultPublisher(exchange="out-ex", routing_key="out-key")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg, publish_fn=publish_fn)
+
+        publish_fn.assert_called_once()
+        env = publish_fn.call_args[0][0]
+        # reply_to wins → routing_key=reply_to, exchange="", correlation_id from msg.
+        assert env.routing_key == "amq.rabbitmq.reply-to"
+        assert env.exchange == ""
+        assert env.correlation_id == "corr-9"
+        # User fields preserved.
+        assert env.body == b"resp"
+        assert env.headers == {"h": "1"}
+        assert env.priority == 3
+
+    def test_envelope_result_no_destination_no_publish(self) -> None:
+        """A returned envelope with no reply_to and no result_publisher → no publish."""
+        msg = _make_message()
+        _wire_sync(msg)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> MessageEnvelope:
+            return MessageEnvelope(routing_key="x", body=b"...", headers={"k": "v"})
+
+        route = _make_route(handler=handler, result_publisher=None)
+        pipeline = HandlerPipeline()
+        pipeline.process_sync(route, msg, publish_fn=publish_fn)
+        publish_fn.assert_not_called()
+
+    def test_build_envelope_direct_with_user_envelope_result_publisher(self) -> None:
+        """White-box: _build_result_envelope with an envelope result + result_publisher."""
+        rp = ResultPublisher(exchange="results", routing_key="output.key")
+        route = _make_route(result_publisher=rp)
+        pipeline = HandlerPipeline()
+        msg = _make_message()
+
+        user_env = MessageEnvelope(
+            routing_key="ignored",
+            body=b"body",
+            headers={"x": "y"},
+            priority=7,
+            message_id="user-mid",
+        )
+        env = pipeline._build_result_envelope(route, msg, user_env)
+        assert env is not None
+        assert env.routing_key == "output.key"
+        assert env.exchange == "results"
+        assert env.headers == {"x": "y"}
+        assert env.priority == 7
+        assert env.message_id == "user-mid"
+        assert env.body == b"body"
+
+
+# ── I-18: publish-side middleware chain cache ────────────────────────────
+
+
+class TestPublishChainCache:
+    """I-18: the publish-side middleware chain is cached per route (keyed by
+    ``id(route)``) — mirrors the consume cache so we don't allocate N closures
+    per message.
+    """
+
+    def test_compose_publish_sync_caches_per_route(self) -> None:
+        pipeline = HandlerPipeline()
+        route = _make_route()
+        fn1 = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        fn2 = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        chain1 = pipeline._compose_publish_sync(route, fn1)
+        chain2 = pipeline._compose_publish_sync(route, fn2)
+
+        # Cache hit → same callable returned.
+        assert chain1 is chain2
+        assert id(route) in pipeline._publish_chain_cache
+
+        # L-1: publish_fn is NOT captured in the cached closure — it is threaded
+        # through at call time, so the chain uses whichever fn is passed in.
+        env = MessageEnvelope(routing_key="k", body=b"x", exchange="")
+        chain1(env, fn1)
+        fn1.assert_called_once()
+        fn2.assert_not_called()
+        chain2(env, fn2)
+        fn2.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_compose_publish_async_caches_per_route(self) -> None:
+        pipeline = HandlerPipeline()
+        route = _make_route()
+        fn1 = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        fn2 = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        chain1 = pipeline._compose_publish_async(route, fn1)
+        chain2 = pipeline._compose_publish_async(route, fn2)
+
+        assert chain1 is chain2
+        assert id(route) in pipeline._publish_chain_async_cache
+
+        # L-1: publish_fn is threaded through at call time, not captured.
+        env = MessageEnvelope(routing_key="k", body=b"x", exchange="")
+        await chain1(env, fn1)
+        fn1.assert_awaited_once()
+        fn2.assert_not_awaited()
+        await chain2(env, fn2)
+        fn2.assert_awaited_once()
+
+    def test_publish_chain_built_once_across_messages_sync(self) -> None:
+        """Behavioral: two process_sync calls for the same route reuse one chain."""
+        msg1 = _make_message()
+        _wire_sync(msg1)
+        msg2 = _make_message()
+        _wire_sync(msg2)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        pipeline.process_sync(route, msg1, publish_fn=publish_fn)
+        pipeline.process_sync(route, msg2, publish_fn=publish_fn)
+
+        assert publish_fn.call_count == 2
+        assert len(pipeline._publish_chain_cache) == 1
+        assert id(route) in pipeline._publish_chain_cache
+
+    @pytest.mark.asyncio
+    async def test_publish_chain_built_once_across_messages_async(self) -> None:
+        msg1 = _make_message()
+        _wire_async(msg1)
+        msg2 = _make_message()
+        _wire_async(msg2)
+        publish_fn = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        async def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        await pipeline.process_async(route, msg1, publish_fn=publish_fn)
+        await pipeline.process_async(route, msg2, publish_fn=publish_fn)
+
+        assert publish_fn.await_count == 2
+        assert len(pipeline._publish_chain_async_cache) == 1
+        assert id(route) in pipeline._publish_chain_async_cache
+
+
+# ── L-1: cached publish chain must use the per-call publish_fn ───────────────
+
+
+class TestPublishChainPerCallPublishFn:
+    """L-1: the cached publish-side middleware chain must NOT capture the first
+    ``publish_fn``. A second call for the same route with a DIFFERENT
+    ``publish_fn`` must route through the new one (the pre-fix cache silently
+    reused the first ``publish_fn`` forever).
+    """
+
+    def test_sync_two_calls_with_different_publish_fns_route_correctly(self) -> None:
+        msg1 = _make_message()
+        _wire_sync(msg1)
+        msg2 = _make_message()
+        _wire_sync(msg2)
+
+        fn_a = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        fn_b = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        pipeline.process_sync(route, msg1, publish_fn=fn_a)
+        pipeline.process_sync(route, msg2, publish_fn=fn_b)
+
+        # L-1: the second call must use fn_b, not the cached fn_a (the bug would
+        # call fn_a twice and fn_b never).
+        fn_a.assert_called_once()
+        fn_b.assert_called_once()
+        assert len(pipeline._publish_chain_cache) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_two_calls_with_different_publish_fns_route_correctly(self) -> None:
+        msg1 = _make_message()
+        _wire_async(msg1)
+        msg2 = _make_message()
+        _wire_async(msg2)
+
+        fn_a = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        fn_b = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        async def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        await pipeline.process_async(route, msg1, publish_fn=fn_a)
+        await pipeline.process_async(route, msg2, publish_fn=fn_b)
+
+        fn_a.assert_awaited_once()
+        fn_b.assert_awaited_once()
+        assert len(pipeline._publish_chain_async_cache) == 1
+
+    def test_sync_publish_fn_distinguished_by_marker(self) -> None:
+        """Stronger: tag each publish_fn so we can prove the RIGHT one was used
+        per call (not just 'both called once')."""
+        msg1 = _make_message()
+        _wire_sync(msg1)
+        msg2 = _make_message()
+        _wire_sync(msg2)
+
+        seen: list[str] = []
+
+        def fn_a(env: MessageEnvelope) -> PublishOutcome:
+            seen.append("a")
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        def fn_b(env: MessageEnvelope) -> PublishOutcome:
+            seen.append("b")
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        pipeline.process_sync(route, msg1, publish_fn=fn_a)
+        pipeline.process_sync(route, msg2, publish_fn=fn_b)
+
+        # First call routed through fn_a, second through fn_b — in order.
+        assert seen == ["a", "b"]
+
+
+# ── clear_caches() (R8) ───────────────────────────────────────────────────
+
+
+class TestClearCaches:
+    """R8: HandlerPipeline.clear_caches() drops all four route-keyed caches so
+    stale entries (keyed by the id of dropped routes) don't linger across
+    reconnect/restart cycles.
+    """
+
+    def test_clear_caches_empties_all_four_caches(self) -> None:
+        pipeline = HandlerPipeline()
+        route = _make_route()
+        fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        afn = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        # Populate the four route-keyed caches.
+        pipeline._compose_publish_sync(route, fn)
+        pipeline._compose_publish_async(route, afn)
+        pipeline._consume_chain_cache[id(route)] = lambda _msg: None
+        pipeline._consume_chain_async_cache[id(route)] = lambda _msg: None
+
+        assert len(pipeline._consume_chain_cache) == 1
+        assert len(pipeline._consume_chain_async_cache) == 1
+        assert len(pipeline._publish_chain_cache) == 1
+        assert len(pipeline._publish_chain_async_cache) == 1
+
+        pipeline.clear_caches()
+
+        assert pipeline._consume_chain_cache == {}
+        assert pipeline._consume_chain_async_cache == {}
+        assert pipeline._publish_chain_cache == {}
+        assert pipeline._publish_chain_async_cache == {}
+
+    def test_clear_caches_allows_rebuild(self) -> None:
+        """After clearing, the next call rebuilds the chain lazily."""
+        msg = _make_message()
+        _wire_sync(msg)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> bytes:
+            return b"r"
+
+        rp = ResultPublisher(exchange="out", routing_key="k")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        pipeline.process_sync(route, msg, publish_fn=publish_fn)
+        assert len(pipeline._publish_chain_cache) == 1
+
+        pipeline.clear_caches()
+        assert pipeline._publish_chain_cache == {}
+
+        pipeline.process_sync(route, msg, publish_fn=publish_fn)
+        assert len(pipeline._publish_chain_cache) == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_caches_async(self) -> None:
+        pipeline = HandlerPipeline()
+        route = _make_route()
+        fn = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        pipeline._compose_publish_async(route, fn)
+        assert len(pipeline._publish_chain_async_cache) == 1
+        pipeline.clear_caches()
+        assert pipeline._publish_chain_async_cache == {}
+        assert pipeline._consume_chain_async_cache == {}
+
+    def test_clear_caches_on_empty_pipeline_is_safe(self) -> None:
+        """Calling clear_caches() before any processing is a no-op."""
+        pipeline = HandlerPipeline()
+        pipeline.clear_caches()  # no exception
+        assert pipeline._consume_chain_cache == {}
+
+
+# ── _AckFirstStrategy direct calls ───────────────────────────────────────
+
+
+class TestAckFirstStrategyDirectCalls:
+    """Direct calls to _AckFirstStrategy to cover lines 92 and 98-102."""
+
+    def test_on_success_acks_unsettled_message(self) -> None:
+        """Line 92: on_success acks msg when not already settled."""
+        from rabbitkit.core.pipeline import _AckFirstStrategy
+
+        msg = _make_message()
+        ack, _, _ = _wire_sync(msg)
+        _AckFirstStrategy().on_success(msg)
+        ack.assert_called_once()
+
+    def test_on_success_skips_settled_message(self) -> None:
+        """Line 91: on_success skips ack when already settled."""
+        from rabbitkit.core.pipeline import _AckFirstStrategy
+
+        msg = _make_message()
+        ack, _, _ = _wire_sync(msg)
+        msg.ack()  # settle the message via the proper method (sets _disposition)
+        ack.reset_mock()
+        _AckFirstStrategy().on_success(msg)
+        ack.assert_not_called()
+
+    def test_on_error_transient_nacks(self) -> None:
+        """Lines 99-100: on_error with transient error → nack(requeue=True)."""
+        from rabbitkit.core.pipeline import _AckFirstStrategy
+
+        msg = _make_message()
+        _, nack, _ = _wire_sync(msg)
+        _AckFirstStrategy().on_error(msg, ConnectionResetError("transient"))
+        nack.assert_called_once_with(True)
+
+    def test_on_error_permanent_rejects(self) -> None:
+        """Lines 101-102: on_error with permanent error → reject(requeue=False)."""
+        from rabbitkit.core.pipeline import _AckFirstStrategy
+
+        msg = _make_message()
+        _, _, reject = _wire_sync(msg)
+        _AckFirstStrategy().on_error(msg, ValueError("permanent"))
+        reject.assert_called_once_with(False)
+
+
+# ── async strategy direct calls ───────────────────────────────────────────
+
+
+class TestAsyncStrategyDirectCalls:
+    """Direct calls to async strategy classes (lines 143-144, 155-156, 167, 170-174)."""
+
+    @pytest.mark.asyncio
+    async def test_manual_async_on_success_acks_unsettled(self) -> None:
+        """Lines 143-144: _ManualStrategyAsync.on_success acks when unsettled."""
+        from rabbitkit.core.pipeline import _ManualStrategyAsync
+
+        msg = _make_message()
+        ack, _, _ = _wire_async(msg)
+        await _ManualStrategyAsync().on_success(msg)
+        ack.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_nack_on_error_async_on_success_acks_unsettled(self) -> None:
+        """Lines 155-156: _NackOnErrorStrategyAsync.on_success acks when unsettled."""
+        from rabbitkit.core.pipeline import _NackOnErrorStrategyAsync
+
+        msg = _make_message()
+        ack, _, _ = _wire_async(msg)
+        await _NackOnErrorStrategyAsync().on_success(msg)
+        ack.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_ack_first_async_on_success_acks_unsettled(self) -> None:
+        """Line 167: _AckFirstStrategyAsync.on_success acks when unsettled."""
+        from rabbitkit.core.pipeline import _AckFirstStrategyAsync
+
+        msg = _make_message()
+        ack, _, _ = _wire_async(msg)
+        await _AckFirstStrategyAsync().on_success(msg)
+        ack.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_ack_first_async_on_error_transient_nacks(self) -> None:
+        """Lines 170-172: _AckFirstStrategyAsync.on_error transient → nack_async(True)."""
+        from rabbitkit.core.pipeline import _AckFirstStrategyAsync
+
+        msg = _make_message()
+        _, nack, _ = _wire_async(msg)
+        await _AckFirstStrategyAsync().on_error(msg, ConnectionResetError("transient"))
+        nack.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_ack_first_async_on_error_permanent_rejects(self) -> None:
+        """Lines 173-174: _AckFirstStrategyAsync.on_error permanent → reject_async(False)."""
+        from rabbitkit.core.pipeline import _AckFirstStrategyAsync
+
+        msg = _make_message()
+        _, _, reject = _wire_async(msg)
+        await _AckFirstStrategyAsync().on_error(msg, ValueError("permanent"))
+        reject.assert_called_once_with(False)
+
+
+# ── DEBUG logging path ────────────────────────────────────────────────────
+
+
+class TestDebugLoggingPath:
+    """Lines 280, 326, 347, 393: contextvars bind/clear on DEBUG logging."""
+
+    def test_sync_debug_path_binds_and_clears_contextvars(self) -> None:
+        """Lines 280, 326: bind/clear when DEBUG logging enabled."""
+        import structlog.contextvars
+
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+
+        with patch("rabbitkit.core.pipeline._stdlib_logger") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            with patch.object(structlog.contextvars, "bind_contextvars") as mock_bind:
+                with patch.object(structlog.contextvars, "clear_contextvars") as mock_clear:
+                    pipeline.process_sync(route, msg)
+
+        mock_bind.assert_called_once()
+        mock_clear.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_debug_path_binds_and_clears_contextvars(self) -> None:
+        """Lines 347, 393: async debug path bind/clear."""
+        import structlog.contextvars
+
+        msg = _make_message()
+        _wire_async(msg)
+
+        async def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+
+        with patch("rabbitkit.core.pipeline._stdlib_logger") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            with patch.object(structlog.contextvars, "bind_contextvars") as mock_bind:
+                with patch.object(structlog.contextvars, "clear_contextvars") as mock_clear:
+                    await pipeline.process_async(route, msg)
+
+        mock_bind.assert_called_once()
+        mock_clear.assert_called_once()
+
+
+# ── _get_body_type cache hit ──────────────────────────────────────────────
+
+
+class TestGetBodyTypeCacheHit:
+    """Line 550: _get_body_type returns cached value on second call."""
+
+    def test_cache_hit_returns_cached_type(self) -> None:
+        pipeline = HandlerPipeline()
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        # First call computes and caches
+        result1 = pipeline._get_body_type(route)
+        # Second call hits cache (line 550)
+        result2 = pipeline._get_body_type(route)
+        assert result1 == result2
+        assert handler in pipeline._body_type_cache
+
+
+# ── _compute_body_type get_type_hints fallback ────────────────────────────
+
+
+class TestComputeBodyTypeFallback:
+    """Lines 569-570: _compute_body_type falls back to {} when get_type_hints raises."""
+
+    def test_get_type_hints_exception_falls_back_to_raw_annotation(self) -> None:
+        """Lines 569-570: get_type_hints raises → hints={}, raw inspect annotation used."""
+        pipeline = HandlerPipeline()
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+
+        with patch("typing.get_type_hints", side_effect=NameError("undefined")):
+            result = pipeline._compute_body_type(route)
+
+        # When get_type_hints raises, fall back to the raw inspect annotation.
+        # With `from __future__ import annotations` in this test file, the
+        # raw annotation is the string "bytes" rather than the bytes type.
+        assert result == "bytes" or result is bytes
+
+
+# ── _publish_result_async success return ─────────────────────────────────
+
+
+class TestPublishResultAsyncSuccess:
+    """Line 841: _publish_result_async returns True on success."""
+
+    @pytest.mark.asyncio
+    async def test_publish_result_async_returns_true_on_confirmed(self) -> None:
+        """Line 841/852: _publish_result_async returns True when publish succeeds."""
+        msg = _make_message()
+        _wire_async(msg)
+
+        async def publish_fn(envelope: MessageEnvelope) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        def handler(body: bytes) -> bytes:
+            return b"result"
+
+        rp = ResultPublisher(exchange="out", routing_key="result")
+        route = _make_route(handler=handler, result_publisher=rp)
+        pipeline = HandlerPipeline()
+
+        result = await pipeline._publish_result_async(route, msg, b"result", publish_fn)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_publish_result_async_returns_true_when_envelope_is_none(self) -> None:
+        """Line 841: _publish_result_async returns True when publish_fn is not None
+        but _build_result_envelope returns None (no reply_to, no result_publisher).
+
+        This covers the second 'return True' branch — the one after the
+        'if envelope is None' check (line 841), which is distinct from the
+        first 'return True' (line 837) when publish_fn is None.
+        """
+        msg = _make_message()  # no reply_to
+
+        async def publish_fn(envelope: MessageEnvelope) -> PublishOutcome:  # pragma: no cover
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        # Route with no result_publisher and message has no reply_to →
+        # _build_result_envelope returns None.
+        route = _make_route(result_publisher=None)
+        pipeline = HandlerPipeline()
+
+        # Pass a non-None result so _build_result_envelope is called.
+        result = await pipeline._publish_result_async(route, msg, b"some-result", publish_fn)
+        # publish_fn is not None but envelope is None → return True (line 841).
+        assert result is True

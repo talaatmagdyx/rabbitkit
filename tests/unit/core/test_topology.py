@@ -23,9 +23,9 @@ class TestRabbitExchange:
         assert ex.bind_to is None
 
     def test_validate_empty_name_non_direct(self) -> None:
-        ex = RabbitExchange(name="", type=ExchangeType.FANOUT)
+        # Validation now runs at construction (fail-fast __post_init__).
         with pytest.raises(ValueError, match="name"):
-            ex.validate()
+            RabbitExchange(name="", type=ExchangeType.FANOUT)
 
     def test_validate_empty_name_direct_ok(self) -> None:
         ex = RabbitExchange(name="", type=ExchangeType.DIRECT)
@@ -245,3 +245,12 @@ class TestRabbitQueueFeatures:
         )
         kwargs = q.to_bind_kwargs("events")
         assert kwargs["arguments"] == {"x-match": "all"}
+
+
+class TestRabbitExchangeInternalAutoDelete:
+    def test_internal_and_auto_delete_raises(self) -> None:
+        """RabbitExchange with internal=True and auto_delete=True is invalid."""
+        from rabbitkit.core.topology import RabbitExchange
+        from rabbitkit.core.types import ExchangeType
+        with pytest.raises(ValueError, match="auto_delete"):
+            RabbitExchange(name="x", type=ExchangeType.DIRECT, internal=True, auto_delete=True)

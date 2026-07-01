@@ -10,7 +10,35 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
+
+from rabbitkit.core.message import RabbitMessage
+
+# ── AMQP protocol-level constants ────────────────────────────────────────
+
+# RabbitMQ's "direct reply-to" pseudo-queue (an AMQP protocol feature, not a
+# rabbitkit invention). It has two hard broker rules: consuming from it
+# requires a no-ack consumer, and the broker rejects any Queue.Declare against
+# it (active or passive). A more subtle rule transports must also honor:
+# publishing a request with reply_to=DIRECT_REPLY_TO_QUEUE must happen on the
+# SAME channel that registered the reply consumer — otherwise the broker
+# raises "PRECONDITION_FAILED - fast reply consumer does not exist" on
+# publish. Single canonical constant so rpc.py and both transports agree.
+DIRECT_REPLY_TO_QUEUE = "amq.rabbitmq.reply-to"
+
+
+class AppState(str, Enum):
+    """Application lifecycle states.
+
+    Canonical home for this enum is ``core/types.py`` per the project rule that
+    ``types.py`` is the SINGLE canonical location for all enums and data types.
+    """
+
+    IDLE = "idle"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
 
 
 class ExchangeType(str, Enum):
@@ -130,3 +158,28 @@ class ClassifiedError:
     severity: ErrorSeverity
     original: BaseException
     reason: str
+
+
+@runtime_checkable
+class AckStrategy(Protocol):
+    """Settlement strategy for an ``AckPolicy``.
+
+    Each strategy owns the success-path ack and the error-path settlement.
+    Handler-raised ``AckMessage`` / ``NackMessage`` / ``RejectMessage`` are
+    NOT policy-driven and stay in the pipeline.
+
+    See Contract 1 in the plan for per-policy semantics.
+    """
+
+    @property
+    def acks_first(self) -> bool:
+        """True when the message is acked BEFORE the handler runs (ACK_FIRST)."""
+        ...
+
+    def on_success(self, msg: RabbitMessage) -> None:
+        """Settle the message after a successful handler invocation."""
+        ...
+
+    def on_error(self, msg: RabbitMessage, exc: Exception) -> None:
+        """Settle the message after an unhandled handler exception."""
+        ...

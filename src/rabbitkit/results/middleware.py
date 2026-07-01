@@ -60,6 +60,7 @@ from typing import Any
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.results.backend import ResultBackend
 
 
 class ResultMiddleware(BaseMiddleware):
@@ -68,7 +69,7 @@ class ResultMiddleware(BaseMiddleware):
     Keyed by the message's correlation_id. If no correlation_id, skips storage.
     """
 
-    def __init__(self, backend: Any, serializer: Any | None = None, ttl: int = 3600) -> None:
+    def __init__(self, backend: ResultBackend[Any], serializer: Any | None = None, ttl: int = 3600) -> None:
         self._backend = backend
         self._serializer = serializer
         self._ttl = ttl

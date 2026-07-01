@@ -79,9 +79,7 @@ class RateLimitConfig:
         if self.burst < 1:
             raise ValueError("burst must be >= 1")
         if self.on_limited not in ("wait", "nack", "drop"):
-            raise ValueError(
-                f"on_limited must be 'wait', 'nack', or 'drop', got '{self.on_limited}'"
-            )
+            raise ValueError(f"on_limited must be 'wait', 'nack', or 'drop', got '{self.on_limited}'")
 
 
 class _TokenBucket:
@@ -133,28 +131,45 @@ class RateLimitMiddleware(BaseMiddleware):
     def __init__(self, config: RateLimitConfig) -> None:
         self._config = config
         self._bucket = _TokenBucket(config.max_rate, config.burst)
+        # Maximum time (s) a "wait" policy will block for a token before falling
+        # back to drop semantics. Override per-instance if needed.
+        self._wait_deadline: float = 30.0
 
     def consume_scope(
         self,
         call_next: Any,
         message: RabbitMessage,
     ) -> Any:
-        """Rate-limit sync message processing."""
-        if not self._bucket.try_acquire():
-            if self._config.on_limited == "nack":
-                if not message.is_settled:
-                    message.nack(requeue=True)
-                return None
-            if self._config.on_limited == "drop":
+        """Rate-limit sync message processing.
+
+        For ``on_limited="wait"`` the loop polls the token bucket until a token
+        is acquired **or** ``wait_deadline`` (seconds, monotonic) expires. If the
+        deadline elapses with no token, the message falls back to the configured
+        drop/nack semantics so the handler is **never** invoked without a token.
+        """
+        if self._bucket.try_acquire():
+            return call_next(message)
+
+        if self._config.on_limited == "nack":
+            if not message.is_settled:
+                message.nack(requeue=True)
+            return None
+        if self._config.on_limited == "drop":
+            if not message.is_settled:
+                message.nack(requeue=False)
+            return None
+
+        # "wait" — bounded loop; only proceed once a token is actually acquired.
+        deadline = time.monotonic() + self._wait_deadline
+        while not self._bucket.try_acquire():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # No token within the deadline — fall back to drop semantics so
+                # the handler is NOT called without a token.
                 if not message.is_settled:
                     message.nack(requeue=False)
                 return None
-            # "wait" -- block until token available
-            wait = self._bucket.wait_time()
-            if wait > 0:
-                time.sleep(wait)
-            # Re-acquire after sleeping
-            self._bucket.try_acquire()
+            time.sleep(min(self._bucket.wait_time(), remaining))
 
         return call_next(message)
 
@@ -163,20 +178,32 @@ class RateLimitMiddleware(BaseMiddleware):
         call_next: Any,
         message: RabbitMessage,
     ) -> Any:
-        """Rate-limit async message processing."""
-        if not self._bucket.try_acquire():
-            if self._config.on_limited == "nack":
-                if not message.is_settled:
-                    await message.nack_async(requeue=True)
-                return None
-            if self._config.on_limited == "drop":
+        """Rate-limit async message processing.
+
+        Mirrors the sync logic: the "wait" loop is bounded by
+        ``self._wait_deadline`` and falls back to drop semantics if no token is
+        acquired in time, so the handler is never called without a token.
+        """
+        if self._bucket.try_acquire():
+            return await call_next(message)
+
+        if self._config.on_limited == "nack":
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
+            return None
+        if self._config.on_limited == "drop":
+            if not message.is_settled:
+                await message.nack_async(requeue=False)
+            return None
+
+        # "wait" — bounded loop; only proceed once a token is actually acquired.
+        deadline = time.monotonic() + self._wait_deadline
+        while not self._bucket.try_acquire():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 if not message.is_settled:
                     await message.nack_async(requeue=False)
                 return None
-            # "wait" -- async sleep until token available
-            wait = self._bucket.wait_time()
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._bucket.try_acquire()
+            await asyncio.sleep(min(self._bucket.wait_time(), remaining))
 
         return await call_next(message)

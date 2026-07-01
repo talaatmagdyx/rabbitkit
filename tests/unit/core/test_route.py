@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from rabbitkit.core.config import RETRY_DISABLED, RetryConfig
-from rabbitkit.core.route import ConfigurationError, ResultPublisher, RouteDefinition
+from rabbitkit.core.route import (
+    ConfigurationError,
+    ResultPublisher,
+    RouteDefinition,
+    RouteRuntimeState,
+)
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
 
@@ -102,6 +107,54 @@ class TestRouteDefinitionConstruction:
     def test_prefetch_count_set(self) -> None:
         route = _make_route(prefetch_count=50)
         assert route.prefetch_count == 50
+
+    def test_frozen_cannot_reassign_metadata(self) -> None:
+        route = _make_route()
+        with pytest.raises(AttributeError):
+            route.name = "other"  # type: ignore[misc]
+
+    def test_runtime_state_default(self) -> None:
+        route = _make_route()
+        assert isinstance(route.runtime_state, RouteRuntimeState)
+        assert route.runtime_state.consumer_tag is None
+
+    def test_consumer_tag_via_runtime_state_is_mutable(self) -> None:
+        route = _make_route()
+        assert route.consumer_tag is None
+        route.runtime_state.consumer_tag = "ctag.1"
+        assert route.runtime_state.consumer_tag == "ctag.1"
+        # Backward-compat property reflects the runtime state.
+        assert route.consumer_tag == "ctag.1"
+
+    def test_consumer_tag_property_is_read_only(self) -> None:
+        # ``consumer_tag`` is a property backed by ``runtime_state``. Writes
+        # via ``route.consumer_tag = x`` are supported for backward
+        # compatibility and delegate to ``runtime_state.consumer_tag``.
+        route = _make_route()
+        route.consumer_tag = "ctag.2"
+        assert route.consumer_tag == "ctag.2"
+        assert route.runtime_state.consumer_tag == "ctag.2"
+
+    def test_consumer_tag_delete_resets_to_none(self) -> None:
+        route = _make_route()
+        route.runtime_state.consumer_tag = "ctag.3"
+        assert route.consumer_tag == "ctag.3"
+        del route.consumer_tag
+        assert route.consumer_tag is None
+        assert route.runtime_state.consumer_tag is None
+
+    def test_default_runtime_state_is_unique_per_instance(self) -> None:
+        route_a = _make_route()
+        route_b = _make_route()
+        assert route_a.runtime_state is not route_b.runtime_state
+        route_a.runtime_state.consumer_tag = "a"
+        assert route_b.runtime_state.consumer_tag is None
+
+    def test_runtime_state_shared_when_passed_explicitly(self) -> None:
+        state = RouteRuntimeState(consumer_tag="pre")
+        route = _make_route(runtime_state=state)
+        assert route.runtime_state is state
+        assert route.consumer_tag == "pre"
 
 
 # ── Retry resolution ────────────────────────────────────────────────────
@@ -272,3 +325,20 @@ class TestFullValidation:
     def test_validate_with_broker_retry(self) -> None:
         route = _make_route(ack_policy=AckPolicy.AUTO)
         route.validate(broker_retry=RetryConfig())  # no exception
+
+
+class TestRouteDynamic:
+    def test_delete_consumer_tag_sets_none(self) -> None:
+        """del route.consumer_tag clears the runtime consumer_tag to None."""
+        route = _make_route()
+        route.consumer_tag = "my-tag"
+        assert route.consumer_tag == "my-tag"
+        del route.consumer_tag
+        assert route.consumer_tag is None
+
+    def test_delete_other_field_raises(self) -> None:
+        """del on any field other than consumer_tag raises FrozenInstanceError."""
+        from dataclasses import FrozenInstanceError
+        route = _make_route()
+        with pytest.raises(FrozenInstanceError):
+            del route.name  # type: ignore[misc]

@@ -1,0 +1,40 @@
+# Dedicated integration workflow — runs the integration test suite and chaos
+# suite against a real RabbitMQ broker. Triggered manually
+# (workflow_dispatch) and on nightly schedule so it doesn't block every PR;
+# the lightweight `integration` job in `ci.yml` already covers PR-time runs.
+#
+# Each test module starts its own disposable broker via testcontainers (see
+# tests/integration/test_real_rabbitmq.py's `rabbitmq_url` fixture) — there is
+# no GHA `services:` container here because nothing in the suite connects to
+# one; testcontainers manages the broker's full lifecycle against the Docker
+# daemon already present on GitHub-hosted runners.
+#
+# Gating policy: the nightly run fails loudly on real integration regressions
+# (no job-level `continue-on-error`). The chaos/benchmark step remains
+# best-effort via a step-level `continue-on-error: true`.
+name: Integration
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Nightly at 03:30 UTC.
+    - cron: "30 3 * * *"
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[integration]"
+      # GATING: real integration regressions fail the nightly job.
+      - name: Integration tests
+        run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short
+      # BEST-EFFORT: chaos/benchmark suite — step-level continue-on-error.
+      - name: Chaos suite (best-effort)
+        continue-on-error: true
+        env:
+          RK_CHAOS_PORT: "32778"
+        run: .venv/bin/python -m benchmarks

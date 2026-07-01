@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -412,3 +414,196 @@ class TestSignalHandler:
         app._signal_handler()
 
         assert app._shutdown_event.is_set()
+
+
+# ── startup_timeout bounds hung hooks (I-12) ──────────────────────────────
+
+
+class TestStartupTimeoutBounds:
+    """I-12: ``startup_timeout`` must actually bound a hung hook instead of
+    hanging the caller forever (the old ``with ThreadPoolExecutor()`` context
+    manager called ``shutdown(wait=True)`` on ``__exit__``).
+    """
+
+    def test_hung_sync_hook_start_raises_timeout(self) -> None:
+        app = RabbitApp(startup_timeout=0.1)
+
+        @app.on_startup
+        def slow_hook() -> None:
+            time.sleep(0.4)  # well beyond the timeout
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            app.start()
+
+        # Startup failure → on_shutdown still called → STOPPED.
+        assert app.state == AppState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_hung_sync_hook_start_async_raises_timeout(self) -> None:
+        app = RabbitApp(startup_timeout=0.1)
+
+        @app.on_startup
+        def slow_hook() -> None:
+            time.sleep(0.4)
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            await app.start_async()
+
+        assert app.state == AppState.STOPPED
+
+    def test_normal_hook_completes_within_timeout(self) -> None:
+        app = RabbitApp(startup_timeout=1.0)
+        called = False
+
+        @app.on_startup
+        def quick_hook() -> None:
+            nonlocal called
+            called = True
+
+        app.start()
+        assert called
+        assert app.state == AppState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_normal_async_hook_completes_within_timeout(self) -> None:
+        app = RabbitApp(startup_timeout=1.0)
+        called = False
+
+        @app.on_startup
+        async def quick_hook() -> None:
+            nonlocal called
+            called = True
+
+        await app.start_async()
+        assert called
+        assert app.state == AppState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_hung_async_hook_start_async_raises_timeout(self) -> None:
+        """A coroutine-function hook that never awaits completion is bounded."""
+        app = RabbitApp(startup_timeout=0.1)
+        event = asyncio.Event()
+
+        @app.on_startup
+        async def slow_async_hook() -> None:
+            await event.wait()  # never set
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            await app.start_async()
+
+        assert app.state == AppState.STOPPED
+
+    def test_threading_hook_not_confused_for_async(self) -> None:
+        """A sync hook that uses threads is NOT mistaken for an async hook."""
+        app = RabbitApp(startup_timeout=1.0)
+        done = threading.Event()
+
+        @app.on_startup
+        def threaded_hook() -> None:
+            done.set()
+
+        app.start()
+        assert done.is_set()
+        assert app.state == AppState.RUNNING
+
+    # ── SRE-M-2: default startup_timeout is finite (120s) ──────────────────
+
+    def test_default_startup_timeout_is_finite(self) -> None:
+        """Out-of-the-box ``RabbitApp()`` has a finite startup_timeout (120.0s)
+        so a hung startup hook fails fast instead of hanging until SIGKILL.
+        Passing ``startup_timeout=None`` explicitly restores unbounded behavior.
+        """
+        app = RabbitApp()
+        assert app._startup_timeout == 120.0
+
+        unbounded = RabbitApp(startup_timeout=None)
+        assert unbounded._startup_timeout is None
+
+    def test_default_startup_timeout_bounds_hung_hook(self) -> None:
+        """With the default finite timeout, a hung startup hook raises
+        TimeoutError. The real default (120s) is too long to wait in CI, so the
+        instance timeout is overridden to a tiny value post-construction to
+        exercise the same bounded-default code path quickly.
+        """
+        app = RabbitApp()
+        assert app._startup_timeout is not None  # bounded by default
+        app._startup_timeout = 0.1
+
+        @app.on_startup
+        def slow_hook() -> None:
+            time.sleep(0.4)  # well beyond the overridden timeout
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            app.start()
+
+        # Startup failure → on_shutdown still called → STOPPED.
+        assert app.state == AppState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_default_startup_timeout_bounds_hung_hook_async(self) -> None:
+        """Async twin: the default finite timeout bounds a hung async hook."""
+        app = RabbitApp()
+        assert app._startup_timeout is not None
+        app._startup_timeout = 0.1
+        event = asyncio.Event()
+
+        @app.on_startup
+        async def slow_async_hook() -> None:
+            await event.wait()  # never set
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            await app.start_async()
+
+        assert app.state == AppState.STOPPED
+
+
+# ── _run_hooks_sync with timeout=None raises for async hook (line 269) ───
+
+
+class TestRunHooksSyncNoTimeout:
+    def test_async_hook_no_timeout_raises_typeerror(self) -> None:
+        """Line 269: _run_hooks_sync(timeout=None) raises TypeError for async hook."""
+        app = RabbitApp()
+
+        async def async_hook() -> None:
+            pass
+
+        with pytest.raises(TypeError, match="Async hook"):
+            app._run_hooks_sync([async_hook], timeout=None)
+
+
+# ── _run_hooks_async: sync hook returning asyncio.Future (lines 318-322) ──
+
+
+class TestRunHooksAsyncFutureResult:
+    @pytest.mark.asyncio
+    async def test_sync_hook_returning_future_is_awaited(self) -> None:
+        """Lines 318-322: when a sync hook returns an asyncio.Future, it is awaited."""
+        app = RabbitApp()
+
+        # Pre-create a resolved future in the async context (not inside to_thread)
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        fut.set_result(None)
+
+        # The hook is sync (not a coroutinefunction) and returns the pre-resolved future
+        def hook_returning_future() -> asyncio.Future[None]:
+            return fut
+
+        await app._run_hooks_async([hook_returning_future], timeout=2.0)
+        assert fut.done()
+
+    @pytest.mark.asyncio
+    async def test_sync_hook_returning_future_timeout_raises(self) -> None:
+        """Lines 318-322: when the awaited Future exceeds timeout, TimeoutError is raised."""
+        app = RabbitApp()
+
+        # Pre-create an unresolved future in the async context
+        loop = asyncio.get_event_loop()
+        pending_fut: asyncio.Future[None] = loop.create_future()
+
+        def hook_returning_pending_future() -> asyncio.Future[None]:
+            return pending_fut
+
+        with pytest.raises(TimeoutError, match="exceeded timeout"):
+            await app._run_hooks_async([hook_returning_pending_future], timeout=0.05)

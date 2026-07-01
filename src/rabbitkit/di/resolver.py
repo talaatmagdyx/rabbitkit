@@ -6,17 +6,29 @@ See Contract 4 (Parameter Resolution Precedence) for the full rules.
 from __future__ import annotations
 
 import inspect
+import logging
 import typing
 from collections.abc import AsyncGenerator, Callable, Generator
 from typing import Annotated, Any, get_args, get_origin
 
-from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.errors import ConfigurationError
+from rabbitkit.core.message import RabbitMessage, is_rabbit_message_annotation
 from rabbitkit.di.context import Context, ContextRepo, Header, Path
 from rabbitkit.di.depends import Depends
 
+_logger = logging.getLogger(__name__)
 
-class ConfigurationError(Exception):
-    """Raised for invalid handler signatures."""
+
+def _is_rabbit_message(ann: Any) -> bool:
+    """True if ``ann`` is/mentions :class:`RabbitMessage`.
+
+    Handles both the resolved class and the string form (``"RabbitMessage"``)
+    produced by ``from __future__ import annotations`` when the hint can't be
+    resolved by ``typing.get_type_hints``. Recognizing the string form prevents
+    valid ``(body: bytes, msg: RabbitMessage)`` handlers from being mis-classified
+    as having two body-like parameters.
+    """
+    return is_rabbit_message_annotation(ann)
 
 
 class DependencyScope:
@@ -33,25 +45,45 @@ class DependencyScope:
         self._async_generators.append(gen)
 
     def cleanup(self) -> None:
-        """Close all sync generators (in reverse order)."""
+        """Close all sync generators (in reverse order).
+
+        Each generator's teardown is isolated: a raising teardown is logged
+        and skipped so one misbehaving generator does not leak the rest or
+        prevent ``clear()`` from running.
+        """
         for gen in reversed(self._sync_generators):
             try:
                 next(gen, None)
             except StopIteration:  # pragma: no cover
                 pass  # pragma: no cover
+            except Exception:
+                _logger.warning("sync generator teardown raised", exc_info=True)
             finally:
-                gen.close()
+                try:
+                    gen.close()
+                except Exception:
+                    _logger.warning("sync generator close() raised", exc_info=True)
         self._sync_generators.clear()
 
     async def cleanup_async(self) -> None:
-        """Close all generators (async generators + sync generators, in reverse order)."""
+        """Close all generators (async generators + sync generators, in reverse order).
+
+        Each generator's teardown is isolated: a raising async teardown is
+        logged and skipped, and the sync-generator pass always runs even if an
+        async generator raised. ``clear()`` always runs.
+        """
         for gen in reversed(self._async_generators):
             try:
                 await gen.__anext__()
             except StopAsyncIteration:
                 pass
+            except Exception:
+                _logger.warning("async generator teardown raised", exc_info=True)
             finally:
-                await gen.aclose()
+                try:
+                    await gen.aclose()
+                except Exception:
+                    _logger.warning("async generator aclose() raised", exc_info=True)
         self._async_generators.clear()
 
         for sync_gen in reversed(self._sync_generators):
@@ -59,8 +91,13 @@ class DependencyScope:
                 next(sync_gen, None)
             except StopIteration:  # pragma: no cover
                 pass  # pragma: no cover
+            except Exception:
+                _logger.warning("sync generator teardown raised", exc_info=True)
             finally:
-                sync_gen.close()
+                try:
+                    sync_gen.close()
+                except Exception:
+                    _logger.warning("sync generator close() raised", exc_info=True)
         self._sync_generators.clear()
 
 
@@ -83,9 +120,7 @@ class DIResolver:
         # computed once and reused on the per-message hot path.
         self._sig_hints_cache: dict[Any, tuple[inspect.Signature, dict[str, Any]]] = {}
 
-    def _sig_and_hints(
-        self, handler: Callable[..., Any]
-    ) -> tuple[inspect.Signature, dict[str, Any]]:
+    def _sig_and_hints(self, handler: Callable[..., Any]) -> tuple[inspect.Signature, dict[str, Any]]:
         cached = self._sig_hints_cache.get(handler)
         if cached is None:
             cached = (inspect.signature(handler), self._get_type_hints(handler))
@@ -163,15 +198,24 @@ class DIResolver:
             if self._has_di_marker(ann):
                 continue
 
-            # Check if it's RabbitMessage type
-            if ann is RabbitMessage:
+            # Check if it's RabbitMessage type (class or string form)
+            if _is_rabbit_message(ann):
                 continue
 
             # Check if it has a default (non-body)
             if param.default is not inspect.Parameter.empty:
                 continue
 
-            # This is a potential body parameter
+            # Unannotated parameters are NOT body-like candidates: the fallback
+            # resolver binds the first unannotated param to the body and subsequent
+            # unannotated params to the message (a documented pattern, e.g.
+            # ``handle(body, msg)``). Only flag ANNOTATED params that look like body
+            # types (a clear intent signal that multiple body bindings are expected,
+            # which the resolver does not support) — e.g. ``handle(a: Order, b: Customer)``.
+            if ann is inspect.Parameter.empty:
+                continue
+
+            # This is an annotated body-like parameter
             body_params.append(param_name)
 
         if len(body_params) > 1:
@@ -207,8 +251,8 @@ class DIResolver:
                     kwargs[param_name] = self._resolve_marker(marker, message, context_repo, depends_cache)
                 continue
 
-            # Rule 2: RabbitMessage type
-            if ann is RabbitMessage:
+            # Rule 2: RabbitMessage type (class or string form)
+            if _is_rabbit_message(ann):
                 kwargs[param_name] = message
                 continue
 
@@ -248,8 +292,8 @@ class DIResolver:
                     kwargs[param_name] = self._resolve_marker(marker, message, context_repo, depends_cache)
                 continue
 
-            # Rule 2: RabbitMessage type
-            if ann is RabbitMessage:
+            # Rule 2: RabbitMessage type (class or string form)
+            if _is_rabbit_message(ann):
                 kwargs[param_name] = message
                 continue
 
@@ -300,9 +344,7 @@ class DIResolver:
             return self._resolve_context(marker, context_repo)
         raise ConfigurationError(f"Unknown DI marker: {marker!r}")
 
-    def _resolve_depends(
-        self, marker: Depends, cache: dict[int, Any], scope: DependencyScope | None = None
-    ) -> Any:
+    def _resolve_depends(self, marker: Depends, cache: dict[int, Any], scope: DependencyScope | None = None) -> Any:
         """Resolve a Depends() marker, with support for sync generator dependencies."""
         dep_id = id(marker.dependency)
         if marker.use_cache and dep_id in cache:

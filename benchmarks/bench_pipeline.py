@@ -129,11 +129,14 @@ def bench_result_publishing(iterations: int = 5000) -> float:
     return rate
 
 
-def run_all() -> None:
-    """Run all benchmarks and print results."""
-    print("=" * 60)
+def run_all() -> dict[str, float]:
+    """Run all pipeline benchmarks and print results."""
+    print("=" * 66)
     print("rabbitkit Pipeline Benchmarks (in-memory TestBroker)")
-    print("=" * 60)
+    print("  Pure Python overhead: serialization, DI, middleware chain.")
+    print("  Numbers exclude AMQP network / broker cost — see bench_throughput")
+    print("  for real-broker numbers.")
+    print("=" * 66)
     print()
 
     benchmarks = [
@@ -143,17 +146,18 @@ def run_all() -> None:
         ("Result publishing", bench_result_publishing),
     ]
 
+    results: dict[str, float] = {}
     for name, fn in benchmarks:
-        # Run 3 times, take median
+        # Run 3 times, take median for stability
         rates = [fn() for _ in range(3)]
         median_rate = statistics.median(rates)
         print(f"  {name:<40} {median_rate:>10,.0f} msg/s")
+        key = name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        results[f"pipeline_{key}_msg_s"] = median_rate
 
     print()
-    print("=" * 60)
-    print("Note: These are in-memory benchmarks. Real RabbitMQ")
-    print("throughput depends on network, persistence, and broker config.")
-    print("=" * 60)
+    print("=" * 66)
+    return results
 
 
 if __name__ == "__main__":

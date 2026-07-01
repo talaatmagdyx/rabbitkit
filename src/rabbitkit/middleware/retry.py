@@ -26,6 +26,58 @@ from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 logger = logging.getLogger(__name__)
 
 
+def retry_middleware_insertion_index(middlewares: Sequence[Any]) -> int:
+    """Index at which an auto-wired ``RetryMiddleware`` should be inserted.
+
+    Retry must be OUTER of ordinary user middlewares (e.g. ``TimeoutMiddleware``)
+    so it can classify and re-queue exceptions they raise — this is the
+    documented composition in ``middleware/timeout.py``
+    (``middlewares=[retry_mw, timeout_mw]  # retry outermost``), which relies on
+    retry seeing ``HandlerTimeoutError``.
+
+    Retry must be INNER of any ``ExceptionMiddleware``, which is documented as
+    the true outermost layer that "catches exceptions AFTER retry gives up"
+    (``middleware/exception.py``) — it needs to see the ``_rabbitkit_terminal``
+    exceptions retry re-raises on exhaustion/permanent failure.
+
+    So retry is inserted right after any *leading* ``ExceptionMiddleware``
+    instances, ahead of everything else.
+    """
+    from rabbitkit.middleware.exception import ExceptionMiddleware
+
+    index = 0
+    for mw in middlewares:
+        if isinstance(mw, ExceptionMiddleware):
+            index += 1
+        else:
+            break
+    return index
+
+
+def warn_retry_middleware_without_topology(route_name: str) -> None:
+    """Warn when a route carries a ``RetryMiddleware`` but no retry topology.
+
+    A ``RetryMiddleware`` publishes failed messages to ``<queue>.retry.<n>``
+    delay queues. Those queues are only declared when retry is enabled via
+    ``RabbitConfig.retry`` / ``@subscriber(retry=...)`` (which drives
+    ``_declare_topology``). If a caller adds a ``RetryMiddleware`` manually to
+    ``middlewares=[...]`` *without* also setting ``retry=``, the delay queues
+    are never declared, so the retry publishes target non-existent queues on the
+    default exchange and are silently dropped — the source message is acked and
+    the retry is lost. Surface that half-configuration loudly.
+    """
+    import warnings
+
+    warnings.warn(
+        f"Route {route_name!r} has a RetryMiddleware but no retry topology was declared "
+        "(no retry=RetryConfig(...) on the broker or subscriber). Its delay-queue publishes "
+        "will target non-existent queues and be dropped. Set retry=RetryConfig(...) so the "
+        "delay/DLQ topology is declared, or remove the manual RetryMiddleware.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 class RetryMiddleware(BaseMiddleware):
     """Routes failed messages to delay queues for retry.
 

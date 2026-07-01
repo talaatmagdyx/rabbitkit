@@ -71,14 +71,15 @@ class InvalidModel:
 
 class TestPydanticAutoValidation:
     def test_dict_auto_validated_to_pydantic_model(self) -> None:
-        """When serializer returns dict and target has model_validate, auto-validate."""
+        """Serializer returns the validated model (not a dict) — the pipeline
+        should pass it through directly (no second-guess validation)."""
         captured: list = []
 
         def handler(body: FakeModel) -> None:
             captured.append(body)
 
         serializer = MagicMock()
-        serializer.decode.return_value = {"name": "Alice", "age": 30}
+        serializer.decode.return_value = FakeModel(name="Alice", age=30)
 
         route = _make_route(handler=handler, serializer_override=serializer)
         pipeline = HandlerPipeline()
@@ -120,7 +121,7 @@ class TestPydanticAutoValidation:
             pass  # pragma: no cover
 
         serializer = MagicMock()
-        serializer.decode.return_value = {"name": "Alice"}  # Missing 'email'
+        serializer.decode.side_effect = ValueError("Validation failed: missing required field 'email'")
 
         route = _make_route(handler=handler, serializer_override=serializer)
         pipeline = HandlerPipeline()

@@ -290,3 +290,64 @@ class MetricsMiddleware(BaseMiddleware):
                 time.monotonic() - start,
             )
             return result
+
+
+# ── Prometheus exposition (M-SRE1) ────────────────────────────────────────
+
+
+def metrics_app() -> Callable[[Any, Any, Any], Awaitable[None]]:
+    """Return a minimal ASGI app that exposes ``/metrics`` in Prometheus text format.
+
+    Requires ``prometheus_client`` (lazy-imported on first request). Mount it
+    behind your existing ASGI server (uvicorn, hypercorn) or the dashboard::
+
+        from rabbitkit.middleware.metrics import metrics_app
+        app = metrics_app()
+        # uvicorn rabbitkit.middleware.metrics:metrics_app  (after binding the factory)
+
+    For a stdlib one-liner without an ASGI server, see :func:`start_metrics_server`.
+    """
+    try:
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "metrics_app() requires the 'prometheus_client' package. Install it with: pip install prometheus-client"
+        ) from exc
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope.get("path") != "/metrics":
+            await send({"type": "http.response.start", "status": 404, "headers": []})
+            await send({"type": "http.response.body", "body": b"not found", "more_body": False})
+            return
+        body = generate_latest()
+        headers = [[b"content-type", CONTENT_TYPE_LATEST.encode()]]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+def start_metrics_server(port: int = 8000, host: str = "127.0.0.1") -> None:
+    """Start a background HTTP server exposing ``/metrics`` on ``port``.
+
+    Thin wrapper around ``prometheus_client.start_http_server``. Call once at
+    process startup (e.g. in a ``RabbitApp.on_startup`` hook). For k8s, scrape
+    this port with a ``ServiceMonitor`` / ``PodMonitor``.
+
+    The default ``host`` is ``127.0.0.1`` (loopback only) so the metrics
+    endpoint is not exposed to the network by default. For k8s / multi-host
+    scrapers pass ``host="0.0.0.0"`` explicitly and restrict access with a
+    NetworkPolicy (the metrics endpoint is unauthenticated and exposes broker
+    topology/throughput — never expose it publicly without authn in front).
+
+    Requires ``prometheus_client``.
+    """
+    try:
+        from prometheus_client import start_http_server
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "start_metrics_server() requires the 'prometheus_client' package. "
+            "Install it with: pip install prometheus-client"
+        ) from exc
+    start_http_server(port, host)
+    logger.info("Prometheus metrics server on http://%s:%d/metrics", host, port)

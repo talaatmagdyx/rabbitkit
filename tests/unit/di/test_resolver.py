@@ -788,3 +788,119 @@ class TestSignatureHintsCache:
 
         assert first is second  # same cached tuple, not recomputed
         assert handler in resolver._sig_hints_cache
+
+
+# ── DependencyScope — error-path coverage ────────────────────────────────
+
+
+class TestDependencyScopeErrorPaths:
+    def test_cleanup_sync_gen_close_raises_is_logged(self, caplog: Any) -> None:
+        """Lines 64-65: gen.close() raising Exception is caught and logged.
+
+        A generator that intercepts GeneratorExit in its finally block and
+        raises a different exception causes gen.close() to propagate that
+        exception. The DependencyScope must catch it and log a warning instead
+        of crashing.
+        """
+        import logging
+
+        def raising_close_gen() -> Any:
+            try:
+                yield "first"   # test advances here
+                yield "second"  # cleanup() next() call advances here; close() then raises
+            finally:
+                raise RuntimeError("close exploded")
+
+        scope = DependencyScope()
+        gen = raising_close_gen()
+        next(gen)  # advance past the yield
+        scope.add_sync_generator(gen)
+
+        with caplog.at_level(logging.WARNING, logger="rabbitkit.di.resolver"):
+            scope.cleanup()  # must NOT raise
+
+        assert any("close() raised" in r.message for r in caplog.records)
+        assert scope._sync_generators == []
+
+    async def test_cleanup_async_gen_aclose_raises_is_logged(self, caplog: Any) -> None:
+        """Lines 85-86: gen.aclose() raising Exception is caught and logged."""
+        import logging
+
+        async def raising_aclose_gen() -> Any:
+            try:
+                yield "first"   # test advances here
+                yield "second"  # cleanup_async() __anext__() advances here; aclose() then raises
+            finally:
+                raise RuntimeError("aclose exploded")
+
+        scope = DependencyScope()
+        gen = raising_aclose_gen()
+        await gen.__anext__()  # advance past the yield
+        scope.add_async_generator(gen)
+
+        with caplog.at_level(logging.WARNING, logger="rabbitkit.di.resolver"):
+            await scope.cleanup_async()  # must NOT raise
+
+        assert any("aclose() raised" in r.message for r in caplog.records)
+        assert scope._async_generators == []
+
+    async def test_cleanup_async_sync_gen_teardown_raises_is_logged(self, caplog: Any) -> None:
+        """Lines 94-95: sync generator teardown (next()) raising in cleanup_async is logged."""
+        import logging
+
+        def raising_teardown_gen() -> Any:
+            yield "value"
+            raise RuntimeError("teardown boom")
+
+        scope = DependencyScope()
+        gen = raising_teardown_gen()
+        next(gen)  # advance past the yield; teardown will raise on next()
+        scope.add_sync_generator(gen)
+
+        with caplog.at_level(logging.WARNING, logger="rabbitkit.di.resolver"):
+            await scope.cleanup_async()  # must NOT raise
+
+        # The teardown-raised warning must be present.
+        assert any("teardown raised" in r.message for r in caplog.records)
+        assert scope._sync_generators == []
+
+    async def test_cleanup_async_sync_gen_close_raises_is_logged(self, caplog: Any) -> None:
+        """Lines 99-100: sync gen close() raising in cleanup_async is logged."""
+        import logging
+
+        def raising_close_sync_gen() -> Any:
+            try:
+                yield "first"   # test advances here
+                yield "second"  # cleanup_async() next() call advances here; close() then raises
+            finally:
+                raise RuntimeError("sync close boom in async path")
+
+        scope = DependencyScope()
+        gen = raising_close_sync_gen()
+        next(gen)  # advance past the yield
+        scope.add_sync_generator(gen)
+
+        with caplog.at_level(logging.WARNING, logger="rabbitkit.di.resolver"):
+            await scope.cleanup_async()  # must NOT raise
+
+        assert any("close() raised" in r.message for r in caplog.records)
+        assert scope._sync_generators == []
+
+
+# ── validate_handler — unannotated param among annotated ones (line 216) ─
+
+
+class TestValidateHandlerUnannotatedParam:
+    def test_unannotated_param_among_annotated_not_counted_as_body(self) -> None:
+        """Line 216: unannotated param triggers the 'if ann is empty: continue'
+        branch in validate_handler, so it is NOT counted as a body-like param.
+
+        A handler (annotated_body, unannotated) should pass validation even
+        though there are two non-DI, non-message params, because the second one
+        has no annotation and is skipped by the early-continue guard.
+        """
+
+        def handler(body: bytes, extra) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        DIResolver().validate_handler(handler)  # must not raise

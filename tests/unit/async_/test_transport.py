@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from rabbitkit.async_.transport import AsyncTransportImpl
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import MessageEnvelope, PublishStatus, TopologyMode
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus, TopologyMode
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -375,6 +376,54 @@ class TestConsume:
         # Should have called cancel on the queue
         assert mock_queue.cancel.called
 
+    @pytest.mark.asyncio
+    async def test_consume_declare_false_uses_get_queue_not_declare(self) -> None:
+        """C2: declare=False must skip declare_queue entirely and use get_queue
+        (ensure=False) instead — required for amq.rabbitmq.reply-to, which the
+        broker rejects any Queue.Declare (even passive) for."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+        channel.declare_queue = AsyncMock()
+
+        await transport.consume("amq.rabbitmq.reply-to", AsyncMock(), declare=False)
+
+        channel.declare_queue.assert_not_called()
+        channel.get_queue.assert_awaited_once_with("amq.rabbitmq.reply-to", ensure=False)
+        mock_queue.consume.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_consume_no_ack_passed_to_queue_consume(self) -> None:
+        """C2: no_ack=True is threaded through to Queue.consume()."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+
+        await transport.consume("amq.rabbitmq.reply-to", AsyncMock(), no_ack=True, declare=False)
+
+        mock_queue.consume.assert_awaited_once()
+        assert mock_queue.consume.call_args.kwargs["no_ack"] is True
+
+    @pytest.mark.asyncio
+    async def test_consume_default_declare_true_no_ack_false(self) -> None:
+        """Ordinary consume() keeps declaring the queue and manual ack."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=mock_queue)
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+
+        await transport.consume("orders", AsyncMock())
+
+        channel.declare_queue.assert_awaited_once_with("orders", passive=True)
+        channel.get_queue.assert_not_called()
+        assert mock_queue.consume.call_args.kwargs["no_ack"] is False
+
 
 # ── Message Building ────────────────────────────────────────────────────
 
@@ -451,6 +500,35 @@ class TestBuildMessage:
         assert message._ack_async_fn is not None
         assert message._nack_async_fn is not None
         assert message._reject_async_fn is not None
+
+    def test_build_message_no_ack_skips_settlement_wiring(self) -> None:
+        """C2: a no-ack delivery (e.g. amq.rabbitmq.reply-to) gets no ack/nack/
+        reject functions — the broker already auto-acked it, and aio-pika's
+        IncomingMessage.ack()/nack()/reject() raise TypeError on a no-ack
+        message anyway."""
+        transport = _make_transport()
+
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"reply-body"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.message_id = None
+        mock_aio_msg.correlation_id = "cid-1"
+        mock_aio_msg.reply_to = None
+        mock_aio_msg.content_type = None
+        mock_aio_msg.content_encoding = None
+        mock_aio_msg.type = None
+        mock_aio_msg.app_id = None
+        mock_aio_msg.routing_key = "amq.rabbitmq.reply-to"
+        mock_aio_msg.exchange = ""
+        mock_aio_msg.delivery_tag = 1
+        mock_aio_msg.redelivered = False
+        mock_aio_msg.consumer_tag = "rpc-tag"
+
+        message = transport._build_message(mock_aio_msg, no_ack=True)
+
+        assert message._ack_async_fn is None
+        assert message._nack_async_fn is None
+        assert message._reject_async_fn is None
 
     def test_build_message_empty_headers(self) -> None:
         transport = _make_transport()
@@ -778,3 +856,651 @@ class TestCancelConsumerEdgeCases:
         # After the finally block the tracking dicts should be cleaned up
         assert "orders" not in transport._consumer_tags
         assert "orders" not in transport._consumer_channels
+
+
+# ── on_blocked / on_unblocked callbacks ──────────────────────────────────
+
+
+class TestBlockedUnblockedCallbacks:
+    def test_on_blocked_registers_callback(self) -> None:
+        """Line 94: on_blocked() appends callback to _blocked_callbacks."""
+        transport = _make_transport()
+
+        def cb() -> None:
+            pass
+
+        transport.on_blocked(cb)
+        assert cb in transport._blocked_callbacks
+
+    def test_on_unblocked_registers_callback(self) -> None:
+        """Line 98: on_unblocked() appends callback to _unblocked_callbacks."""
+        transport = _make_transport()
+
+        def cb() -> None:
+            pass
+
+        transport.on_unblocked(cb)
+        assert cb in transport._unblocked_callbacks
+
+    def test_aio_blocked_calls_all_callbacks(self) -> None:
+        """Lines 101-103: _aio_blocked() calls every registered blocked callback."""
+        transport = _make_transport()
+        called: list[str] = []
+        transport.on_blocked(lambda: called.append("cb1"))
+        transport.on_blocked(lambda: called.append("cb2"))
+        transport._aio_blocked()
+        assert called == ["cb1", "cb2"]
+
+    def test_aio_unblocked_calls_all_callbacks(self) -> None:
+        """Lines 108-110: _aio_unblocked() calls every registered unblocked callback."""
+        transport = _make_transport()
+        called: list[str] = []
+        transport.on_unblocked(lambda: called.append("cb1"))
+        transport.on_unblocked(lambda: called.append("cb2"))
+        transport._aio_unblocked()
+        assert called == ["cb1", "cb2"]
+
+    def test_aio_blocked_with_no_callbacks_is_noop(self) -> None:
+        """_aio_blocked() with empty list does nothing."""
+        transport = _make_transport()
+        transport._aio_blocked()  # should not raise
+
+    def test_aio_unblocked_with_no_callbacks_is_noop(self) -> None:
+        """_aio_unblocked() with empty list does nothing."""
+        transport = _make_transport()
+        transport._aio_unblocked()  # should not raise
+
+
+# ── async context manager ─────────────────────────────────────────────────
+
+
+class TestAsyncContextManager:
+    @pytest.mark.asyncio
+    async def test_aenter_connects_and_returns_self(self) -> None:
+        """Lines 152-153: __aenter__ connects and returns the transport."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                result = await transport.__aenter__()
+
+        assert result is transport
+        assert transport.is_connected()
+
+    @pytest.mark.asyncio
+    async def test_aexit_disconnects(self) -> None:
+        """Line 156: __exit__ (used as __aexit__) calls disconnect()."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+
+        assert transport.is_connected()
+        await transport.__exit__(None, None, None)
+        assert not transport.is_connected()
+
+
+# ── disconnect fast_publish_channel ──────────────────────────────────────
+
+
+class TestDisconnectFastChannel:
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_fast_publish_channel(self) -> None:
+        """Lines 184-187: disconnect() closes an open fast_publish_channel."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+
+        # Inject an open fast publish channel
+        fast_ch = MagicMock()
+        fast_ch.is_closed = False
+        fast_ch.close = AsyncMock()
+        transport._fast_publish_channel = fast_ch
+
+        await transport.disconnect()
+
+        fast_ch.close.assert_called_once()
+        assert transport._fast_publish_channel is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_skips_closed_fast_publish_channel(self) -> None:
+        """disconnect() does NOT call close() on an already-closed fast channel."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+
+        fast_ch = MagicMock()
+        fast_ch.is_closed = True
+        fast_ch.close = AsyncMock()
+        transport._fast_publish_channel = fast_ch
+
+        await transport.disconnect()
+
+        fast_ch.close.assert_not_called()
+
+
+# ── is_connected edge cases ───────────────────────────────────────────────
+
+
+class TestIsConnectedEdgeCases:
+    def test_is_connected_returns_false_when_publisher_connection_is_none(self) -> None:
+        """Line 210: is_connected() returns False when _publisher_connection is None."""
+        transport = _make_transport()
+        transport._connected = True
+        transport._conn_pool._publisher_connection = None
+        assert transport.is_connected() is False
+
+    def test_is_connected_returns_false_when_connection_is_closed(self) -> None:
+        """Line 214: is_connected() returns False when connection.is_closed is True."""
+        transport = _make_transport()
+        transport._connected = True
+        mock_conn = MagicMock()
+        mock_conn.is_closed = True
+        transport._conn_pool._publisher_connection = mock_conn
+        assert transport.is_connected() is False
+
+    def test_is_connected_returns_true_when_open(self) -> None:
+        """is_connected() returns True when connected and is_closed is False."""
+        transport = _make_transport()
+        transport._connected = True
+        mock_conn = MagicMock()
+        mock_conn.is_closed = False
+        transport._conn_pool._publisher_connection = mock_conn
+        assert transport.is_connected() is True
+
+
+# ── has_open_channels ────────────────────────────────────────────────────
+
+
+class TestHasOpenChannels:
+    def test_has_open_channels_false_when_no_consumer_channels(self) -> None:
+        """Line 226-227: returns False when _consumer_channels is empty."""
+        transport = _make_transport()
+        assert transport._consumer_channels == {}
+        assert transport.has_open_channels is False
+
+    def test_has_open_channels_true_when_all_open(self) -> None:
+        """Line 228: returns True when all channels are open."""
+        transport = _make_transport()
+        ch = MagicMock()
+        ch.is_closed = False
+        transport._consumer_channels["q1"] = ch
+        assert transport.has_open_channels is True
+
+    def test_has_open_channels_false_when_any_closed(self) -> None:
+        """Line 228: returns False when at least one channel is closed."""
+        transport = _make_transport()
+        open_ch = MagicMock()
+        open_ch.is_closed = False
+        closed_ch = MagicMock()
+        closed_ch.is_closed = True
+        transport._consumer_channels["q1"] = open_ch
+        transport._consumer_channels["q2"] = closed_ch
+        assert transport.has_open_channels is False
+
+
+# ── is_reconnecting ──────────────────────────────────────────────────────
+
+
+class TestIsReconnecting:
+    def test_is_reconnecting_false_when_no_publisher_connection(self) -> None:
+        """Lines 237-238: returns False when _publisher_connection is None."""
+        transport = _make_transport()
+        transport._conn_pool._publisher_connection = None
+        assert transport.is_reconnecting is False
+
+    def test_is_reconnecting_false_when_no_reconnect_lock(self) -> None:
+        """Lines 242-244: returns False when connection has no _reconnect_lock."""
+        transport = _make_transport()
+        mock_conn = MagicMock(spec=[])  # no _reconnect_lock attribute
+        transport._conn_pool._publisher_connection = mock_conn
+        assert transport.is_reconnecting is False
+
+    def test_is_reconnecting_true_when_lock_is_locked(self) -> None:
+        """Lines 242-244: returns True when _reconnect_lock.locked() is True."""
+        transport = _make_transport()
+        mock_lock = MagicMock()
+        mock_lock.locked.return_value = True
+        mock_conn = MagicMock()
+        mock_conn._reconnect_lock = mock_lock
+        transport._conn_pool._publisher_connection = mock_conn
+        assert transport.is_reconnecting is True
+
+    def test_is_reconnecting_false_when_lock_not_locked(self) -> None:
+        """Returns False when _reconnect_lock.locked() is False."""
+        transport = _make_transport()
+        mock_lock = MagicMock()
+        mock_lock.locked.return_value = False
+        mock_conn = MagicMock()
+        mock_conn._reconnect_lock = mock_lock
+        transport._conn_pool._publisher_connection = mock_conn
+        assert transport.is_reconnecting is False
+
+
+# ── _get_fast_channel ────────────────────────────────────────────────────
+
+
+class TestGetFastChannel:
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_creates_new_channel(self) -> None:
+        """Lines 262-273: _get_fast_channel() creates a channel when none exists."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+
+        # Inject publisher connection
+        mock_pub_conn = MagicMock()
+        new_channel = AsyncMock()
+        mock_pub_conn.channel = AsyncMock(return_value=new_channel)
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        ch = await transport._get_fast_channel()
+        assert ch is new_channel
+        mock_pub_conn.channel.assert_called_once_with(publisher_confirms=False)
+
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_reuses_existing_open_channel(self) -> None:
+        """Lines 262-264: _get_fast_channel() returns existing open channel."""
+        transport = _make_transport()
+        existing_ch = MagicMock()
+        existing_ch.is_closed = False
+        transport._fast_publish_channel = existing_ch
+
+        ch = await transport._get_fast_channel()
+        assert ch is existing_ch
+
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_reopens_closed_channel(self) -> None:
+        """Lines 265-273: _get_fast_channel() reopens a closed fast channel."""
+        transport = _make_transport()
+        closed_ch = MagicMock()
+        closed_ch.is_closed = True
+        transport._fast_publish_channel = closed_ch
+
+        mock_pub_conn = MagicMock()
+        new_ch = AsyncMock()
+        mock_pub_conn.channel = AsyncMock(return_value=new_ch)
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        ch = await transport._get_fast_channel()
+        assert ch is new_ch
+
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_raises_when_no_publisher_connection(self) -> None:
+        """Line 270-271: _get_fast_channel() raises RuntimeError when no conn."""
+        transport = _make_transport()
+        transport._conn_pool._publisher_connection = None
+
+        with pytest.raises(RuntimeError, match="Publisher connection is not available"):
+            await transport._get_fast_channel()
+
+
+# ── _publish_on_channel timeout ───────────────────────────────────────────
+
+
+class TestPublishOnChannelTimeout:
+    @pytest.mark.asyncio
+    async def test_publish_on_channel_returns_timeout_outcome(self) -> None:
+        """Lines 317-328: _publish_on_channel() returns TIMEOUT outcome on TimeoutError."""
+        transport = _make_transport(confirm_timeout=0.01)
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_exchange.publish.side_effect = TimeoutError("timeout")
+        mock_channel.get_exchange = AsyncMock(return_value=mock_exchange)
+        mock_channel.default_exchange = mock_exchange
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"x", exchange="ex")
+
+        with patch("aio_pika.Message") as mock_msg_cls:
+            mock_msg_cls.return_value = MagicMock()
+            with patch("aio_pika.DeliveryMode") as mock_dm:
+                mock_dm.return_value = 2
+                # Patch asyncio.timeout to just raise TimeoutError immediately
+                with patch("asyncio.timeout") as mock_timeout:
+                    class _FakeCtx:
+                        async def __aenter__(self):
+                            return self
+                        async def __aexit__(self, exc_type, exc, tb):
+                            return False
+
+                    mock_timeout.return_value = _FakeCtx()
+                    mock_exchange.publish.side_effect = TimeoutError("broker stalled")
+
+                    outcome = await transport._publish_on_channel(mock_channel, envelope)
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        assert outcome.error is not None
+
+
+# ── publish fast-path (no confirm) ───────────────────────────────────────
+
+
+class TestPublishFastPath:
+    async def _connected_transport(self, confirm_delivery: bool = False) -> AsyncTransportImpl:
+        transport = _make_transport(confirm_delivery=confirm_delivery)
+        mock_connection = _make_mock_connection()
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+        return transport
+
+    @pytest.mark.asyncio
+    async def test_publish_fast_path_when_not_connected_triggers_ensure_connected(self) -> None:
+        """Line 344-345: publish() calls _ensure_connected() when not yet connected."""
+        transport = _make_transport(confirm_delivery=False)
+        mock_connection = _make_mock_connection()
+
+        ensure_called: list[bool] = []
+        original_ensure = transport._ensure_connected
+
+        async def spy_ensure() -> None:
+            ensure_called.append(True)
+            await original_ensure()
+
+        transport._ensure_connected = spy_ensure  # type: ignore[method-assign]
+
+        mock_exchange = AsyncMock()
+        mock_connection.channel.return_value.get_exchange = AsyncMock(return_value=mock_exchange)
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                with patch("aio_pika.Message") as mock_msg_cls:
+                    with patch("aio_pika.DeliveryMode") as mock_dm:
+                        mock_dm.return_value = 2
+                        mock_msg_cls.return_value = MagicMock()
+                        outcome = await transport.publish(
+                            MessageEnvelope(routing_key="rk", body=b"x", exchange="ex")
+                        )
+
+        assert len(ensure_called) == 1
+        assert outcome.status == PublishStatus.CONFIRMED
+
+    @pytest.mark.asyncio
+    async def test_publish_no_confirm_fast_path(self) -> None:
+        """Lines 349-365: publish() with confirm_delivery=False uses fast channel."""
+        transport = await self._connected_transport(confirm_delivery=False)
+
+        mock_pub_conn = MagicMock()
+        mock_fast_ch = AsyncMock()
+        mock_fast_ch.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_fast_ch.get_exchange = AsyncMock(return_value=mock_exchange)
+        mock_fast_ch.default_exchange = mock_exchange
+        mock_pub_conn.channel = AsyncMock(return_value=mock_fast_ch)
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        # Inject the fast channel directly so _get_fast_channel returns it
+        transport._fast_publish_channel = mock_fast_ch
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"x", exchange="ex")
+        with patch("aio_pika.Message") as mock_msg_cls:
+            with patch("aio_pika.DeliveryMode") as mock_dm:
+                mock_dm.return_value = 2
+                mock_msg_cls.return_value = MagicMock()
+                outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        mock_exchange.publish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_publish_no_confirm_fast_path_default_exchange(self) -> None:
+        """Fast path uses default_exchange when exchange name is empty."""
+        transport = await self._connected_transport(confirm_delivery=False)
+
+        mock_fast_ch = AsyncMock()
+        mock_fast_ch.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_fast_ch.default_exchange = mock_exchange
+        transport._fast_publish_channel = mock_fast_ch
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"x", exchange="")
+        with patch("aio_pika.Message") as mock_msg_cls:
+            with patch("aio_pika.DeliveryMode") as mock_dm:
+                mock_dm.return_value = 2
+                mock_msg_cls.return_value = MagicMock()
+                outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        mock_fast_ch.get_exchange.assert_not_called()
+        mock_exchange.publish.assert_called_once()
+
+
+# ── C2: direct reply-to channel affinity ──────────────────────────────────
+
+
+class TestReplyToChannelAffinity:
+    """C2: RabbitMQ's direct reply-to requires the reply consumer and the
+    corresponding request publish to happen on the SAME channel."""
+
+    async def _connected_transport(self, confirm_delivery: bool = False) -> AsyncTransportImpl:
+        transport = _make_transport(confirm_delivery=confirm_delivery)
+        mock_connection = _make_mock_connection()
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+        return transport
+
+    @pytest.mark.asyncio
+    async def test_consume_declare_false_reply_to_queue_tracks_channel(self) -> None:
+        transport = await self._connected_transport()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_queue = AsyncMock()
+
+        with patch.object(transport, "_conn_pool") as mock_pool:
+            mock_conn = AsyncMock()
+            mock_conn.channel = AsyncMock(return_value=mock_channel)
+            mock_pool.get_consumer_connection = AsyncMock(return_value=mock_conn)
+            mock_channel.get_queue = AsyncMock(return_value=mock_queue)
+
+            await transport.consume("amq.rabbitmq.reply-to", AsyncMock(), no_ack=True, declare=False)
+
+        assert transport._reply_to_channel is mock_channel
+
+    @pytest.mark.asyncio
+    async def test_consume_declare_true_does_not_track_reply_to_channel(self) -> None:
+        transport = await self._connected_transport()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_queue = AsyncMock()
+
+        with patch.object(transport, "_conn_pool") as mock_pool:
+            mock_conn = AsyncMock()
+            mock_conn.channel = AsyncMock(return_value=mock_channel)
+            mock_pool.get_consumer_connection = AsyncMock(return_value=mock_conn)
+            mock_channel.declare_queue = AsyncMock(return_value=mock_queue)
+
+            await transport.consume("orders", AsyncMock())
+
+        assert transport._reply_to_channel is None
+
+    @pytest.mark.asyncio
+    async def test_publish_reply_to_routes_onto_reply_channel(self) -> None:
+        """A request with reply_to=amq.rabbitmq.reply-to must publish via
+        _reply_to_channel, bypassing the normal fast/pool paths entirely."""
+        transport = await self._connected_transport(confirm_delivery=False)
+
+        reply_channel = AsyncMock()
+        reply_channel.is_closed = False
+        transport._reply_to_channel = reply_channel
+
+        captured: list[Any] = []
+
+        async def fake_publish_on_channel(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+            captured.append(channel)
+            return PublishOutcome(
+                status=PublishStatus.CONFIRMED, exchange=envelope.exchange, routing_key=envelope.routing_key
+            )
+
+        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
+
+        envelope = MessageEnvelope(routing_key="rpc.q", body=b"req", reply_to="amq.rabbitmq.reply-to")
+        outcome = await transport.publish(envelope)
+
+        assert outcome.ok
+        assert captured == [reply_channel]
+
+    @pytest.mark.asyncio
+    async def test_publish_without_reply_to_ignores_reply_channel(self) -> None:
+        """A normal publish must not touch _reply_to_channel even if one is set."""
+        transport = await self._connected_transport(confirm_delivery=False)
+
+        reply_channel = AsyncMock()
+        reply_channel.is_closed = False
+        transport._reply_to_channel = reply_channel
+
+        mock_fast_ch = AsyncMock()
+        mock_fast_ch.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_fast_ch.default_exchange = mock_exchange
+        transport._fast_publish_channel = mock_fast_ch
+
+        envelope = MessageEnvelope(routing_key="orders", body=b"data", exchange="")
+        with patch("aio_pika.Message") as mock_msg_cls:
+            with patch("aio_pika.DeliveryMode") as mock_dm:
+                mock_dm.return_value = 2
+                mock_msg_cls.return_value = MagicMock()
+                outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        reply_channel.basic_publish.assert_not_called()
+        mock_exchange.publish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_publish_reply_to_falls_back_when_reply_channel_closed(self) -> None:
+        """A closed _reply_to_channel must not be used — fall through to the
+        normal publish path instead of erroring on a dead channel."""
+        transport = await self._connected_transport(confirm_delivery=False)
+
+        reply_channel = AsyncMock()
+        reply_channel.is_closed = True  # stale/closed
+        transport._reply_to_channel = reply_channel
+
+        mock_fast_ch = AsyncMock()
+        mock_fast_ch.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_fast_ch.default_exchange = mock_exchange
+        transport._fast_publish_channel = mock_fast_ch
+
+        envelope = MessageEnvelope(routing_key="rpc.q", body=b"req", reply_to="amq.rabbitmq.reply-to", exchange="")
+        with patch("aio_pika.Message") as mock_msg_cls:
+            with patch("aio_pika.DeliveryMode") as mock_dm:
+                mock_dm.return_value = 2
+                mock_msg_cls.return_value = MagicMock()
+                outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        reply_channel.basic_publish.assert_not_called()
+        mock_exchange.publish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_consumer_clears_reply_to_channel(self) -> None:
+        transport = await self._connected_transport()
+        reply_channel = AsyncMock()
+        reply_channel.is_closed = False
+        transport._reply_to_channel = reply_channel
+        transport._consumer_channels["amq.rabbitmq.reply-to"] = reply_channel
+        transport._consumer_tags["amq.rabbitmq.reply-to"] = "reply-tag"
+
+        mock_queue = AsyncMock()
+        reply_channel.get_queue = AsyncMock(return_value=mock_queue)
+
+        await transport.cancel_consumer("reply-tag")
+
+        assert transport._reply_to_channel is None
+
+
+# ── basic_get / purge_queue ───────────────────────────────────────────────
+
+
+class TestBasicGetAndPurge:
+    async def _connected_transport(self) -> tuple[AsyncTransportImpl, AsyncMock]:
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+        topo_ch = mock_connection.channel.return_value
+        transport._topology_channel = topo_ch
+        return transport, topo_ch
+
+    @pytest.mark.asyncio
+    async def test_basic_get_returns_none_when_queue_empty(self) -> None:
+        """Lines 518-523: basic_get() returns None when queue is empty."""
+        transport, topo_ch = await self._connected_transport()
+
+        mock_queue = AsyncMock()
+        mock_queue.get = AsyncMock(return_value=None)
+        topo_ch.get_queue = AsyncMock(return_value=mock_queue)
+
+        result = await transport.basic_get("orders.dlq")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_basic_get_returns_message_when_present(self) -> None:
+        """Line 524: basic_get() builds and returns a RabbitMessage."""
+        transport, topo_ch = await self._connected_transport()
+
+        fake_aio_msg = MagicMock()
+        fake_aio_msg.body = b"payload"
+        fake_aio_msg.headers = {}
+        fake_aio_msg.message_id = "m1"
+        fake_aio_msg.correlation_id = None
+        fake_aio_msg.reply_to = None
+        fake_aio_msg.content_type = None
+        fake_aio_msg.content_encoding = None
+        fake_aio_msg.type = None
+        fake_aio_msg.app_id = None
+        fake_aio_msg.routing_key = "rk"
+        fake_aio_msg.exchange = ""
+        fake_aio_msg.delivery_tag = 1
+        fake_aio_msg.redelivered = False
+        fake_aio_msg.consumer_tag = "t"
+
+        mock_queue = AsyncMock()
+        mock_queue.get = AsyncMock(return_value=fake_aio_msg)
+        topo_ch.get_queue = AsyncMock(return_value=mock_queue)
+
+        result = await transport.basic_get("orders.dlq")
+        assert result is not None
+        assert result.body == b"payload"
+
+    @pytest.mark.asyncio
+    async def test_purge_queue_returns_message_count(self) -> None:
+        """Lines 528-532: purge_queue() returns int message count."""
+        transport, topo_ch = await self._connected_transport()
+
+        purge_result = MagicMock()
+        purge_result.message_count = 42
+
+        mock_queue = AsyncMock()
+        mock_queue.purge = AsyncMock(return_value=purge_result)
+        topo_ch.get_queue = AsyncMock(return_value=mock_queue)
+
+        count = await transport.purge_queue("orders.dlq")
+        assert count == 42
+
+    @pytest.mark.asyncio
+    async def test_purge_queue_returns_zero_when_no_message_count(self) -> None:
+        """purge_queue() returns 0 when result has no message_count attribute."""
+        transport, topo_ch = await self._connected_transport()
+
+        mock_queue = AsyncMock()
+        mock_queue.purge = AsyncMock(return_value=MagicMock(spec=[]))  # no message_count
+        topo_ch.get_queue = AsyncMock(return_value=mock_queue)
+
+        count = await transport.purge_queue("orders.dlq")
+        assert count == 0

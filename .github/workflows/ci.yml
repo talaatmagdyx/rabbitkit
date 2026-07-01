@@ -31,5 +31,46 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
+      # NOTE(coverage): the project aims for ~100% coverage, but the floor is
+      # intentionally kept at 85 here so CI stays green while unreachable
+      # defensive guards and transport-shim paths are brought under test.
+      # Do NOT raise this to 100 — it would break the pipeline. Raise it
+      # incrementally as new tests close the gap.
       - name: Tests
         run: .venv/bin/pytest tests/unit/ -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+
+  # Integration tests run against a real RabbitMQ broker. Each test module
+  # starts its own disposable container via testcontainers (see
+  # tests/integration/test_real_rabbitmq.py's `rabbitmq_url` fixture), talking
+  # directly to the Docker daemon already present on GitHub-hosted runners —
+  # there is no GHA `services:` container here because nothing in the suite
+  # connects to one (testcontainers manages the broker's full lifecycle
+  # itself, including teardown via its Ryuk reaper sidecar).
+  #
+  # Gating vs best-effort split:
+  #   - The `Integration tests` step is GATING: a real regression in a marked
+  #     integration test fails the job. Do NOT swallow its exit code.
+  #   - The `Chaos suite` step is best-effort (`continue-on-error: true` on the
+  #     step only): the chaos/benchmark suite may be flaky or environment-bound,
+  #     so it reports results without failing the pipeline.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[integration]"
+      # GATING: real integration regressions fail the job. `-m integration`
+      # selects only marked tests; if none are marked pytest exits 5 (no tests
+      # ran), which is treated as a failure so missing tests surface loudly.
+      - name: Integration tests
+        run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short
+      # BEST-EFFORT: the chaos/benchmark suite is allowed to fail without
+      # breaking the pipeline (`continue-on-error: true` on this step only).
+      - name: Chaos suite (best-effort)
+        continue-on-error: true
+        env:
+          RK_CHAOS_PORT: "32777"
+        run: |
+          .venv/bin/python -m benchmarks || echo "chaos suite skipped/failed (best-effort)"

@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,19 +94,43 @@ class TimeoutConfig:
 class TimeoutMiddleware(BaseMiddleware):
     """Enforces a maximum processing time per message.
 
-    Async: uses asyncio.wait_for() — clean cancellation.
-    Sync: uses concurrent.futures with timeout — raises HandlerTimeoutError.
+    Async: uses ``asyncio.wait_for()`` — clean cancellation.
+    Sync: runs ``call_next`` in a daemon ``threading.Thread`` and raises
+    ``HandlerTimeoutError`` if the thread is still alive at the deadline.
+
+    .. warning::
+        CPython cannot safely kill a thread, so a sync handler that exceeds the
+        timeout is **abandoned** — it keeps running detached until it finishes
+        naturally. This can leak threads and resources for long-running / blocked
+        IO handlers. Use an **async** handler for true cooperative cancellation.
+        When a sync timeout fires, a CRITICAL log record is emitted and the
+        optional ``on_timeout`` callback (if configured) is invoked so the
+        abandonment is observable (e.g. increment a metric counter).
     """
 
-    def __init__(self, config: TimeoutConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TimeoutConfig | None = None,
+        *,
+        on_timeout: Callable[[RabbitMessage, float], None] | None = None,
+    ) -> None:
         self._config = config or TimeoutConfig()
+        self._on_timeout = on_timeout
+        # Observable counter of sync threads abandoned due to timeout.
+        self.abandoned_threads: int = 0
 
     def consume_scope(
         self,
         call_next: Any,
         message: RabbitMessage,
     ) -> Any:
-        """Sync timeout — runs call_next in a thread with timeout."""
+        """Sync timeout — runs call_next in a thread with timeout.
+
+        If the deadline elapses with the thread still alive, the thread is
+        abandoned (CPython cannot kill it), a CRITICAL log is emitted, the
+        ``abandoned_threads`` counter is incremented, ``on_timeout`` (if any)
+        is invoked, and ``HandlerTimeoutError`` is raised.
+        """
         result_holder: list[Any] = []
         exception_holder: list[BaseException] = []
 
@@ -121,13 +146,20 @@ class TimeoutMiddleware(BaseMiddleware):
 
         if thread.is_alive():
             # CPython cannot safely kill a thread — the handler keeps running
-            # detached. Warn so this is visible (a slow handler can pile up
-            # abandoned threads). For true cancellation, use an async handler.
-            logger.warning(
+            # detached. Make the abandonment explicit and observable.
+            self.abandoned_threads += 1
+            logger.critical(
                 "Sync handler exceeded %.1fs timeout; thread abandoned (still running). "
-                "Use an async handler for real cancellation.",
+                "Use an async handler for real cancellation. "
+                "abandoned_threads=%d",
                 self._config.timeout_seconds,
+                self.abandoned_threads,
             )
+            if self._on_timeout is not None:
+                try:
+                    self._on_timeout(message, self._config.timeout_seconds)
+                except Exception:  # pragma: no cover - callback must not break flow
+                    logger.exception("on_timeout callback raised")
             raise HandlerTimeoutError(self._config.timeout_seconds)
 
         if exception_holder:

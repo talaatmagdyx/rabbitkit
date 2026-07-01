@@ -73,6 +73,7 @@ class RabbitRouter:
         description: str = "",
         name: str | None = None,
         prefetch_count: int | None = None,
+        filter_fn: Callable[[Any], bool] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber on this router.
 
@@ -115,6 +116,7 @@ class RabbitRouter:
             description=description,
             name=name,
             prefetch_count=prefetch_count,
+            filter_fn=filter_fn,
         )
 
     def publisher(

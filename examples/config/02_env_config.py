@@ -22,9 +22,8 @@ if not _PYDANTIC_SETTINGS_AVAILABLE:
     print("pydantic-settings not installed. Run: pip install 'rabbitkit[settings]'")
     exit(1)
 
-from rabbitkit.core.env_config import RabbitSettings
 from rabbitkit.async_ import AsyncBroker
-
+from rabbitkit.core.env_config import RabbitSettings
 
 # ── 1. Basic usage — reads from environment ───────────────────────────────────
 print("=== Reading from environment ===")
@@ -88,19 +87,19 @@ print(f"Broker created: {broker.config.connection.host}:{broker.config.connectio
 # ── 5. All supported env vars ────────────────────────────────────────────────
 print("\n=== Supported RABBITMQ_* variables ===")
 var_table = [
-    ("RABBITMQ_HOST",                      "localhost",      "str"),
-    ("RABBITMQ_PORT",                      "5672",           "int"),
-    ("RABBITMQ_USER",                      "guest",          "str"),
-    ("RABBITMQ_PASSWORD",                  "guest",          "str (sensitive!)"),
-    ("RABBITMQ_VHOST",                     "/",              "str"),
-    ("RABBITMQ_HEARTBEAT",                 "30",             "int (seconds)"),
-    ("RABBITMQ_SOCKET_TIMEOUT",            "10.0",           "float (seconds)"),
-    ("RABBITMQ_BLOCKED_CONNECTION_TIMEOUT","300.0",          "float (seconds)"),
-    ("RABBITMQ_CONNECTION_NAME",           "None",           "str | None"),
-    ("RABBITMQ_PREFETCH_COUNT",            "10",             "int"),
-    ("RABBITMQ_CONFIRM_DELIVERY",          "true",           "bool"),
-    ("RABBITMQ_CHANNEL_POOL_SIZE",         "10",             "int"),
-    ("RABBITMQ_TOPOLOGY_MODE",             "AUTO_DECLARE",   "AUTO_DECLARE|PASSIVE_ONLY|MANUAL"),
+    ("RABBITMQ_HOST", "localhost", "str"),
+    ("RABBITMQ_PORT", "5672", "int"),
+    ("RABBITMQ_USER", "guest", "str"),
+    ("RABBITMQ_PASSWORD", "guest", "str (sensitive!)"),
+    ("RABBITMQ_VHOST", "/", "str"),
+    ("RABBITMQ_HEARTBEAT", "30", "int (seconds)"),
+    ("RABBITMQ_SOCKET_TIMEOUT", "10.0", "float (seconds)"),
+    ("RABBITMQ_BLOCKED_CONNECTION_TIMEOUT", "60.0", "float (seconds)"),
+    ("RABBITMQ_CONNECTION_NAME", "None", "str | None"),
+    ("RABBITMQ_PREFETCH_COUNT", "10", "int"),
+    ("RABBITMQ_CONFIRM_DELIVERY", "true", "bool"),
+    ("RABBITMQ_CHANNEL_POOL_SIZE", "10", "int"),
+    ("RABBITMQ_TOPOLOGY_MODE", "AUTO_DECLARE", "AUTO_DECLARE|PASSIVE_ONLY|MANUAL"),
 ]
 for name, default, type_ in var_table:
     print(f"  {name:<45} default={default!r:<15} type={type_}")

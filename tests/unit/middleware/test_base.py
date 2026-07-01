@@ -104,3 +104,39 @@ class TestCustomMiddleware:
         mw.on_receive(msg)
         assert len(mw.received) == 1
         assert mw.received[0] is msg
+
+
+class TestNoOpMiddleware:
+    def test_consume_scope_passthrough(self) -> None:
+        from rabbitkit.middleware.base import NoOpMiddleware
+        mw = NoOpMiddleware()
+        msg = _make_message()
+        assert mw.consume_scope(lambda m: "ok", msg) == "ok"
+
+    @pytest.mark.asyncio
+    async def test_consume_scope_async_passthrough(self) -> None:
+        from rabbitkit.middleware.base import NoOpMiddleware
+        mw = NoOpMiddleware()
+        msg = _make_message()
+
+        async def call_next(m: RabbitMessage) -> str:
+            return "async-ok"
+
+        assert await mw.consume_scope_async(call_next, msg) == "async-ok"
+
+    def test_publish_scope_passthrough(self) -> None:
+        from rabbitkit.middleware.base import NoOpMiddleware
+        mw = NoOpMiddleware()
+        env = MessageEnvelope(routing_key="q", body=b"x")
+        assert mw.publish_scope(lambda e: "pub-ok", env) == "pub-ok"
+
+    @pytest.mark.asyncio
+    async def test_publish_scope_async_passthrough(self) -> None:
+        from rabbitkit.middleware.base import NoOpMiddleware
+        mw = NoOpMiddleware()
+        env = MessageEnvelope(routing_key="q", body=b"x")
+
+        async def call_next(e: MessageEnvelope) -> str:
+            return "pub-async-ok"
+
+        assert await mw.publish_scope_async(call_next, env) == "pub-async-ok"

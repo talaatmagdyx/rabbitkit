@@ -247,3 +247,27 @@ class TestSerializationPipeline:
 
         # Content type
         assert pipeline.content_type == "custom/type"
+
+
+class TestJsonParserDefault:
+    def test_coerce_unknown_to_str(self) -> None:
+        """_default returns str(data) when coerce_unknown_to_str=True."""
+        parser = JsonParser(coerce_unknown_to_str=True)
+
+        class NotSerializable:
+            def __repr__(self) -> str:
+                return "NotSerializable()"
+
+        result = parser.serialize(NotSerializable())
+        assert b"NotSerializable" in result
+
+    def test_no_coerce_raises_type_error(self) -> None:
+        """_default raises TypeError when coerce_unknown_to_str=False (default)."""
+        parser = JsonParser()
+
+        class NotSerializable:
+            pass
+
+        import pytest
+        with pytest.raises(TypeError):
+            parser.serialize(NotSerializable())

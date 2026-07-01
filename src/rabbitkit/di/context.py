@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import contextvars
 from typing import Any
 
 
@@ -88,41 +88,53 @@ class Path:
 
 
 class ContextRepo:
-    """Thread-safe context repository for global and local values.
+    """Context repository for global and per-request values.
 
-    Global values are shared across all messages.
-    Local values are per-thread (thread-local storage).
+    Global values are shared across all messages (thread-safe via a lock).
+    Local values use ``contextvars.ContextVar`` for correct isolation across
+    both sync threads AND async coroutines on the same event loop —
+    ``threading.local()`` would bleed context between concurrent coroutines
+    sharing one OS thread in an async transport.
     """
 
     def __init__(self) -> None:
         self._global: dict[str, Any] = {}
-        self._local = threading.local()
+        self._local: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("rabbitkit_local_ctx")
 
     def set_global(self, key: str, value: Any) -> None:
         """Set a global context value (shared across all messages)."""
         self._global[key] = value
 
     def set_local(self, key: str, value: Any) -> None:
-        """Set a thread-local context value (per-message in sync transport)."""
-        if not hasattr(self._local, "store"):
-            self._local.store = {}
-        self._local.store[key] = value
+        """Set a per-request context value.
+
+        Uses ``ContextVar.set`` with an immutable copy so that each
+        coroutine/task gets its own isolated snapshot (contextvars
+        copy-on-write semantics).
+        """
+        try:
+            current = self._local.get()
+        except LookupError:
+            current = {}
+        self._local.set({**current, key: value})
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get a context value. Local overrides global."""
-        # Check local first
-        if hasattr(self._local, "store") and key in self._local.store:
-            return self._local.store[key]
-        # Then global
+        try:
+            local = self._local.get()
+        except LookupError:
+            local = {}
+        if key in local:
+            return local[key]
         return self._global.get(key, default)
 
     def clear_local(self) -> None:
-        """Clear thread-local context (called after each message)."""
-        if hasattr(self._local, "store"):
-            self._local.store.clear()
+        """Clear per-request context (called after each message)."""
+        self._local.set({})
 
     def has(self, key: str) -> bool:
         """Check if a key exists in either local or global context."""
-        if hasattr(self._local, "store") and key in self._local.store:
-            return True
-        return key in self._global
+        try:
+            return key in self._local.get() or key in self._global
+        except LookupError:
+            return key in self._global

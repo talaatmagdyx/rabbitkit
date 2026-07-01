@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from rabbitkit.concurrency import AsyncWorkerPool, SyncWorkerPool
 from rabbitkit.core.config import WorkerConfig
 from rabbitkit.core.message import RabbitMessage
@@ -331,35 +333,27 @@ class TestWorkerConfigStopTimeout:
         assert WorkerConfig().stop_timeout == 30.0
 
     async def test_async_stop_uses_config_timeout(self) -> None:
-        """AsyncWorkerPool.stop() uses WorkerConfig.stop_timeout as default."""
-        import asyncio
-        from unittest.mock import patch
+        """AsyncWorkerPool.stop() uses config.stop_timeout as the default."""
+        import time
 
-        pool = AsyncWorkerPool(config=WorkerConfig(worker_count=2, stop_timeout=8.0))
+        pool = AsyncWorkerPool(config=WorkerConfig(worker_count=2, stop_timeout=0.2))
         pool.start()
+        pool._running = True
 
-        # Add a task that outlasts our wait so asyncio.wait is actually called
         async def slow() -> None:
-            await asyncio.sleep(10)
+            await asyncio.sleep(100)
 
         task = asyncio.create_task(slow())
         pool._tasks.add(task)
         task.add_done_callback(pool._tasks.discard)
 
-        wait_timeouts: list[float | None] = []
-        original_wait = asyncio.wait
+        t0 = time.monotonic()
+        await pool.stop()
+        elapsed = time.monotonic() - t0
 
-        async def recording_wait(
-            fs: object, timeout: float | None = None, **kw: object
-        ) -> object:
-            wait_timeouts.append(timeout)
-            return await original_wait(fs, timeout=0.01, **kw)  # type: ignore[arg-type]
-
-        with patch("rabbitkit.concurrency.asyncio.wait", side_effect=recording_wait):
-            await pool.stop()
-
-        task.cancel()
-        assert wait_timeouts == [8.0]
+        # Should timeout after ~0.2s (the config stop_timeout), not 100s
+        assert elapsed < 1.0, f"stop() took {elapsed:.1f}s, expected <1s"
+        assert task.cancelled() or task.done(), "task should be cancelled after timeout"
 
 
 class TestSyncWorkerPoolTimeout:
@@ -400,4 +394,226 @@ class TestSyncWorkerPoolTimeout:
 
         pool = SyncWorkerPool(WorkerConfig(worker_count=2))
         # Don't call start() — _executor stays None
+        assert pool.pending_count == 0
+
+
+# ── H-SRE2: daemon worker threads ─────────────────────────────────────────
+
+
+class TestDaemonWorkerThreads:
+    def test_sync_worker_pool_threads_are_daemon(self) -> None:
+        """SyncWorkerPool worker threads must be daemon so a stuck handler
+        cannot keep the process alive past stop() (k8s graceful shutdown)."""
+        import threading
+        import time
+
+        from rabbitkit.concurrency import SyncWorkerPool
+
+        pool = SyncWorkerPool(config=WorkerConfig(worker_count=2))
+        pool.start()
+        try:
+            block = threading.Event()
+
+            def slow_handler(_msg: object) -> None:
+                block.wait(timeout=2.0)
+
+            pool.submit(slow_handler, None)  # type: ignore[arg-type]
+            # Give the worker thread a moment to start.
+            time.sleep(0.1)
+            assert pool._executor is not None
+            threads = list(pool._executor._threads)  # type: ignore[union-attr]
+            assert threads, "expected at least one worker thread to have started"
+            assert all(t.daemon for t in threads), "all worker threads must be daemon"
+            block.set()
+        finally:
+            pool.stop(timeout=1.0)
+
+
+class TestDaemonPoolParallelism:
+    def test_worker_count_runs_in_parallel(self) -> None:
+        """R-1 regression: worker_count>1 must actually parallelize work.
+
+        Before the fix, _idle_count semantics were inverted so the pool trended
+        to a single worker. Submit worker_count tasks that each hold a slot,
+        sleep, and release; assert max concurrency reaches worker_count.
+        """
+        import threading
+        import time
+
+        from rabbitkit.concurrency import SyncWorkerPool
+
+        n = 4
+        per_task = 0.2
+        pool = SyncWorkerPool(config=WorkerConfig(worker_count=n))
+        pool.start()
+        current = 0
+        max_concurrent = 0
+        state_lock = threading.Lock()
+
+        def task(_msg: object) -> None:
+            nonlocal current, max_concurrent
+            with state_lock:
+                current += 1
+                if current > max_concurrent:
+                    max_concurrent = current
+            time.sleep(per_task)
+            with state_lock:
+                current -= 1
+
+        try:
+            t0 = time.monotonic()
+            for _ in range(n):
+                pool.submit(task, None)  # type: ignore[arg-type]
+            # Wait for all to finish by polling pending_count.
+            deadline = t0 + 10.0
+            while pool.pending_count > 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            elapsed = time.monotonic() - t0
+        finally:
+            pool.stop(timeout=2.0)
+        assert max_concurrent == n, (
+            f"pool did not parallelize: max_concurrent={max_concurrent}, expected {n}"
+        )
+        # And it should be clearly faster than serial.
+        assert elapsed < n * per_task, (
+            f"elapsed={elapsed:.2f}s should be < serial={n*per_task:.2f}s"
+        )
+
+
+# ── _DaemonWorkerPool uncovered lines ──────────────────────────────────────
+
+
+class TestDaemonWorkerPoolUncovered:
+    """Tests for uncovered lines in _DaemonWorkerPool."""
+
+    def test_submit_raises_after_shutdown(self) -> None:
+        """Line 60: submit() after shutdown raises RuntimeError."""
+        from rabbitkit.concurrency import _DaemonWorkerPool
+
+        pool = _DaemonWorkerPool(max_workers=2)
+        pool.shutdown()
+        with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+            pool.submit(lambda: None)
+
+    def test_worker_sets_exception_on_raising_function(self) -> None:
+        """Lines 108-109: fut.set_exception(exc) when fn raises."""
+        from rabbitkit.concurrency import _DaemonWorkerPool
+
+        pool = _DaemonWorkerPool(max_workers=1)
+
+        def bad_fn() -> None:
+            raise ValueError("boom")
+
+        fut = pool.submit(bad_fn)
+        # Wait for the worker to process it
+        import concurrent.futures
+
+        concurrent.futures.wait([fut], timeout=5.0)
+        assert fut.done()
+        with pytest.raises(ValueError, match="boom"):
+            fut.result()
+        pool.shutdown(wait=True)
+
+    def test_shutdown_cancel_futures_cancels_pending(self) -> None:
+        """Line 122: shutdown(cancel_futures=True) cancels queued futures."""
+        from rabbitkit.concurrency import _DaemonWorkerPool
+
+        # Use a large pool to prevent immediate execution of queued items
+        pool = _DaemonWorkerPool(max_workers=1)
+
+        # Block the single worker so the second submit stays queued
+        block = threading.Event()
+
+        def blocking_fn() -> None:
+            block.wait(timeout=5.0)
+
+        pool.submit(blocking_fn)  # runs immediately in the worker
+        # Give the worker a moment to pick up fut1
+        time.sleep(0.05)
+
+        # Second future queued — worker is busy with fut1
+        fut2 = pool.submit(lambda: None)
+
+        # Shut down with cancel_futures: queued fut2 should be cancelled
+        block.set()  # unblock fut1
+        pool.shutdown(cancel_futures=True, wait=True)
+
+        # fut2 should be either cancelled or done (worker may race to pick it up)
+        assert fut2.cancelled() or fut2.done()
+
+    def test_shutdown_wait_joins_threads(self) -> None:
+        """Lines 124-125: shutdown(wait=True) joins all worker threads."""
+        from rabbitkit.concurrency import _DaemonWorkerPool
+
+        pool = _DaemonWorkerPool(max_workers=2)
+
+        results: list[int] = []
+
+        def work(n: int) -> int:
+            results.append(n)
+            return n
+
+        pool.submit(work, 1)
+        pool.submit(work, 2)
+        # shutdown with wait=True: must join threads before returning
+        pool.shutdown(wait=True)
+
+        # After join, all submitted work should be complete
+        assert sorted(results) == [1, 2]
+
+    def test_worker_count_property(self) -> None:
+        """Lines 131-132: worker_count property returns len(_threads)."""
+        from rabbitkit.concurrency import _DaemonWorkerPool
+
+        pool = _DaemonWorkerPool(max_workers=2)
+
+        # No threads yet
+        assert pool.worker_count == 0
+
+        block = threading.Event()
+
+        def slow() -> None:
+            block.wait(timeout=5.0)
+
+        pool.submit(slow)
+        # Give the pool a moment to spawn a thread
+        time.sleep(0.05)
+
+        assert pool.worker_count >= 1
+
+        block.set()
+        pool.shutdown(wait=True)
+
+
+# ── AsyncWorkerPool.stop() TimeoutError path ─────────────────────────────
+
+
+class TestAsyncWorkerPoolStopTimeout:
+    """Lines 296, 298: task.cancel() and gather in stop() TimeoutError branch."""
+
+    async def test_stop_timeout_cancels_tasks_and_gathers(self) -> None:
+        """Lines 296-298: when timeout elapses, not-done tasks are cancelled
+        and then gathered so CancelledError is consumed cleanly."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        cancelled_flag: list[bool] = []
+
+        async def never_finishes(msg: RabbitMessage) -> None:
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                cancelled_flag.append(True)
+                raise
+
+        await pool.submit(never_finishes, _make_message())
+        # Let the task start running
+        await asyncio.sleep(0.01)
+
+        # stop() with tiny timeout → TimeoutError branch
+        await pool.stop(timeout=0.02)
+
+        # The task was cancelled (CancelledError was raised inside it)
+        assert cancelled_flag == [True]
+        # Pool cleaned up
         assert pool.pending_count == 0

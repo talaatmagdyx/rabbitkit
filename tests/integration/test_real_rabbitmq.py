@@ -298,11 +298,13 @@ async def test_async_message_headers_preserved(rabbitmq_url: str) -> None:
 
 
 async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
-    """Handler always fails, max_retries=1, verifies handler is called >= 2 times.
+    """A TRANSIENT failure is retried through the delay queue, then dead-lettered.
 
-    Uses RetryConfig(max_retries=1, delays=(1,)) so the total wait is ~1s.
-    After exhaustion the message is dead-lettered (nacked) and will not be
-    redelivered to this consumer.
+    Uses a transient error (``TimeoutError``) so retry actually engages —
+    ``RetryConfig(max_retries=1, delays=(1,))`` means one delayed retry (~1s)
+    then the message is dead-lettered to ``<queue>.dlq``. We assert the handler
+    is called exactly twice (original + 1 retry) and that the DLQ receives the
+    exhausted message — proving retry is wired, not just the topology declared.
     """
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import RetryConfig
@@ -310,6 +312,7 @@ async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
 
     call_count = 0
     exhausted = asyncio.Event()
+    dead_lettered = asyncio.Event()
 
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config)
@@ -322,19 +325,22 @@ async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
         call_count += 1
         if call_count >= 2:  # original + 1 retry
             exhausted.set()
-        raise ValueError("permanent error")
+        raise TimeoutError("transient outage")  # transient → engages retry
+
+    # Consume the DLQ to prove the exhausted message is dead-lettered there.
+    @broker.subscriber(queue="integ-dlq-src.dlq")
+    async def on_dlq(body: bytes) -> None:
+        dead_lettered.set()
 
     await broker.start()
     await asyncio.sleep(0.3)
 
     await broker.publish(MessageEnvelope(routing_key="integ-dlq-src", body=b"doomed"))
 
-    try:
-        await asyncio.wait_for(exhausted.wait(), timeout=20.0)
-    except TimeoutError:
-        pass  # may have been called fewer times; check assertion below
+    await asyncio.wait_for(exhausted.wait(), timeout=20.0)
+    await asyncio.wait_for(dead_lettered.wait(), timeout=20.0)
 
-    assert call_count >= 1, "Handler should have been called at least once"
+    assert call_count == 2, f"expected original + 1 retry = 2 handler calls, got {call_count}"
     await broker.stop()
 
 
@@ -478,6 +484,63 @@ async def test_async_rpc_request_response(rabbitmq_url: str) -> None:
     await asyncio.wait_for(reply_done.wait(), timeout=15.0)
 
     assert response_received == [b"ping"]
+    await broker.stop()
+
+
+async def test_async_rpc_via_real_rpc_client(rabbitmq_url: str) -> None:
+    """C2: AsyncRPCClient.call() round-trips against a real broker.
+
+    Unlike test_async_rpc_request_response above (which deliberately avoids
+    amq.rabbitmq.reply-to), this exercises the actual RPCClient/AsyncRPCClient
+    production code path: transport.consume() against the broker's direct
+    reply-to pseudo-queue. Before the C2 fix this consumer registration
+    violated two hard AMQP rules (manual-ack consume + passive-declare of a
+    pseudo-queue that cannot be declared at all), so every call timed out.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.rpc import AsyncRPCClient
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    # Contract 5 (result publishing): a handler that receives a message with
+    # reply_to set auto-replies with its return value — this is exactly the
+    # RPC server side, no manual reply_to plumbing needed.
+    @broker.subscriber(queue="integ-rpc-echo")
+    async def echo(body: bytes) -> bytes:
+        return body
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    assert broker._transport is not None
+    client = AsyncRPCClient(broker._transport)
+    try:
+        response = await client.call("integ-rpc-echo", b"ping-via-real-client", timeout=10.0)
+        assert response.body == b"ping-via-real-client"
+    finally:
+        await client.close()
+
+    await broker.stop()
+
+
+async def test_async_rpc_via_broker_request_shorthand(rabbitmq_url: str) -> None:
+    """C2: broker.request() (the public shorthand) round-trips against a real broker."""
+    from rabbitkit.async_.broker import AsyncBroker
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue="integ-rpc-request-echo")
+    async def echo(body: bytes) -> bytes:
+        return body
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    response = await broker.request("integ-rpc-request-echo", b"via-request", timeout=10.0)
+    assert response.body == b"via-request"
+
     await broker.stop()
 
 
@@ -743,6 +806,55 @@ def test_sync_error_handling(rabbitmq_url: str) -> None:
     # the pipeline will have settled the message after the raise.
     # At minimum the handler was called.
     assert len(dispositions) >= 0  # handler was invoked
+
+
+def test_sync_rpc_via_real_rpc_client(rabbitmq_url: str) -> None:
+    """C2: RPCClient.call() round-trips against a real broker.
+
+    Passes ``reply_connection=broker._transport._connection`` so ``call()``
+    pumps that connection itself while waiting — no separate consume-loop
+    thread needed. That single pump loop services BOTH the echo handler's
+    request-side consumer channel and the RPCClient's reply-side consumer
+    channel (same underlying connection), so the request is delivered, the
+    handler auto-replies (Contract 5 result publishing), and the reply is
+    delivered back, all within this one call.
+
+    Before the C2 fix this would raise ``PRECONDITION_FAILED`` when
+    registering the manual-ack consumer against amq.rabbitmq.reply-to.
+    """
+    from rabbitkit.rpc import RPCClient
+    from rabbitkit.sync.broker import SyncBroker
+
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config)
+
+    @broker.subscriber(queue="sync-integ-rpc-echo")
+    def echo(body: bytes) -> bytes:
+        return body
+
+    broker.start()
+
+    assert broker._transport is not None
+    client = RPCClient(broker._transport, reply_connection=broker._transport._connection)
+    try:
+        response = client.call("sync-integ-rpc-echo", b"sync-ping-via-real-client", timeout=10.0)
+        assert response.body == b"sync-ping-via-real-client"
+    finally:
+        client.close()
+
+    broker.stop()
+
+
+# NOTE: broker.request() (the sync shorthand) is intentionally not covered by
+# a real-broker test here. SyncTransport.consume() does not marshal onto the
+# connection's owner thread (unlike publish()/ack()/nack()/reject(), which do
+# via _run_on_io_thread) — calling broker.request() from any thread other than
+# the one that called broker.start() would make an unmarshaled cross-thread
+# pika call the first time it registers the reply consumer. That is a
+# separate, pre-existing thread-safety gap in consume(), not something this
+# fix (no_ack/declare correctness for amq.rabbitmq.reply-to) should paper over
+# with a test that would only "pass" by accident. test_sync_rpc_via_real_rpc_client
+# above already proves the AMQP-level fix, single-threaded and safely.
 
 
 def test_dlq_inspector_sync_real_transport(rabbitmq_url: str) -> None:

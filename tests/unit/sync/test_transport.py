@@ -175,9 +175,7 @@ class TestTopology:
 
         transport.bind_queue("orders", "events", "orders.created")
 
-        channel.queue_bind.assert_called_once_with(
-            queue="orders", exchange="events", routing_key="orders.created"
-        )
+        channel.queue_bind.assert_called_once_with(queue="orders", exchange="events", routing_key="orders.created")
 
     def test_bind_queue_manual_mode_skips(self) -> None:
         transport = _make_transport(topology_mode=TopologyMode.MANUAL)
@@ -302,6 +300,116 @@ class TestConsume:
 
         channel.basic_cancel.assert_called_once_with(consumer_tag=tag)
 
+    def test_consume_no_ack_passes_auto_ack_true(self) -> None:
+        """C2: no_ack=True maps to pika's auto_ack=True (broker auto-acks)."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        transport.consume("amq.rabbitmq.reply-to", lambda msg: None, no_ack=True)
+
+        call_kwargs = channel.basic_consume.call_args.kwargs
+        assert call_kwargs["auto_ack"] is True
+
+    def test_consume_default_no_ack_is_false(self) -> None:
+        """Default consume() still uses manual ack (auto_ack=False)."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        transport.consume("orders", lambda msg: None)
+
+        call_kwargs = channel.basic_consume.call_args.kwargs
+        assert call_kwargs["auto_ack"] is False
+
+    def test_consume_declare_false_reply_to_queue_tracks_channel(self) -> None:
+        """C2: consuming amq.rabbitmq.reply-to with declare=False remembers the
+        channel so publish() can route matching requests onto it."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        transport.consume("amq.rabbitmq.reply-to", lambda msg: None, no_ack=True, declare=False)
+
+        assert transport._reply_to_channel is transport._consumer_channels["amq.rabbitmq.reply-to"]
+
+    def test_consume_declare_true_does_not_track_reply_to_channel(self) -> None:
+        """Ordinary consume() (declare=True) must not set _reply_to_channel,
+        even if the queue happened to be named amq.rabbitmq.reply-to."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        transport.consume("orders", lambda msg: None)
+
+        assert transport._reply_to_channel is None
+
+    def _connect_transport_with_distinct_channels(self, transport: SyncTransport) -> MagicMock:
+        """Like _connect_transport, but self._connection.channel() returns a
+        FRESH mock on each call — required to verify that publish() picks
+        the correct one of several distinct channels (channel-affinity)."""
+        publisher_channel = MagicMock()
+        publisher_channel.is_open = True
+        call_count = [0]
+
+        def channel_side_effect(*args: object, **kwargs: object) -> MagicMock:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return publisher_channel
+            ch = MagicMock()
+            ch.is_open = True
+            return ch
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.side_effect = channel_side_effect
+                mock_conn.return_value.is_open = True
+                transport.connect()
+
+        return publisher_channel
+
+    def test_publish_routes_reply_to_request_onto_reply_channel(self) -> None:
+        """C2: a publish with reply_to=amq.rabbitmq.reply-to must use the SAME
+        channel that registered the reply consumer, not the default publisher
+        channel — RabbitMQ rejects the request otherwise (channel affinity)."""
+        transport = _make_transport()
+        publisher_channel = self._connect_transport_with_distinct_channels(transport)
+
+        transport.consume("amq.rabbitmq.reply-to", lambda msg: None, no_ack=True, declare=False)
+        reply_channel = transport._reply_to_channel
+        assert reply_channel is not publisher_channel
+
+        outcome = transport.publish(
+            MessageEnvelope(routing_key="rpc.q", body=b"req", reply_to="amq.rabbitmq.reply-to")
+        )
+
+        assert outcome.ok
+        reply_channel.basic_publish.assert_called_once()
+        publisher_channel.basic_publish.assert_not_called()
+
+    def test_publish_without_reply_to_uses_default_channel(self) -> None:
+        """A normal publish (no direct reply-to) must still use the default
+        publisher channel, even while a reply-to consumer is active."""
+        transport = _make_transport()
+        publisher_channel = self._connect_transport_with_distinct_channels(transport)
+
+        transport.consume("amq.rabbitmq.reply-to", lambda msg: None, no_ack=True, declare=False)
+
+        outcome = transport.publish(MessageEnvelope(routing_key="orders", body=b"data"))
+
+        assert outcome.ok
+        publisher_channel.basic_publish.assert_called_once()
+        transport._reply_to_channel.basic_publish.assert_not_called()
+
+    def test_cancel_consumer_clears_reply_to_channel(self) -> None:
+        """Cancelling the reply-to consumer must clear _reply_to_channel so a
+        later publish falls back to the default channel instead of a closed one."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        tag = transport.consume("amq.rabbitmq.reply-to", lambda msg: None, no_ack=True, declare=False)
+        assert transport._reply_to_channel is not None
+
+        transport.cancel_consumer(tag)
+
+        assert transport._reply_to_channel is None
+
 
 # ── Additional coverage tests ─────────────────────────────────────────────
 
@@ -351,7 +459,6 @@ class TestConnectErrors:
         """_ensure_connected retries after connection errors."""
         pytest.importorskip("pika")
         import pika
-
 
         transport = _make_transport()
         call_count = 0
@@ -462,6 +569,7 @@ class TestConsumeCallback:
 
         assert len(received) == 1
         from rabbitkit.core.message import RabbitMessage
+
         assert isinstance(received[0], RabbitMessage)
         assert received[0].routing_key == "orders"
 
@@ -481,9 +589,32 @@ class TestConsumeCallback:
         props.headers = None
         props.timestamp = 1704164645  # 2024-01-02T03:04:05Z
 
-        msg = transport._build_message(method, props, b"{}")
+        msg = transport._build_message(MagicMock(), method, props, b"{}")
 
         assert msg.timestamp == datetime.fromtimestamp(1704164645, tz=UTC)
+
+    def test_build_message_no_ack_skips_settlement_wiring(self) -> None:
+        """C2: a no-ack delivery (e.g. amq.rabbitmq.reply-to) gets no ack/nack/
+        reject functions — the broker already auto-acked it, and calling
+        basic_ack/nack/reject on such a delivery would be a protocol violation."""
+        transport = _make_transport()
+        method = MagicMock()
+        method.routing_key = "amq.rabbitmq.reply-to"
+        method.exchange = ""
+        method.delivery_tag = 1
+        method.redelivered = False
+        method.consumer_tag = "rpc-tag"
+        props = MagicMock()
+        props.headers = None
+        props.timestamp = None
+
+        msg = transport._build_message(MagicMock(), method, props, b"reply-body", no_ack=True)
+
+        assert msg._ack_fn is None
+        assert msg._nack_fn is None
+        assert msg._reject_fn is None
+        with pytest.raises(RuntimeError):
+            msg.ack()
 
     def test_build_message_wires_ack_functions(self) -> None:
         """_build_message sets ack/nack/reject callables on the message."""
@@ -528,6 +659,7 @@ class TestConsumeCallback:
         on_msg2(channel2, mock_method, mock_props, b"body")
 
         from rabbitkit.core.message import RabbitMessage
+
         msg = captured[0]
         assert isinstance(msg, RabbitMessage)
         assert msg._ack_fn is not None
@@ -604,14 +736,15 @@ class TestAdditionalTopology:
         tag = transport.consume("orders", lambda msg: None)
         transport.cancel_consumer(tag)  # should not raise
 
-    def test_start_consuming_keyboard_interrupt(self) -> None:
-        transport = _make_transport()
-        channel = self._connect_transport(transport)
-        channel.start_consuming.side_effect = KeyboardInterrupt()
+        def test_start_consuming_keyboard_interrupt(self) -> None:
+            transport = _make_transport()
+            channel = self._connect_transport(transport)
+            # New start_consuming drives the connection I/O loop via process_data_events.
+            transport._connection.process_data_events.side_effect = KeyboardInterrupt()
 
-        # Should not propagate the KeyboardInterrupt
-        transport.start_consuming()
-        channel.stop_consuming.assert_called_once()
+            # Should not propagate the KeyboardInterrupt
+            transport.start_consuming()
+            channel.stop_consuming.assert_called_once()
 
     def test_stop_consuming_when_connected(self) -> None:
         transport = _make_transport()
@@ -626,6 +759,7 @@ class TestEdgeCases:
     def test_is_connected_exception_returns_false(self) -> None:
         """is_connected() returns False when checking raises."""
         from unittest.mock import PropertyMock
+
         pytest.importorskip("pika")
         transport = _make_transport()
 
@@ -648,7 +782,646 @@ class TestEdgeCases:
     def test_connect_without_pika_raises(self) -> None:
         """connect() raises ImportError when pika is not installed."""
         import sys
+
         transport = _make_transport()
         with patch.dict(sys.modules, {"pika": None}):
             with pytest.raises(ImportError, match="pika is required"):
                 transport.connect()
+
+
+# -- R-3: _run_on_io_thread zombie callback is a no-op after a stall ---------
+
+
+class TestRunOnIoThreadStall:
+    """R-3: when the I/O loop stalls and the wait times out, a late callback
+    drain must be a no-op (cancelled flag set) so it cannot settle an
+    already-redelivered message."""
+
+    def test_stalled_callback_is_noop_after_timeout(self) -> None:
+        transport = _make_transport()
+        # Force the cross-thread path: consuming=True and a different owner.
+        transport._consuming = True
+        transport._owner_ident = -99999
+
+        queued: list = []
+        conn = MagicMock()
+        conn.add_callback_threadsafe.side_effect = lambda cb: queued.append(cb)
+        transport._connection = conn
+
+        sentinel: list[str] = []
+
+        def fn() -> None:
+            sentinel.append("ran")
+
+        with pytest.raises(TimeoutError):
+            transport._run_on_io_thread(fn, timeout=0.05)
+
+        # The callback was queued but never drained within the timeout.
+        assert sentinel == []
+        assert len(queued) == 1
+
+        # Simulate the late drain (the I/O loop finally runs the callback).
+        # R-3: the cancelled flag must make this a no-op so fn() does NOT run.
+        queued[0]()
+        assert sentinel == []  # fn() was NOT executed by the late callback
+
+    def test_inline_path_runs_fn_immediately(self) -> None:
+        """On the owner thread, _run_on_io_thread runs fn() inline (no marshal)."""
+        import threading
+
+        transport = _make_transport()
+        transport._consuming = True
+        transport._owner_ident = threading.get_ident()  # same thread -> inline
+        transport._connection = MagicMock()
+
+        ran: list[bool] = []
+        transport._run_on_io_thread(lambda: ran.append(True))
+        assert ran == [True]
+
+
+# -- I-10: publish respects confirm_timeout on a stalled I/O loop ------------
+
+
+class TestPublishConfirmTimeout:
+    """I-10: a publish whose confirm never arrives (stalled I/O loop) raises
+    within ~confirm_timeout instead of hanging the worker forever."""
+
+    def test_publish_raises_within_confirm_timeout(self) -> None:
+        pytest.importorskip("pika")
+        import time
+
+        transport = _make_transport(confirm_timeout=0.1)
+        # Make the transport appear connected and force the cross-thread path
+        # so the publish marshal is bounded by confirm_timeout.
+        transport._connected = True
+        transport._consuming = True
+        transport._owner_ident = -99999
+
+        channel = MagicMock()
+        channel.is_open = True
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        # The I/O loop never drains the callback -> publish marshal times out.
+        conn.add_callback_threadsafe.side_effect = lambda cb: None
+        transport._connection = conn
+
+        env = MessageEnvelope(routing_key="rk", body=b"x")
+        start = time.monotonic()
+        outcome = transport.publish(env)
+        elapsed = time.monotonic() - start
+
+        assert outcome.status == PublishStatus.ERROR
+        assert isinstance(outcome.error, TimeoutError)
+        # Bounded by ~confirm_timeout (allow scheduling slack, but well under 30s).
+        assert elapsed < 1.0
+
+    def test_confirm_timeout_kwarg_stored(self) -> None:
+        transport = _make_transport(confirm_timeout=7.5)
+        assert transport._confirm_timeout == 7.5
+
+    def test_confirm_timeout_default(self) -> None:
+        transport = _make_transport()
+        assert transport._confirm_timeout == 5.0
+
+
+# ── I-17: cross-thread stop_consuming marshalling ──────────────────────────
+
+
+class TestStopConsumingCrossThread:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_stop_consuming_inline_when_not_consuming(self) -> None:
+        """When not in a consume loop, stop_consuming runs inline (synchronous)."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        transport.stop_consuming()
+        channel.stop_consuming.assert_called_once()
+
+    def test_stop_consuming_marshals_cross_thread_during_consume(self) -> None:
+        """During active consuming on a different thread, stop_consuming marshals
+        via add_callback_threadsafe (I-17) instead of calling pika cross-thread."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        # Pretend an active consume loop owned by a different thread.
+        transport._consuming = True
+        transport._owner_ident = 1  # some other thread id
+        marshalled: list = []
+        conn = transport._connection
+        # Simulate the I/O loop draining the callback synchronously.
+        conn.add_callback_threadsafe = lambda cb: (marshalled.append(cb), cb())[1]
+        transport.stop_consuming()
+        # The call was marshalled via add_callback_threadsafe (not inline).
+        assert len(marshalled) == 1
+        # The drained callback performed the actual stop on the I/O thread.
+        channel.stop_consuming.assert_called_once()
+
+
+# ── on_blocked / on_unblocked callbacks ──────────────────────────────────
+
+
+class TestBlockedUnblockedCallbacksSync:
+    def test_on_blocked_registers_callback(self) -> None:
+        """Line 95: on_blocked() appends callback to _blocked_callbacks."""
+        transport = _make_transport()
+
+        def cb() -> None:
+            pass
+
+        transport.on_blocked(cb)
+        assert cb in transport._blocked_callbacks
+
+    def test_on_unblocked_registers_callback(self) -> None:
+        """Line 99: on_unblocked() appends callback to _unblocked_callbacks."""
+        transport = _make_transport()
+
+        def cb() -> None:
+            pass
+
+        transport.on_unblocked(cb)
+        assert cb in transport._unblocked_callbacks
+
+    def test_pika_blocked_calls_all_callbacks(self) -> None:
+        """Lines 102-104: _pika_blocked() calls every registered blocked callback."""
+        transport = _make_transport()
+        called: list[str] = []
+        transport.on_blocked(lambda: called.append("cb1"))
+        transport.on_blocked(lambda: called.append("cb2"))
+        transport._pika_blocked(None)
+        assert called == ["cb1", "cb2"]
+
+    def test_pika_unblocked_calls_all_callbacks(self) -> None:
+        """Lines 109-111: _pika_unblocked() calls every registered unblocked callback."""
+        transport = _make_transport()
+        called: list[str] = []
+        transport.on_unblocked(lambda: called.append("cb1"))
+        transport.on_unblocked(lambda: called.append("cb2"))
+        transport._pika_unblocked(None)
+        assert called == ["cb1", "cb2"]
+
+    def test_pika_blocked_no_callbacks_is_noop(self) -> None:
+        """_pika_blocked() with no callbacks does nothing."""
+        transport = _make_transport()
+        transport._pika_blocked(None)  # should not raise
+
+    def test_pika_unblocked_no_callbacks_is_noop(self) -> None:
+        """_pika_unblocked() with no callbacks does nothing."""
+        transport = _make_transport()
+        transport._pika_unblocked(None)  # should not raise
+
+
+# ── sync context manager ──────────────────────────────────────────────────
+
+
+class TestSyncContextManager:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _make_connected_mock(self):
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_conn = MagicMock()
+        mock_conn.is_open = True
+        mock_conn.channel.return_value = mock_channel
+        return mock_conn, mock_channel
+
+    def test_enter_connects_and_returns_self(self) -> None:
+        """Lines 158-159: __enter__ calls connect() and returns self."""
+        transport = _make_transport()
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_bc:
+                mock_conn, _mock_ch = self._make_connected_mock()
+                mock_bc.return_value = mock_conn
+                result = transport.__enter__()
+        assert result is transport
+        assert transport.is_connected()
+
+    def test_exit_disconnects(self) -> None:
+        """Line 162: __exit__ calls disconnect()."""
+        transport = _make_transport()
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_bc:
+                mock_conn, _mock_ch = self._make_connected_mock()
+                mock_bc.return_value = mock_conn
+                transport.connect()
+        assert transport.is_connected()
+        transport.__exit__(None, None, None)
+        assert not transport.is_connected()
+
+
+# ── disconnect consumer channels ──────────────────────────────────────────
+
+
+class TestDisconnectConsumerChannelsSync:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_disconnect_closes_open_consumer_channels(self) -> None:
+        """Lines 172-174: disconnect() closes each open consumer channel."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        consumer_ch = MagicMock()
+        consumer_ch.is_open = True
+        transport._consumer_channels["q1"] = consumer_ch
+
+        transport.disconnect()
+
+        consumer_ch.close.assert_called_once()
+
+    def test_disconnect_skips_closed_consumer_channels(self) -> None:
+        """Lines 172-174: disconnect() skips already-closed consumer channels."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        closed_ch = MagicMock()
+        closed_ch.is_open = False
+        transport._consumer_channels["q1"] = closed_ch
+
+        transport.disconnect()
+
+        closed_ch.close.assert_not_called()
+
+
+# ── has_open_channels ────────────────────────────────────────────────────
+
+
+class TestHasOpenChannelsSync:
+    def test_has_open_channels_false_when_empty(self) -> None:
+        """Lines 218-219: returns False when no consumer channels registered."""
+        transport = _make_transport()
+        assert transport.has_open_channels is False
+
+    def test_has_open_channels_true_when_all_open(self) -> None:
+        """Returns True when all channels are open."""
+        transport = _make_transport()
+        ch = MagicMock()
+        ch.is_open = True
+        transport._consumer_channels["q1"] = ch
+        assert transport.has_open_channels is True
+
+    def test_has_open_channels_false_when_any_closed(self) -> None:
+        """Returns False when at least one channel is closed."""
+        transport = _make_transport()
+        open_ch = MagicMock()
+        open_ch.is_open = True
+        closed_ch = MagicMock()
+        closed_ch.is_open = False
+        transport._consumer_channels["q1"] = open_ch
+        transport._consumer_channels["q2"] = closed_ch
+        assert transport.has_open_channels is False
+
+
+# ── _ensure_connected exhaustion ─────────────────────────────────────────
+
+
+class TestEnsureConnectedExhaustion:
+    def test_ensure_connected_raises_after_max_attempts(self) -> None:
+        """Lines 261-266: _ensure_connected() re-raises after max attempts."""
+        pytest.importorskip("pika")
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 1
+
+        with patch.object(transport, "connect", side_effect=pika.exceptions.AMQPConnectionError("down")):
+            with patch("rabbitkit.sync.transport.time.sleep"):
+                with pytest.raises(pika.exceptions.AMQPConnectionError):
+                    transport._ensure_connected()
+
+    def test_ensure_connected_raises_after_deadline(self) -> None:
+        """Lines 260-266: _ensure_connected() re-raises after time deadline."""
+        pytest.importorskip("pika")
+        import pika
+
+        transport = _make_transport()
+        # Make the deadline already past on first check
+        transport._reconnect_total_timeout = 0.0
+
+        with patch.object(transport, "connect", side_effect=pika.exceptions.AMQPConnectionError("down")):
+            with patch("rabbitkit.sync.transport.time.sleep"):
+                with pytest.raises(pika.exceptions.AMQPConnectionError):
+                    transport._ensure_connected()
+
+
+# ── _run_on_io_thread error propagation ──────────────────────────────────
+
+
+class TestRunOnIoThreadErrors:
+    def test_run_on_io_thread_propagates_exception_from_cb(self) -> None:
+        """Lines 310-311: _run_on_io_thread() re-raises exception from the fn."""
+        transport = _make_transport()
+        transport._consuming = True
+        transport._owner_ident = -99999  # different thread
+
+        conn = MagicMock()
+
+        def drain_immediately(cb):
+            cb()  # run the callback inline to simulate I/O loop draining it
+
+        conn.add_callback_threadsafe.side_effect = drain_immediately
+        transport._connection = conn
+
+        class _Boom(Exception):
+            pass
+
+        def boom() -> None:
+            raise _Boom("intentional error")
+
+        with pytest.raises(_Boom, match="intentional error"):
+            transport._run_on_io_thread(boom)
+
+    def test_run_on_io_thread_returns_result_from_cb(self) -> None:
+        """Line 329-330: _run_on_io_thread() returns fn() result on cross-thread path."""
+        transport = _make_transport()
+        transport._consuming = True
+        transport._owner_ident = -99999
+
+        conn = MagicMock()
+
+        def drain_immediately(cb):
+            cb()
+
+        conn.add_callback_threadsafe.side_effect = drain_immediately
+        transport._connection = conn
+
+        result = transport._run_on_io_thread(lambda: 42)
+        assert result == 42
+
+
+# ── cancel_consumer: tag not found ───────────────────────────────────────
+
+
+class TestCancelConsumerTagNotFound:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_cancel_consumer_unknown_tag_is_noop(self) -> None:
+        """Line 512: cancel_consumer() returns when tag is not in consumer_tags."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+        # Tag not registered — should not raise
+        transport.cancel_consumer("rabbitkit.nonexistent-tag")
+
+
+# ── start_consuming loop ──────────────────────────────────────────────────
+
+
+class TestStartConsuming:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_start_consuming_exits_when_no_consumer_channels(self) -> None:
+        """Lines 538-555: start_consuming() breaks when _consumer_channels is empty."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        # No consumer channels registered — loop should break after first iteration
+        call_count = 0
+
+        def process_one(time_limit: float) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        transport._connection.process_data_events = process_one
+
+        transport.start_consuming()
+
+        assert call_count == 1  # one call before break
+        assert transport._consuming is False
+
+    def test_start_consuming_keyboard_interrupt_calls_stop(self) -> None:
+        """Lines 552-553: KeyboardInterrupt triggers _stop_all_consumers()."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        transport._connection.process_data_events.side_effect = KeyboardInterrupt()
+
+        transport.start_consuming()
+
+        # _stop_all_consumers should have been called; consuming is False
+        assert transport._consuming is False
+
+    def test_start_consuming_processes_until_consumers_cleared(self) -> None:
+        """Lines 542-551: loop calls process_data_events while channels exist."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        # Add a consumer channel that disappears after first process_data_events
+        consumer_ch = MagicMock()
+        consumer_ch.is_open = True
+        transport._consumer_channels["q1"] = consumer_ch
+
+        call_count = 0
+
+        def remove_after_first(time_limit: float) -> None:
+            nonlocal call_count
+            call_count += 1
+            transport._consumer_channels.clear()
+
+        transport._connection.process_data_events = remove_after_first
+
+        transport.start_consuming()
+
+        assert call_count == 1
+        assert transport._consuming is False
+
+
+# ── stop_consuming: not connected / timeout ───────────────────────────────
+
+
+class TestStopConsumingEdgeCases:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_stop_consuming_when_not_connected_is_noop(self) -> None:
+        """Line 583: stop_consuming() returns immediately when not connected."""
+        transport = _make_transport()
+        # Never connected — should not raise
+        transport.stop_consuming()
+
+    def test_stop_consuming_timeout_is_logged_not_raised(self) -> None:
+        """Lines 586-590: TimeoutError from _run_on_io_thread is caught and logged."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+
+        with patch.object(transport, "_run_on_io_thread", side_effect=TimeoutError("stalled")):
+            # Should not raise even though _run_on_io_thread times out
+            transport.stop_consuming()
+
+
+# ── basic_get / purge_queue (sync) ────────────────────────────────────────
+
+
+class TestBasicGetAndPurgeSync:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_basic_get_returns_none_when_queue_empty(self) -> None:
+        """Lines 599-602: basic_get() returns None when method is None."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        # basic_get returns (None, None, None) for an empty queue
+        channel.basic_get.return_value = (None, None, None)
+
+        result = transport.basic_get("orders.dlq")
+        assert result is None
+
+    def test_basic_get_returns_message_when_present(self) -> None:
+        """Line 603: basic_get() builds and returns a RabbitMessage."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        mock_method = MagicMock()
+        mock_method.routing_key = "orders.dlq"
+        mock_method.exchange = ""
+        mock_method.delivery_tag = 7
+        mock_method.redelivered = False
+        mock_method.consumer_tag = None
+
+        mock_props = MagicMock()
+        mock_props.headers = None
+        mock_props.timestamp = None
+        mock_props.message_id = None
+        mock_props.correlation_id = None
+        mock_props.reply_to = None
+        mock_props.content_type = None
+        mock_props.content_encoding = None
+        mock_props.type = None
+        mock_props.app_id = None
+
+        channel.basic_get.return_value = (mock_method, mock_props, b"dlq-payload")
+
+        result = transport.basic_get("orders.dlq")
+        assert result is not None
+        assert result.body == b"dlq-payload"
+        assert result.delivery_tag == 7
+
+    def test_purge_queue_returns_message_count(self) -> None:
+        """Lines 607-609: purge_queue() returns the message count from frame."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        purge_frame = MagicMock()
+        purge_frame.method.message_count = 15
+        channel.queue_purge.return_value = purge_frame
+
+        count = transport.purge_queue("orders.dlq")
+        assert count == 15
+        channel.queue_purge.assert_called_once_with(queue="orders.dlq")
+
+
+# ── reconnect() ──────────────────────────────────────────────────────────
+
+
+class TestReconnect:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect_transport(self, transport: SyncTransport) -> MagicMock:
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return mock_channel
+
+    def test_reconnect_disconnects_then_reconnects(self) -> None:
+        """Lines 270-271: reconnect() calls disconnect() then _ensure_connected()."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+        assert transport.is_connected()
+
+        disconnect_called: list[bool] = []
+        ensure_called: list[bool] = []
+
+        original_disconnect = transport.disconnect
+
+        def spy_disconnect() -> None:
+            disconnect_called.append(True)
+            original_disconnect()
+
+        def spy_ensure() -> None:
+            ensure_called.append(True)
+            # Don't actually reconnect in this test
+
+        transport.disconnect = spy_disconnect  # type: ignore[method-assign]
+        transport._ensure_connected = spy_ensure  # type: ignore[method-assign]
+
+        transport.reconnect()
+
+        assert disconnect_called == [True]
+        assert ensure_called == [True]

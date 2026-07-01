@@ -137,6 +137,7 @@ class TestC2CircuitBreakerAsyncFallback:
     @pytest.mark.asyncio
     async def test_sync_cb_async_handler_raises_type_error(self) -> None:
         """C2: sync CB + async broker raises TypeError instead of silently skipping."""
+
         class _SyncCB:
             def call(self, fn: object, *args: object) -> object:
                 return fn(*args)  # type: ignore[operator]
@@ -160,6 +161,7 @@ class TestC2CircuitBreakerAsyncFallback:
     @pytest.mark.asyncio
     async def test_sync_publish_cb_async_raises_type_error(self) -> None:
         """C2: sync publish CB + async publish raises TypeError."""
+
         class _SyncCB:
             def call(self, fn: object, *args: object) -> object:
                 return fn(*args)  # type: ignore[operator]
@@ -175,6 +177,7 @@ class TestC2CircuitBreakerAsyncFallback:
     @pytest.mark.asyncio
     async def test_async_cb_works_correctly(self) -> None:
         """C2 sanity: proper async CB is called and handler runs."""
+
         class _AsyncCB:
             calls: ClassVar[list[str]] = []
 
@@ -218,7 +221,9 @@ class TestC3RPCEnsureConsumingRace:
         lock = threading.Lock()
 
         class _MockTransport:
-            def consume(self, queue: str, callback: object) -> str:  # type: ignore[override]
+            def consume(
+                self, queue: str, callback: object, *, no_ack: bool = False, declare: bool = True
+            ) -> str:  # type: ignore[override]
                 nonlocal consume_count
                 time.sleep(0.01)  # simulate latency
                 with lock:
@@ -350,10 +355,9 @@ class TestH4SyncWorkerPoolThreadSafety:
                 except Exception as e:
                     errors.append(e)
 
-        threads = (
-            [threading.Thread(target=submit_messages) for _ in range(4)]
-            + [threading.Thread(target=read_pending) for _ in range(4)]
-        )
+        threads = [threading.Thread(target=submit_messages) for _ in range(4)] + [
+            threading.Thread(target=read_pending) for _ in range(4)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -411,6 +415,7 @@ class TestM1AsyncRateLimiter:
 class TestM2DICleanupException:
     def test_sync_cleanup_exception_is_logged_not_swallowed(self) -> None:
         """M2: scope.cleanup() raising must be caught + logged, handler result preserved."""
+
         class _FailingScope:
             def cleanup(self) -> None:
                 raise RuntimeError("cleanup explosion")
@@ -439,6 +444,7 @@ class TestM2DICleanupException:
     @pytest.mark.asyncio
     async def test_async_cleanup_exception_is_logged_not_swallowed(self) -> None:
         """M2: async scope.cleanup_async() raising must be caught + logged."""
+
         class _FailingScope:
             def cleanup(self) -> None:
                 pass
@@ -475,18 +481,25 @@ class TestM2DICleanupException:
 
 class TestM3RetryConfigValidation:
     def test_warns_when_fewer_delays_than_retries(self) -> None:
-        """M3: UserWarning emitted when len(delays) < max_retries."""
+        """M3: UserWarning emitted when len(delays) < max_retries (non-strict mode)."""
         import warnings
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            RetryConfig(max_retries=4, delays=(5, 30))
+            RetryConfig(max_retries=4, delays=(5, 30), strict_delays=False)
             assert len(w) == 1
             assert issubclass(w[0].category, UserWarning)
             assert "max_retries" in str(w[0].message)
 
+    def test_raises_when_strict_and_fewer_delays_than_retries(self) -> None:
+        """M3: strict mode (default) raises ValueError on under-length delays."""
+        with pytest.raises(ValueError, match="max_retries"):
+            RetryConfig(max_retries=4, delays=(5, 30))
+
     def test_no_warning_when_delays_match(self) -> None:
         """M3: No warning when delays tuple has >= max_retries entries."""
         import warnings
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             RetryConfig(max_retries=3, delays=(5, 30, 120))
@@ -531,10 +544,14 @@ class TestM4SetQosPerConsumer:
 
         mock_conn = AsyncMock()
         mock_conn.is_closed = False
-        mock_conn.channel = AsyncMock(side_effect=[
-            ch1, ch1,   # publisher pool: topology channel
-            ch2, ch2,   # consumer connection channels
-        ])
+        mock_conn.channel = AsyncMock(
+            side_effect=[
+                ch1,
+                ch1,  # publisher pool: topology channel
+                ch2,
+                ch2,  # consumer connection channels
+            ]
+        )
         mock_conn.close = AsyncMock()
 
         with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={}):

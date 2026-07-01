@@ -549,3 +549,82 @@ class TestPrometheusCollector:
         with patch("builtins.__import__", side_effect=mock_import):
             with pytest.raises(ImportError, match="PrometheusCollector requires"):
                 PrometheusCollector()
+
+
+# ── metrics_app exposition (M-SRE1) ───────────────────────────────────────
+
+
+class TestMetricsApp:
+    def test_metrics_app_exposes_prometheus_text(self) -> None:
+        """metrics_app() returns an ASGI app serving /metrics in Prometheus format."""
+        pytest.importorskip("prometheus_client")
+        from rabbitkit.middleware.metrics import metrics_app
+
+        app = metrics_app()
+
+        captured: dict[str, object] = {}
+
+        async def receive():  # pragma: no cover - not used for http.response
+            return {"type": "http.request"}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                captured["status"] = message["status"]
+                captured["headers"] = message["headers"]
+            elif message["type"] == "http.response.body":
+                captured["body"] = message["body"]
+
+        import asyncio
+
+        scope = {"type": "http", "path": "/metrics"}
+        asyncio.run(app(scope, receive, send))
+
+        assert captured["status"] == 200
+        body = captured["body"]
+        assert isinstance(body, (bytes, bytearray))
+        # Prometheus text format always starts with a '# HELP' or '# TYPE' or a metric line
+        text = body.decode()
+        assert "=" in text or text.startswith("#")
+
+    def test_metrics_app_404_for_non_metrics_path(self) -> None:
+        pytest.importorskip("prometheus_client")
+        from rabbitkit.middleware.metrics import metrics_app
+
+        app = metrics_app()
+        captured: dict[str, object] = {}
+
+        async def receive():  # pragma: no cover
+            return {"type": "http.request"}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                captured["status"] = message["status"]
+
+        import asyncio
+
+        scope = {"type": "http", "path": "/other"}
+        asyncio.run(app(scope, receive, send))
+        assert captured["status"] == 404
+
+
+class TestStartMetricsServerDefaultHost:
+    def test_default_host_is_loopback(self) -> None:
+        """M-2: start_metrics_server binds 127.0.0.1 by default (not 0.0.0.0)."""
+        import inspect
+
+        from rabbitkit.middleware.metrics import start_metrics_server
+
+        sig = inspect.signature(start_metrics_server)
+        host_default = sig.parameters["host"].default
+        assert host_default == "127.0.0.1"
+
+    def test_explicit_host_is_used(self) -> None:
+        """An explicit host=0.0.0.0 is forwarded to prometheus_client."""
+        pytest.importorskip("prometheus_client")
+        from unittest.mock import patch
+
+        from rabbitkit.middleware.metrics import start_metrics_server
+
+        with patch("prometheus_client.start_http_server") as mock_start:
+            start_metrics_server(port=9090, host="0.0.0.0")  # noqa: S104  # explicit all-ifaces test
+        mock_start.assert_called_once_with(9090, "0.0.0.0")  # noqa: S104

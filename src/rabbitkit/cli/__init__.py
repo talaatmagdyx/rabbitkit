@@ -12,7 +12,14 @@ rabbitkit run <app_path> --reload   Start with hot-reload (requires rabbitkit[re
 rabbitkit run <app_path> -w 4       Start 4 worker processes
 
 rabbitkit health check <app_path>   Print broker health as JSON
+
 rabbitkit topology list <app_path>  List all registered routes
+
+rabbitkit routes list <app_path>    List all consumer routes with retry info
+rabbitkit routes describe <app_path> <name>  Show full route details
+
+rabbitkit dlq inspect <queue>       Peek at messages in a dead-letter queue
+rabbitkit dlq replay <queue> <target>  Republish DLQ messages to a target exchange
 
 rabbitkit shell <app_path>          Open interactive Python shell with broker pre-loaded
 
@@ -23,10 +30,12 @@ App path format
 Examples::
 
     rabbitkit run myapp.main:broker
-    rabbitkit run services.orders.app:broker --reload
-    rabbitkit run myapp.main:broker -w 4
     rabbitkit health check myapp.main:broker
     rabbitkit topology list myapp.main:broker --format json
+    rabbitkit routes list myapp.main:broker
+    rabbitkit routes describe myapp.main:broker handle_order
+    rabbitkit dlq inspect orders.created.dlq --limit 50
+    rabbitkit dlq replay orders.created.dlq orders --dry-run
     rabbitkit shell myapp.main:broker
 
 The module must be importable from the current working directory (add it to
@@ -47,7 +56,9 @@ except ImportError as _err:  # pragma: no cover
         "rabbitkit CLI requires typer. Install with: pip install rabbitkit[cli]"
     ) from _err
 
+from rabbitkit.cli.commands.dlq import dlq_app
 from rabbitkit.cli.commands.health import health_app
+from rabbitkit.cli.commands.routes import routes_app
 from rabbitkit.cli.commands.run import run_command
 from rabbitkit.cli.commands.shell import shell_command
 from rabbitkit.cli.commands.topology import topology_app
@@ -62,3 +73,5 @@ app.command("run")(run_command)
 app.command("shell")(shell_command)
 app.add_typer(health_app, name="health")
 app.add_typer(topology_app, name="topology")
+app.add_typer(routes_app, name="routes")
+app.add_typer(dlq_app, name="dlq")

@@ -184,9 +184,11 @@ class TestCustomTuples:
 
 class TestTupleContents:
     def test_transient_errors_tuple(self) -> None:
-        assert ConnectionResetError in TRANSIENT_ERRORS
-        assert BrokenPipeError in TRANSIENT_ERRORS
+        # ConnectionResetError is covered by OSError (isinstance), not listed explicitly
+        assert issubclass(ConnectionResetError, OSError)
+        assert issubclass(BrokenPipeError, OSError)
         assert TimeoutError in TRANSIENT_ERRORS
+        assert EOFError in TRANSIENT_ERRORS
         assert OSError in TRANSIENT_ERRORS
 
     def test_permanent_errors_tuple(self) -> None:

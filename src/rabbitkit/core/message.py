@@ -15,6 +15,23 @@ from datetime import datetime
 from typing import Any
 
 
+def is_rabbit_message_annotation(ann: Any) -> bool:
+    """True if ``ann`` is/mentions :class:`RabbitMessage`.
+
+    Handles both the resolved class and the string form (``"RabbitMessage"``)
+    produced by ``from __future__ import annotations`` when the hint can't be
+    resolved by ``typing.get_type_hints`` (e.g. a handler in a module that didn't
+    import the name). Recognizing the string form prevents valid
+    ``(body: bytes, msg: RabbitMessage)`` handlers from being mis-classified as
+    having two body-like parameters / wrong body-type detection.
+    """
+    if ann is RabbitMessage:
+        return True
+    if isinstance(ann, str):
+        return ann == "RabbitMessage" or ann.endswith(".RabbitMessage")
+    return False
+
+
 class RabbitMessage:
     """Rich incoming message with transport-aware settlement.
 
@@ -108,14 +125,19 @@ class RabbitMessage:
     # ── Sync settlement ───────────────────────────────────────────────────
 
     def ack(self) -> None:
-        """Synchronous ack. Raises RuntimeError on async-only transport."""
+        """Synchronous ack. Raises RuntimeError on async-only transport.
+
+        Sets disposition only after the transport call succeeds, so a failed
+        ack (channel closed, frame error) leaves the message unsettled and the
+        exception propagates to the recovery loop instead of being swallowed.
+        """
         if self._disposition != "pending":
             return  # idempotent guard
         if self._ack_fn is None:
             msg = "Cannot sync-ack an async transport message. Use await msg.ack_async()."
             raise RuntimeError(msg)
+        self._ack_fn()  # may raise — disposition stays "pending" on failure
         self._disposition = "acked"
-        self._ack_fn()
 
     def nack(self, requeue: bool = True) -> None:
         """Synchronous nack. Raises RuntimeError on async-only transport."""
@@ -124,8 +146,8 @@ class RabbitMessage:
         if self._nack_fn is None:
             msg = "Cannot sync-nack an async transport message. Use await msg.nack_async()."
             raise RuntimeError(msg)
-        self._disposition = "nacked"
         self._nack_fn(requeue)
+        self._disposition = "nacked"
 
     def reject(self, requeue: bool = False) -> None:
         """Synchronous reject. Raises RuntimeError on async-only transport."""
@@ -134,8 +156,8 @@ class RabbitMessage:
         if self._reject_fn is None:
             msg = "Cannot sync-reject an async transport message. Use await msg.reject_async()."
             raise RuntimeError(msg)
-        self._disposition = "rejected"
         self._reject_fn(requeue)
+        self._disposition = "rejected"
 
     # ── Async settlement ──────────────────────────────────────────────────
 
@@ -143,31 +165,37 @@ class RabbitMessage:
         """Async ack. Falls back to sync if async fn not set."""
         if self._disposition != "pending":
             return
-        self._disposition = "acked"
         if self._ack_async_fn:
             await self._ack_async_fn()
         elif self._ack_fn:
             self._ack_fn()
+        else:
+            raise RuntimeError("Cannot async-ack: no settlement fn set. Use msg.ack() on a sync transport.")
+        self._disposition = "acked"
 
     async def nack_async(self, requeue: bool = True) -> None:
         """Async nack. Falls back to sync if async fn not set."""
         if self._disposition != "pending":
             return
-        self._disposition = "nacked"
         if self._nack_async_fn:
             await self._nack_async_fn(requeue)
         elif self._nack_fn:
             self._nack_fn(requeue)
+        else:
+            raise RuntimeError("Cannot async-nack: no settlement fn set. Use msg.nack() on a sync transport.")
+        self._disposition = "nacked"
 
     async def reject_async(self, requeue: bool = False) -> None:
         """Async reject. Falls back to sync if async fn not set."""
         if self._disposition != "pending":
             return
-        self._disposition = "rejected"
         if self._reject_async_fn:
             await self._reject_async_fn(requeue)
         elif self._reject_fn:
             self._reject_fn(requeue)
+        else:
+            raise RuntimeError("Cannot async-reject: no settlement fn set. Use msg.reject() on a sync transport.")
+        self._disposition = "rejected"
 
 
 # ── Exception-based ack control ──────────────────────────────────────────

@@ -7,8 +7,9 @@ Throughput/batching config objects are accepted by their respective components.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from rabbitkit.core.logging import LoggingConfig
 from rabbitkit.core.types import ErrorSeverity, TopologyMode
@@ -27,18 +28,40 @@ class ConnectionConfig:
     vhost: str = "/"
     heartbeat: int = 30
     socket_timeout: float = 10.0
-    blocked_connection_timeout: float = 300.0
+    # k8s-friendly default: fail fast on a blocked connection rather than
+    # appearing healthy for 5 minutes while publishing stalls.
+    blocked_connection_timeout: float = 60.0
     connection_name: str | None = None
     reconnect_backoff_base: float = 1.0
     reconnect_backoff_max: float = 30.0
 
     @property
     def url(self) -> str:
-        """Build AMQP URL from config fields."""
-        vhost = self.vhost
-        if vhost == "/":
+        """Build AMQP URL from config fields.
+
+        Username, password and vhost are URL-encoded so credentials containing
+        reserved characters (``@:/#`` etc.) cannot corrupt the host/port parse
+        (mirrors the encoding done in ``async_/connection.py``).
+        """
+        if self.vhost == "/":
             vhost = "%2F"
-        return f"amqp://{self.username}:{self.password}@{self.host}:{self.port}/{vhost}"
+        else:
+            vhost = quote(self.vhost, safe="")
+        user = quote(self.username, safe="")
+        pwd = quote(self.password, safe="")
+        return f"amqp://{user}:{pwd}@{self.host}:{self.port}/{vhost}"
+
+    def __post_init__(self) -> None:
+        # Surface the insecure default-credentials-against-non-local-host mistake
+        # once at construction (not per-connection). The default is kept for dev
+        # convenience; this only warns.
+        if self.username == "guest" and self.host not in {"localhost", "127.0.0.1", "::1"}:
+            warnings.warn(
+                "ConnectionConfig uses default 'guest' credentials against non-local "
+                f"host {self.host!r}; set explicit username/password for production.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     @classmethod
     def from_url(cls, url: str) -> ConnectionConfig:
@@ -56,8 +79,10 @@ class ConnectionConfig:
         kwargs: dict[str, str | int | float | None] = {
             "host": parsed.hostname or "localhost",
             "port": parsed.port or 5672,
-            "username": parsed.username or "guest",
-            "password": parsed.password or "guest",
+            # Percent-decode credentials so an encoded AMQP URL round-trips
+            # without double-encoding (e.g. user%40 -> user@).
+            "username": unquote(parsed.username) if parsed.username else "guest",
+            "password": unquote(parsed.password) if parsed.password else "guest",
             "vhost": vhost,
         }
 
@@ -157,9 +182,10 @@ class PoolConfig:
     """
 
     channel_pool_size: int = 10
-    publisher_connections: int = 1   # reserved — see class docstring
-    consumer_connections: int = 1    # reserved — see class docstring
+    publisher_connections: int = 1  # reserved — see class docstring
+    consumer_connections: int = 1  # reserved — see class docstring
     channel_acquire_timeout: float = 10.0  # seconds to wait for a pooled channel
+    prewarm_channels: bool = False  # pre-create all pool channels on connect() to eliminate warmup jitter
 
 
 # ── Retry ──────────────────────────────────────────────────────────────────
@@ -184,19 +210,28 @@ class RetryConfig:
     dead_letter_exchange: str = ""
     per_queue: bool = True
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT
+    strict_delays: bool = True
 
     def __post_init__(self) -> None:
-        import warnings
         if self.max_retries < 0:
             raise ValueError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
-        if self.delays and len(self.delays) < self.max_retries:
-            warnings.warn(
+        if len(self.delays) < self.max_retries:
+            msg = (
                 f"RetryConfig.delays has {len(self.delays)} entries but max_retries={self.max_retries}. "
-                "Retries beyond the last delay entry will reuse the last delay value. "
-                "Consider providing at least max_retries delay values for explicit control.",
-                UserWarning,
-                stacklevel=2,
+                "Retries beyond the last delay entry will reuse the last delay value, "
+                "which is almost always a misconfiguration. Provide at least max_retries "
+                "delay values, or set strict_delays=False to allow the flat-tail behavior."
             )
+            if self.strict_delays:
+                raise ValueError(msg)
+            import warnings
+
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
+
+# NOTE: ``RetryConfig`` no longer imports ``warnings`` at module top-level; the
+# warning is only emitted on the non-strict path. Strict (default) raises so
+# misconfiguration fails fast per the project's fail-fast philosophy.
 
 
 # ── Compression ────────────────────────────────────────────────────────────
@@ -240,12 +275,68 @@ class MetricsConfig:
         return self.processing_histogram or f"{self.namespace}_message_processing_seconds"
 
     @property
+    def handler_duration_seconds(self) -> str:
+        return self.processing_histogram or f"{self.namespace}_handler_duration_seconds"
+
+    @property
+    def handler_errors_total(self) -> str:
+        return f"{self.namespace}_handler_errors_total"
+
+    @property
+    def messages_acked_total(self) -> str:
+        return f"{self.namespace}_messages_acked_total"
+
+    @property
+    def messages_nacked_total(self) -> str:
+        return f"{self.namespace}_messages_nacked_total"
+
+    @property
+    def messages_rejected_total(self) -> str:
+        return f"{self.namespace}_messages_rejected_total"
+
+    @property
+    def messages_retried_total(self) -> str:
+        return f"{self.namespace}_messages_retried_total"
+
+    @property
+    def messages_dead_lettered_total(self) -> str:
+        return f"{self.namespace}_messages_dead_lettered_total"
+
+    @property
     def published_total(self) -> str:
         return self.published_counter or f"{self.namespace}_messages_published_total"
 
     @property
+    def publish_total(self) -> str:
+        return self.published_counter or f"{self.namespace}_publish_total"
+
+    @property
+    def publish_failures_total(self) -> str:
+        return f"{self.namespace}_publish_failures_total"
+
+    @property
+    def publish_confirm_latency_seconds(self) -> str:
+        return f"{self.namespace}_publish_confirm_latency_seconds"
+
+    @property
     def publish_seconds(self) -> str:
         return self.publish_histogram or f"{self.namespace}_message_publish_seconds"
+
+    @property
+    def in_flight_messages(self) -> str:
+        return f"{self.namespace}_in_flight_messages"
+
+    @property
+    def worker_pool_pending(self) -> str:
+        return f"{self.namespace}_worker_pool_pending"
+
+    @property
+    def broker_connected(self) -> str:
+        return f"{self.namespace}_broker_connected"
+
+    @property
+    def consumer_active(self) -> str:
+        return f"{self.namespace}_consumer_active"
 
 
 # ── Health Check ──────────────────────────────────────────────────────────
@@ -286,25 +377,27 @@ class RetryDisabled:
 RETRY_DISABLED = RetryDisabled()
 
 
-# ── Deduplication (0.2.0 — placeholder) ──────────────────────────────────
+# ── Deduplication (active) ──────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
 class DeduplicationConfig:
-    """Deduplication configuration. Used in 0.2.0."""
+    """Deduplication configuration. Active."""
 
     key_prefix: str = "rabbitkit:dedup"
     ttl: int = 86400
     fallback_on_redis_error: bool = True
     key_source: str = "message_id"
+    mark_policy: str = "on_success"
+    local_cache_size: int = 0  # 0 = disabled; >0 = in-process LRU capacity (short-circuits Redis for known duplicates)
 
 
-# ── Backpressure (0.2.0 — placeholder) ───────────────────────────────────
+# ── Backpressure (active) ───────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
 class BackpressureConfig:
-    """Backpressure configuration. Used in 0.2.0."""
+    """Backpressure configuration. Active."""
 
     max_in_flight: int = 1000
     rate_limit: int | None = None
@@ -313,27 +406,44 @@ class BackpressureConfig:
     poll_interval_ms: int = 10
 
 
-# ── Batch (0.2.0 — placeholder) ──────────────────────────────────────────
+# ── Batch (active) ──────────────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
 class BatchPublishConfig:
-    """Batch publish configuration. Used in 0.2.0."""
+    """Batch publish configuration. Active."""
 
     batch_size: int = 100
     flush_interval_ms: int = 50
     max_in_flight: int = 1000
+    flush_workers: int = 0  # 0 = auto (min(16, max_in_flight // batch_size)); >0 = explicit count
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError(f"BatchPublishConfig.batch_size must be > 0, got {self.batch_size}")
+        if self.flush_interval_ms < 0:
+            raise ValueError(
+                f"BatchPublishConfig.flush_interval_ms must be >= 0, got {self.flush_interval_ms}"
+            )
+        if self.max_in_flight <= 0:
+            raise ValueError(
+                f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}"
+            )
+        if self.flush_workers < 0:
+            raise ValueError(
+                f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class BatchAckConfig:
-    """Batch ack configuration. Used in 0.2.0."""
+    """Batch ack configuration. Active."""
 
     batch_size: int = 100
     flush_interval_ms: int = 200
 
 
-# ── Worker (0.2.0 — placeholder) ─────────────────────────────────────────
+# ── Worker (active) ─────────────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,9 +461,13 @@ class WorkerConfig:
 # ── Top-Level Config ─────────────────────────────────────────────────────
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class RabbitConfig:
     """Top-level config — composes focused config objects.
+
+    Frozen + slots (per project convention). Brokers that need to apply
+    per-route overrides (e.g. prefetch) hold a private ``dataclasses.replace``
+    copy rather than mutating the caller's object.
 
     Only connection/broker defaults. Throughput/batching configs
     are accepted by their respective components directly.

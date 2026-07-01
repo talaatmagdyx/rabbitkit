@@ -12,10 +12,11 @@ Produced by SubscriberRegistry, consumed by Broker.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
 
@@ -46,15 +47,43 @@ class ResultPublisher:
         return self.exchange.name
 
 
-# ── Route definition ─────────────────────────────────────────────────────
+# ── Route runtime state ──────────────────────────────────────────────────
 
 
 @dataclass(slots=True)
+class RouteRuntimeState:
+    """Mutable per-route runtime state, held by the (frozen) RouteDefinition.
+
+    Separated from registration metadata so that ``RouteDefinition`` can be
+    immutable (frozen) while still allowing the broker to update runtime
+    fields (``consumer_tag``) during start/reconnect.
+
+    The frozen ``RouteDefinition`` holds a reference to this object; the
+    dataclass is frozen (the field cannot be reassigned) but the inner
+    object is mutable (``consumer_tag`` can be updated in place). This is
+    the standard "frozen container holding mutable internals" pattern.
+    """
+
+    consumer_tag: str | None = None
+
+
+# ── Route definition ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
 class RouteDefinition:
     """Internal route model — produced by registry, consumed by broker.
 
-    Registration metadata is fixed after creation; runtime fields
-    (consumer_tag) are populated by the broker during start/reconnect.
+    Registration metadata is immutable (frozen) after creation. Runtime
+    state (``consumer_tag``) lives in the separate mutable
+    :class:`RouteRuntimeState` instance held by :attr:`runtime_state`, and
+    is populated by the broker during start/reconnect.
+
+    A backward-compatible ``consumer_tag`` property is provided (read-only)
+    that delegates to ``runtime_state.consumer_tag`` so that callers that
+    still read ``route.consumer_tag`` (e.g. ``health.py``) keep working
+    without modification. Brokers write via
+    ``route.runtime_state.consumer_tag = ...``.
 
     Contains all metadata needed to:
     - declare topology
@@ -90,8 +119,24 @@ class RouteDefinition:
     # Filter predicate — reject messages before deserialization
     filter_fn: Callable[[RabbitMessage], bool] | None = None
 
-    # ── Runtime state (populated by broker, updated on reconnect) ──
-    consumer_tag: str | None = None
+    # ── Runtime state (mutable sub-object; populated by broker) ──
+    runtime_state: RouteRuntimeState = field(default_factory=RouteRuntimeState)
+
+    # ── Backward-compatible runtime accessor (read-only) ──
+
+    @property
+    def consumer_tag(self) -> str | None:
+        """Active consumer tag for this route (delegates to runtime_state).
+
+        Kept for backward compatibility with callers (e.g. ``health.py``)
+        that read ``route.consumer_tag``. Writes are also supported for
+        backward compatibility — ``route.consumer_tag = x`` delegates to
+        ``route.runtime_state.consumer_tag = x`` via the custom
+        ``__setattr__`` installed below (frozen+slots would otherwise block
+        property setters). New code should prefer writing
+        ``route.runtime_state.consumer_tag`` directly.
+        """
+        return self.runtime_state.consumer_tag
 
     def has_retry_enabled(self, broker_retry: RetryConfig | None = None) -> bool:
         """Check if this route has retry enabled.
@@ -176,5 +221,39 @@ class RouteDefinition:
         self.validate_retry_dlx_conflict(broker_retry)
 
 
-class ConfigurationError(Exception):
-    """Raised for invalid configuration combinations detected at registration time."""
+# ── Backward-compatible ``consumer_tag`` writes on frozen RouteDefinition ─
+#
+# ``@dataclass(frozen=True, slots=True)`` generates a ``__setattr__`` that
+# raises ``FrozenInstanceError`` for every assignment, and (due to a
+# frozen+slots interaction) it also blocks property setters with a misleading
+# ``TypeError``. To keep the public write path
+# ``route.consumer_tag = ...`` working for callers that predate the R13
+# split (and for tests that reset it), we reinstall a thin ``__setattr__``
+# that routes ``consumer_tag`` writes to the mutable ``runtime_state``
+# sub-object and rejects every other assignment (preserving frozen semantics
+# for all registration-metadata fields).
+
+
+def _route_setattr(self: RouteDefinition, name: str, value: object) -> None:
+    if name == "consumer_tag":
+        # Delegate to the mutable runtime-state sub-object.
+        object.__getattribute__(self, "runtime_state").consumer_tag = value
+        return
+    raise FrozenInstanceError(f"cannot assign field {name!r} to {type(self).__name__!r}")
+
+
+def _route_delattr(self: RouteDefinition, name: str) -> None:
+    if name == "consumer_tag":
+        object.__getattribute__(self, "runtime_state").consumer_tag = None
+        return
+    raise FrozenInstanceError(f"cannot delete field {name!r} from {type(self).__name__!r}")
+
+
+RouteDefinition.__setattr__ = _route_setattr  # type: ignore[assignment]
+RouteDefinition.__delattr__ = _route_delattr  # type: ignore[assignment]
+
+
+# ``ConfigurationError`` now lives in ``rabbitkit.core.errors`` (single
+# canonical location). It is re-exported here for backwards compatibility with
+# code that imported it from this module.
+__all__ = ["ConfigurationError", "ResultPublisher", "RouteDefinition", "RouteRuntimeState"]

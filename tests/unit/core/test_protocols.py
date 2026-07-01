@@ -44,6 +44,9 @@ class ConcreteTransport:
         queue: str,
         callback: Callable[[RabbitMessage], None],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
         return "ctag.1"
 
@@ -89,6 +92,9 @@ class ConcreteAsyncTransport:
         queue: str,
         callback: Callable[[RabbitMessage], Awaitable[None]],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
         return "ctag.1"
 

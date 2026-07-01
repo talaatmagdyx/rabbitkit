@@ -209,8 +209,8 @@ def build_config(env: str) -> RabbitConfig:
             heartbeat=30,             # detect dead peers in ~60s (2 missed beats). Lower = faster
                                       #   detection but more chatter; 30 is a good default.
             socket_timeout=10.0,      # TCP connect/op timeout. Fail fast on a black-hole network.
-            blocked_connection_timeout=300.0,  # if broker says connection.blocked (memory/disk
-                                      #   alarm), give up after 5 min instead of hanging forever.
+            blocked_connection_timeout=60.0,  # if broker says connection.blocked (memory/disk
+                                      #   alarm), give up after 60s instead of hanging forever.
             reconnect_backoff_base=1.0,   # first reconnect after 1s
             reconnect_backoff_max=30.0,   # cap exponential backoff at 30s
             connection_name=f"order-service@{env}",  # shows in mgmt UI — priceless during incidents

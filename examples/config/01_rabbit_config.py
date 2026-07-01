@@ -12,23 +12,22 @@ Requirements:
 """
 
 from rabbitkit import (
-    RabbitConfig,
+    CompressionConfig,
     ConnectionConfig,
     ConsumerConfig,
-    PublisherConfig,
     PoolConfig,
+    PublisherConfig,
+    RabbitConfig,
     RetryConfig,
-    CompressionConfig,
     TopologyMode,
 )
+from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.config import (
-    SocketConfig,
     SecurityConfig,
+    SocketConfig,
     SSLConfig,
     WorkerConfig,
 )
-from rabbitkit.async_ import AsyncBroker
-
 
 # ── Minimal config (defaults) ─────────────────────────────────────────────────
 minimal = RabbitConfig()
@@ -46,22 +45,20 @@ production_config = RabbitConfig(
         vhost="/production",
         heartbeat=30,
         socket_timeout=10.0,
-        blocked_connection_timeout=300.0,
+        blocked_connection_timeout=60.0,
         connection_name="order-service",
-        reconnect_backoff_base=1.0,   # 1s initial backoff
-        reconnect_backoff_max=30.0,   # 30s max backoff
+        reconnect_backoff_base=1.0,  # 1s initial backoff
+        reconnect_backoff_max=30.0,  # 30s max backoff
     ),
-
     # TCP tuning
     socket=SocketConfig(
         tcp_nodelay=True,
         tcp_keepidle=10,
         tcp_keepintvl=5,
         tcp_keepcnt=3,
-        tcp_sndbuf=196608,   # 192KB send buffer
-        tcp_rcvbuf=196608,   # 192KB recv buffer
+        tcp_sndbuf=196608,  # 192KB send buffer
+        tcp_rcvbuf=196608,  # 192KB recv buffer
     ),
-
     # TLS
     security=SecurityConfig(
         mechanism="PLAIN",
@@ -74,31 +71,26 @@ production_config = RabbitConfig(
             server_hostname="rabbitmq.prod.internal",
         ),
     ),
-
     # Publishing
     publisher=PublisherConfig(
-        confirm_delivery=True,    # publisher confirms (at-least-once)
+        confirm_delivery=True,  # publisher confirms (at-least-once)
         confirm_timeout=5.0,
-        persistent=True,          # delivery_mode=2 (durable messages)
+        persistent=True,  # delivery_mode=2 (durable messages)
         mandatory=False,
     ),
-
     # Consuming
     consumer=ConsumerConfig(
-        prefetch_count=20,        # fetch 20 messages ahead
-        graceful_timeout=30.0,    # wait 30s for in-flight on shutdown
+        prefetch_count=20,  # fetch 20 messages ahead
+        graceful_timeout=30.0,  # wait 30s for in-flight on shutdown
     ),
-
     # Channel pooling
     pool=PoolConfig(
         channel_pool_size=10,
         publisher_connections=1,
         consumer_connections=1,
     ),
-
     # Topology
     topology_mode=TopologyMode.AUTO_DECLARE,
-
     # Default retry for all subscribers
     retry=RetryConfig(
         max_retries=4,
@@ -107,11 +99,10 @@ production_config = RabbitConfig(
         dead_letter_exchange="",
         per_queue=True,
     ),
-
     # Default compression for all messages
     compression=CompressionConfig(
         algorithm="gzip",
-        threshold=1024,   # compress bodies >= 1KB
+        threshold=1024,  # compress bodies >= 1KB
         level=6,
     ),
 )
@@ -120,14 +111,14 @@ production_config = RabbitConfig(
 # ── Connection from URL ────────────────────────────────────────────────────────
 url_config = RabbitConfig(
     connection=ConnectionConfig.from_url(
-        "amqp://user:pass@rabbitmq.prod.internal:5672/production"
-        "?heartbeat=60&connection_name=worker"
+        "amqp://user:pass@rabbitmq.prod.internal:5672/production?heartbeat=60&connection_name=worker"
     )
 )
 print(f"From URL: host={url_config.connection.host}, vhost={url_config.connection.vhost!r}")
 
 
 # ── Per-environment configs ───────────────────────────────────────────────────
+
 
 def get_config(env: str) -> RabbitConfig:
     """Return environment-specific config."""
@@ -157,7 +148,7 @@ print(f"Retry:   dev={dev_config.retry is None}, staging={stg_config.retry is no
 # WorkerConfig is NOT part of RabbitConfig — passed to broker.start()
 worker_config = WorkerConfig(
     worker_count=4,
-    prefetch_per_worker=5,   # total prefetch = 4×5 = 20
+    prefetch_per_worker=5,  # total prefetch = 4×5 = 20
 )
 
 broker = AsyncBroker(production_config)

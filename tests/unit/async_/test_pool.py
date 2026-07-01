@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -141,7 +142,9 @@ class TestAsyncConnectionPool:
         mock_conn = AsyncMock()
         mock_conn.is_closed = False
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_conn):
                 conn = await pool.get_publisher_connection()
                 assert conn is not None
@@ -157,7 +160,9 @@ class TestAsyncConnectionPool:
         mock_conn = AsyncMock()
         mock_conn.is_closed = False
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_conn) as mock_connect:
                 conn1 = await pool.get_publisher_connection()
                 conn2 = await pool.get_publisher_connection()
@@ -176,7 +181,9 @@ class TestAsyncConnectionPool:
         conn_b = AsyncMock()
         conn_b.is_closed = False
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[conn_a, conn_b]):
                 pub_conn = await pool.get_publisher_connection()
                 con_conn = await pool.get_consumer_connection()
@@ -197,7 +204,9 @@ class TestAsyncConnectionPool:
         mock_con.is_closed = False
         mock_con.close = AsyncMock()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[mock_pub, mock_con]):
                 await pool.get_publisher_connection()
                 await pool.get_consumer_connection()
@@ -220,7 +229,9 @@ class TestAsyncConnectionPool:
         conn_b = AsyncMock()
         conn_b.is_closed = False
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[conn_a, conn_b]) as mock_connect:
                 await pool.connect()
 
@@ -243,7 +254,9 @@ class TestAsyncConnectionPool:
         conn_b = AsyncMock()
         conn_b.is_closed = False
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[conn_a, conn_b]) as mock_connect:
                 await pool.connect()
                 await pool.connect()  # second call should be no-op
@@ -263,7 +276,9 @@ class TestAsyncConnectionPool:
         mock_channel.is_closed = False
         mock_conn.channel = AsyncMock(return_value=mock_channel)
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_conn):
                 # Pool not yet initialised
                 assert pool._publisher_channel_pool is None
@@ -298,7 +313,9 @@ class TestAsyncConnectionPool:
         mock_channel.is_closed = False
         mock_conn.channel = AsyncMock(return_value=mock_channel)
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_conn):
                 # This triggers lazy init of _publisher_channel_pool
                 ch = await pool.acquire_publisher_channel()
@@ -338,7 +355,9 @@ class TestAsyncConnectionPool:
         mock_con.is_closed = False
         mock_con.close = AsyncMock()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[mock_pub, mock_con]):
                 await pool.get_publisher_connection()
                 await pool.get_consumer_connection()
@@ -365,7 +384,9 @@ class TestAsyncConnectionPool:
         mock_con.is_closed = False
         mock_con.close = AsyncMock()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[mock_pub, mock_con]):
                 await pool.get_publisher_connection()
                 await pool.get_consumer_connection()
@@ -377,6 +398,51 @@ class TestAsyncConnectionPool:
 
                 assert pool._publisher_connection is None
                 assert pool._consumer_connection is None
+
+    @pytest.mark.asyncio
+    async def test_create_connection_retries_then_succeeds(self) -> None:
+        """Lines 342-353: retry loop sleeps and retries on connection error, succeeds on second attempt."""
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+        )
+
+        mock_conn = AsyncMock()
+
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
+            return_value={"url": "amqp://guest:guest@localhost/"},
+        ):
+            with patch(
+                "aio_pika.connect_robust",
+                new_callable=AsyncMock,
+                side_effect=[ConnectionRefusedError("refused"), mock_conn],
+            ):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    conn = await pool._create_connection()
+
+        assert conn is mock_conn
+
+    @pytest.mark.asyncio
+    async def test_create_connection_raises_after_max_attempts(self) -> None:
+        """Lines 343-344: re-raises the last error after max_attempts exhausted."""
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+        )
+
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
+            return_value={"url": "amqp://guest:guest@localhost/"},
+        ):
+            with patch(
+                "aio_pika.connect_robust",
+                new_callable=AsyncMock,
+                side_effect=[ConnectionRefusedError("all failed")] * 30,
+            ):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    with pytest.raises(ConnectionRefusedError, match="all failed"):
+                        await pool._create_connection()
 
 
 class TestAsyncChannelPoolExhausted:
@@ -511,4 +577,338 @@ class TestAsyncChannelPoolExhausted:
 
         # Should not raise even when channel.close() raises
         await pool.close_all()
+        assert pool.created_count == 0
+
+
+# ── I-6: acquire() must decrement _created on a closed pooled channel ──────
+
+
+class TestAsyncChannelPoolCreatedLeak:
+    """I-6: pulling a closed channel from the pool must not inflate _created."""
+
+    async def test_acquire_closed_pooled_channel_decrements_created(self) -> None:
+        """A closed channel found in the pool is discarded and _created is
+        decremented before a fresh channel is created, so the count stays
+        consistent (regression for the acquire() _created leak)."""
+        from unittest.mock import AsyncMock
+
+        mock_conn = AsyncMock()
+
+        closed_channel = AsyncMock()
+        closed_channel.is_closed = True
+
+        fresh_channel = AsyncMock()
+        fresh_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=fresh_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+
+        # Pre-load the pool with a closed channel and pretend it was created.
+        pool._pool.put_nowait(closed_channel)
+        pool._created = 1
+
+        # acquire() pulls the closed channel, decrements _created, then creates
+        # a fresh one (incrementing back to 1).
+        ch = await pool.acquire()
+        assert ch is fresh_channel
+        assert pool.created_count == 1  # not 2 — the stale slot was reclaimed
+        mock_conn.channel.assert_called_once_with(publisher_confirms=True)
+
+    async def test_acquire_closed_then_open_keeps_created_consistent(self) -> None:
+        """Repeated acquire/release with a closed channel in the pool does not
+        monotonically grow _created."""
+        from unittest.mock import AsyncMock
+
+        mock_conn = AsyncMock()
+
+        closed_channel = AsyncMock()
+        closed_channel.is_closed = True
+
+        fresh_channel = AsyncMock()
+        fresh_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=fresh_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+        pool._pool.put_nowait(closed_channel)
+        pool._created = 1
+
+        ch1 = await pool.acquire()  # discards closed, creates fresh
+        assert pool.created_count == 1
+        await pool.release(ch1)  # back in pool, _created stays 1
+        assert pool.created_count == 1
+        ch2 = await pool.acquire()  # reuses the released open channel
+        assert ch2 is fresh_channel
+        assert pool.created_count == 1  # no inflation
+
+
+# ── perf-M-2: channel creation must not happen under the pool lock ──────────
+
+
+class TestAsyncChannelPoolCreateOutsideLock:
+    """perf-M-2: ``acquire()`` creates the AMQP channel OUTSIDE the pool lock so
+    concurrent acquires don't serialize on the network round-trip during
+    warmup/refill.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_acquire_does_not_serialize_on_channel_creation(self) -> None:
+        import asyncio
+        from unittest.mock import MagicMock
+
+        in_flight = 0
+        max_concurrent = 0
+        guard = asyncio.Lock()
+
+        async def channel(**kwargs: object) -> Any:
+            nonlocal in_flight, max_concurrent
+            async with guard:
+                in_flight += 1
+                max_concurrent = max(max_concurrent, in_flight)
+            await asyncio.sleep(0.05)  # simulate a network round-trip
+            async with guard:
+                in_flight -= 1
+            ch = MagicMock()
+            ch.is_closed = False
+            return ch
+
+        conn = MagicMock()
+        conn.channel = channel
+        pool = AsyncChannelPool(conn, pool_size=5, acquire_timeout=5.0)
+
+        channels = await asyncio.gather(*[pool.acquire() for _ in range(5)])
+
+        assert len(channels) == 5
+        assert pool.created_count == 5
+        # Under the lock, creation would be strictly serial (max_concurrent == 1).
+        assert max_concurrent > 1, "channel creation was serialized under the pool lock"
+
+    @pytest.mark.asyncio
+    async def test_acquire_creation_failure_returns_reserved_slot(self) -> None:
+        """If channel() raises, the reserved _created slot is returned so the
+        pool doesn't permanently lose capacity."""
+        from unittest.mock import MagicMock
+
+        calls = 0
+
+        async def channel(**kwargs: object) -> Any:
+            nonlocal calls
+            calls += 1
+            raise ConnectionError("broker refused channel")
+
+        conn = MagicMock()
+        conn.channel = channel
+        pool = AsyncChannelPool(conn, pool_size=3, acquire_timeout=0.2)
+
+        with pytest.raises(ConnectionError):
+            await pool.acquire()
+
+        # The reserved slot was returned — created_count is back to 0, so a later
+        # acquire can still try (it will fail again, but won't deadlock on a
+        # phantom slot).
+        assert pool.created_count == 0
+        assert calls == 1
+
+
+# ── prewarm_channels ──────────────────────────────────────────────────────────
+
+
+class TestPrewarmChannels:
+    @pytest.mark.asyncio
+    async def test_prewarm_creates_and_releases_all_channels(self) -> None:
+        """prewarm_channels=True acquires all pool channels during connect() so
+        the first batch of publishers never pays channel-creation latency."""
+        from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
+
+        pool_size = 4
+        channel_count = 0
+
+        async def make_channel(**kwargs: object) -> Any:
+            nonlocal channel_count
+            channel_count += 1
+            ch = AsyncMock()
+            ch.is_closed = False
+            return ch
+
+        conn = AsyncMock()
+        conn.channel = make_channel
+        conn.is_closed = False
+
+        pool_cfg = PoolConfig(channel_pool_size=pool_size, prewarm_channels=True)
+
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
+            cp = AsyncConnectionPool(
+                ConnectionConfig(),
+                SecurityConfig(),
+                pool_config=pool_cfg,
+            )
+            await cp.connect()
+
+        # All pool_size channels were created during prewarm
+        assert channel_count == pool_size
+        # After prewarm + release, the pool queue is full (channels returned)
+        assert cp._publisher_channel_pool is not None
+        assert cp._publisher_channel_pool.size == pool_size
+
+    @pytest.mark.asyncio
+    async def test_prewarm_idempotent_on_double_connect(self) -> None:
+        """Calling connect() twice with prewarm_channels=True must NOT double-create channels."""
+        from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
+
+        pool_size = 3
+        channel_count = 0
+
+        async def make_channel(**kwargs: object) -> Any:
+            nonlocal channel_count
+            channel_count += 1
+            ch = AsyncMock()
+            ch.is_closed = False
+            return ch
+
+        conn = AsyncMock()
+        conn.channel = make_channel
+        conn.is_closed = False
+
+        pool_cfg = PoolConfig(channel_pool_size=pool_size, prewarm_channels=True)
+
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
+            cp = AsyncConnectionPool(
+                ConnectionConfig(),
+                SecurityConfig(),
+                pool_config=pool_cfg,
+            )
+            await cp.connect()
+            first_count = channel_count
+            await cp.connect()  # second call — must be a no-op for prewarm
+
+        assert channel_count == first_count == pool_size
+
+
+# ── Lines 122-124: stale channel pulled from pool after exhaustion wait ──────
+
+
+class TestAsyncChannelPoolStaleAfterWait:
+    """Lines 122-124: when acquire() waits for a channel (pool exhausted) and
+    then gets a *closed* channel from the queue, it must decrement _created and
+    recurse so the caller gets a live channel."""
+
+    @pytest.mark.asyncio
+    async def test_acquire_stale_channel_after_exhaustion_wait_recurses(self) -> None:
+        """Pool exhausted → waits → receives a closed channel → discards it and
+        creates a fresh one via the recursive acquire() call."""
+        import asyncio
+
+        mock_conn = AsyncMock()
+
+        closed_channel = AsyncMock()
+        closed_channel.is_closed = True
+
+        fresh_channel = AsyncMock()
+        fresh_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=fresh_channel)
+
+        # pool_size=1 so the pool hits the exhausted-wait path immediately after
+        # the first acquire uses the single slot.
+        pool = AsyncChannelPool(mock_conn, pool_size=1, acquire_timeout=2.0)
+
+        # Acquire the only slot so _created == pool_size.
+        first_ch = await pool.acquire()
+        assert pool.created_count == 1
+
+        # Schedule: release the closed_channel back into the pool shortly, then
+        # release the real first channel so the recursive acquire() can succeed.
+        async def release_sequence() -> None:
+            await asyncio.sleep(0.02)
+            # Put the *closed* channel into the queue — this is what the waiting
+            # acquire() will pick up first.
+            pool._pool.put_nowait(closed_channel)
+            # Allow _created to reflect the slot being "returned" so the
+            # recursive acquire() can create a new one.
+            async with pool._lock:
+                pool._created -= 1
+            # Give the recursive acquire() a moment, then release the first
+            # channel so the recursive call gets a slot.
+            await asyncio.sleep(0.02)
+            await pool.release(first_ch)
+
+        release_task = asyncio.create_task(release_sequence())
+
+        ch = await pool.acquire()
+        await release_task
+
+        assert ch is fresh_channel
+        assert not ch.is_closed
+
+
+# ── Lines 157-161: acquire_ctx() async context manager ───────────────────────
+
+
+class TestAsyncChannelPoolAcquireCtx:
+    """Lines 157-161: acquire_ctx() must acquire, yield, and release the channel."""
+
+    @pytest.mark.asyncio
+    async def test_acquire_ctx_yields_channel_and_releases(self) -> None:
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+
+        async with pool.acquire_ctx() as ch:
+            assert ch is mock_channel
+            # Channel should be in _in_use while held
+            assert mock_channel in pool._in_use
+
+        # After the context exits, channel should be released back to the pool
+        assert mock_channel not in pool._in_use
+        assert pool.size == 1
+
+    @pytest.mark.asyncio
+    async def test_acquire_ctx_releases_on_exception(self) -> None:
+        """acquire_ctx() must still release the channel even when the body raises."""
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+
+        with pytest.raises(ValueError, match="boom"):
+            async with pool.acquire_ctx() as ch:
+                assert ch is mock_channel
+                raise ValueError("boom")
+
+        # Channel still released despite the exception
+        assert mock_channel not in pool._in_use
+        assert pool.size == 1
+
+
+# ── Lines 169-175: close_all() for in-use channels ───────────────────────────
+
+
+class TestAsyncChannelPoolCloseAllInUse:
+    """Lines 169-175: close_all() must close channels that are currently
+    checked out (tracked in _in_use), not just idle ones in the queue."""
+
+    @pytest.mark.asyncio
+    async def test_close_all_closes_in_use_channels(self) -> None:
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_channel.close = AsyncMock()
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+
+        # Acquire but do NOT release — the channel stays in _in_use
+        ch = await pool.acquire()
+        assert ch is mock_channel
+        assert mock_channel in pool._in_use
+
+        await pool.close_all()
+
+        # close() must have been called on the in-use channel
+        mock_channel.close.assert_called_once()
+        # _in_use must be cleared and _created reset
+        assert pool._in_use == set()
         assert pool.created_count == 0

@@ -30,7 +30,7 @@ def build_config(env: str) -> RabbitConfig:
             vhost="/orders",
             heartbeat=30,
             socket_timeout=10.0,
-            blocked_connection_timeout=300.0,
+            blocked_connection_timeout=60.0,
             reconnect_backoff_base=1.0,
             reconnect_backoff_max=30.0,
             connection_name=f"order-service@{env}",
@@ -40,7 +40,5 @@ def build_config(env: str) -> RabbitConfig:
         pool=PoolConfig(channel_pool_size=20, channel_acquire_timeout=10.0),
         retry=ORDERS_RETRY,
         # Application code should not mutate production topology (docs §5/§34).
-        topology_mode=(
-            TopologyMode.AUTO_DECLARE if env in ("dev", "staging") else TopologyMode.PASSIVE_ONLY
-        ),
+        topology_mode=(TopologyMode.AUTO_DECLARE if env in ("dev", "staging") else TopologyMode.PASSIVE_ONLY),
     )

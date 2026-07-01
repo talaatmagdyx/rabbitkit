@@ -6,19 +6,22 @@ request/result pattern — the broker stores results; clients fetch them.
 
 Protocol
 --------
-``ResultBackend`` is a ``@runtime_checkable`` ``Protocol``.  Any object with
-``store`` / ``fetch`` (sync) and ``store_async`` / ``fetch_async`` (async)
-methods qualifies.
+``ResultBackend`` is a ``@runtime_checkable`` generic ``Protocol[T]``.  ``T``
+is the type of the stored result, so the type flows from
+``store(correlation_id, result: T)`` into ``fetch(correlation_id) -> T | None``.
+Any object with ``store`` / ``fetch`` (sync) and ``store_async`` / ``fetch_async``
+(async) methods qualifies.
 
 Built-in implementation
 -----------------------
-``RedisResultBackend`` stores results as Redis strings with configurable TTL:
+``RedisResultBackend`` stores results as Redis strings with configurable TTL,
+so it satisfies ``ResultBackend[bytes]``:
 
     import redis
     from rabbitkit.results.backend import RedisResultBackend
 
     r = redis.Redis(host="redis")
-    backend = RedisResultBackend(r, key_prefix="myapp:result:", )
+    backend = RedisResultBackend(r, key_prefix="myapp:result:")
 
 Keys are stored as ``{key_prefix}{correlation_id}``.  Default TTL is 3600 s (1 h).
 
@@ -53,21 +56,31 @@ handler return values are stored automatically.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
+
+T = TypeVar("T")
 
 
 @runtime_checkable
-class ResultBackend(Protocol):
-    """Protocol for result storage backends."""
+class ResultBackend(Protocol[T]):
+    """Protocol for result storage backends.
 
-    def store(self, correlation_id: str, result: bytes, ttl: int = 3600) -> None: ...
-    def fetch(self, correlation_id: str, timeout: float = 5.0) -> bytes | None: ...
-    async def store_async(self, correlation_id: str, result: bytes, ttl: int = 3600) -> None: ...
-    async def fetch_async(self, correlation_id: str, timeout: float = 5.0) -> bytes | None: ...
+    Generic in ``T`` (the stored result type) so the type flows from
+    ``store`` into ``fetch``.  ``RedisResultBackend`` stores ``bytes``, so it
+    satisfies ``ResultBackend[bytes]``.
+    """
+
+    def store(self, correlation_id: str, result: T, ttl: int = 3600) -> None: ...
+    def fetch(self, correlation_id: str, timeout: float = 5.0) -> T | None: ...
+    async def store_async(self, correlation_id: str, result: T, ttl: int = 3600) -> None: ...
+    async def fetch_async(self, correlation_id: str, timeout: float = 5.0) -> T | None: ...
 
 
 class RedisResultBackend:
-    """Redis-based result backend using GET/SET with TTL."""
+    """Redis-based result backend using GET/SET with TTL.
+
+    Stores results as raw bytes, so it satisfies ``ResultBackend[bytes]``.
+    """
 
     def __init__(self, redis_client: Any, key_prefix: str = "rabbitkit:result:") -> None:
         self._redis = redis_client

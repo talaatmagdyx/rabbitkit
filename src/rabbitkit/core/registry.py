@@ -80,6 +80,14 @@ class SubscriberRegistry:
         if isinstance(queue, str):
             queue = RabbitQueue(name=queue)
 
+        # Apply routing_key to the queue if not already set. The queue is frozen,
+        # so build a copy rather than mutating the caller's object (which may be
+        # shared across brokers/routers — see topology freeze + include-router).
+        if routing_key and not queue.routing_key:
+            from dataclasses import replace as _replace
+
+            queue = _replace(queue, routing_key=routing_key)
+
         # Normalize exchange
         if isinstance(exchange, str):
             exchange = RabbitExchange(name=exchange)
@@ -90,11 +98,13 @@ class SubscriberRegistry:
         elif tags is None:
             tags = frozenset()
 
-        # Apply routing_key to queue if not already set
-        if routing_key and not queue.routing_key:
-            queue.routing_key = routing_key
-
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            # Validate handler signature at registration time (fail fast).
+            # Covers *args/**kwargs and multiple body-like parameters (Contract 4).
+            from rabbitkit.di.resolver import DIResolver
+
+            DIResolver().validate_handler(func)
+
             # Check duplicate queue
             if queue.name in self._queue_names:
                 raise DuplicateRouteError(
@@ -131,6 +141,9 @@ class SubscriberRegistry:
 
             self._routes.append(route)
             self._queue_names.add(queue.name)
+
+            # M-C6: detect dead-letter-exchange cycles across the growing route graph.
+            self.validate_dlx_graph()
 
             return func
 
@@ -174,16 +187,21 @@ class SubscriberRegistry:
             raise TypeError(f"Expected a RabbitRouter, got {type(router).__name__}")
 
         for route in router._registry.routes:
-            # Apply prefix to routing key
+            # Apply prefix to routing key WITHOUT mutating the included router's
+            # RabbitQueue/RouteDefinition (frozen + shared-object safety). Build
+            # fresh copies so re-including the same router under a different
+            # prefix doesn't double-prefix or cross-contaminate.
+            from dataclasses import replace as _replace
+
             if prefix:
                 effective_rk = f"{prefix}.{route.queue.routing_key}" if route.queue.routing_key else prefix
-                route.queue.routing_key = effective_rk
+                new_queue = _replace(route.queue, routing_key=effective_rk)
+                route = _replace(route, queue=new_queue)
 
             # Check duplicate
             if route.queue.name in self._queue_names:
                 raise DuplicateRouteError(
-                    f"Queue '{route.queue.name}' already has a registered handler. "
-                    "Duplicate from included router."
+                    f"Queue '{route.queue.name}' already has a registered handler. Duplicate from included router."
                 )
 
             # Validate with broker retry context
@@ -192,8 +210,62 @@ class SubscriberRegistry:
             self._routes.append(route)
             self._queue_names.add(route.queue.name)
 
+            # M-C6: detect DLX cycles after including router routes.
+            self.validate_dlx_graph()
+
     def set_broker_retry(self, retry: RetryConfig | None) -> None:
         """Update broker retry default. Re-validates all existing routes."""
         self._broker_retry = retry
         for route in self._routes:
             route.validate(self._broker_retry)
+
+    def validate_dlx_graph(self) -> None:
+        """Detect dead-letter-exchange cycles across registered routes.
+
+        A queue's ``dead_letter_exchange`` points at an exchange; if that exchange
+        is the bind target of another route whose queue dead-letters back to an
+        exchange reachable from the first, messages loop forever (until TTL/GC).
+        This builds a queue→queue graph via DLX→exchange→bound-queue and rejects
+        any cycle with :class:`ConfigurationError`. Best-effort: only exchanges
+        named as a route's ``exchange`` are resolvable to a queue; unknown DLX
+        targets (external exchanges) are treated as sinks.
+        """
+        from rabbitkit.core.errors import ConfigurationError as _CfgErr
+
+        # exchange name → list of queue names bound to it via a registered route
+        exchange_to_queues: dict[str, list[str]] = {}
+        for r in self._routes:
+            if r.exchange is not None:
+                exchange_to_queues.setdefault(r.exchange.name, []).append(r.queue.name)
+
+        # queue → next queues reachable via its DLX (through the exchange graph)
+        adj: dict[str, list[str]] = {}
+        for r in self._routes:
+            dlx = r.queue.dead_letter_exchange
+            if not dlx:
+                continue
+            nxts = exchange_to_queues.get(dlx, [])  # unknown DLX → sink (no edges)
+            adj.setdefault(r.queue.name, []).extend(nxts)
+
+        # DFS cycle detection
+        white, gray, black = 0, 1, 2
+        color: dict[str, int] = {}
+
+        def dfs(node: str, path: list[str]) -> None:
+            color[node] = gray
+            for nxt in adj.get(node, []):
+                if color.get(nxt, white) == gray:
+                    cycle = " -> ".join([*path, node, nxt])
+                    raise _CfgErr(
+                        f"Dead-letter-exchange cycle detected: {cycle}. "
+                        "Messages would loop forever. Break the cycle (e.g. let "
+                        "retry own DLQ topology, or point the final DLX at a sink "
+                        "exchange with no bound queue)."
+                    )
+                if color.get(nxt, white) == white:
+                    dfs(nxt, [*path, node])
+            color[node] = black
+
+        for q in adj:
+            if color.get(q, white) == white:
+                dfs(q, [])

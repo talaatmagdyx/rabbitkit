@@ -106,7 +106,7 @@ def test_compose_publish_sync_applies_route_publish_scope() -> None:
 
     pipeline = HandlerPipeline()
     chain = pipeline._compose_publish_sync(_Route([PubProbe()]), publish_fn)
-    outcome = chain(MessageEnvelope(routing_key="x", body=b"{}"))
+    outcome = chain(MessageEnvelope(routing_key="x", body=b"{}"), publish_fn)
 
     assert order == ["pub:before", "publish", "pub:after"]
     assert outcome.ok
@@ -128,7 +128,47 @@ async def test_compose_publish_async_applies_route_publish_scope() -> None:
 
     pipeline = HandlerPipeline()
     chain = pipeline._compose_publish_async(_Route([PubProbe()]), publish_fn)
-    outcome = await chain(MessageEnvelope(routing_key="x", body=b"{}"))
+    outcome = await chain(MessageEnvelope(routing_key="x", body=b"{}"), publish_fn)
 
     assert order == ["pub:before", "publish", "pub:after"]
     assert outcome.ok
+
+
+# ── M-P1: middleware chain cached per route ───────────────────────────────
+
+
+class TestChainCaching:
+    def test_consume_chain_cached_per_route(self) -> None:
+        """The composed middleware chain is built once per route, not per message."""
+        from rabbitkit.core.message import RabbitMessage
+        from rabbitkit.core.registry import SubscriberRegistry
+        from rabbitkit.core.types import AckPolicy
+
+        calls: list[str] = []
+
+        class TaggingMiddleware(BaseMiddleware):
+            def consume_scope(self, call_next, message):  # type: ignore[no-untyped-def]
+                calls.append("mw")
+                return call_next(message)
+
+        pipeline = HandlerPipeline()
+        reg = SubscriberRegistry()
+
+        @reg.subscriber(queue="q1", middlewares=[TaggingMiddleware()], ack_policy=AckPolicy.MANUAL)
+        def handle(msg: RabbitMessage) -> None:
+            pass
+
+        route = reg.routes[0]
+
+        def _make_msg() -> RabbitMessage:
+            m = RabbitMessage(body=b"{}", routing_key="q1")
+            m._ack_fn = lambda: None  # wire a no-op sync ack so the pipeline can settle
+            return m
+
+        pipeline.process_sync(route, _make_msg())
+        assert id(route) in pipeline._consume_chain_cache
+        pipeline.process_sync(route, _make_msg())
+        # Cache hit: the chain is reused (mw still called per message, but the
+        # closure object is the same — verify the cache entry is stable).
+        assert calls.count("mw") == 2
+        assert len(pipeline._consume_chain_cache) == 1

@@ -47,8 +47,18 @@ class Transport(Protocol):
         queue: str,
         callback: Callable[[RabbitMessage], None],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
-        """Start consuming from a queue. Returns consumer_tag."""
+        """Start consuming from a queue. Returns consumer_tag.
+
+        ``no_ack=True`` starts a no-ack consumer (the broker auto-acks on
+        delivery; the built ``RabbitMessage`` gets no settlement functions).
+        ``declare=False`` skips declaring/checking the queue first — required
+        for AMQP pseudo-queues such as ``amq.rabbitmq.reply-to``, which the
+        broker rejects any Queue.Declare for (active or passive).
+        """
         ...
 
     def declare_exchange(self, exchange: RabbitExchange) -> None:
@@ -106,8 +116,18 @@ class AsyncTransport(Protocol):
         queue: str,
         callback: Callable[[RabbitMessage], Awaitable[None]],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
-        """Start consuming from a queue. Returns consumer_tag."""
+        """Start consuming from a queue. Returns consumer_tag.
+
+        ``no_ack=True`` starts a no-ack consumer (the broker auto-acks on
+        delivery; the built ``RabbitMessage`` gets no settlement functions).
+        ``declare=False`` skips declaring/checking the queue first — required
+        for AMQP pseudo-queues such as ``amq.rabbitmq.reply-to``, which the
+        broker rejects any Queue.Declare for (active or passive).
+        """
         ...
 
     async def declare_exchange(self, exchange: RabbitExchange) -> None:
@@ -264,4 +284,48 @@ class AsyncMetricsCollector(Protocol):
 
     async def histogram(self, name: str, value: float, tags: dict[str, str] | None = None) -> None:
         """Record a histogram metric value."""
+        ...
+
+
+# ── Health sub-protocol ─────────────────────────────────────────────────
+
+
+@runtime_checkable
+class HealthProvider(Protocol):
+    """Broker health surface — typed alternative to private-attribute probing.
+
+    Brokers that expose these read-only properties satisfy the protocol and
+    :mod:`rabbitkit.health` will use them directly. Brokers that still use
+    private attributes (``_started``, ``_transport``, ...) are supported via
+    the deprecation fallback in :func:`rabbitkit.health._get`.
+    """
+
+    @property
+    def started(self) -> bool:
+        """Whether the broker has been started."""
+        ...
+
+    @property
+    def connected(self) -> bool:
+        """Whether the underlying transport is connected."""
+        ...
+
+    @property
+    def consumer_count(self) -> int:
+        """Number of routes with an active (live) consumer."""
+        ...
+
+    @property
+    def route_count(self) -> int:
+        """Total number of registered routes."""
+        ...
+
+    @property
+    def worker_pool_pending(self) -> int:
+        """Current worker-pool backlog (pending tasks)."""
+        ...
+
+    @property
+    def last_heartbeat(self) -> float | None:
+        """Last liveness heartbeat (monotonic seconds), or None."""
         ...

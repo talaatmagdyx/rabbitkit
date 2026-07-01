@@ -13,6 +13,7 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -22,7 +23,9 @@ from rabbitkit.async_.pool import AsyncConnectionPool
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
 from rabbitkit.core.types import (
+    DIRECT_REPLY_TO_QUEUE,
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
@@ -47,12 +50,18 @@ class AsyncTransportImpl:
         pool_config: PoolConfig | None = None,
         topology_mode: TopologyMode = TopologyMode.AUTO_DECLARE,
         confirm_delivery: bool = True,
+        confirm_timeout: float = 5.0,
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._security_config = security_config or SecurityConfig()
         self._pool_config = pool_config or PoolConfig()
         self._topology_mode = topology_mode
+        self._topo = TopologyDispatcher(topology_mode)
         self._confirm_delivery = confirm_delivery
+        # Per-publish timeout when publisher confirms are enabled. Without this a
+        # broker that never confirms would block the publish coroutine forever;
+        # on timeout we release/close the channel and return PublishStatus.TIMEOUT.
+        self._confirm_timeout = float(confirm_timeout)
 
         self._conn_pool = AsyncConnectionPool(
             self._connection_config,
@@ -62,12 +71,55 @@ class AsyncTransportImpl:
         )
         self._connected = False
 
-        # Per-queue consumer channels: queue_name → aio_pika channel
+        # Per-queue consumer channels: queue_name -> aio_pika channel
         self._consumer_channels: dict[str, Any] = {}
-        self._consumer_tags: dict[str, str] = {}  # queue_name → consumer_tag
+        self._consumer_tags: dict[str, str] = {}  # queue_name -> consumer_tag
+
+        # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
+        # consume(declare=False), cleared on cancel/disconnect). RabbitMQ's
+        # direct reply-to requires the reply consumer and the corresponding
+        # request publish to happen on the SAME channel (a publish on a
+        # different channel raises "PRECONDITION_FAILED - fast reply consumer
+        # does not exist") — publish() checks this to route RPC requests
+        # correctly without RPCClient needing to know about channels at all.
+        self._reply_to_channel: Any = None
 
         # Shared topology channel (consumer connection)
         self._topology_channel: Any | None = None
+
+        # Persistent no-confirm publish channel — reused across all fire-and-forget
+        # publishes when confirm_delivery=False. Eliminates per-publish pool
+        # acquire/release overhead; a single channel handles concurrent writes
+        # safely because aio-pika serialises AMQP frames at the connection level.
+        self._fast_publish_channel: Any | None = None
+        self._fast_channel_lock: asyncio.Lock = asyncio.Lock()
+
+        # Backpressure callbacks (FlowController registers here). Each is a
+        # zero-arg callable; aio-pika's blocked/unblocked frames are adapted.
+        self._blocked_callbacks: list[Callable[[], None]] = []
+        self._unblocked_callbacks: list[Callable[[], None]] = []
+
+    def on_blocked(self, callback: Callable[[], None]) -> None:
+        """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
+        self._blocked_callbacks.append(callback)
+
+    def on_unblocked(self, callback: Callable[[], None]) -> None:
+        """Register a connection-unblocked callback (e.g. FlowController.on_unblocked)."""
+        self._unblocked_callbacks.append(callback)
+
+    def _aio_blocked(self, *_args: Any) -> None:
+        for cb in list(self._blocked_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover - never break the event loop
+                logger.exception("blocked callback raised")
+
+    def _aio_unblocked(self, *_args: Any) -> None:
+        for cb in list(self._unblocked_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover
+                logger.exception("unblocked callback raised")
 
     async def connect(self) -> None:
         """Establish publisher and consumer connections."""
@@ -75,6 +127,25 @@ class AsyncTransportImpl:
             return
 
         await self._conn_pool.connect()
+
+        # Register connection blocked/unblocked callbacks (C-6) so a
+        # FlowController can throttle publishes when RabbitMQ raises an alarm.
+        pub_conn = await self._conn_pool.get_publisher_connection()
+        try:
+            pub_conn.connection_blocked.add_callback(self._aio_blocked)
+            pub_conn.connection_unblocked.add_callback(self._aio_unblocked)
+        except Exception:  # pragma: no cover - older aio-pika may differ
+            logger.debug("Could not register blocked/unblocked callbacks")
+
+        # I-11: install a blocked-connection watchdog so a broker alarm that isn't
+        # cleared within blocked_connection_timeout closes the connection (forcing
+        # reconnect) — aio-pika has no native knob for this.
+        try:
+            from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+            await install_blocked_connection_watchdog(pub_conn, self._connection_config.blocked_connection_timeout)
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("Could not install blocked-connection watchdog")
 
         # Open topology channel on consumer connection
         consumer_conn = await self._conn_pool.get_consumer_connection()
@@ -86,6 +157,13 @@ class AsyncTransportImpl:
             self._connection_config.host,
             self._connection_config.port,
         )
+
+    async def __aenter__(self) -> AsyncTransportImpl:
+        await self.connect()
+        return self
+
+    async def __exit__(self, *args: Any) -> None:
+        await self.disconnect()
 
     async def disconnect(self) -> None:
         """Close all channels and connections."""
@@ -102,6 +180,7 @@ class AsyncTransportImpl:
                     pass
             self._consumer_channels.clear()
             self._consumer_tags.clear()
+            self._reply_to_channel = None
 
             # Close topology channel
             if self._topology_channel is not None and not self._topology_channel.is_closed:
@@ -111,6 +190,14 @@ class AsyncTransportImpl:
                     pass
             self._topology_channel = None
 
+            # Close fast publish channel (no-confirm persistent path)
+            if self._fast_publish_channel is not None and not self._fast_publish_channel.is_closed:
+                try:
+                    await self._fast_publish_channel.close()
+                except Exception:  # pragma: no cover — best effort close, network errors only
+                    pass
+            self._fast_publish_channel = None
+
             await self._conn_pool.close_all()
         except Exception as e:
             logger.warning("Error during disconnect: %s", e)
@@ -119,8 +206,56 @@ class AsyncTransportImpl:
             logger.info("Disconnected from RabbitMQ (async)")
 
     def is_connected(self) -> bool:
-        """Check if connected to RabbitMQ."""
-        return self._connected
+        """Check if connected to RabbitMQ.
+
+        Reflects the real underlying robust-connection state rather than a
+        stale cached flag: if our cached flag is False we return False;
+        otherwise we inspect the robust connection's ``is_closed`` attribute
+        (guarded) so a connection that aio-pika has silently dropped is not
+        reported as healthy.
+        """
+        if not self._connected:
+            return False
+        conn = self._conn_pool._publisher_connection
+        if conn is None:
+            return False
+        try:
+            # RobustConnection exposes ``is_closed``; True means fully closed.
+            if bool(getattr(conn, "is_closed", False)):
+                return False
+        except Exception:  # pragma: no cover — defensive
+            return False
+        return True
+
+    @property
+    def has_open_channels(self) -> bool:
+        """True if at least one consumer channel is open (readiness contract).
+
+        Mirrors ``SyncTransport.has_open_channels`` so ``broker_readiness`` can
+        detect a dead consumer channel on async transports (I-5 async side).
+        """
+        if not self._consumer_channels:
+            return False
+        return all(not bool(getattr(ch, "is_closed", False)) for ch in self._consumer_channels.values())
+
+    @property
+    def is_reconnecting(self) -> bool:
+        """Best-effort: True if the robust connection is mid-reconnect.
+
+        aio-pika does not expose a stable public attribute, so this is a
+        cheap, guarded heuristic (``reconnects`` counter / ``_reconnect_lock").
+        """
+        conn = self._conn_pool._publisher_connection
+        if conn is None:
+            return False
+        try:
+            # Newer aio-pika tracks pending reconnects via a lock/event.
+            lock = getattr(conn, "_reconnect_lock", None)
+            if lock is not None and getattr(lock, "locked", lambda: False)():
+                return True
+        except Exception:  # pragma: no cover
+            pass
+        return False
 
     async def _ensure_connected(self) -> None:
         """Ensure connection is established."""
@@ -128,58 +263,136 @@ class AsyncTransportImpl:
             return
         await self.connect()
 
-    async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
-        """Publish a message using a channel from the publisher pool.
+    async def _get_fast_channel(self) -> Any:
+        """Return the persistent no-confirm publish channel, (re)opening if needed.
 
-        Hot path: inlined channel acquire/release (no @asynccontextmanager) and a
-        synchronous connected-check, to cut per-publish coroutine overhead. Same
-        acquire -> publish -> release -> confirm semantics.
+        Used exclusively by the fire-and-forget publish path (confirm_delivery=False).
+        A single channel is reused across all concurrent publishes; aio-pika
+        serialises AMQP frames at the transport level so concurrent writes are safe.
         """
+        ch = self._fast_publish_channel
+        if ch is not None and not ch.is_closed:
+            return ch
+        async with self._fast_channel_lock:
+            ch = self._fast_publish_channel
+            if ch is not None and not ch.is_closed:  # pragma: no cover — concurrent path
+                return ch
+            conn = self._conn_pool._publisher_connection
+            if conn is None:
+                raise RuntimeError("Publisher connection is not available")
+            self._fast_publish_channel = await conn.channel(publisher_confirms=False)
+            return self._fast_publish_channel
+
+    def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
+        """Build an aio_pika.Message from a MessageEnvelope."""
+        import aio_pika
+
+        return aio_pika.Message(
+            body=envelope.body,
+            message_id=envelope.message_id,
+            correlation_id=envelope.correlation_id,
+            reply_to=envelope.reply_to,
+            content_type=envelope.content_type,
+            content_encoding=envelope.content_encoding,
+            headers=envelope.headers or None,
+            delivery_mode=aio_pika.DeliveryMode(envelope.delivery_mode),
+            priority=envelope.priority,
+            expiration=(int(envelope.expiration) / 1000 if envelope.expiration else None),
+            type=envelope.type,
+            user_id=envelope.user_id,
+            app_id=envelope.app_id,
+            timestamp=envelope.timestamp,
+        )
+
+    async def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+        """Publish *envelope* on an already-acquired channel.
+
+        Used by BatchPublisher to publish many messages on one channel and
+        gather all confirms concurrently — one pool acquire/release for N
+        messages instead of N separate round-trips.
+        """
+        message = self._build_aio_message(envelope)
+        exchange = (
+            await channel.get_exchange(envelope.exchange, ensure=False)
+            if envelope.exchange
+            else channel.default_exchange
+        )
         try:
-            import aio_pika
-
-            if not self._connected:
-                await self._ensure_connected()
-
-            channel = await self._conn_pool.acquire_publisher_channel()
-            try:
-                message = aio_pika.Message(
-                    body=envelope.body,
-                    message_id=envelope.message_id,
-                    correlation_id=envelope.correlation_id,
-                    reply_to=envelope.reply_to,
-                    content_type=envelope.content_type,
-                    content_encoding=envelope.content_encoding,
-                    headers=envelope.headers or None,
-                    delivery_mode=aio_pika.DeliveryMode(envelope.delivery_mode),
-                    priority=envelope.priority,
-                    # envelope.expiration is milliseconds (str); aio-pika wants SECONDS.
-                    # (Was *1000, making the TTL 1e6x too long and inconsistent with sync.)
-                    expiration=(int(envelope.expiration) / 1000 if envelope.expiration else None),
-                    type=envelope.type,
-                    user_id=envelope.user_id,
-                    app_id=envelope.app_id,
-                    timestamp=envelope.timestamp,  # was dropped on async; sync already sends it
-                )
-
-                if envelope.exchange:
-                    exchange = await channel.get_exchange(envelope.exchange, ensure=False)
-                else:
-                    exchange = channel.default_exchange
-
+            async with asyncio.timeout(self._confirm_timeout):
                 await exchange.publish(
                     message,
                     routing_key=envelope.routing_key,
                     mandatory=envelope.mandatory,
                 )
-            finally:
-                await self._conn_pool.release_publisher_channel(channel)
-
+        except TimeoutError as e:
+            logger.warning("Batch publish confirm timed out after %.1fs", self._confirm_timeout)
+            try:
+                if not channel.is_closed:
+                    await channel.close()
+            except Exception:  # pragma: no cover — best effort
+                pass
             return PublishOutcome(
-                status=PublishStatus.CONFIRMED,
+                status=PublishStatus.TIMEOUT,
                 exchange=envelope.exchange,
                 routing_key=envelope.routing_key,
+                error=e,
             )
+        return PublishOutcome(
+            status=PublishStatus.CONFIRMED,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+        )
+
+    async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        """Publish a message.
+
+        When confirm_delivery=False: uses a single persistent channel (no
+        acquire/release overhead, no broker ACK wait) for maximum throughput.
+        When confirm_delivery=True: uses the channel pool so each in-flight
+        confirm is isolated to its own channel slot.
+
+        A request with ``reply_to=DIRECT_REPLY_TO_QUEUE`` (RPCClient's direct
+        reply-to requests) bypasses both paths above and is routed onto
+        ``self._reply_to_channel`` — the same channel that registered the
+        reply consumer — instead. RabbitMQ requires this exact channel
+        affinity for direct reply-to; publishing on a different channel raises
+        "PRECONDITION_FAILED - fast reply consumer does not exist".
+        """
+        try:
+            if not self._connected:
+                await self._ensure_connected()
+
+            if envelope.reply_to == DIRECT_REPLY_TO_QUEUE and self._reply_to_channel is not None:
+                channel = self._reply_to_channel
+                if not channel.is_closed:
+                    return await self._publish_on_channel(channel, envelope)
+
+            if not self._confirm_delivery:
+                # Fast path: persistent channel, no confirm wait, no pool overhead
+                message = self._build_aio_message(envelope)
+                channel = await self._get_fast_channel()
+                exchange = (
+                    await channel.get_exchange(envelope.exchange, ensure=False)
+                    if envelope.exchange
+                    else channel.default_exchange
+                )
+                await exchange.publish(
+                    message,
+                    routing_key=envelope.routing_key,
+                    mandatory=envelope.mandatory,
+                )
+                return PublishOutcome(
+                    status=PublishStatus.CONFIRMED,
+                    exchange=envelope.exchange,
+                    routing_key=envelope.routing_key,
+                )
+
+            # Confirmed path: pool channel per publish so each confirm is isolated
+            channel = await self._conn_pool.acquire_publisher_channel()
+            try:
+                return await self._publish_on_channel(channel, envelope)
+            finally:
+                await self._conn_pool.release_publisher_channel(channel)
 
         except Exception as e:
             logger.error("Async publish failed: %s", e)
@@ -189,17 +402,41 @@ class AsyncTransportImpl:
                 routing_key=envelope.routing_key,
                 error=e,
             )
-
     async def consume(
         self,
         queue: str,
         callback: Callable[[RabbitMessage], Awaitable[None]],
         prefetch: int = 10,
+        *,
+        no_ack: bool = False,
+        declare: bool = True,
     ) -> str:
         """Start consuming from a queue.
 
         Each queue gets a dedicated channel so per-queue QoS settings do not
         interfere with each other.  Returns the consumer tag.
+
+        ``no_ack=True`` starts a no-ack consumer: the broker auto-acks on
+        delivery, and the built ``RabbitMessage`` is not wired with settlement
+        functions (there is nothing to ack/nack/reject).
+
+        ``declare=False`` skips the passive-declare check and instead obtains a
+        bare, undeclared ``Queue`` handle (``channel.get_queue(queue,
+        ensure=False)`` — constructs the wrapper locally with no AMQP frame
+        sent, unlike ``declare_queue(passive=True)``). Required for AMQP
+        pseudo-queues such as ``amq.rabbitmq.reply-to``: the broker rejects
+        *any* Queue.Declare against that name (even passive), yet basic_consume
+        against it is valid and is how RabbitMQ's direct-reply-to feature works.
+        Note: an undeclared queue is not tracked in ``RobustChannel``'s
+        internal registry, so unlike the ``declare=True`` path this consumer is
+        NOT automatically resumed by aio-pika after a ``connect_robust``
+        reconnect — acceptable for ``amq.rabbitmq.reply-to``, whose lifetime is
+        scoped to the connection anyway.
+
+        When ``declare=False`` and ``queue == DIRECT_REPLY_TO_QUEUE``, this
+        consumer's channel is also remembered as ``self._reply_to_channel`` so
+        :meth:`publish` can route matching requests onto the SAME channel —
+        required by RabbitMQ's direct reply-to (see :meth:`publish`).
         """
         await self._ensure_connected()
 
@@ -209,25 +446,35 @@ class AsyncTransportImpl:
         await channel.set_qos(prefetch_count=prefetch)
         self._consumer_channels[queue] = channel
 
-        # passive declare (not get_queue): RobustChannel only restores queues in
-        # its _queues registry, which declare_queue populates and get_queue does
-        # not. Without this, the consumer is silently NOT resumed after a
-        # connect_robust reconnect (the queue — and its consumer — are untracked).
-        q = await channel.declare_queue(queue, passive=True)
+        if not declare and queue == DIRECT_REPLY_TO_QUEUE:
+            self._reply_to_channel = channel
+
+        if declare:
+            # passive declare (not get_queue): RobustChannel only restores queues
+            # in its _queues registry, which declare_queue populates and get_queue
+            # does not. Without this, the consumer is silently NOT resumed after a
+            # connect_robust reconnect (the queue — and its consumer — are
+            # untracked).
+            q = await channel.declare_queue(queue, passive=True)
+        else:
+            # No AMQP frame sent — just a local Queue wrapper for `queue`. Some
+            # pseudo-queues (amq.rabbitmq.reply-to) reject any Queue.Declare.
+            q = await channel.get_queue(queue, ensure=False)
         consumer_tag = f"rabbitkit.{uuid.uuid4()}"
 
         async def on_message(message: Any) -> None:
-            rabbit_msg = self._build_message(message)
+            rabbit_msg = self._build_message(message, no_ack=no_ack)
             await callback(rabbit_msg)
 
-        await q.consume(on_message, consumer_tag=consumer_tag)
+        await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
         self._consumer_tags[queue] = consumer_tag
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)
         return consumer_tag
 
     async def declare_exchange(self, exchange: RabbitExchange) -> None:
         """Declare an exchange on the topology channel."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        action = self._topo.exchange_action(exchange)
+        if action is TopoAction.SKIP:
             return
 
         await self._ensure_connected()
@@ -235,21 +482,22 @@ class AsyncTransportImpl:
 
         kwargs = exchange.to_declare_kwargs()
 
-        if self._topology_mode == TopologyMode.PASSIVE_ONLY or exchange.passive:
+        if action is TopoAction.PASSIVE:
             await self._topology_channel.get_exchange(kwargs["exchange"], ensure=True)
         else:
             await self._topology_channel.declare_exchange(
-                name=kwargs["exchange"],
-                type=kwargs.get("exchange_type", "direct"),
-                durable=kwargs.get("durable", True),
-                auto_delete=kwargs.get("auto_delete", False),
-                internal=kwargs.get("internal", False),
-                arguments=kwargs.get("arguments"),
-            )
+            name=kwargs["exchange"],
+            type=kwargs.get("exchange_type", "direct"),
+            durable=kwargs.get("durable", True),
+            auto_delete=kwargs.get("auto_delete", False),
+            internal=kwargs.get("internal", False),
+            arguments=kwargs.get("arguments"),
+        )
 
     async def declare_queue(self, queue: RabbitQueue) -> None:
         """Declare a queue on the topology channel."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        action = self._topo.queue_action(queue)
+        if action is TopoAction.SKIP:
             return
 
         await self._ensure_connected()
@@ -257,7 +505,7 @@ class AsyncTransportImpl:
 
         kwargs = queue.to_declare_kwargs()
 
-        if self._topology_mode == TopologyMode.PASSIVE_ONLY or queue.passive:
+        if action is TopoAction.PASSIVE:
             await self._topology_channel.get_queue(kwargs["queue"], ensure=True)
         else:
             await self._topology_channel.declare_queue(
@@ -270,7 +518,7 @@ class AsyncTransportImpl:
 
     async def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
         """Bind a queue to an exchange on the topology channel."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        if self._topo.binding_action() is TopoAction.SKIP:
             return
 
         await self._ensure_connected()
@@ -288,7 +536,7 @@ class AsyncTransportImpl:
         arguments: dict[str, Any] | None = None,
     ) -> None:
         """Bind an exchange to another exchange on the topology channel."""
-        if self._topology_mode == TopologyMode.MANUAL:
+        if self._topo.binding_action() is TopoAction.SKIP:
             return
 
         await self._ensure_connected()
@@ -315,6 +563,8 @@ class AsyncTransportImpl:
                     finally:
                         del self._consumer_tags[queue_name]
                         del self._consumer_channels[queue_name]
+                        if channel is self._reply_to_channel:
+                            self._reply_to_channel = None
                 break
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
@@ -342,26 +592,35 @@ class AsyncTransportImpl:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _build_message(self, aio_message: Any) -> RabbitMessage:
-        """Build RabbitMessage from aio-pika IncomingMessage."""
+    def _build_message(self, aio_message: Any, *, no_ack: bool = False) -> RabbitMessage:
+        """Build RabbitMessage from aio-pika IncomingMessage.
+
+        ``no_ack=True`` (delivery came from a no-ack consumer) skips wiring
+        settlement functions entirely — the broker already auto-acked the
+        delivery, and aio-pika's ``IncomingMessage.ack()``/``nack()``/``reject()``
+        raise ``TypeError`` on a no-ack message anyway.
+        """
         message = RabbitMessage(
             body=aio_message.body,
             headers=dict(aio_message.headers) if aio_message.headers else {},
-            message_id=aio_message.message_id,
-            correlation_id=aio_message.correlation_id,
-            reply_to=aio_message.reply_to,
-            content_type=aio_message.content_type,
-            content_encoding=aio_message.content_encoding,
-            type=aio_message.type,
-            app_id=aio_message.app_id,
-            timestamp=aio_message.timestamp,  # was never surfaced on consume
-            routing_key=aio_message.routing_key,
-            exchange=aio_message.exchange or "",
-            delivery_tag=aio_message.delivery_tag,
-            redelivered=aio_message.redelivered,
-            consumer_tag=aio_message.consumer_tag,
-            raw_message=aio_message,
+        message_id=aio_message.message_id,
+        correlation_id=aio_message.correlation_id,
+        reply_to=aio_message.reply_to,
+        content_type=aio_message.content_type,
+        content_encoding=aio_message.content_encoding,
+        type=aio_message.type,
+        app_id=aio_message.app_id,
+        timestamp=aio_message.timestamp,  # was never surfaced on consume
+        routing_key=aio_message.routing_key,
+        exchange=aio_message.exchange or "",
+        delivery_tag=aio_message.delivery_tag,
+        redelivered=aio_message.redelivered,
+        consumer_tag=aio_message.consumer_tag,
+        raw_message=aio_message,
         )
+
+        if no_ack:
+            return message
 
         async def ack_fn() -> None:
             await aio_message.ack()

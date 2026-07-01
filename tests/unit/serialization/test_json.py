@@ -22,6 +22,27 @@ class TestProtocolCompliance:
         s = JSONSerializer()
         assert s.content_type == "application/json"
 
+    def test_protocol_is_generic(self) -> None:
+        """R-Generic-Serializer: Serializer is now generic (Parameterized)."""
+        # A generic Protocol exposes its type parameters via __parameters__.
+        assert hasattr(Serializer, "__parameters__")
+        params = Serializer.__parameters__
+        assert len(params) == 1
+
+    def test_isinstance_works_with_generic_protocol(self) -> None:
+        """runtime_checkable isinstance still works after making the protocol generic."""
+        s = JSONSerializer()
+        assert isinstance(s, Serializer)
+        # Negative: a plain object is not a Serializer.
+        assert not isinstance(object(), Serializer)
+
+    def test_decode_returns_target_type(self) -> None:
+        """Generic decode(data, target_type) -> T returns an instance of target_type."""
+        s = JSONSerializer()
+        result = s.decode(b'{"id": 1}', dict)
+        assert isinstance(result, dict)
+        assert result == {"id": 1}
+
 
 # ── encode ───────────────────────────────────────────────────────────────
 
@@ -229,3 +250,75 @@ class TestDecodeDataclassNonDict:
         # json.loads("[1,2,3]") returns a list, not a dict → returns parsed as-is
         result = s.decode(b"[1, 2, 3]", Item)
         assert result == [1, 2, 3]
+
+
+# ── default=str coercion (L-P1) ──────────────────────────────────────────
+
+
+class TestNoSilentCoercion:
+    def test_default_raises_on_unserializable(self) -> None:
+        """By default, encoding an un-serializable object raises TypeError."""
+        from datetime import datetime
+
+        s = JSONSerializer()
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            s.encode({"ts": datetime(2024, 1, 1)})
+
+    def test_default_raises_on_decimal(self) -> None:
+        from decimal import Decimal
+
+        s = JSONSerializer()
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            s.encode({"amount": Decimal("1.5")})
+
+    def test_coerce_unknown_to_str_opt_in(self) -> None:
+        """coerce_unknown_to_str=True restores the legacy default=str behaviour."""
+        from datetime import datetime
+
+        s = JSONSerializer(coerce_unknown_to_str=True)
+        result = s.encode({"ts": datetime(2024, 1, 1)})
+        import json as _json
+
+        parsed = _json.loads(result)
+        assert parsed["ts"] == "2024-01-01 00:00:00"
+
+    def test_coerce_decimal_to_str_opt_in(self) -> None:
+        from decimal import Decimal
+
+        s = JSONSerializer(coerce_unknown_to_str=True)
+        result = s.encode({"amount": Decimal("1.5")})
+        import json as _json
+
+        assert _json.loads(result)["amount"] == "1.5"
+
+    def test_normal_data_still_serializes_without_coerce(self) -> None:
+        s = JSONSerializer()  # default coerce=False
+        result = s.encode({"a": 1, "b": [1, 2], "c": "x"})
+        import json as _json
+
+        assert _json.loads(result) == {"a": 1, "b": [1, 2], "c": "x"}
+
+
+# ── L-9: json max_parse_bytes cap ─────────────────────────────────────────
+
+
+class TestJsonParseSizeCap:
+    def test_oversized_input_raises(self) -> None:
+        from rabbitkit.serialization.json import JSONSerializer
+
+        ser = JSONSerializer(max_parse_bytes=16)
+        with pytest.raises(ValueError, match="max_parse_bytes"):
+            ser.decode(b'{"x": "this is way longer than sixteen bytes"}', dict)
+
+    def test_within_cap_decodes(self) -> None:
+        from rabbitkit.serialization.json import JSONSerializer
+
+        ser = JSONSerializer(max_parse_bytes=100)
+        assert ser.decode(b'{"a": 1}', dict) == {"a": 1}
+
+    def test_default_none_no_cap(self) -> None:
+        from rabbitkit.serialization.json import JSONSerializer
+
+        ser = JSONSerializer()
+        big = b'{"x": "' + b'a' * 100_000 + b'"}'
+        assert ser.decode(big, dict)["x"] == "a" * 100_000

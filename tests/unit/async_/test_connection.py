@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ssl
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -228,6 +229,7 @@ class TestGetConnectionErrorsFallback:
         with patch.dict(sys.modules, {"aio_pika": None, "aio_pika.exceptions": None}):
             # Reload to ensure the patched sys.modules is used
             import rabbitkit.async_.connection as conn_module
+
             importlib.reload(conn_module)
             errors = conn_module.get_connection_errors()
 
@@ -311,3 +313,116 @@ class TestBuildSSLContextCerts:
                 certfile="/path/to/client.crt",
                 keyfile=None,
             )
+
+
+# -- I-11: blocked-connection watchdog --------------------------------------
+
+
+class _FakeCallbackCollection:
+    """Minimal stand-in for aio-pika CallbackCollection."""
+
+    def __init__(self) -> None:
+        self.callbacks: list = []
+
+    def add_callback(self, cb: Any) -> None:
+        self.callbacks.append(cb)
+
+    async def fire(self, *args: Any) -> None:
+        for cb in list(self.callbacks):
+            await cb(*args)
+
+
+class TestBlockedConnectionWatchdog:
+    """I-11: a blocked alarm with no unblock within the timeout closes the
+    connection (aio-pika has no native blocked_connection_timeout knob)."""
+
+    async def test_blocked_alarm_without_unblock_closes_connection(self) -> None:
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+        connection = MagicMock()
+        connection.connection_blocked = _FakeCallbackCollection()
+        connection.connection_unblocked = _FakeCallbackCollection()
+        connection.close = AsyncMock()
+
+        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
+
+        # Fire the blocked alarm; no unblock follows.
+        await connection.connection_blocked.fire()
+        await asyncio.sleep(0.15)
+
+        assert connection.close.await_count >= 1  # connection was closed to force reconnect
+
+    async def test_unblock_cancels_watchdog_timer(self) -> None:
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+        connection = MagicMock()
+        connection.connection_blocked = _FakeCallbackCollection()
+        connection.connection_unblocked = _FakeCallbackCollection()
+        connection.close = AsyncMock()
+
+        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
+
+        # Fire blocked, then immediately unblock -> the timer must be cancelled.
+        await connection.connection_blocked.fire()
+        await connection.connection_unblocked.fire()
+        await asyncio.sleep(0.15)
+
+        assert connection.close.await_count == 0  # transient alarm did not close
+
+    async def test_zero_timeout_is_noop(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+        connection = MagicMock()
+        connection.connection_blocked = _FakeCallbackCollection()
+        connection.connection_unblocked = _FakeCallbackCollection()
+        connection.close = AsyncMock()
+
+        await install_blocked_connection_watchdog(connection, blocked_timeout=0.0)
+        # No callbacks should have been registered.
+        assert connection.connection_blocked.callbacks == []
+        assert connection.connection_unblocked.callbacks == []
+
+    async def test_missing_collections_is_noop(self) -> None:
+        """A connection without the callback collections is tolerated (no raise)."""
+        from unittest.mock import MagicMock
+
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+        connection = MagicMock()
+        # Remove the collections so getattr returns a MagicMock default - emulate
+        # a connection that truly lacks them by deleting the attrs.
+        del connection.connection_blocked
+        del connection.connection_unblocked
+
+        # Should not raise.
+        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
+
+    async def test_reblocked_replaces_pending_timer(self) -> None:
+        """A second blocked alarm replaces the pending timer (no double-close)."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+
+        connection = MagicMock()
+        connection.connection_blocked = _FakeCallbackCollection()
+        connection.connection_unblocked = _FakeCallbackCollection()
+        connection.close = AsyncMock()
+
+        await install_blocked_connection_watchdog(connection, blocked_timeout=0.2)
+        # Fire blocked, then fire blocked again shortly after (resets the timer).
+        await connection.connection_blocked.fire()
+        await asyncio.sleep(0.05)
+        await connection.connection_blocked.fire()
+        await asyncio.sleep(0.3)
+
+        # Closed exactly once (the first timer was cancelled, the second fired).
+        assert connection.close.await_count == 1

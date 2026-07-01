@@ -40,7 +40,7 @@ Connection
     RABBITMQ_VHOST                       (str,   default "/")
     RABBITMQ_HEARTBEAT                   (int,   default 30)
     RABBITMQ_SOCKET_TIMEOUT              (float, default 10.0)
-    RABBITMQ_BLOCKED_CONNECTION_TIMEOUT  (float, default 300.0)
+    RABBITMQ_BLOCKED_CONNECTION_TIMEOUT  (float, default 60.0)
     RABBITMQ_CONNECTION_NAME             (str | None, default None)
     RABBITMQ_RECONNECT_BACKOFF_BASE      (float, default 1.0)
     RABBITMQ_RECONNECT_BACKOFF_MAX       (float, default 30.0)
@@ -103,7 +103,7 @@ from typing import Any
 _PYDANTIC_SETTINGS_AVAILABLE = False
 
 try:
-    from pydantic import Field
+    from pydantic import Field, SecretStr
     from pydantic_settings import BaseSettings, SettingsConfigDict
 
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -142,11 +142,11 @@ if _PYDANTIC_SETTINGS_AVAILABLE:
         host: str = "localhost"
         port: int = 5672
         user: str = Field(default="guest")
-        password: str = "guest"
+        password: SecretStr = SecretStr("guest")
         vhost: str = "/"
         heartbeat: int = 30
         socket_timeout: float = 10.0
-        blocked_connection_timeout: float = 300.0
+        blocked_connection_timeout: float = 60.0
         connection_name: str | None = None
         reconnect_backoff_base: float = 1.0
         reconnect_backoff_max: float = 30.0
@@ -194,9 +194,7 @@ if _PYDANTIC_SETTINGS_AVAILABLE:
             )
             retry: RetryConfig | None = None
             if self.retry_max_retries > 0:
-                delays = tuple(
-                    int(d) for d in self.retry_delays.split(",") if d.strip()
-                )
+                delays = tuple(int(d) for d in self.retry_delays.split(",") if d.strip())
                 retry = RetryConfig(
                     max_retries=self.retry_max_retries,
                     delays=delays,
@@ -207,7 +205,7 @@ if _PYDANTIC_SETTINGS_AVAILABLE:
                     host=self.host,
                     port=self.port,
                     username=self.user,
-                    password=self.password,
+                    password=self.password.get_secret_value(),
                     vhost=self.vhost,
                     heartbeat=self.heartbeat,
                     socket_timeout=self.socket_timeout,
@@ -245,8 +243,7 @@ else:  # pragma: no cover
 
         def __init__(self, **_: Any) -> None:
             raise ImportError(
-                "RabbitSettings requires pydantic-settings. "
-                "Install with: pip install rabbitkit[settings]"
+                "RabbitSettings requires pydantic-settings. Install with: pip install rabbitkit[settings]"
             )
 
         def to_rabbit_config(self) -> Any:

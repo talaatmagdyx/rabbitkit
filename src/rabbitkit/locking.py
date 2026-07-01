@@ -69,6 +69,7 @@ Any object satisfying the ``DistributedLock`` protocol works:
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 import uuid
@@ -76,6 +77,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+
+logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 0.05  # seconds between lock-acquire retries when waiting
 
@@ -91,7 +94,20 @@ class DistributedLock(Protocol):
 
 
 class RedisLock:
-    """Redis-based distributed lock using SET NX EX."""
+    """Redis-based distributed lock using SET NX EX.
+
+    Release uses an atomic Lua compare-and-delete so a stale holder can never
+    delete another owner's lock. The per-acquisition UUID is also exposed as a
+    *fencing token* via :attr:`fencing_token` for use in downstream writes that
+    need to guard against reordered operations.
+    """
+
+    # Atomic compare-and-delete: only deletes the key if the stored value
+    # matches the caller's lock value. Returns 1 on delete, 0 otherwise.
+    _RELEASE_SCRIPT = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    _RELEASE_SCRIPT_ASYNC = _RELEASE_SCRIPT
 
     def __init__(self, redis_client: Any, prefix: str = "rabbitkit:lock:", ttl: int = 30) -> None:
         self._redis = redis_client
@@ -99,9 +115,19 @@ class RedisLock:
         self._ttl = ttl
         self._lock_values: dict[str, str] = {}
         self._guard = threading.Lock()  # protects _lock_values across threads
+        # SHA1 digest of the loaded release script (cached after first eval).
+        self._release_sha: str | None = None
 
     def _key(self, key: str) -> str:
         return f"{self._prefix}{key}"
+
+    def fencing_token(self, key: str) -> str | None:
+        """Return the lock value (UUID) for *key* as a fencing token.
+
+        ``None`` if this lock does not currently hold *key*.
+        """
+        with self._guard:
+            return self._lock_values.get(key)
 
     def acquire(self, key: str, timeout: float = 10.0) -> bool:
         """Acquire the lock. Waits up to ``timeout`` seconds (polling); ``timeout
@@ -120,11 +146,44 @@ class RedisLock:
 
     def release(self, key: str) -> None:
         with self._guard:
-            lock_value = self._lock_values.pop(key, None)
-        if lock_value is not None:
-            stored = self._redis.get(self._key(key))
-            if stored is not None and (stored == lock_value or stored == lock_value.encode()):
-                self._redis.delete(self._key(key))
+            lock_value = self._lock_values.get(key)
+        if lock_value is None:
+            return
+        deleted = self._eval_release(self._key(key), lock_value)
+        # L-5: only drop local tracking after a successful delete. On a transport
+        # error the value stays tracked so the TTL (or a later retry) cleans up,
+        # rather than silently stranding the lock and losing the fencing token.
+        if deleted:
+            with self._guard:
+                # Re-check the value hasn't been replaced by a re-acquire in the
+                # meantime before popping.
+                if self._lock_values.get(key) == lock_value:
+                    self._lock_values.pop(key, None)
+
+    def _eval_release(self, redis_key: str, lock_value: str) -> bool:
+        """Atomically delete the lock only if its stored value matches.
+
+        Returns True when the lock was deleted, False when the script returned 0
+        (stale/foreign lock) or the client lacks ``eval``. A real transport error
+        is logged and reported as "not deleted" so the caller keeps the local
+        tracking intact (L-5) rather than silently swallowing it.
+        """
+        # Prefer EVALSHA with the cached SHA, falling back to EVAL. Many test
+        # doubles only implement `eval`, so keep `eval` as the primary path and
+        # treat any AttributeError / failure as "use eval".
+        try:
+            result = self._redis.eval(self._RELEASE_SCRIPT, 1, redis_key, lock_value)
+        except AttributeError:
+            # No eval support at all — nothing we can do safely.
+            return False
+        except Exception as exc:
+            # Some clients raise when the script returns 0 (no delete); that's
+            # expected for a stale/foreign lock. A real transport error, however,
+            # must not be silently swallowed — log it so operators notice, and
+            # signal "not deleted" so the local tracking is preserved (L-5).
+            logger.warning("Redis EVAL failed during lock release: %s", exc)
+            return False
+        return bool(result)
 
     async def acquire_async(self, key: str, timeout: float = 10.0) -> bool:
         """Async variant of :meth:`acquire` (polls with ``asyncio.sleep``)."""
@@ -142,11 +201,26 @@ class RedisLock:
 
     async def release_async(self, key: str) -> None:
         with self._guard:
-            lock_value = self._lock_values.pop(key, None)
-        if lock_value is not None:
-            stored = await self._redis.get(self._key(key))
-            if stored is not None and (stored == lock_value or stored == lock_value.encode()):
-                await self._redis.delete(self._key(key))
+            lock_value = self._lock_values.get(key)
+        if lock_value is None:
+            return
+        deleted = await self._eval_release_async(self._key(key), lock_value)
+        # L-5: only drop local tracking after a successful delete.
+        if deleted:
+            with self._guard:
+                if self._lock_values.get(key) == lock_value:
+                    self._lock_values.pop(key, None)
+
+    async def _eval_release_async(self, redis_key: str, lock_value: str) -> bool:
+        """Async variant of :meth:`_eval_release`."""
+        try:
+            result = await self._redis.eval(self._RELEASE_SCRIPT_ASYNC, 1, redis_key, lock_value)
+        except AttributeError:
+            return False
+        except Exception as exc:
+            logger.warning("Redis EVAL failed during async lock release: %s", exc)
+            return False
+        return bool(result)
 
 
 class LockMiddleware(BaseMiddleware):

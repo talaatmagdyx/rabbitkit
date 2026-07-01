@@ -1,6 +1,8 @@
 """rabbitkit — Production-grade RabbitMQ toolkit."""
 
+from rabbitkit import aio, experimental
 from rabbitkit._version import __version__
+from rabbitkit.async_.batch import AsyncBatchPublisher
 from rabbitkit.asyncapi import AsyncAPIGeneratorConfig, generate_asyncapi_doc, generate_asyncapi_json
 from rabbitkit.concurrency import AsyncWorkerPool, SyncWorkerPool
 from rabbitkit.core.app import AppState, RabbitApp
@@ -25,7 +27,7 @@ from rabbitkit.core.config import (
     SSLConfig,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError
+from rabbitkit.core.errors import BackpressureError, ConfigurationError
 from rabbitkit.core.logging import LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.router import RabbitRouter
@@ -42,17 +44,33 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.dashboard import create_dashboard_app
+from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
 from rabbitkit.di.resolver import DependencyScope
 from rabbitkit.dlq import DLQInspector
 from rabbitkit.fastapi import rabbitkit_lifespan
-from rabbitkit.health import BrokerHealthResult, HealthStatus, broker_health_check, broker_health_check_async
+from rabbitkit.health import (
+    BrokerHealthResult,
+    HealthStatus,
+    broker_health_check,
+    broker_health_check_async,
+    broker_liveness,
+    broker_liveness_async,
+    broker_readiness,
+    broker_readiness_async,
+)
 from rabbitkit.highload.backpressure import FlowController
 from rabbitkit.highload.batch import BatchAcker, BatchPublisher
 from rabbitkit.locking import DistributedLock, LockMiddleware, RedisLock
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
-from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware, PrometheusCollector
+from rabbitkit.middleware.metrics import (
+    MetricsCollector,
+    MetricsMiddleware,
+    PrometheusCollector,
+    metrics_app,
+    start_metrics_server,
+)
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.signing import InvalidSignatureError, SigningConfig, SigningMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
@@ -76,6 +94,7 @@ __all__ = [
     "AckPolicy",
     "AppState",
     "AsyncAPIGeneratorConfig",
+    "AsyncBatchPublisher",
     "AsyncRPCClient",
     "AsyncWorkerPool",
     "BackpressureConfig",
@@ -89,17 +108,23 @@ __all__ = [
     "CircuitBreakerOpenError",
     "ClassifiedError",
     "CompressionConfig",
+    "ConfigurationError",
     "ConnectionConfig",
     "ConsumerConfig",
+    "Context",
+    "ContextRepo",
+    "DIResolver",
     "DLQInspector",
     "DataclassDecoder",
     "DeduplicationConfig",
     "DeduplicationMiddleware",
     "DependencyScope",
+    "Depends",
     "DistributedLock",
     "ErrorSeverity",
     "ExchangeType",
     "FlowController",
+    "Header",
     "HealthCheckConfig",
     "HealthStatus",
     "InvalidSignatureError",
@@ -114,6 +139,7 @@ __all__ = [
     "MetricsConfig",
     "MetricsMiddleware",
     "NackMessage",
+    "Path",
     "PoolConfig",
     "PrometheusCollector",
     "PublishOutcome",
@@ -154,11 +180,19 @@ __all__ = [
     "TracedConsumerMiddleware",
     "WorkerConfig",
     "__version__",
+    "aio",
     "broker_health_check",
     "broker_health_check_async",
+    "broker_liveness",
+    "broker_liveness_async",
+    "broker_readiness",
+    "broker_readiness_async",
     "configure_structlog",
     "create_dashboard_app",
+    "experimental",
     "generate_asyncapi_doc",
     "generate_asyncapi_json",
+    "metrics_app",
     "rabbitkit_lifespan",
+    "start_metrics_server",
 ]

@@ -8,7 +8,18 @@ import pytest
 
 from rabbitkit.core.config import BackpressureConfig
 from rabbitkit.core.errors import BackpressureError
-from rabbitkit.highload.backpressure import FlowController, _AsyncTokenBucket, _TokenBucket
+from rabbitkit.highload.backpressure import (
+    _REASON_BLOCKED,
+    _REASON_RATE,
+    _REASON_RATE_RETRY,
+    _REASON_SLOT,
+    FlowController,
+    _AsyncTokenBucket,
+    _DropPolicy,
+    _RaisePolicy,
+    _TokenBucket,
+    _WaitPolicy,
+)
 
 # ── TokenBucket tests ────────────────────────────────────────────────────
 
@@ -51,6 +62,147 @@ class TestTokenBucket:
         bucket.acquire()  # consume the one token
         # With rate=1 per second, next token in ~1s, but timeout is 0.05s
         assert bucket.wait(timeout=0.05) is False
+
+
+# ── Blocked-policy strategy tests ────────────────────────────────────────
+
+
+class TestBlockedPolicySelection:
+    """FlowController.__init__ selects the strategy from on_blocked."""
+
+    def test_wait_policy_selected_for_wait(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        assert isinstance(fc._policy, _WaitPolicy)
+
+    def test_raise_policy_selected_for_raise(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="raise"))
+        assert isinstance(fc._policy, _RaisePolicy)
+
+    def test_drop_policy_selected_for_drop(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="drop"))
+        assert isinstance(fc._policy, _DropPolicy)
+
+
+class TestWaitPolicy:
+    """_WaitPolicy blocks on the primitive matching the reason."""
+
+    def test_handle_blocked_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        fc.on_blocked()
+        assert _WaitPolicy().handle(fc, _REASON_BLOCKED, 0.01) is False
+
+    def test_handle_blocked_unblocks(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        fc.on_blocked()
+
+        result = [None]
+
+        def wait_then_unblock() -> None:
+            result[0] = _WaitPolicy().handle(fc, _REASON_BLOCKED, 2.0)
+
+        t = threading.Thread(target=wait_then_unblock)
+        t.start()
+        import time
+
+        time.sleep(0.05)
+        fc.on_unblocked()
+        t.join(timeout=3.0)
+        assert result[0] is True
+
+    def test_handle_rate_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(rate_limit=1, on_blocked="wait"))
+        assert fc._rate_limiter is not None
+        fc._rate_limiter._tokens = 0.0
+        assert _WaitPolicy().handle(fc, _REASON_RATE, 0.01) is False
+
+    def test_handle_rate_returns_false_when_no_limiter(self) -> None:
+        fc = FlowController(BackpressureConfig(rate_limit=None, on_blocked="wait"))
+        assert _WaitPolicy().handle(fc, _REASON_RATE, 0.01) is False
+
+    def test_handle_slot_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait"))
+        fc.acquire()  # fill to limit → slot_event cleared
+        assert _WaitPolicy().handle(fc, _REASON_SLOT, 0.01) is False
+
+    def test_handle_rate_retry_always_false(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        assert _WaitPolicy().handle(fc, _REASON_RATE_RETRY, None) is False
+        assert _WaitPolicy().handle(fc, _REASON_RATE_RETRY, 1.0) is False
+
+    async def test_handle_async_blocked_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        fc._ensure_async_primitives()
+        fc.on_blocked()
+        assert await _WaitPolicy().handle_async(fc, _REASON_BLOCKED, 0.01) is False
+
+    async def test_handle_async_rate_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(rate_limit=1, on_blocked="wait"))
+        fc._ensure_async_primitives()
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+        assert await _WaitPolicy().handle_async(fc, _REASON_RATE, 0.01) is False
+
+    async def test_handle_async_slot_times_out(self) -> None:
+        fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait"))
+        fc._ensure_async_primitives()
+        await fc.acquire_async()  # fill to limit → slot_event cleared
+        assert await _WaitPolicy().handle_async(fc, _REASON_SLOT, 0.01) is False
+
+    async def test_handle_async_rate_retry_always_false(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="wait"))
+        fc._ensure_async_primitives()
+        assert await _WaitPolicy().handle_async(fc, _REASON_RATE_RETRY, None) is False
+
+
+class TestRaisePolicy:
+    """_RaisePolicy raises BackpressureError with a reason-specific message."""
+
+    def test_handle_blocked_raises(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="raise"))
+        with pytest.raises(BackpressureError, match="blocked"):
+            _RaisePolicy().handle(fc, _REASON_BLOCKED, None)
+
+    def test_handle_rate_raises(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="raise"))
+        with pytest.raises(BackpressureError, match="Rate limit"):
+            _RaisePolicy().handle(fc, _REASON_RATE, None)
+
+    def test_handle_slot_raises_with_limit(self) -> None:
+        fc = FlowController(BackpressureConfig(max_in_flight=42, on_blocked="raise"))
+        with pytest.raises(BackpressureError, match=r"In-flight limit reached \(42\)"):
+            _RaisePolicy().handle(fc, _REASON_SLOT, None)
+
+    def test_handle_rate_retry_raises(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="raise"))
+        with pytest.raises(BackpressureError, match="Rate limit"):
+            _RaisePolicy().handle(fc, _REASON_RATE_RETRY, None)
+
+    async def test_handle_async_blocked_raises(self) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="raise"))
+        with pytest.raises(BackpressureError, match="blocked"):
+            await _RaisePolicy().handle_async(fc, _REASON_BLOCKED, None)
+
+    async def test_handle_async_slot_raises_with_limit(self) -> None:
+        fc = FlowController(BackpressureConfig(max_in_flight=7, on_blocked="raise"))
+        with pytest.raises(BackpressureError, match=r"In-flight limit reached \(7\)"):
+            await _RaisePolicy().handle_async(fc, _REASON_SLOT, None)
+
+
+class TestDropPolicy:
+    """_DropPolicy returns False for every reason (sync + async)."""
+
+    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT, _REASON_RATE_RETRY])
+    def test_handle_returns_false(self, reason: str) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="drop"))
+        assert _DropPolicy().handle(fc, reason, None) is False
+        assert _DropPolicy().handle(fc, reason, 1.0) is False
+
+    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT, _REASON_RATE_RETRY])
+    async def test_handle_async_returns_false(self, reason: str) -> None:
+        fc = FlowController(BackpressureConfig(on_blocked="drop"))
+        fc._ensure_async_primitives()
+        assert await _DropPolicy().handle_async(fc, reason, None) is False
+        assert await _DropPolicy().handle_async(fc, reason, 1.0) is False
 
 
 # ── FlowController init ─────────────────────────────────────────────────
@@ -336,9 +488,7 @@ class TestTokenBucketPollInterval:
             bucket.wait(timeout=0.02)
 
         assert sleep_args, "time.sleep should have been called"
-        assert all(abs(v - 0.005) < 1e-9 for v in sleep_args), (
-            f"Expected all sleeps to be 0.005, got {sleep_args}"
-        )
+        assert all(abs(v - 0.005) < 1e-9 for v in sleep_args), f"Expected all sleeps to be 0.005, got {sleep_args}"
 
     def test_flow_controller_passes_poll_interval_to_bucket(self) -> None:
         """FlowController passes poll_interval_ms to _TokenBucket."""
@@ -392,6 +542,7 @@ class TestAsyncTokenBucket:
     async def test_wait_returns_true_after_refill(self) -> None:
         """wait() returns True after tokens refill."""
         import time as _time
+
         bucket = _AsyncTokenBucket(rate=100)  # fast refill
         # Drain tokens
         while await bucket.acquire():
@@ -462,12 +613,14 @@ class TestAcquireComplexPaths:
     def test_acquire_waits_for_slot_and_retries(self) -> None:
         """acquire() waits for slot event when at limit with wait policy."""
         import threading
+
         fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait", blocked_timeout=2.0))
         fc.acquire()  # fill to limit
 
         # Release after 50ms
         def release_after_delay() -> None:
             import time
+
             time.sleep(0.05)
             fc.release()
 
@@ -536,6 +689,7 @@ class TestAcquireAsyncComplexPaths:
     async def test_acquire_async_waits_for_slot(self) -> None:
         """acquire_async() waits for slot and retries successfully."""
         import asyncio
+
         fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait", blocked_timeout=2.0))
         await fc.acquire_async()  # fill to limit
 
@@ -566,6 +720,7 @@ class TestAcquireAsyncComplexPaths:
     async def test_acquire_async_blocked_wait_then_unblock(self) -> None:
         """acquire_async() returns True after connection unblocks."""
         import asyncio
+
         fc = FlowController(BackpressureConfig(on_blocked="wait", blocked_timeout=2.0))
         fc._ensure_async_primitives()
         fc.on_blocked()
@@ -602,6 +757,7 @@ class TestAcquireRemainingPaths:
         """After waiting for slot, retry finds limit still reached (race)."""
         import threading
         import time
+
         fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait", blocked_timeout=1.0))
         fc.acquire()  # fill to limit
 
@@ -629,12 +785,15 @@ class TestAcquireRemainingPaths:
         with pytest.raises(BackpressureError, match="Rate limit"):
             await fc.acquire_async()
 
-    async def test_acquire_async_slot_retry_rate_limit_drop(self) -> None:
-        """acquire_async() returns False when slot retry finds rate limited."""
+    async def test_acquire_async_slot_retry_rate_limit_waits_for_token(self) -> None:
+        """acquire_async() with on_blocked="wait" waits for a rate token after the slot frees (H-P4 fix).
+
+        Previously this path dropped (returned False) when no rate token was available;
+        the fix makes "wait" actually wait for a token within the deadline.
+        """
         import asyncio
-        fc = FlowController(BackpressureConfig(
-            max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=2.0
-        ))
+
+        fc = FlowController(BackpressureConfig(max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=2.0))
         await fc.acquire_async()  # fill to limit
         # Drain rate limiter tokens
         fc._ensure_async_primitives()
@@ -645,9 +804,9 @@ class TestAcquireRemainingPaths:
             await fc.release_async()
 
         _task = asyncio.create_task(release_after())
-        result = await fc.acquire_async(timeout=1.0)
-        # rate limiter exhausted → returns False after getting the slot
-        assert result is False
+        result = await fc.acquire_async(timeout=1.5)
+        # "wait" waits for both the slot AND a rate token → succeeds within the deadline
+        assert result is True
 
     async def test_acquire_async_blocked_timeout(self) -> None:
         """acquire_async() returns False when connection unblock times out."""
@@ -673,22 +832,33 @@ class TestRemainingEdgeCases:
         pass  # covered by pragma on the source file instead
 
     def test_acquire_slot_retry_with_rate_limit_fail(self) -> None:
-        """After slot opens, rate_limiter.acquire() returns False → returns False (line 287)."""
+        """I-9: after the slot opens, a still-exhausted rate limiter under
+        ``on_blocked="wait"`` waits for a token; if the token never arrives
+        within the deadline, ``acquire`` returns False (no silent drop on the
+        first race loss, but a genuine deadline miss still fails).
+
+        Replaces the rate limiter with a deterministic fake whose ``wait`` never
+        produces a token, so the outcome is timing-independent.
+        """
         import threading
         import time
 
-        # rate_limit=1 means only 0.05 tokens refill in 50ms → still exhausted on retry
-        fc = FlowController(BackpressureConfig(
-            max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=1.0
-        ))
+        class _ExhaustedBucket:
+            """Rate limiter that never yields a token (models permanent exhaustion)."""
+
+            def acquire(self) -> bool:
+                return False
+
+            def wait(self, timeout: float | None = None) -> bool:
+                return False
+
+        fc = FlowController(BackpressureConfig(max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=1.0))
         fc.acquire()  # fill to limit, consumes the one rate limit token
 
-        # Drain rate limiter completely BEFORE the slot opens
-        assert fc._rate_limiter is not None
-        fc._rate_limiter._tokens = 0.0
-        fc._rate_limiter._last_refill = time.monotonic()  # reset refill clock
+        # Swap in a permanently-exhausted rate limiter BEFORE the slot opens.
+        fc._rate_limiter = _ExhaustedBucket()
 
-        # Release the slot after a short delay
+        # Release the slot after a short delay so the at-limit wait wakes up.
         def release_slot() -> None:
             time.sleep(0.05)
             fc.release()
@@ -696,10 +866,12 @@ class TestRemainingEdgeCases:
         t = threading.Thread(target=release_slot)
         t.start()
 
-        result = fc.acquire(timeout=1.0)
+        result = fc.acquire(timeout=0.5)
         t.join()
-        # Rate limiter exhausted (< 1 token after 50ms at rate=1) → returns False
+        # Slot opened, but the rate limiter never yields a token within the
+        # deadline → acquire returns False (a genuine failure, not a silent drop).
         assert result is False
+        assert fc.in_flight == 0  # the slot was released by the background thread; nothing acquired
 
     async def test_acquire_async_slot_retry_race_condition(self) -> None:
         """acquire_async(): retry finds limit still reached → returns False (line 359)."""
@@ -724,12 +896,16 @@ class TestRemainingEdgeCases:
         assert result is False
 
     async def test_acquire_async_slot_retry_rate_limit_drop(self) -> None:
-        """acquire_async(): slot retry with rate limit exhausted → returns False (line 363)."""
+        """acquire_async(): with on_blocked="wait" a missing rate token now waits.
+
+        Previously the async path silently dropped when no rate token was
+        available even under "wait" (H-P4 bug). Now it waits for a token; if the
+        deadline expires before one refills, it returns False. We use a short
+        timeout + drained bucket so the wait times out deterministically.
+        """
         import asyncio
 
-        fc = FlowController(BackpressureConfig(
-            max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=2.0
-        ))
+        fc = FlowController(BackpressureConfig(max_in_flight=1, rate_limit=1, on_blocked="wait", blocked_timeout=2.0))
         fc._ensure_async_primitives()
 
         # Fill to limit manually (so rate limiter token is not consumed)
@@ -750,6 +926,469 @@ class TestRemainingEdgeCases:
 
         _task = asyncio.create_task(trigger_slot())
 
+        result = await fc.acquire_async(timeout=0.1)
+        # Slot opened but rate token cannot refill within the remaining ~0.05s
+        # (rate=1 token/sec needs ~1.0s) -> the rate wait times out -> False.
+        assert result is False
+
+
+# I-9: sync acquire("wait") must not drop on slot-race loss
+
+
+class TestSyncAcquireWaitRaceLoss:
+    """I-9: with on_blocked="wait" and max_in_flight=1, N concurrent contenders
+    must ALL eventually acquire a slot -- none may be silently dropped on a
+    race loss (the pre-I-9 single-retry-then-return-False behaviour).
+    """
+
+    def test_all_contenders_acquire_within_deadline(self) -> None:
+        import threading
+        import time
+
+        n = 8
+        fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait", blocked_timeout=10.0))
+        results: list[bool] = []
+        results_lock = threading.Lock()
+        barrier = threading.Barrier(n)
+
+        def contender() -> None:
+            barrier.wait()  # release all threads at once for a tight race
+            ok = fc.acquire(timeout=10.0)
+            with results_lock:
+                results.append(ok)
+            if ok:
+                # Hold the slot briefly so others race, then release for the next.
+                time.sleep(0.005)
+                fc.release()
+
+        threads = [threading.Thread(target=contender, daemon=True) for _ in range(n)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=20.0)
+
+        # No contender may have been silently dropped: every acquire must
+        # eventually return True within the deadline.
+        assert len(results) == n, f"only {len(results)}/{n} contenders returned"
+        assert all(r is True for r in results), f"some contenders dropped: {results}"
+        # After everyone is done, the single slot is released.
+        assert fc.in_flight == 0
+
+    def test_single_contender_at_limit_eventually_acquires_after_release(self) -> None:
+        """Direct check: a waiter at the limit acquires once a slot opens,
+        instead of returning False after a single race loss (I-9)."""
+        import threading
+        import time
+
+        fc = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="wait", blocked_timeout=5.0))
+        assert fc.acquire() is True  # fill the single slot
+
+        def release_later() -> None:
+            time.sleep(0.05)
+            fc.release()
+
+        t = threading.Thread(target=release_later, daemon=True)
+        t.start()
+
+        # Must wait-and-acquire, not drop on the first observation of at-limit.
+        assert fc.acquire(timeout=2.0) is True
+        t.join()
+        fc.release()
+        assert fc.in_flight == 0
+
+
+class TestAsyncAcquireWaitRaceLoss:
+    """perf-M-1: with on_blocked="wait" + a rate limit + max_in_flight=1, N
+    concurrent async contenders must ALL eventually acquire a slot -- none may
+    be silently dropped after losing the slot race post-rate-token-wait (the
+    pre-fix ``return False`` drop). Mirrors the sync ``TestSyncAcquireWaitRaceLoss``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_contenders_acquire_within_deadline(self) -> None:
+        import asyncio
+
+        n = 6
+        fc = FlowController(
+            BackpressureConfig(
+                max_in_flight=1,
+                rate_limit=100,
+                on_blocked="wait",
+                blocked_timeout=10.0,
+            )
+        )
+        fc._ensure_async_primitives()
+        # Drain the rate bucket so contenders hit the rate_needed wait path
+        # (exercising the slot-race-loss branch fixed in perf-M-1).
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        results: list[bool] = []
+        started = asyncio.Event()
+
+        async def contender(idx: int) -> None:
+            # Stagger starts slightly to make the slot race tight but fair.
+            await asyncio.sleep(0.001 * idx)
+            started.set()
+            ok = await fc.acquire_async(timeout=10.0)
+            results.append(ok)
+            if ok:
+                await asyncio.sleep(0.005)  # hold the slot briefly
+                await fc.release_async()
+
+        await asyncio.gather(*[asyncio.create_task(contender(i)) for i in range(n)])
+
+        # No contender may have been silently dropped on a slot-race loss.
+        assert len(results) == n, f"only {len(results)}/{n} contenders returned"
+        assert all(r is True for r in results), f"some contenders dropped: {results}"
+        assert fc.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_single_contender_at_limit_with_rate_re_acquires_after_release(self) -> None:
+        """A waiter that loses the slot race after paying for a rate token
+        re-waits and acquires once a slot opens, instead of returning False."""
+        import asyncio
+
+        fc = FlowController(
+            BackpressureConfig(
+                max_in_flight=1,
+                rate_limit=100,
+                on_blocked="wait",
+                blocked_timeout=5.0,
+            )
+        )
+        assert await fc.acquire_async() is True  # fill the single slot
+        fc._ensure_async_primitives()
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        async def release_after() -> None:
+            await asyncio.sleep(0.05)
+            await fc.release_async()
+
+        _task = asyncio.create_task(release_after())
+        # Must wait-and-acquire, not drop on the slot-race loss.
+        assert await fc.acquire_async(timeout=2.0) is True
+        await fc.release_async()
+        assert fc.in_flight == 0
+
+
+# ── _WaitPolicy.handle_async: RATE with no async rate limiter ─────────────
+
+
+class TestWaitPolicyAsyncRateNoLimiter:
+    """Line 197: handle_async with RATE reason when _async_rate_limiter is None."""
+
+    @pytest.mark.asyncio
+    async def test_handle_async_rate_no_limiter_returns_false(self) -> None:
+        """When rate_limit=None, _async_rate_limiter is None → return False."""
+        fc = FlowController(BackpressureConfig(rate_limit=None, on_blocked="wait"))
+        fc._ensure_async_primitives()
+        # With no rate_limit, there should be no async rate limiter
+        assert fc._async_rate_limiter is None
+        result = await _WaitPolicy().handle_async(fc, _REASON_RATE, 0.1)
+        assert result is False
+
+
+# ── sync acquire: rate_needed + slot race (lines 394-404) ────────────────
+
+
+class TestSyncAcquireRateNeededSlotRace:
+    """Lines 394-404: rate token acquired but slot taken while waiting → wait for slot → timeout."""
+
+    def test_rate_token_acquired_but_slot_taken_times_out(self) -> None:
+        """Simulate race: rate token consumed by _WaitPolicy, then inner lock finds slot full."""
+        config = BackpressureConfig(rate_limit=10, max_in_flight=1, on_blocked="wait")
+        fc = FlowController(config)
+
+        # Exhaust rate tokens without using any slot
+        fc._rate_limiter._tokens = 0.0
+
+        # Patch _rate_limiter.wait to return True immediately (simulates successful rate-wait)
+        # but fill the slot as a side effect so the inner lock check fails.
+        def take_slot_then_succeed(timeout: float | None) -> bool:
+            # Fill the slot while "waiting" for the rate token, simulating a race
+            fc._in_flight = 1
+            fc._slot_event.clear()
+            return True  # token "acquired"
+
+        fc._rate_limiter.wait = take_slot_then_succeed  # type: ignore[method-assign]
+
+        # Now acquire with a very short timeout: slot is taken → _slot_event.wait times out
+        result = fc.acquire(timeout=0.02)
+        assert result is False
+
+    def test_rate_token_acquired_slot_available_succeeds(self) -> None:
+        """Lines 396-399: rate token acquired via policy.handle, slot still free → return True.
+
+        This covers the success path of the second inner lock check after waiting
+        for a rate token.
+        """
+        config = BackpressureConfig(rate_limit=10, max_in_flight=5, on_blocked="wait")
+        fc = FlowController(config)
+
+        # Exhaust rate tokens so first non-blocking acquire fails → rate_needed=True
+        assert fc._rate_limiter is not None
+        fc._rate_limiter._tokens = 0.0
+
+        # Patch wait() to immediately restore a token and return True,
+        # without touching _in_flight (slot stays available)
+        def immediate_success(timeout: float | None) -> bool:
+            return True
+
+        fc._rate_limiter.wait = immediate_success  # type: ignore[method-assign]
+
+        result = fc.acquire(timeout=1.0)
+        assert result is True
+        assert fc.in_flight == 1
+
+    def test_rate_token_acquired_slot_taken_then_slot_freed_continues(self) -> None:
+        """Line 404: after slot-event.wait() succeeds (slot freed), continue re-loops.
+
+        Sequence: _in_flight=0, rate_needed=True (no token) → rate.wait() returns
+        True AND fills the slot as side effect → second lock: slot full → falls to
+        _slot_event.wait(). The background thread releases the slot after 50ms so
+        _slot_event.wait() succeeds → line 404 `continue` executes → second
+        iteration acquires normally.
+        """
+        import threading
+        import time
+
+        config = BackpressureConfig(rate_limit=10, max_in_flight=1, on_blocked="wait")
+        fc = FlowController(config)
+
+        # Do NOT fill the slot yet — _in_flight=0 so first lock: 0 < 1 → rate check
+        # Exhaust rate tokens
+        assert fc._rate_limiter is not None
+        fc._rate_limiter._tokens = 0.0
+
+        wait_call_count = [0]
+
+        def rate_wait_fills_slot(timeout: float | None) -> bool:
+            wait_call_count[0] += 1
+            if wait_call_count[0] == 1:
+                # First call: fill the slot as a race effect, then return True
+                fc._in_flight = 1
+                fc._slot_event.clear()
+                return True  # token "acquired" but slot taken
+            # Subsequent calls: just return True (slot freed by background thread)
+            return True
+
+        fc._rate_limiter.wait = rate_wait_fills_slot  # type: ignore[method-assign]
+
+        # Release the slot after a short delay so _slot_event.wait() fires
+        def release_after_delay() -> None:
+            time.sleep(0.05)
+            fc.release()
+
+        t = threading.Thread(target=release_after_delay)
+        t.start()
+
+        result = fc.acquire(timeout=2.0)
+        t.join()
+        # After line 404 `continue`, second iteration: _in_flight=0, rate.acquire()
+        # returns False (tokens still 0), rate.wait() returns True (call 2),
+        # second lock: 0 < 1 → success.
+        assert result is True
+
+
+# ── async acquire: rate_needed slot-race paths (lines 479-503) ────────────
+
+
+class TestAsyncAcquireRateNeededSlotRace:
+    """Lines 479-503: async rate-needed path where slot is taken while waiting
+    for a rate token, then the slot_event wait, and the subsequent lock re-check.
+
+    Key: for rate_needed=True, _in_flight < max_in_flight must hold in the first
+    lock. We use max_in_flight=2 with _in_flight=1. During policy.handle_async the
+    second slot is taken (_in_flight=2) so the second lock check routes to line 479.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deadline_already_expired_returns_false(self) -> None:
+        """Lines 480-482: _rem <= 0 after slot race → return False."""
+        import asyncio
+
+        fc = FlowController(BackpressureConfig(rate_limit=10, max_in_flight=2, on_blocked="wait"))
+        fc._ensure_async_primitives()
+
+        fc._in_flight = 1  # first lock: 1 < 2 → rate_needed path
+
+        # Drain rate tokens so rate acquire fails → rate_needed=True
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        # policy.handle_async: fill the second slot (race) and burn the deadline
+        async def fill_slot_and_burn_deadline(
+            fc_: object, reason: str, timeout: float | None
+        ) -> bool:
+            fc._in_flight = 2  # second slot taken
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.clear()
+            await asyncio.sleep(0.05)  # exhaust the tiny deadline
+            return True
+
+        fc._policy.handle_async = fill_slot_and_burn_deadline  # type: ignore[method-assign]
+
+        # Tiny timeout: deadline expires during handle_async → _rem <= 0 at line 481
+        result = await fc.acquire_async(timeout=0.02)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_slot_event_times_out_returns_false(self) -> None:
+        """Lines 483-487: async slot_event.wait() times out → return False."""
+        fc = FlowController(BackpressureConfig(rate_limit=10, max_in_flight=2, on_blocked="wait"))
+        fc._ensure_async_primitives()
+
+        fc._in_flight = 1  # first lock: 1 < 2 → rate_needed path
+
+        # Drain rate tokens
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        # policy.handle_async: fill second slot then return True (slot taken during rate wait)
+        async def fill_slot_then_ok(fc_: object, reason: str, timeout: float | None) -> bool:
+            fc._in_flight = 2
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.clear()
+            return True
+
+        fc._policy.handle_async = fill_slot_then_ok  # type: ignore[method-assign]
+
+        # Short timeout: slot event never set → asyncio.timeout fires at line 486
+        result = await fc.acquire_async(timeout=0.05)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_slot_freed_then_acquire_succeeds(self) -> None:
+        """Lines 488-503 happy path: slot event fires, re-check succeeds → True.
+
+        Covers:
+        - 488: async with self._async_lock (third lock acquisition)
+        - 492: _in_flight < max_in_flight (no continue)
+        - 493: rate limiter re-acquire succeeds (no RATE_RETRY)
+        - 499-503: increment _in_flight, optionally clear slot, return True
+        """
+        import asyncio
+
+        # Use a high rate_limit so tokens refill quickly during the slot wait
+        fc = FlowController(BackpressureConfig(rate_limit=1000, max_in_flight=2, on_blocked="wait"))
+        fc._ensure_async_primitives()
+
+        fc._in_flight = 1  # first lock: 1 < 2 → rate_needed path
+
+        # Drain rate tokens to force rate_needed=True on first iteration
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+        # Also backdate last_refill so no tokens refill during the brief time
+        # between draining and calling acquire_async.
+        import time as _time
+
+        fc._async_rate_limiter._last_refill = _time.monotonic()
+
+        # policy.handle_async: fill second slot immediately, return True
+        # (simulates rate token obtained while another caller grabbed the slot)
+        async def fill_slot_then_ok(fc_: object, reason: str, timeout: float | None) -> bool:
+            fc._in_flight = 2
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.clear()
+            return True
+
+        fc._policy.handle_async = fill_slot_then_ok  # type: ignore[method-assign]
+
+        # Release one slot after delay; with rate_limit=1000, ~30 tokens refill
+        # in 30ms, so the re-acquire at line 494 succeeds.
+        async def release_after() -> None:
+            await asyncio.sleep(0.05)
+            fc._in_flight = 1  # back below max_in_flight=2
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.set()
+
+        _task = asyncio.create_task(release_after())
+        result = await fc.acquire_async(timeout=2.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_slot_freed_but_rate_retry_fails_returns_false(self) -> None:
+        """Lines 494-498: slot freed, rate token gone → RATE_RETRY policy → False."""
+        import asyncio
+
+        fc = FlowController(BackpressureConfig(rate_limit=10, max_in_flight=2, on_blocked="drop"))
+        fc._ensure_async_primitives()
+
+        fc._in_flight = 1  # first lock: 1 < 2 → rate_needed path
+
+        # Drain rate tokens
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        # policy.handle_async for REASON_RATE: fill second slot, return True
+        original_handle = fc._policy.handle_async
+
+        async def patched_handle(fc_: object, reason: str, timeout: float | None) -> bool:
+            if reason == _REASON_RATE:
+                fc._in_flight = 2  # second slot taken (race)
+                assert fc._async_slot_event is not None
+                fc._async_slot_event.clear()
+                return True  # pretend token obtained; tokens stay at 0
+            # RATE_RETRY with drop returns False
+            return await original_handle(fc_, reason, timeout)
+
+        fc._policy.handle_async = patched_handle  # type: ignore[method-assign]
+
+        # Release one slot so slot_event.wait() succeeds
+        async def release_after() -> None:
+            await asyncio.sleep(0.03)
+            fc._in_flight = 1
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.set()
+
+        _task = asyncio.create_task(release_after())
+        result = await fc.acquire_async(timeout=2.0)
+        # Rate token gone after slot wait → RATE_RETRY → drop returns False
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_slot_freed_in_flight_still_full_continues(self) -> None:
+        """Line 492-493: slot event fires but in_flight still >= max → continue.
+
+        After continue, the next loop iteration finds at_limit=True with the
+        drop policy, so handle_async returns False immediately.
+        """
+        import asyncio
+
+        fc = FlowController(BackpressureConfig(rate_limit=10, max_in_flight=2, on_blocked="drop"))
+        fc._ensure_async_primitives()
+
+        fc._in_flight = 1  # first lock: 1 < 2 → rate_needed path
+
+        # Drain rate tokens
+        assert fc._async_rate_limiter is not None
+        fc._async_rate_limiter._tokens = 0.0
+
+        # policy.handle_async: only intercept REASON_RATE; forward others to the
+        # real drop policy (which returns False for REASON_SLOT).
+        original_handle = fc._policy.handle_async
+
+        async def rate_ok_slot_drop(fc_: object, reason: str, timeout: float | None) -> bool:
+            if reason == _REASON_RATE:
+                # Fill second slot and return True (token "obtained")
+                fc._in_flight = 2
+                assert fc._async_slot_event is not None
+                fc._async_slot_event.clear()
+                return True
+            # REASON_SLOT → real drop policy returns False
+            return await original_handle(fc_, reason, timeout)
+
+        fc._policy.handle_async = rate_ok_slot_drop  # type: ignore[method-assign]
+
+        # Set slot event without releasing (spurious wake → continue at line 492)
+        async def set_event_only() -> None:
+            await asyncio.sleep(0.03)
+            assert fc._async_slot_event is not None
+            fc._async_slot_event.set()  # set without decrementing in_flight
+
+        _task = asyncio.create_task(set_event_only())
         result = await fc.acquire_async(timeout=1.0)
-        # Slot opened but rate limiter exhausted → returns False at line 363
+        # in_flight=2 >= max=2 after spurious wake → continue → at_limit → drop → False
         assert result is False

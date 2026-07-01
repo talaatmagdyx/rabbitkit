@@ -130,13 +130,27 @@ class SerializationPipeline:
 
 
 class JsonParser:
-    """Built-in JSON parser."""
+    """Built-in JSON parser.
+
+    By default ``serialize`` **raises** on objects ``json`` cannot represent
+    (e.g. ``datetime``, ``Decimal``) rather than silently coercing them via
+    ``str()``. Pass ``coerce_unknown_to_str=True`` to restore the legacy
+    ``default=str`` coercion behaviour.
+    """
+
+    def __init__(self, *, coerce_unknown_to_str: bool = False) -> None:
+        self._coerce = coerce_unknown_to_str
 
     def parse(self, data: bytes, content_type: str | None = None) -> Any:
         return json.loads(data)
 
+    def _default(self, data: Any) -> Any:
+        if self._coerce:
+            return str(data)
+        raise TypeError(f"Object of type {type(data).__name__} is not JSON serializable")
+
     def serialize(self, data: Any) -> bytes:
-        return json.dumps(data, default=str).encode("utf-8")
+        return json.dumps(data, default=self._default).encode("utf-8")
 
     @property
     def content_type(self) -> str:
@@ -162,12 +176,14 @@ class DataclassDecoder:
 
     def decode(self, data: Any, target_type: type) -> Any:
         import dataclasses
+
         if dataclasses.is_dataclass(target_type) and isinstance(data, dict):
             return target_type(**data)
         return data
 
     def encode(self, data: Any) -> Any:
         import dataclasses
+
         if dataclasses.is_dataclass(data) and not isinstance(data, type):
             return dataclasses.asdict(data)
         return data

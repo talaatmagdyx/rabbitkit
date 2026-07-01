@@ -14,7 +14,7 @@ from typing import Any
 from rabbitkit.core.types import ExchangeType, QueueType
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class RabbitExchange:
     """Exchange declaration model."""
 
@@ -29,10 +29,16 @@ class RabbitExchange:
     bind_arguments: dict[str, Any] = field(default_factory=dict)
     routing_key: str = ""
 
+    def __post_init__(self) -> None:
+        self.validate()
+
     def validate(self) -> None:
         """Validate exchange configuration."""
         if not self.name and self.type != ExchangeType.DIRECT:
             msg = "Non-default exchanges must have a name"
+            raise ValueError(msg)
+        if self.internal and self.auto_delete:
+            msg = "Internal exchanges cannot be auto_delete (they are never published to directly)."
             raise ValueError(msg)
 
     def to_declare_kwargs(self) -> dict[str, Any]:
@@ -59,7 +65,7 @@ class RabbitExchange:
         }
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class RabbitQueue:
     """Queue declaration model with type-specific validation."""
 
@@ -160,13 +166,15 @@ class RabbitQueue:
                 stacklevel=2,
             )
 
-        if self.passive and any([
-            self.lazy,
-            self.max_priority is not None,
-            self.delivery_limit is not None,
-            self.message_ttl is not None,
-            self.max_length is not None,
-        ]):
+        if self.passive and any(
+            [
+                self.lazy,
+                self.max_priority is not None,
+                self.delivery_limit is not None,
+                self.message_ttl is not None,
+                self.max_length is not None,
+            ]
+        ):
             warnings.warn(
                 f"Queue '{self.name}': passive=True with creation-only options set — "
                 "these options are ignored for passive declarations",

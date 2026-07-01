@@ -110,7 +110,7 @@ class TestRetryTransient:
         """Original exchange/routing_key/queue are preserved in headers."""
         published: list[MessageEnvelope] = []
 
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
 
         msg = _make_message(exchange="my-exchange", routing_key="my.rk")
@@ -144,7 +144,7 @@ class TestRetryTransient:
         """per_queue=False uses shared 'rabbitkit' prefix."""
         published: list[MessageEnvelope] = []
 
-        config = RetryConfig(max_retries=2, delays=(5,), per_queue=False)
+        config = RetryConfig(max_retries=2, delays=(5,), per_queue=False, strict_delays=False)
         mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
 
         msg = _make_message()
@@ -163,12 +163,14 @@ class TestRetryTransient:
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
         mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
 
-        msg = _make_message(headers={
-            "x-rabbitkit-retry-count": 1,
-            "x-rabbitkit-original-queue": "orders-queue",
-            "x-rabbitkit-original-exchange": "orders",
-            "x-rabbitkit-original-routing-key": "orders.created",
-        })
+        msg = _make_message(
+            headers={
+                "x-rabbitkit-retry-count": 1,
+                "x-rabbitkit-original-queue": "orders-queue",
+                "x-rabbitkit-original-exchange": "orders",
+                "x-rabbitkit-original-routing-key": "orders.created",
+            }
+        )
 
         def failing_handler(m: RabbitMessage) -> None:
             raise ConnectionResetError("lost again")
@@ -185,7 +187,7 @@ class TestRetryTransient:
 class TestRetryTerminal:
     def test_permanent_error_raises_terminal(self) -> None:
         """Permanent errors are tagged terminal and re-raised."""
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config)
 
         msg = _make_message()
@@ -204,10 +206,12 @@ class TestRetryTerminal:
         mw = RetryMiddleware(config)
 
         # Message already at retry count 2 (exhausted for max_retries=2)
-        msg = _make_message(headers={
-            "x-rabbitkit-retry-count": 2,
-            "x-rabbitkit-original-queue": "orders-queue",
-        })
+        msg = _make_message(
+            headers={
+                "x-rabbitkit-retry-count": 2,
+                "x-rabbitkit-original-queue": "orders-queue",
+            }
+        )
 
         def failing_handler(m: RabbitMessage) -> None:
             raise ConnectionResetError("still failing")
@@ -219,7 +223,7 @@ class TestRetryTerminal:
 
     def test_success_passes_through(self) -> None:
         """Successful handler calls pass through unchanged."""
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config)
 
         msg = _make_message()
@@ -253,7 +257,7 @@ class TestRetryTerminal:
 class TestRetryClassification:
     def test_unknown_error_uses_config_policy(self) -> None:
         """Unknown errors use the config's unknown_policy (default PERMANENT)."""
-        config = RetryConfig(max_retries=3, delays=(5,), unknown_policy=ErrorSeverity.PERMANENT)
+        config = RetryConfig(max_retries=3, delays=(5,), unknown_policy=ErrorSeverity.PERMANENT, strict_delays=False)
         mw = RetryMiddleware(config)
 
         msg = _make_message()
@@ -270,9 +274,7 @@ class TestRetryClassification:
         """Unknown errors treated as transient when configured."""
         published: list[MessageEnvelope] = []
 
-        config = RetryConfig(
-            max_retries=3, delays=(5,), unknown_policy=ErrorSeverity.TRANSIENT
-        )
+        config = RetryConfig(max_retries=3, delays=(5,), unknown_policy=ErrorSeverity.TRANSIENT, strict_delays=False)
         mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
 
         msg = _make_message()
@@ -297,7 +299,7 @@ class TestRetryAsync:
         async def capture_publish(env: MessageEnvelope) -> None:
             published.append(env)
 
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config, publish_async_fn=capture_publish)
 
         msg = _make_message()
@@ -323,7 +325,7 @@ class TestRetryAsync:
     @pytest.mark.asyncio
     async def test_async_permanent_raises_terminal(self) -> None:
         """Async: permanent error → terminal, re-raised."""
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config)
 
         msg = _make_message()
@@ -339,7 +341,7 @@ class TestRetryAsync:
     @pytest.mark.asyncio
     async def test_async_success_passes_through(self) -> None:
         """Async: successful handler returns normally."""
-        config = RetryConfig(max_retries=3, delays=(5,))
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config)
 
         msg = _make_message()
@@ -356,7 +358,7 @@ class TestRetryAsync:
 
 class TestRetryConfig:
     def test_config_property(self) -> None:
-        config = RetryConfig(max_retries=5)
+        config = RetryConfig(max_retries=5, strict_delays=False)
         mw = RetryMiddleware(config)
         assert mw.config is config
         assert mw.config.max_retries == 5
@@ -379,14 +381,14 @@ class TestRetryDelay:
 
     def test_delay_clamps_to_last(self) -> None:
         """Retry count beyond delays length clamps to last delay."""
-        config = RetryConfig(max_retries=10, delays=(5, 30), jitter_factor=0.0)
+        config = RetryConfig(max_retries=10, delays=(5, 30), jitter_factor=0.0, strict_delays=False)
         mw = RetryMiddleware(config)
 
         assert mw._compute_delay(5) == 30  # clamped to index 1
 
     def test_delay_with_jitter(self) -> None:
         """Jitter creates variation around base delay."""
-        config = RetryConfig(max_retries=3, delays=(100,), jitter_factor=0.5)
+        config = RetryConfig(max_retries=3, delays=(100,), jitter_factor=0.5, strict_delays=False)
         mw = RetryMiddleware(config)
 
         # With 50% jitter on delay=100, values should be in [50, 150]
@@ -522,7 +524,8 @@ class TestRetryPredicates:
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
         # ValueError is normally PERMANENT; the predicate marks it transient.
         mw = RetryMiddleware(
-            config, publish_fn=capture,
+            config,
+            publish_fn=capture,
             predicates=[lambda exc: isinstance(exc, ValueError)],
         )
         msg = _make_message()
@@ -532,6 +535,77 @@ class TestRetryPredicates:
 
         mw.consume_scope(handler, msg)
 
-        assert len(published) == 1                         # routed to a delay queue
+        assert len(published) == 1  # routed to a delay queue
         assert ".retry." in published[0].routing_key
-        assert msg._disposition == "acked"                # source acked, not DLQ'd
+        assert msg._disposition == "acked"  # source acked, not DLQ'd
+
+
+class TestMaxRetriesZero:
+    def test_transient_error_with_max_retries_0_is_terminal_sync(self) -> None:
+        """RetryConfig(max_retries=0): a transient error is immediately terminal
+        (marked and re-raised). No publish to a delay queue ever happens."""
+        published: list[MessageEnvelope] = []
+
+        def capture(env: MessageEnvelope) -> PublishOutcome:
+            published.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        config = RetryConfig(max_retries=0, delays=())
+        mw = RetryMiddleware(config, publish_fn=capture)
+        msg = _make_message()
+
+        def handler(m: RabbitMessage) -> None:
+            raise OSError("transient — but no retries allowed")
+
+        with pytest.raises(OSError):
+            mw.consume_scope(handler, msg)
+
+        # No delay-queue publish — message was terminal immediately
+        assert published == []
+        # Exception is marked terminal
+        try:
+            mw.consume_scope(handler, msg)
+        except OSError as exc:
+            assert getattr(exc, "_rabbitkit_terminal", False) is True
+
+    @pytest.mark.asyncio
+    async def test_transient_error_with_max_retries_0_is_terminal_async(self) -> None:
+        """RetryConfig(max_retries=0): async path — same immediate-terminal behavior."""
+        published: list[MessageEnvelope] = []
+
+        async def capture(env: MessageEnvelope) -> PublishOutcome:
+            published.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        config = RetryConfig(max_retries=0, delays=())
+        mw = RetryMiddleware(config, publish_async_fn=capture)
+        msg = _make_message()
+
+        async def handler(m: RabbitMessage) -> None:
+            raise OSError("transient — but no retries allowed")
+
+        with pytest.raises(OSError):
+            await mw.consume_scope_async(handler, msg)
+
+        assert published == []
+
+
+class TestRetryAsyncPublishFailure:
+    @pytest.mark.asyncio
+    async def test_async_delay_publish_failure_nacks_source(self) -> None:
+        """When async delay-queue publish returns a non-ok outcome, the source is nacked."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+
+        async def failing_publish(env: MessageEnvelope) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.NACKED)
+
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        mw = RetryMiddleware(config, publish_async_fn=failing_publish)
+        msg = _make_message()
+
+        async def handler(m: RabbitMessage) -> None:
+            raise ConnectionError("transient")
+
+        await mw.consume_scope_async(handler, msg)
+
+        assert msg._disposition == "nacked"

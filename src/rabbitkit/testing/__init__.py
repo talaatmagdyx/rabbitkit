@@ -15,6 +15,6 @@ Usage:
 """
 
 from rabbitkit.testing.app import TestApp
-from rabbitkit.testing.broker import TestBroker
+from rabbitkit.testing.broker import SettlementRecord, TestAsyncBroker, TestBroker
 
-__all__ = ["TestApp", "TestBroker"]
+__all__ = ["SettlementRecord", "TestApp", "TestAsyncBroker", "TestBroker"]

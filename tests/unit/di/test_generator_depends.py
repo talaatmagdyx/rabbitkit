@@ -358,11 +358,10 @@ class TestResolveAsyncGeneratorDepends:
 class TestGeneratorEdgeCases:
     """Edge cases for generator dependency lifecycle."""
 
-    def test_cleanup_exception_propagates(self) -> None:
-        """If generator cleanup raises, the exception propagates from scope.cleanup().
-
-        The current implementation does not suppress cleanup exceptions, so callers
-        (e.g. the pipeline) must handle them. This verifies the raw scope behavior.
+    def test_cleanup_exception_isolated(self) -> None:
+        """If a generator's teardown raises, the exception is logged and isolated —
+        ``scope.cleanup()`` does NOT re-raise (I-13: one misbehaving teardown must
+        not abort cleanup of the rest).
         """
 
         def gen_raises_on_cleanup():  # type: ignore[no-untyped-def]
@@ -375,8 +374,10 @@ class TestGeneratorEdgeCases:
         scope.add_sync_generator(gen)
         assert val == "value"
 
-        with pytest.raises(RuntimeError, match="cleanup failed!"):
-            scope.cleanup()
+        # Must not raise — teardown failure is logged and swallowed.
+        scope.cleanup()
+        # The scope was cleared regardless.
+        assert scope._sync_generators == []
 
     def test_generator_exception_before_yield(self) -> None:
         """If generator raises BEFORE yield, the original exception propagates
@@ -386,9 +387,7 @@ class TestGeneratorEdgeCases:
             raise ValueError("setup failure")
             yield "never reached"
 
-        def handler(
-            body: bytes, val: Annotated[str, Depends(gen_raises_before)]
-        ) -> None:
+        def handler(body: bytes, val: Annotated[str, Depends(gen_raises_before)]) -> None:
             pass
 
         msg = _make_message()
@@ -400,7 +399,8 @@ class TestGeneratorEdgeCases:
 
     def test_multiple_generators_partial_cleanup_failure(self) -> None:
         """If gen_b cleanup fails (reversed order, cleaned first), gen_a cleanup
-        does NOT run because the exception short-circuits the loop."""
+        STILL runs — teardown failures are isolated (I-13) and ``cleanup()``
+        does not re-raise."""
         order: list[str] = []
 
         def gen_a():  # type: ignore[no-untyped-def]
@@ -420,12 +420,11 @@ class TestGeneratorEdgeCases:
         next(gb)
         scope.add_sync_generator(gb)
 
-        with pytest.raises(RuntimeError, match="b cleanup failed"):
-            scope.cleanup()
+        # Reversed order: gen_b cleaned first (and raises), then gen_a — both run.
+        scope.cleanup()
 
-        # gen_b ran cleanup (reversed order), but gen_a did NOT because
-        # the exception from gen_b propagated before gen_a could be cleaned.
-        assert order == ["b-cleanup"]
+        assert order == ["b-cleanup", "a-cleanup"]
+        assert scope._sync_generators == []
 
     def test_use_cache_false_calls_generator_each_time(self) -> None:
         """Depends(gen_fn, use_cache=False) creates fresh generator per resolution."""
@@ -495,8 +494,9 @@ class TestGeneratorEdgeCases:
         assert cleaned == [True]
 
     @pytest.mark.asyncio
-    async def test_async_cleanup_exception_propagates(self) -> None:
-        """If async generator cleanup raises, exception propagates from cleanup_async()."""
+    async def test_async_cleanup_exception_isolated(self) -> None:
+        """If async generator cleanup raises, the exception is logged and isolated —
+        ``cleanup_async()`` does NOT re-raise (I-13)."""
 
         async def gen_raises_on_cleanup():  # type: ignore[no-untyped-def]
             yield "async-value"
@@ -508,13 +508,16 @@ class TestGeneratorEdgeCases:
         scope.add_async_generator(gen)
         assert val == "async-value"
 
-        with pytest.raises(RuntimeError, match="async cleanup failed!"):
-            await scope.cleanup_async()
+        # Must not raise — async teardown failure is logged and swallowed.
+        await scope.cleanup_async()
+        assert scope._async_generators == []
+        assert scope._sync_generators == []
 
     @pytest.mark.asyncio
     async def test_mixed_cleanup_one_fails(self) -> None:
         """Mixed sync+async generators: if the async generator cleanup fails,
-        the sync generator cleanup does NOT run because the exception propagates."""
+        the sync generator cleanup STILL runs — teardown failures are isolated
+        (I-13) and ``cleanup_async()`` does not re-raise."""
         order: list[str] = []
 
         def sync_gen():  # type: ignore[no-untyped-def]
@@ -534,8 +537,72 @@ class TestGeneratorEdgeCases:
         await ag.__anext__()
         scope.add_async_generator(ag)
 
-        with pytest.raises(RuntimeError, match="async cleanup failed"):
-            await scope.cleanup_async()
+        # Async generators cleaned first (and raises), then sync — both run.
+        await scope.cleanup_async()
 
-        # Async generators are cleaned first. The failure prevents sync cleanup.
-        assert order == ["async-cleanup"]
+        assert order == ["async-cleanup", "sync-cleanup"]
+        assert scope._async_generators == []
+        assert scope._sync_generators == []
+
+    # ── I-13 regression: teardown isolation ─────────────────────────────────
+
+    def test_i13_gen_a_teardown_raises_gen_b_still_closed(self) -> None:
+        """I-13: when gen A's teardown raises, gen B is still closed (its
+        post-yield teardown runs). Cleanup does not re-raise and ``clear()``
+        always runs.
+        """
+        events: list[str] = []
+
+        def gen_a():  # type: ignore[no-untyped-def]
+            yield "a"
+            events.append("a-cleanup")
+            raise RuntimeError("a teardown failed")
+
+        def gen_b():  # type: ignore[no-untyped-def]
+            yield "b"
+            events.append("b-cleanup")
+
+        scope = DependencyScope()
+        ga = gen_a()
+        next(ga)
+        scope.add_sync_generator(ga)  # added first
+        gb = gen_b()
+        next(gb)
+        scope.add_sync_generator(gb)  # added second → cleaned first (reversed)
+
+        # Must not raise despite gen_a's teardown raising.
+        scope.cleanup()
+
+        # Reversed order: gen_b cleaned first (post-yield ran), then gen_a
+        # (post-yield ran, then raised — caught + logged).
+        assert events == ["b-cleanup", "a-cleanup"]
+        assert scope._sync_generators == []
+
+    @pytest.mark.asyncio
+    async def test_i13_async_gen_raises_sync_still_closed_and_clear_runs(self) -> None:
+        """I-13: an async generator teardown raising must not skip the sync-gen
+        pass nor skip ``clear()`` on both lists."""
+        events: list[str] = []
+
+        def sync_gen():  # type: ignore[no-untyped-def]
+            yield "sync"
+            events.append("sync-cleanup")
+
+        async def async_gen():  # type: ignore[no-untyped-def]
+            yield "async"
+            events.append("async-cleanup")
+            raise RuntimeError("async teardown failed")
+
+        scope = DependencyScope()
+        sg = sync_gen()
+        next(sg)
+        scope.add_sync_generator(sg)
+        ag = async_gen()
+        await ag.__anext__()
+        scope.add_async_generator(ag)
+
+        await scope.cleanup_async()  # must not raise
+
+        assert events == ["async-cleanup", "sync-cleanup"]
+        assert scope._async_generators == []
+        assert scope._sync_generators == []

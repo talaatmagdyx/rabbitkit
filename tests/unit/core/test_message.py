@@ -309,3 +309,142 @@ class TestAsyncAlreadySettled:
         await msg.reject_async()  # should be a no-op
 
         reject_fn.assert_not_called()
+
+
+# ── ack-failure propagation (Core-H4) ─────────────────────────────────────
+# A failed settlement must RAISE and leave the message UNSETTLED, so the
+# recovery loop can redeliver instead of silently swallowing the failure.
+
+
+class TestAckFailurePropagation:
+    def test_sync_ack_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        def boom() -> None:
+            raise RuntimeError("channel closed")
+
+        msg._ack_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            msg.ack()
+
+        # disposition stayed pending — recovery loop can redeliver
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+    def test_sync_nack_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        def boom(_requeue: bool) -> None:
+            raise RuntimeError("channel closed")
+
+        msg._nack_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            msg.nack(requeue=True)
+
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+    def test_sync_reject_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        def boom(_requeue: bool) -> None:
+            raise RuntimeError("channel closed")
+
+        msg._reject_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            msg.reject(requeue=False)
+
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+    def test_failed_ack_then_retry_succeeds(self) -> None:
+        """After a failed ack leaves the message unsettled, a subsequent ack
+        (e.g. on redelivery) can succeed and settle it."""
+        msg = _make_message()
+        calls: list[str] = []
+
+        def flaky() -> None:
+            calls.append("called")
+            if len(calls) == 1:
+                raise RuntimeError("transient")
+
+        msg._ack_fn = flaky
+        with pytest.raises(RuntimeError, match="transient"):
+            msg.ack()
+        assert msg.is_settled is False
+
+        # Second attempt succeeds → disposition set
+        msg.ack()
+        assert msg.is_settled is True
+        assert msg._disposition == "acked"
+
+    @pytest.mark.asyncio
+    async def test_async_ack_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        async def boom() -> None:
+            raise RuntimeError("channel closed")
+
+        msg._ack_async_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            await msg.ack_async()
+
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+    @pytest.mark.asyncio
+    async def test_async_nack_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        async def boom(_requeue: bool) -> None:
+            raise RuntimeError("channel closed")
+
+        msg._nack_async_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            await msg.nack_async(requeue=True)
+
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+    @pytest.mark.asyncio
+    async def test_async_reject_failure_raises_and_leaves_unsettled(self) -> None:
+        msg = _make_message()
+
+        async def boom(_requeue: bool) -> None:
+            raise RuntimeError("channel closed")
+
+        msg._reject_async_fn = boom
+
+        with pytest.raises(RuntimeError, match="channel closed"):
+            await msg.reject_async(requeue=False)
+
+        assert msg.is_settled is False
+        assert msg._disposition == "pending"
+
+
+class TestAsyncNoSettlementFn:
+    @pytest.mark.asyncio
+    async def test_ack_async_no_fn_raises(self) -> None:
+        """ack_async raises RuntimeError when no async or sync fn is set."""
+        msg = RabbitMessage(body=b"x", routing_key="q")
+        with pytest.raises(RuntimeError, match="Cannot async-ack"):
+            await msg.ack_async()
+
+    @pytest.mark.asyncio
+    async def test_nack_async_no_fn_raises(self) -> None:
+        """nack_async raises RuntimeError when no async or sync fn is set."""
+        msg = RabbitMessage(body=b"x", routing_key="q")
+        with pytest.raises(RuntimeError, match="Cannot async-nack"):
+            await msg.nack_async()
+
+    @pytest.mark.asyncio
+    async def test_reject_async_no_fn_raises(self) -> None:
+        """reject_async raises RuntimeError when no async or sync fn is set."""
+        msg = RabbitMessage(body=b"x", routing_key="q")
+        with pytest.raises(RuntimeError, match="Cannot async-reject"):
+            await msg.reject_async()

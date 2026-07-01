@@ -1,44 +1,30 @@
 # rabbitkit
 
-Production-grade RabbitMQ toolkit for Python -- sync (pika) and async (aio-pika) support.
+RabbitMQ-first production toolkit for Python — safe retries, dead-letter queues,
+explicit ack policies, topology validation, testing without RabbitMQ, and
+Kubernetes-ready lifecycle management.
 
-Decorator-based routing, middleware pipeline, retry with delay queues, compression, dependency injection, RPC, circuit breaker, deduplication, backpressure, batch operations, worker pools, and full configurability.
+**Docs:** [Message Safety](docs/message-safety.md) · [Retry & DLQ](docs/retry-and-dlq.md) · [Ack Policies](docs/ack-policy.md) · [Ordering](docs/ordering-guarantees.md) · [Kubernetes](docs/kubernetes.md) · [Security](docs/security.md) · [Comparison](docs/comparison.md) · [Roadmap](docs/roadmap.md)
 
-## Features
+## Core features
 
 - **Decorator-based routing** -- `@broker.subscriber(queue=..., exchange=..., routing_key=...)`
-- **Modular routers** -- `RabbitRouter` with prefix, shared exchange, middleware, and `include_router`
-- **Subscriber filtering** -- `filter_fn=` to reject messages before deserialization
-- **Middleware pipeline** -- exception handling, error classification, retry, compression, tracing, deduplication, circuit breaker, rate limiting, signing, timeout
-- **Retry with delay queues** -- TTL + DLX topology, configurable backoff with jitter, per-queue isolation
-- **Compression** -- gzip (built-in) and zstd (optional) with automatic content-encoding headers
-- **Dependency injection** -- `Depends()`, `Header()`, `Path()`, `Context()` parameter markers with generator support
-- **Serialization** -- JSON (built-in), msgspec (optional), pydantic (optional), two-stage pipeline
-- **Pydantic auto-validation** -- body type hints trigger automatic `model_validate()` during deserialization
-- **RPC** -- `RPCClient` / `AsyncRPCClient` with direct reply-to; `broker.request()` shorthand
-- **Error classification** -- transient vs permanent errors with configurable routing
+- **Sync + Async** -- `SyncBroker` (pika) and `AsyncBroker` (aio-pika) with identical APIs
+- **Retry with delay queues** -- TTL + DLX topology, configurable backoff, per-queue isolation
+- **Dead-letter queues** -- automatic DLQ routing after max retries, CLI inspect/replay
+- **Explicit ack policies** -- `AUTO`, `MANUAL`, `NACK_ON_ERROR`, `ACK_FIRST`
 - **Publisher confirms** -- optional delivery confirmation with `PublishOutcome`
-- **Topology management** -- `AUTO_DECLARE`, `PASSIVE_ONLY`, `MANUAL` modes
-- **Connection pooling** -- separate publisher/consumer connections, channel pools
-- **Backpressure** -- `FlowController` with in-flight limits, rate limiting, connection.blocked handling
-- **Batch operations** -- `BatchPublisher` for buffered publishes, `BatchAcker` for multi-ack
-- **Worker pools** -- `SyncWorkerPool` (thread pool) and `AsyncWorkerPool` (semaphore-based) concurrency
-- **Circuit breaker** -- `CircuitBreakerMiddleware` for fail-fast rejection on cascading failures
-- **Deduplication** -- `DeduplicationMiddleware` for idempotent processing via Redis
-- **Distributed locking** -- `LockMiddleware` + `RedisLock` for single-consumer guarantee
-- **Tracing** -- `TracedConsumerMiddleware` with OpenTelemetry semantic attributes (obskit integration)
-- **Structured logging** -- `LoggingConfig` activates structlog with per-message context binding
-- **Env-based config** -- `RabbitSettings` loads `RABBITMQ_*` env vars via pydantic-settings
-- **Result backends** -- `ResultMiddleware` + `RedisResultBackend` for fire-and-retrieve pattern
-- **AsyncAPI docs** -- `generate_asyncapi_doc()` produces AsyncAPI 2.6.0 spec from broker routes
-- **Management API** -- `RabbitManagementClient` for queue/exchange/connection inspection
-- **Monitoring dashboard** -- `create_dashboard_app()` Starlette ASGI dashboard
-- **CLI** -- `rabbitkit run/health/topology/shell` commands
-- **Hot reload** -- `rabbitkit run --reload` restarts on file changes (watchfiles)
-- **DLQ inspector** -- peek, replay, and purge dead-letter queues
-- **FastAPI integration** -- `rabbitkit_lifespan()` async context manager
-- **App lifecycle** -- startup/shutdown hooks, signal handling, state tracking
+- **Topology management** -- `AUTO_DECLARE`, `PASSIVE_ONLY`, `MANUAL` modes + CLI validate/diff/apply
 - **Testing** -- `TestBroker` (in-memory, no RabbitMQ needed), `TestApp`, pytest fixtures
+- **Health checks** -- liveness and readiness endpoints for Kubernetes
+- **Structured logging** -- structlog with per-message context binding
+- **Serialization** -- JSON, msgspec, Pydantic auto-validation, two-stage pipeline
+- **Middleware pipeline** -- retry, compression, deduplication, rate-limiting, signing, timeout
+- **Dependency injection** -- `Depends()`, `Header()`, `Path()`, `Context()` markers
+- **FastAPI integration** -- `rabbitkit_lifespan()` async context manager
+
+**Advanced (see [experimental](docs/stability-policy.md)):** RPC, distributed locking, circuit breaker,
+result backends, management dashboard, AsyncAPI schema generation.
 
 ## Installation
 
@@ -79,6 +65,89 @@ pip install rabbitkit[all]
 Requires **Python >= 3.11**.
 
 ## Quick Start
+
+### 1. Install
+
+```bash
+pip install rabbitkit[async]   # AsyncBroker (aio-pika)
+pip install rabbitkit[sync]    # SyncBroker  (pika)
+pip install rabbitkit[all]     # everything
+```
+
+### 2. Create a consumer
+
+```python
+from rabbitkit import RabbitConfig, AsyncBroker
+
+broker = AsyncBroker(RabbitConfig())
+
+@broker.subscriber(queue="orders")
+async def handle_order(body: dict) -> None:
+    print(f"order id={body['id']}")
+
+await broker.start()
+```
+
+### 3. Publish a message
+
+```python
+await broker.publish(
+    exchange="orders",
+    routing_key="orders",
+    body={"id": 42, "item": "widget"},
+)
+```
+
+### 4. Add retry and DLQ
+
+```python
+from rabbitkit import RetryConfig
+
+@broker.subscriber(
+    queue="orders",
+    retry=RetryConfig(max_retries=3, delays=(5, 30, 120)),
+)
+async def handle_order(body: dict) -> None:
+    ...   # retried on transient errors; dead-lettered after 3 failures
+```
+
+See [Retry & DLQ guide](docs/retry-and-dlq.md) for the full topology, error classification, and DLQ replay.
+
+### 5. Test without RabbitMQ
+
+```python
+from rabbitkit.testing import TestBroker
+
+def test_order_handler():
+    broker = TestBroker()
+
+    @broker.subscriber(queue="orders")
+    def handle(body: dict) -> None:
+        assert body["id"] == 42
+
+    broker.start()
+    broker.publish("orders", b'{"id": 42}')
+    broker.stop()
+```
+
+### 6. Run in FastAPI
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from rabbitkit.integrations.fastapi import rabbitkit_lifespan
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with rabbitkit_lifespan(broker):
+        yield
+
+app = FastAPI(lifespan=lifespan)
+```
+
+See the [Kubernetes guide](docs/kubernetes.md) for liveness/readiness probes, graceful shutdown, and pod manifests.
+
+---
 
 ### Sync Example
 
@@ -139,7 +208,7 @@ config = RabbitConfig(
     consumer=ConsumerConfig(...),
     pool=PoolConfig(...),
     topology_mode=TopologyMode.AUTO_DECLARE,
-    retry=RetryConfig(...),         # None = no retry middleware
+    retry=RetryConfig(...),         # broker-wide retry+DLQ (None = disabled). Auto-installs RetryMiddleware.
     compression=CompressionConfig(...),  # None = no compression
 )
 ```
@@ -159,7 +228,7 @@ conn = ConnectionConfig(
     vhost="/production",             # default: "/"
     heartbeat=30,                    # default: 30 seconds
     socket_timeout=10.0,             # default: 10.0 seconds
-    blocked_connection_timeout=300.0,# default: 300.0 seconds
+    blocked_connection_timeout=60.0,# default: 60.0 seconds (k8s-friendly: fail fast on a blocked connection)
     connection_name="order-service", # default: None
     reconnect_backoff_base=1.0,      # default: 1.0 seconds
     reconnect_backoff_max=30.0,      # default: 30.0 seconds
@@ -246,8 +315,10 @@ from rabbitkit import PoolConfig
 
 pool = PoolConfig(
     channel_pool_size=10,         # default: 10
-    publisher_connections=1,      # default: 1
-    consumer_connections=1,       # default: 1
+    publisher_connections=1,      # default: 1  (reserved)
+    consumer_connections=1,       # default: 1  (reserved)
+    channel_acquire_timeout=10.0, # default: 10.0 s — raises TimeoutError on pool exhaustion
+    prewarm_channels=False,       # default: False — set True to pre-create all channels on connect()
 )
 ```
 
@@ -261,12 +332,13 @@ from rabbitkit.core.types import ErrorSeverity
 
 retry = RetryConfig(
     max_retries=4,                              # default: 4
-    delays=(5, 30, 120, 600),                   # seconds per attempt
+    delays=(5, 30, 120, 600),                   # seconds per attempt (must have >= max_retries entries)
     retry_header="x-rabbitkit-retry-count",     # default header name
     jitter_factor=0.1,                          # default: 0.1 (10%)
     dead_letter_exchange="",                    # default: ""
     per_queue=True,                             # default: True (isolated delay queues)
     unknown_policy=ErrorSeverity.PERMANENT,     # default: treat unknown errors as permanent
+    strict_delays=True,                         # default: True — raises ValueError if len(delays) < max_retries
 )
 ```
 
@@ -431,6 +503,13 @@ Middleware is applied as a chain. The outermost middleware runs first on receive
 > markers are auto-detected per handler — no setup needed. Handlers without markers
 > use a zero-overhead fast path (body + `RabbitMessage` injection). Pass a custom
 > `di_resolver=` to the broker only if you need to override resolution.
+>
+> **Public exports:** `Depends`, `Header`, `Path`, `Context`, `ContextRepo`,
+> `DIResolver`, and `DependencyScope` are all re-exported from the top-level
+> `rabbitkit` package (`from rabbitkit import Depends, Header, Path, Context`).
+> `ConfigurationError` (raised for invalid handler/route/retry configuration at
+> registration time) is exported from `rabbitkit.core.errors` and the top-level
+> package.
 
 ### Depends()
 
@@ -517,14 +596,36 @@ exc_mw.add_handler(ValueError, lambda exc: {"error": str(exc)})
 
 Routes failed messages to delay queues using TTL + DLX topology. Errors are classified as transient (retryable) or permanent (sent to DLQ).
 
+**You normally do not construct this yourself.** Setting `retry=` on the broker
+config or a subscriber both declares the delay/DLQ topology **and** installs
+`RetryMiddleware` on the route automatically (as the outermost middleware):
+
+```python
+broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=4, delays=(5, 30, 120, 600))))
+
+@broker.subscriber(queue="orders")            # inherits broker-wide retry
+def handle(order: Order) -> None: ...
+
+@broker.subscriber(queue="reports", retry=RetryConfig(max_retries=2, delays=(10, 60)))
+def handle_report(r: Report) -> None: ...      # per-route override
+```
+
+Construct it manually only for advanced cases (custom error `predicates`). If you
+add a `RetryMiddleware` to `middlewares=[...]` yourself, the broker detects it and
+does **not** add a second one:
+
 ```python
 from rabbitkit.middleware.retry import RetryMiddleware
 from rabbitkit import RetryConfig
 
 retry_mw = RetryMiddleware(
     config=RetryConfig(max_retries=4, delays=(5, 30, 120, 600)),
-    publish_fn=transport.publish,
+    predicates=[lambda exc: getattr(exc, "status", None) == 503],  # classify by HTTP status
 )
+
+@broker.subscriber(queue="orders", retry=RetryConfig(max_retries=4, delays=(5, 30, 120, 600)),
+                   middlewares=[retry_mw])     # retry= still declares topology; your mw is reused
+def handle(order: Order) -> None: ...
 ```
 
 Delay queue topology (per_queue=True):
@@ -706,9 +807,53 @@ if await fc.acquire_async(timeout=5.0):
     await fc.release_async()
 ```
 
-### BatchPublisher
+### AsyncBatchPublisher (broker-integrated)
+
+Transparent batch publish for `AsyncBroker`. Pass `batch_config` to the broker
+constructor — every `broker.publish()` call is automatically coalesced into
+batches. Each batch is published on a single dedicated channel with all confirms
+gathered concurrently, dramatically reducing the per-message confirm cost at high
+concurrency.
+
+```python
+from rabbitkit import AsyncBroker, BatchPublishConfig, PoolConfig, RabbitConfig
+
+broker = AsyncBroker(
+    RabbitConfig(
+        pool=PoolConfig(
+            channel_pool_size=32,   # one channel per flush worker + headroom for retry
+            prewarm_channels=True,  # pre-create all channels on connect() to eliminate warmup jitter
+        ),
+    ),
+    batch_config=BatchPublishConfig(
+        batch_size=64,              # max messages per batch (default 100)
+        flush_interval_ms=5,        # max wait for a batch to fill (default 50)
+        max_in_flight=1000,         # max queued publishes (default 1000)
+        flush_workers=0,            # 0 = auto: min(16, max_in_flight // batch_size)
+                                    # broker further caps at pool_size // 2
+    ),
+)
+await broker.start()
+
+# broker.publish() is transparently batched — API is identical to normal usage
+await broker.publish(routing_key="orders", body=b"...")
+```
+
+**Tuning notes:**
+- `flush_workers` auto-computes as `min(16, max_in_flight // batch_size)` but is
+  automatically capped at `pool_size // 2` by the broker to always leave channel
+  slots available for retry middleware and direct publishes.
+- `prewarm_channels=True` eliminates the first-publish warmup latency spike by
+  pre-opening all pool channels during `broker.start()`.
+- Each flush worker holds one channel for its entire lifetime (no acquire/release
+  overhead per batch). On confirm timeout the worker detects the closed channel
+  and re-acquires automatically.
+
+### BatchPublisher (low-level, sync/async)
 
 Buffer outgoing envelopes and flush as a batch with optional delivery confirmation.
+This is the lower-level building block; prefer `AsyncBroker(batch_config=...)` for
+the async path.
 
 ```python
 from rabbitkit import BatchPublisher, BatchPublishConfig
@@ -818,6 +963,16 @@ await client.close()
 
 Each call gets a unique `correlation_id` for response matching. `RPCTimeoutError` is raised if the response is not received within the timeout.
 
+`amq.rabbitmq.reply-to` is a broker pseudo-queue with three hard AMQP rules the
+transport handles for you: no `Queue.Declare` is ever issued against it, its
+consumer is always no-ack (the broker auto-acks each reply), and every request
+carrying `reply_to=amq.rabbitmq.reply-to` is published on the exact same
+channel that registered the reply consumer (RabbitMQ rejects the publish
+otherwise with `PRECONDITION_FAILED - fast reply consumer does not exist`).
+This is validated end-to-end against a real broker in
+[`test_sync_rpc_via_real_rpc_client`](https://github.com/talaatmagdy/rabbitkit/blob/main/tests/integration/test_real_rabbitmq.py)
+and its async counterpart — see [Real-broker integration tests](#real-broker-integration-tests).
+
 ## DLQ Inspector
 
 Inspect and recover messages from dead-letter queues.
@@ -888,6 +1043,123 @@ assert app.state == AppState.RUNNING
 def is_healthy() -> bool:
     return app.state == AppState.RUNNING
 ```
+
+## Running in Kubernetes
+
+rabbitkit consumers run well in Kubernetes with a small amount of probe and
+shutdown wiring. The two key ideas:
+
+- **Liveness** — "is the process alive?" Restart the pod only if the process is
+  wedged (deadlock, infinite loop). Do **not** tie liveness to the RabbitMQ
+  connection: a transient broker outage would then kill every consumer pod at
+  once and cause a thundering-herd reconnect. Liveness should be a cheap,
+  process-level check.
+:
+- **Readiness** — "is this pod ready to receive traffic / take work?" Use
+  `broker_readiness(broker)` (or `await broker_readiness_async(broker)`). It is
+  unhealthy when the broker is unreachable, the connection is down, or the active
+  consumer count doesn't match the route count — so the pod is removed from the
+  load balancer, but the pod stays alive and keeps trying to reconnect.
+- **Liveness** — "should k8s restart this pod?" Use `broker_liveness(broker)`
+  (or `await broker_liveness_async(broker)`). It only fails on a wedged process,
+  NOT on a transient broker disconnect, so a RabbitMQ maintenance window does
+  NOT trigger cascading pod restarts. Both helpers are exported from
+  `rabbitkit` and `rabbitkit.health`. (The original `broker_health_check`
+  remains for a single tri-state result.)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-consumer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-consumer
+  template:
+    metadata:
+      labels:
+        app: order-consumer
+    spec:
+      terminationGracePeriodSeconds: 60   # must exceed graceful_timeout + drain margin
+      containers:
+        - name: consumer
+          image: myregistry/order-consumer:0.7.2
+          ports:
+            - containerPort: 8080              # health/metrics endpoint
+          envFrom:
+            - secretRef:
+                name: rabbitmq-credentials    # RABBITMQ_USER, RABBITMQ_PASSWORD
+            - configMapRef:
+                name: rabbitkit-config         # RABBITMQ_HOST, RABBITMQ_PORT, ...
+          env:
+            # Fail fast on a blocked connection instead of appearing healthy
+            # for minutes while publishes stall. Matches ConnectionConfig default.
+            - name: RABBITMQ_BLOCKED_CONNECTION_TIMEOUT
+              value: "60"
+          # Probes — see the liveness-vs-readiness note above.
+          startupProbe:                         # give slow startup room before liveness kicks in
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:                       # process-alive; do NOT bind to the broker connection
+            httpGet:
+              path: /healthz/live
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:                      # broker-connected + consumers active
+            httpGet:
+              path: /healthz/ready
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          # Let in-flight handlers drain before the SIGTERM path completes.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-consumer-pdb
+spec:
+  minAvailable: 1                  # keep at least one consumer up during node drains
+  selector:
+    matchLabels:
+      app: order-consumer
+```
+
+### Shutdown wiring
+
+- **Sync consumers** should use `broker.run(worker_config=…)`, which blocks on
+  the consume loop and installs a safe SIGTERM handler on a daemon thread
+  that triggers `broker.stop()` (cancels consumers and drains the worker pool
+  within `ConsumerConfig.graceful_timeout`). Do **not** wire
+  `signal.signal(signal.SIGTERM, lambda *_: broker.stop())` yourself: a
+  `signal.signal` handler runs in a signal context where it is **not
+  async-signal-safe** — `broker.stop()` performs threading and I/O (channel
+  closes, futures) that can deadlock the interpreter. `RabbitApp.run_async()`
+  installs SIGINT/SIGTERM handlers for the async lifecycle the same safe way
+  (via the running loop's `add_signal_handler`).
+- **Async** consumers: `RabbitApp.run_async()` starts the app, waits for
+  SIGINT/SIGTERM, and stops cleanly. `broker.stop()` cancels consumers and
+  drains in-flight work; `terminationGracePeriodSeconds` must exceed
+  `graceful_timeout` + the `preStop` sleep, or Kubernetes SIGKILLs the pod
+  mid-message (safe because handlers are idempotent under at-least-once
+  delivery, but noisy — so size the grace period generously).
+- See `deploy/consumer.yaml` for a full reference manifest.
 
 ## FastAPI Integration
 
@@ -986,6 +1258,36 @@ def test_with_lifecycle():
     # async with TestApp(rabbit_app, broker) as ta:
     #     await broker.publish_async("orders", b'...')
 ```
+
+### Real-broker integration tests
+
+`TestBroker` is an in-memory fake -- it never talks AMQP, so it can't catch a
+bug in the real transport layer or the RabbitMQ topology itself (this is how
+retry-with-backoff being unwired from the pipeline slipped through: `TestBroker`
+originally didn't reproduce that wiring either). `tests/integration/` covers
+that gap by running the full stack (`SyncBroker`/`AsyncBroker` + real
+pika/aio-pika) against an **actual RabbitMQ broker**, using
+[testcontainers](https://testcontainers-python.readthedocs.io/) to start and
+tear down a disposable `rabbitmq:3.13-management-alpine` container per test
+module -- no manually-managed broker required.
+
+Run locally (needs Docker running; auto-skips otherwise):
+
+```bash
+pip install -e ".[integration]"   # adds testcontainers[rabbitmq] + docker
+pytest tests/integration/ -m integration -v
+```
+
+Run a single scenario, e.g. the retry-exhaustion-to-DLQ test:
+
+```bash
+pytest tests/integration/test_real_rabbitmq.py::test_async_retry_exhaustion_to_dlq -m integration -v
+```
+
+These tests are gating in CI on every PR (`.github/workflows/ci.yml`, `integration`
+job) and re-run nightly against a fresh image (`.github/workflows/integration.yml`).
+Both jobs just need Docker available on the runner -- GitHub-hosted `ubuntu-latest`
+runners have it by default -- testcontainers manages the broker container itself.
 
 ## Topology
 

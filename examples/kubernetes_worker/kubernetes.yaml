@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-worker
+  labels:
+    app: orders-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orders-worker
+  template:
+    metadata:
+      labels:
+        app: orders-worker
+    spec:
+      # Give SIGTERM time to drain in-flight messages before the pod is killed.
+      # Must be > ConsumerConfig.graceful_timeout (30s here) + preStop sleep (10s).
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: worker
+          image: your-registry/orders-worker:latest
+          command: ["python", "worker.py"]
+
+          env:
+            - name: RABBITMQ_HOST
+              value: "rabbitmq.default.svc.cluster.local"
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: username
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: password
+            - name: QUEUE_NAME
+              value: "orders"
+            - name: PREFETCH_COUNT
+              value: "20"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          # Liveness: fail only if the process is truly wedged (stuck I/O loop).
+          # A temporary RabbitMQ disconnect should NOT fail liveness.
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+          # Readiness: fail when not connected or consumers not active.
+          # This removes the pod from service endpoints while reconnecting.
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+
+          lifecycle:
+            # Give Kubernetes time to remove this pod from endpoint slices
+            # before SIGTERM arrives. Without this, in-flight requests can
+            # still arrive at a pod that is already draining.
+            preStop:
+              exec:
+                command: ["sleep", "10"]
+
+          ports:
+            - containerPort: 8080
+              name: health

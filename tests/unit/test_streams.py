@@ -183,3 +183,11 @@ class TestStreamConsumerConfig:
         config = StreamConsumerConfig()
         with pytest.raises(AttributeError):
             config.offset = StreamOffset.first()  # type: ignore[misc]
+
+
+class TestStreamOffsetTimestampValidation:
+    def test_timestamp_offset_requires_datetime(self) -> None:
+        """TIMESTAMP offset raises TypeError when value is not a datetime."""
+        offset = StreamOffset(type=StreamOffsetType.TIMESTAMP, value="not-a-datetime")
+        with pytest.raises(TypeError, match="TIMESTAMP stream offset requires a datetime"):
+            offset.to_consume_arguments()

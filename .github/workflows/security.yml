@@ -1,11 +1,14 @@
-# Dependency vulnerability scanning + static analysis (H15).
+# Dependency vulnerability scanning + static analysis (H15) + SBOM (§B).
 #
 # - `pip-audit` checks installed dependencies against the OSV/PyPA advisory
 #   databases and fails the job on a known vulnerability.
 # - CodeQL performs static analysis on the Python source for common
 #   security issues (injection, unsafe deserialization, etc.).
+# - pip-audit's own CycloneDX exporter produces a software bill of materials
+#   (every installed dependency + version) as a build artifact, generated
+#   only after the audit step above passes.
 #
-# Both run on every push/PR to main and on a weekly schedule so a newly
+# All run on every push/PR to main and on a weekly schedule so a newly
 # disclosed CVE in an existing dependency is caught even without a code
 # change.
 name: Security
@@ -35,6 +38,12 @@ jobs:
         run: |
           uv pip install pip-audit
           .venv/bin/python -m pip_audit --strict
+      - name: Generate SBOM (CycloneDX)
+        run: .venv/bin/python -m pip_audit --format=cyclonedx-json --output=sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
 
   codeql:
     runs-on: ubuntu-latest

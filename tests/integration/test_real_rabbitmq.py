@@ -498,6 +498,54 @@ async def test_async_retry_count_header_spoofing_clamped(rabbitmq_url: str) -> N
     await broker.stop()
 
 
+async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbitmq_url: str) -> None:
+    """H6: a filter_fn rejection on a route with no retry and no manually
+    configured DLX must not silently discard the message.
+
+    Before the fix, filter_fn returning False settled the message with
+    nack(requeue=False); with no dead-letter-exchange configured (only wired
+    automatically when retry is enabled), RabbitMQ would just drop it. The
+    fix auto-declares a "<queue>.dlq" DLQ and wires the source queue's DLX to
+    it whenever a route has filter_fn but no retry and no manual DLX — this
+    proves the rejected message actually lands there on a real broker.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.types import MessageEnvelope
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    handler_called = asyncio.Event()
+    dead_lettered_bodies: list[bytes] = []
+    dead_lettered = asyncio.Event()
+
+    def reject_everything(msg: object) -> bool:
+        return False  # filter_fn rejects every message
+
+    @broker.subscriber(queue="integ-h6-filter-q", filter_fn=reject_everything)
+    async def handle(body: bytes) -> None:
+        # Must never be called — the message is filtered before the handler.
+        handler_called.set()
+
+    @broker.subscriber(queue="integ-h6-filter-q.dlq")
+    async def on_dlq(body: bytes) -> None:
+        dead_lettered_bodies.append(body)
+        dead_lettered.set()
+
+    with pytest.warns(RuntimeWarning, match="auto-declared 'integ-h6-filter-q.dlq'"):
+        await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(MessageEnvelope(routing_key="integ-h6-filter-q", body=b"filtered-payload"))
+
+    await asyncio.wait_for(dead_lettered.wait(), timeout=20.0)
+
+    assert dead_lettered_bodies == [b"filtered-payload"]
+    assert not handler_called.is_set(), "filter_fn must reject before the handler ever runs"
+
+    await broker.stop()
+
+
 async def test_async_worker_pool_concurrent_messages(rabbitmq_url: str) -> None:
     """Multiple messages are processed concurrently via WorkerConfig(worker_count=4)."""
     from rabbitkit.async_.broker import AsyncBroker

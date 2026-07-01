@@ -242,6 +242,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count dead-letters on the very first delivery (no retry happens at all) and
   a spoofed negative count clamps to 0 and retries through the real,
   declared `retry.1` delay queue rather than being silently dropped.
+- **Filter-rejected messages could be silently lost with no DLX (H6, high)**
+  — `filter_fn` returning `False` settles the message with
+  `nack(requeue=False)`, which relies on a dead-letter-exchange to preserve
+  it. A DLX was only ever wired onto the source queue when retry was
+  enabled (`RetryRouter` sets it as part of the retry topology); a route
+  with `filter_fn` but no retry and no manually-configured
+  `dead_letter_exchange` had no DLX at all, so RabbitMQ just discarded the
+  rejected message — no error, no trace, one filtered message is enough to
+  hit it (no retries needed). Both brokers' `_declare_topology()` now
+  auto-declare a `<queue>.dlq` and wire the source queue's DLX to it
+  whenever a route has `filter_fn` set, retry is disabled, and no manual
+  `dead_letter_exchange` is already set — a route with retry enabled, or one
+  that already configured its own DLX, is left untouched (no double-DLQ, no
+  override of a user's own routing). A `RuntimeWarning` is emitted noting the
+  auto-declared queue name, so the extra topology isn't a surprise.
+  Validated against a real broker: a filter that rejects every message on a
+  route with no retry now reliably lands the rejected body in the
+  auto-declared DLQ instead of vanishing.
 
 ### Performance
 

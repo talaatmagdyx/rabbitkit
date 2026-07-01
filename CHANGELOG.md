@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SyncBroker.pump_idle(time_limit=0.05)`** — a **publish-only** broker (no
+  registered routes, or one that never calls `run()`/`start_consuming()`)
+  had nothing driving `process_data_events()` on its single shared
+  connection: `run()`'s consume loop is what incidentally keeps that
+  connection's heartbeats serviced (see `sync/transport.py`'s one-connection
+  model), so a broker that only ever calls `publish()` could sit idle long
+  enough to get heartbeat-timed-out broker-side, only discovering (and
+  reconnecting from) the dead connection on the *next* publish attempt.
+  Call `pump_idle()` periodically from your own idle loop, on the same
+  thread that called `start()`, to reconnect proactively if the connection
+  died, service pending heartbeat frames, and refresh the liveness
+  heartbeat (`health.broker_liveness`) even though no message was
+  delivered. Backed by a new `SyncTransport.ensure_connected()` (a
+  no-op-if-already-connected public wrapper for the existing
+  `_ensure_connected()`, unlike `reconnect()` which unconditionally tears
+  down and rebuilds). The async broker needs no equivalent: `AsyncBroker`
+  already establishes both the publisher and consumer connections eagerly
+  via `aio_pika.connect_robust()`, which runs its own heartbeat-sending and
+  reconnection logic as an independent asyncio task — no manual pump is
+  possible or necessary there. Covered by new unit tests (no-op before
+  `start()`; calls `ensure_connected()` before `pump()`, in that order;
+  refreshes `last_heartbeat`). Regression-verified by reverting and
+  confirming all 6 new tests fail (`AttributeError` on the now-missing
+  `pump_idle`/`ensure_connected`).
+
 ## [1.1.0] — 2026-07-01
 
 ### Added

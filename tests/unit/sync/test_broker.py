@@ -165,6 +165,68 @@ class TestLifecycle:
         assert broker.last_heartbeat == first + 100.0
 
 
+class TestPumpIdle:
+    """pump_idle(): idle keep-alive for a publish-only (no active consume
+    loop) broker -- reconnects if dead, services pending I/O, refreshes
+    the liveness heartbeat."""
+
+    def _start_broker(self) -> SyncBroker:
+        broker = SyncBroker()
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+        return broker
+
+    def test_pump_idle_before_start_is_noop(self) -> None:
+        broker = SyncBroker()
+        broker.pump_idle()  # must not raise
+
+    def test_pump_idle_calls_ensure_connected_and_pump(self) -> None:
+        broker = self._start_broker()
+        assert broker._transport is not None
+
+        with (
+            patch.object(broker._transport, "ensure_connected") as mock_ensure,
+            patch.object(broker._transport, "pump") as mock_pump,
+        ):
+            broker.pump_idle(time_limit=0.02)
+
+        mock_ensure.assert_called_once()
+        mock_pump.assert_called_once_with(0.02)
+
+    def test_pump_idle_refreshes_liveness_heartbeat(self) -> None:
+        """A publish-only broker with no consume loop must still see its
+        liveness heartbeat advance when pump_idle() is called."""
+        broker = self._start_broker()
+        first = broker.last_heartbeat
+        assert first is not None
+
+        with patch("rabbitkit.sync.broker.time") as mock_time:
+            mock_time.monotonic.return_value = first + 100.0
+            broker.pump_idle()
+
+        assert broker.last_heartbeat == first + 100.0
+
+    def test_pump_idle_reconnects_dead_connection(self) -> None:
+        """ensure_connected() is called before pump() -- a dead connection
+        is reconnected proactively rather than only on the next publish."""
+        broker = self._start_broker()
+        assert broker._transport is not None
+
+        order: list[str] = []
+        with (
+            patch.object(broker._transport, "ensure_connected", side_effect=lambda: order.append("ensure")),
+            patch.object(broker._transport, "pump", side_effect=lambda t: order.append("pump")),
+        ):
+            broker.pump_idle()
+
+        assert order == ["ensure", "pump"]
+
+
 # ── Config ───────────────────────────────────────────────────────────────
 
 

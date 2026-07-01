@@ -340,6 +340,16 @@ class SyncTransport:
         self.disconnect()
         self._ensure_connected()
 
+    def ensure_connected(self) -> None:
+        """Public wrapper for :meth:`_ensure_connected` (idle-pump support).
+
+        Unlike :meth:`reconnect`, this is a no-op if already connected —
+        cheap to call on every tick of an idle-pump loop (see
+        ``SyncBroker.pump_idle``). Reconnects (bounded backoff) only when
+        the connection or channel is actually dead.
+        """
+        self._ensure_connected()
+
     def _run_on_io_thread(
         self,
         fn: Callable[[], _T],

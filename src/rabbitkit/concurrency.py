@@ -151,6 +151,10 @@ class SyncWorkerPool:
         self._config = config or WorkerConfig()
         self._executor: _DaemonWorkerPool | None = None
         self._futures: set[concurrent.futures.Future[Any]] = set()
+        # H12: message associated with each in-flight future, so a future
+        # abandoned at the stop_timeout deadline can be logged by delivery
+        # tag/message id instead of just a bare count.
+        self._future_messages: dict[concurrent.futures.Future[Any], RabbitMessage] = {}
         self._futures_lock = threading.Lock()
 
     @property
@@ -216,6 +220,25 @@ class SyncWorkerPool:
                 _done, not_done = concurrent.futures.wait(not_done, timeout=min(poll, remaining))
             pump()  # final drain in case the last ack was just marshaled
         if not_done:
+            # H12: identify WHICH deliveries were abandoned (delivery_tag /
+            # message_id), not just a count — the handler thread keeps
+            # running (daemon, not killed) and may still ack/nack/produce
+            # side effects later, so operators need to be able to correlate
+            # an abandoned delivery with what shows up (or doesn't) downstream.
+            with self._futures_lock:
+                abandoned = [self._future_messages.get(f) for f in not_done]
+            for message in abandoned:
+                if message is None:
+                    # Not tracked — e.g. a future submitted directly via the
+                    # underlying executor rather than through submit().
+                    continue
+                logger.warning(
+                    "SyncWorkerPool: handler for delivery_tag=%s message_id=%s did not "
+                    "complete within stop_timeout; abandoning (its daemon thread keeps "
+                    "running — ensure handlers are idempotent under at-least-once delivery)",
+                    message.delivery_tag,
+                    message.message_id,
+                )
             logger.warning(
                 "SyncWorkerPool: %d tasks did not complete within timeout; "
                 "abandoning (daemon threads will not block process exit)",
@@ -227,6 +250,7 @@ class SyncWorkerPool:
         self._executor = None
         with self._futures_lock:
             self._futures.clear()
+            self._future_messages.clear()
         logger.info("SyncWorkerPool stopped")
 
     def submit(
@@ -247,6 +271,7 @@ class SyncWorkerPool:
         future = self._executor.submit(callback, message)
         with self._futures_lock:
             self._futures.add(future)
+            self._future_messages[future] = message
         # Self-cleaning: O(1) add + discard instead of rebuilding the list
         # on every message. Callback fires on the worker thread (or inline if
         # already done) and removes the future under the lock.
@@ -255,6 +280,7 @@ class SyncWorkerPool:
     def _discard_future(self, future: concurrent.futures.Future[Any]) -> None:
         with self._futures_lock:
             self._futures.discard(future)
+            self._future_messages.pop(future, None)
 
     @property
     def pending_count(self) -> int:
@@ -282,6 +308,10 @@ class AsyncWorkerPool:
         self._config = config or WorkerConfig()
         self._semaphore: asyncio.Semaphore | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        # H12: message behind each task, so a task abandoned at the
+        # stop_timeout deadline can be nacked (redelivery) and logged by
+        # delivery tag/message id instead of just cancelled and forgotten.
+        self._task_messages: dict[asyncio.Task[None], RabbitMessage] = {}
         self._running = False
 
     @property
@@ -306,25 +336,58 @@ class AsyncWorkerPool:
         the deadline are cancelled and awaited once more so their
         ``CancelledError`` is consumed rather than leaking as "Task was
         destroyed but it is pending" warnings.
+
+        H12: a task cancelled by the deadline is *not* guaranteed to have
+        reached its own ``ack``/``nack`` — ``CancelledError`` is a
+        ``BaseException``, so it skips right past the pipeline's
+        ``except Exception`` handling and the message is left unsettled.
+        Rather than leave that to the implicit requeue-on-unacked-channel-close
+        behavior when the transport eventually disconnects, any message still
+        unsettled after a task is abandoned is nacked (requeue) here and
+        logged by delivery tag — an explicit, immediate, observable
+        redelivery instead of an implicit one.
         """
         self._running = False
         if not self._tasks:
             return
         effective = timeout if timeout is not None else self._config.stop_timeout
         tasks = list(self._tasks)
+        task_messages = dict(self._task_messages)
         try:
             async with asyncio.timeout(effective):
                 await asyncio.gather(*tasks, return_exceptions=True)
         except TimeoutError:
             # Deadline elapsed: cancel any still-running tasks and drain them
             # so cancellation propagates cleanly (no pending-task warnings).
+            # In practice `asyncio.timeout` firing cancels this method's own
+            # await of gather(), and gather's cancellation handling already
+            # cancels + drains every task before re-raising -- so `not_done`
+            # is normally empty by the time we get here; this loop is a
+            # defensive backstop, not the primary abandonment path.
             not_done = [t for t in tasks if not t.done()]
             for task in not_done:  # pragma: no cover — gather already drains before raising
                 task.cancel()  # pragma: no cover
             if not_done:  # pragma: no cover
                 await asyncio.gather(*not_done, return_exceptions=True)  # pragma: no cover
+            for message in task_messages.values():
+                if message.is_settled:
+                    continue  # handler reached its own ack/nack before being cut off
+                logger.warning(
+                    "AsyncWorkerPool: handler for delivery_tag=%s message_id=%s did not "
+                    "complete within stop_timeout; abandoning (task cancelled) and nacking "
+                    "for redelivery — ensure handlers are idempotent under at-least-once delivery",
+                    message.delivery_tag,
+                    message.message_id,
+                )
+                try:
+                    await message.nack_async(requeue=True)
+                except Exception:
+                    logger.warning(
+                        "nack on abandoned handler's message raised", exc_info=True
+                    )
         finally:
             self._tasks.clear()
+            self._task_messages.clear()
         logger.info("AsyncWorkerPool stopped")
 
     async def submit(
@@ -336,9 +399,27 @@ class AsyncWorkerPool:
 
         If worker_count=1, runs directly (no semaphore).
         Otherwise, acquires semaphore slot before executing.
+
+        H12: refuses (nacks for redelivery) instead of scheduling an unawaited
+        task when the pool isn't running — e.g. a delivery callback firing
+        after ``stop()`` already cleared ``_tasks``. Nothing would ever await
+        that task, so it would silently race the event loop's own shutdown
+        instead of the message being cleanly settled.
         """
         if self._semaphore is None:
             await callback(message)
+            return
+
+        if not self._running:
+            logger.warning(
+                "AsyncWorkerPool.submit() called while stopped (delivery_tag=%s, "
+                "message_id=%s); nacking for redelivery instead of orphaning an "
+                "unawaited task",
+                message.delivery_tag,
+                message.message_id,
+            )
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
             return
 
         semaphore = self._semaphore
@@ -349,7 +430,12 @@ class AsyncWorkerPool:
 
         task = asyncio.create_task(_run())
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._task_messages[task] = message
+        task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        self._task_messages.pop(task, None)
 
     @property
     def pending_count(self) -> int:

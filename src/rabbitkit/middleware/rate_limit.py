@@ -50,6 +50,7 @@ Use both together for full end-to-end flow control:
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -57,6 +58,8 @@ from typing import Any
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,14 +129,43 @@ class RateLimitMiddleware(BaseMiddleware):
     - "wait": Sleep until a token is available (default)
     - "nack": Reject message with requeue=True (another consumer can try)
     - "drop": Reject message with requeue=False (message is lost/goes to DLQ)
+
+    L5 — per-process scoping: the token bucket lives in this process's
+    memory. With ``worker_count`` > 1 consumer processes/pods sharing a
+    queue, each gets its own independent bucket — the effective CLUSTER
+    rate is ``workers x max_rate``, not ``max_rate``. Size ``max_rate``
+    accordingly, or put a cluster-wide limiter in front (e.g. a
+    Redis-backed token bucket) if you need a hard global cap. Under
+    sustained overload, "wait" blocks for up to ``_wait_deadline`` (30s by
+    default) before falling back to a drop (nack, no requeue) — every
+    nack/drop/wait-timeout is logged at WARNING and, if you pass
+    ``metrics_collector``, increments ``rate_limit_dropped_total`` labeled
+    by ``reason`` so sustained overload is observable instead of silent.
     """
 
-    def __init__(self, config: RateLimitConfig) -> None:
+    def __init__(
+        self,
+        config: RateLimitConfig,
+        *,
+        metrics_collector: Any | None = None,
+        metrics_config: Any | None = None,
+    ) -> None:
         self._config = config
         self._bucket = _TokenBucket(config.max_rate, config.burst)
         # Maximum time (s) a "wait" policy will block for a token before falling
         # back to drop semantics. Override per-instance if needed.
         self._wait_deadline: float = 30.0
+        self._metrics_collector = metrics_collector
+        self._metrics_config = metrics_config
+
+    def _record_drop(self, reason: str) -> None:
+        """L5: log + optional metric every time a message is settled without
+        the handler running, so sustained rate-limit pressure is observable."""
+        logger.warning("RateLimitMiddleware dropped a message (reason=%s)", reason)
+        if self._metrics_collector is not None and self._metrics_config is not None:
+            self._metrics_collector.inc_counter(
+                self._metrics_config.rate_limit_dropped_total, {"reason": reason}
+            )
 
     def consume_scope(
         self,
@@ -151,10 +183,12 @@ class RateLimitMiddleware(BaseMiddleware):
             return call_next(message)
 
         if self._config.on_limited == "nack":
+            self._record_drop("nack")
             if not message.is_settled:
                 message.nack(requeue=True)
             return None
         if self._config.on_limited == "drop":
+            self._record_drop("drop")
             if not message.is_settled:
                 message.nack(requeue=False)
             return None
@@ -166,6 +200,7 @@ class RateLimitMiddleware(BaseMiddleware):
             if remaining <= 0:
                 # No token within the deadline — fall back to drop semantics so
                 # the handler is NOT called without a token.
+                self._record_drop("wait_deadline_exceeded")
                 if not message.is_settled:
                     message.nack(requeue=False)
                 return None
@@ -188,10 +223,12 @@ class RateLimitMiddleware(BaseMiddleware):
             return await call_next(message)
 
         if self._config.on_limited == "nack":
+            self._record_drop("nack")
             if not message.is_settled:
                 await message.nack_async(requeue=True)
             return None
         if self._config.on_limited == "drop":
+            self._record_drop("drop")
             if not message.is_settled:
                 await message.nack_async(requeue=False)
             return None
@@ -201,6 +238,7 @@ class RateLimitMiddleware(BaseMiddleware):
         while not self._bucket.try_acquire():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._record_drop("wait_deadline_exceeded")
                 if not message.is_settled:
                     await message.nack_async(requeue=False)
                 return None

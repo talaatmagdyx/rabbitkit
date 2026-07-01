@@ -371,6 +371,81 @@ async def test_async_mandatory_publish_to_nonexistent_binding_returns_returned(
     await broker.stop()
 
 
+async def test_async_publish_without_confirms_reports_sent_not_confirmed(rabbitmq_url: str) -> None:
+    """M4: a non-mandatory publish with confirm_delivery=False must report
+    SENT, not CONFIRMED -- the broker never actually acknowledged it, even
+    though the message is genuinely delivered (this proves the fast path
+    still works end-to-end against a real broker, just honestly labeled)."""
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import PublisherConfig
+    from rabbitkit.core.types import MessageEnvelope, PublishStatus
+
+    received: list[bytes] = []
+    done = asyncio.Event()
+
+    config = _make_async_config(rabbitmq_url, publisher=PublisherConfig(confirm_delivery=False))
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue="integ-m4-sent-q")
+    async def handle(body: bytes) -> None:
+        received.append(body)
+        done.set()
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    outcome = await broker.publish(MessageEnvelope(routing_key="integ-m4-sent-q", body=b"fire-and-forget"))
+
+    assert outcome.status == PublishStatus.SENT
+    assert outcome.ok  # not a failure -- just not broker-confirmed
+
+    await asyncio.wait_for(done.wait(), timeout=15.0)
+    assert received == [b"fire-and-forget"]
+    await broker.stop()
+
+
+async def test_async_declare_queue_precondition_failed_raises_configuration_error(
+    rabbitmq_url: str,
+) -> None:
+    """M6: starting a broker whose queue declaration conflicts with an
+    existing queue's arguments (e.g. ops tooling declared it as a quorum
+    queue; rabbitkit's default is classic) must fail with a typed,
+    actionable ConfigurationError -- not an opaque low-level channel-closed
+    traceback -- against a REAL broker's actual 406 response.
+    """
+    import pika
+
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.errors import ConfigurationError
+
+    queue_name = "integ-m6-precondition-q"
+
+    # Pre-declare the queue as a quorum queue via a raw pika connection --
+    # simulating an ops-created queue with different arguments than
+    # whatever rabbitkit would declare (classic, by default).
+    params = pika.URLParameters(rabbitmq_url)
+    conn = pika.BlockingConnection(params)
+    channel = conn.channel()
+    channel.queue_declare(queue=queue_name, durable=True, arguments={"x-queue-type": "quorum"})
+    conn.close()
+
+    broker = AsyncBroker(config=_make_async_config(rabbitmq_url))
+
+    @broker.subscriber(queue=queue_name)
+    async def handle(body: bytes) -> None:  # pragma: no cover - never reached
+        pass
+
+    try:
+        with pytest.raises(ConfigurationError, match=queue_name):
+            await broker.start()
+    finally:
+        # Clean up the quorum queue so a re-run doesn't hit a stale artifact.
+        cleanup_conn = pika.BlockingConnection(params)
+        cleanup_channel = cleanup_conn.channel()
+        cleanup_channel.queue_delete(queue=queue_name)
+        cleanup_conn.close()
+
+
 async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
     """A TRANSIENT failure is retried through the delay queue, then dead-lettered.
 
@@ -415,6 +490,65 @@ async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
     await asyncio.wait_for(dead_lettered.wait(), timeout=20.0)
 
     assert call_count == 2, f"expected original + 1 retry = 2 handler calls, got {call_count}"
+    await broker.stop()
+
+
+async def test_async_retry_routes_back_through_topic_bound_queue(rabbitmq_url: str) -> None:
+    """M5: a delay queue's dead-letter-on-expiry must reach a source queue
+    that is bound to its real exchange via a topic PATTERN, not by its own
+    literal name.
+
+    Before the fix, the delay queue dead-lettered to the source's real
+    exchange using the source queue's NAME as the routing key
+    (``x-dead-letter-exchange=<source_exchange>``,
+    ``x-dead-letter-routing-key=<source_queue_name>``). A queue bound with
+    ``routing_key="orders.*.created"`` is never bound with routing key
+    ``"integ-m5-topic-src"`` (its own name) on a topic exchange, so that
+    routing key matches nothing — the retried message vanishes after the
+    delay instead of coming back, and the handler is only ever called once
+    (no second attempt, no dead-letter to the DLQ either). The fix
+    dead-letters via the DEFAULT exchange instead, which always delivers
+    directly to a queue by name regardless of its other bindings.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import RetryConfig
+    from rabbitkit.core.topology import RabbitExchange
+    from rabbitkit.core.types import ExchangeType, MessageEnvelope
+
+    call_count = 0
+    retried = asyncio.Event()
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    topic_exchange = RabbitExchange(name="integ-m5-topic-ex", type=ExchangeType.TOPIC)
+    retry_cfg = RetryConfig(max_retries=1, delays=(1,))
+
+    @broker.subscriber(
+        queue="integ-m5-topic-src",
+        exchange=topic_exchange,
+        routing_key="orders.*.created",  # pattern binding -- NOT the queue's own name
+        retry=retry_cfg,
+    )
+    async def handle(body: bytes) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise TimeoutError("transient outage")  # engages the one configured retry
+        retried.set()  # only reached if the delay-queue dead-letter routed back
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(
+        MessageEnvelope(
+            routing_key="orders.us.created", body=b"m5-msg", exchange="integ-m5-topic-ex"
+        )
+    )
+
+    await asyncio.wait_for(retried.wait(), timeout=20.0)
+
+    assert call_count == 2, f"expected original + 1 successful retry = 2 handler calls, got {call_count}"
     await broker.stop()
 
 
@@ -546,6 +680,86 @@ async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbit
     await broker.stop()
 
 
+async def test_async_dedup_retry_composition_does_not_drop_retried_message(rabbitmq_url: str) -> None:
+    """H8's exact spec: [dedup(on_success), retry] — dedup OUTER of retry —
+    a handler that fails once (transient) then succeeds must actually be
+    processed on the retry delivery, not dropped as a duplicate.
+
+    RetryMiddleware swallows the handler's transient failure (requeues to a
+    delay queue, acks the source) rather than raising, so from
+    DeduplicationMiddleware's point of view — sitting OUTER of retry here —
+    call_next(message) returns normally either way. Without checking for
+    REQUEUED_FOR_RETRY, dedup would mark the message processed on the FAILED
+    first attempt, so the real retry delivery (same dedup key — message_id
+    is preserved across the retry envelope) would be dropped as a duplicate
+    and never actually processed.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import DeduplicationConfig, RetryConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.deduplication import DeduplicationMiddleware
+    from rabbitkit.middleware.retry import RetryMiddleware
+
+    class _FakeAsyncRedis:
+        """Duck-typed in-memory stand-in for a real async redis client —
+        DeduplicationMiddleware only needs .set(nx=True, ex=...)/.delete()."""
+
+        def __init__(self) -> None:
+            self._store: dict[str, str] = {}
+
+        async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+            if nx and key in self._store:
+                return None
+            self._store[key] = value
+            return True
+
+        async def delete(self, key: str) -> None:
+            self._store.pop(key, None)
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    redis = _FakeAsyncRedis()
+    dedup_mw = DeduplicationMiddleware(redis_client=redis, config=DeduplicationConfig(key_source="message_id"))
+    retry_cfg = RetryConfig(max_retries=2, delays=(1, 1))
+    # publish_async_fn=broker.publish resolves broker._transport lazily at
+    # call time, after broker.start() has already run — mirrors what
+    # _wire_retry_middleware would wire up automatically for an
+    # auto-installed RetryMiddleware, but that auto-wiring only ever
+    # inserts retry OUTERMOST, which can't reproduce dedup-outer-of-retry.
+    retry_mw = RetryMiddleware(retry_cfg, publish_async_fn=broker.publish)
+
+    call_count = 0
+    processed_bodies: list[bytes] = []
+    processed = asyncio.Event()
+
+    # dedup listed FIRST (outer), retry SECOND (inner) — the exact
+    # problematic composition H8 describes. retry= still declares the
+    # delay-queue/DLQ topology; middlewares=[...] supplies our own
+    # RetryMiddleware instance instead of letting the broker auto-wire one
+    # (which would always place it outermost).
+    @broker.subscriber(queue="integ-h8-dedup-retry-q", retry=retry_cfg, middlewares=[dedup_mw, retry_mw])
+    async def handle(body: bytes) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise TimeoutError("transient outage")  # transient -> retry requeues
+        processed_bodies.append(body)
+        processed.set()
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(MessageEnvelope(routing_key="integ-h8-dedup-retry-q", body=b"h8-payload"))
+
+    await asyncio.wait_for(processed.wait(), timeout=20.0)
+
+    assert call_count == 2, "expected one failed attempt + one successful retry attempt"
+    assert processed_bodies == [b"h8-payload"], "message must be processed exactly once, not dropped"
+
+    await broker.stop()
+
+
 async def test_async_worker_pool_concurrent_messages(rabbitmq_url: str) -> None:
     """Multiple messages are processed concurrently via WorkerConfig(worker_count=4)."""
     from rabbitkit.async_.broker import AsyncBroker
@@ -650,6 +864,67 @@ async def test_async_stop_drains_cleanly_under_load(rabbitmq_url: str) -> None:
         f"{len(processed_first)} (first) + {len(processed_second)} (follow-up) = "
         f"{len(set(all_processed))} unique"
     )
+
+
+async def test_async_worker_pool_abandoned_handler_is_nacked_for_redelivery(rabbitmq_url: str) -> None:
+    """H12's exact spec: a handler that outlives ``stop_timeout`` — with a
+    pre-ack side effect already recorded — must result in redelivery, not
+    silent loss.
+
+    ``AsyncWorkerPool.stop()`` cancels a task still running past the
+    deadline; before the fix, that was a bare cancel with nothing guaranteeing
+    the message ever got settled (``CancelledError`` is a ``BaseException``,
+    so the pipeline's ``except Exception`` handling never sees it and never
+    acks/nacks). The message would eventually be requeued only implicitly,
+    when the connection closes and RabbitMQ auto-requeues its unacked
+    deliveries — this test proves it happens explicitly and promptly via the
+    H12 fix's own nack(requeue=True), by observing a follow-up consumer
+    receive the same message right after ``stop()`` returns, without relying
+    on a fresh connection/channel cycle.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import WorkerConfig
+    from rabbitkit.core.types import MessageEnvelope
+
+    side_effects: list[bytes] = []
+    handler_started = asyncio.Event()
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue="integ-h12-abandon-q")
+    async def handle(body: bytes) -> None:
+        side_effects.append(body)  # the "pre-ack side effect" H12 refers to
+        handler_started.set()
+        await asyncio.sleep(5.0)  # far longer than stop_timeout below
+
+    await broker.start(worker_config=WorkerConfig(worker_count=2, stop_timeout=0.3))
+    await asyncio.sleep(0.3)
+
+    await broker.publish(MessageEnvelope(routing_key="integ-h12-abandon-q", body=b"slow-msg"))
+    await asyncio.wait_for(handler_started.wait(), timeout=10.0)
+
+    await broker.stop(timeout=0.3)  # abandons the still-sleeping handler
+
+    assert side_effects == [b"slow-msg"], "the side effect should have run before abandonment"
+
+    # Redelivery proof: a follow-up consumer on the same queue must receive
+    # the message again — it must not be permanently lost.
+    redelivered: list[bytes] = []
+    done = asyncio.Event()
+
+    broker2 = AsyncBroker(config=config)
+
+    @broker2.subscriber(queue="integ-h12-abandon-q")
+    async def handle2(body: bytes) -> None:
+        redelivered.append(body)
+        done.set()
+
+    await broker2.start()
+    await asyncio.wait_for(done.wait(), timeout=15.0)
+    await broker2.stop()
+
+    assert redelivered == [b"slow-msg"]
 
 
 async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
@@ -873,6 +1148,64 @@ async def test_async_rpc_via_broker_request_shorthand(rabbitmq_url: str) -> None
     assert response.body == b"via-request"
 
     await broker.stop()
+
+
+async def test_async_run_joins_drain_of_slow_in_flight_handler(rabbitmq_url: str) -> None:
+    """H11's exact spec: a SIGTERM-equivalent shutdown during a slow in-flight
+    handler under ``broker.run()`` (not ``RabbitApp``) must be joined — the
+    handler must fully complete and ack before the coroutine returns.
+
+    Before the fix, ``AsyncBroker`` had no ``run()``: ``_on_signal`` only
+    ever did an unawaited ``loop.create_task(self.stop())``, so nothing
+    guaranteed the drain finished before whatever coroutine was driving the
+    event loop (e.g. the coroutine passed to ``asyncio.run()``) returned —
+    ``asyncio.run()`` cancels outstanding tasks once its coroutine finishes,
+    which could cut the drain (and this slow handler) short. ``request_shutdown()``
+    triggers the same path a real SIGINT/SIGTERM would via ``_trigger_shutdown()``,
+    without needing an actual OS signal (matching the existing SIGTERM-style
+    tests in this file for the sync broker).
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.types import MessageEnvelope
+
+    handler_started = asyncio.Event()
+    handler_done = asyncio.Event()
+    processed: list[bytes] = []
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue="integ-h11-run-drain")
+    async def handle(body: bytes) -> None:
+        handler_started.set()
+        await asyncio.sleep(0.5)  # slow enough to still be in-flight at shutdown
+        processed.append(body)
+        handler_done.set()
+
+    run_task = asyncio.ensure_future(broker.run())
+    try:
+        for _ in range(200):
+            if broker._run_waiting:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("broker.run() never reached the shutdown wait")
+
+        await broker.publish(
+            MessageEnvelope(routing_key="integ-h11-run-drain", body=b"slow-message")
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=10.0)
+
+        broker.request_shutdown()  # SIGTERM-equivalent while the handler is in-flight
+
+        await asyncio.wait_for(run_task, timeout=10.0)
+    finally:
+        if not run_task.done():  # pragma: no cover - safety net if the test fails early
+            run_task.cancel()
+
+    assert handler_done.is_set(), "run() returned before the in-flight handler finished"
+    assert processed == [b"slow-message"]
+    assert broker._started is False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1209,6 +1542,84 @@ def test_sync_sigterm_mid_flight_drain_acks_run_on_owner_thread(rabbitmq_url: st
     # threads, regardless of whether it acked before or during the drain.
     assert ack_thread_idents, "expected at least one ack to have been issued"
     assert set(ack_thread_idents) == {owner_ident_holder[0]}
+
+
+def test_sync_timeout_middleware_no_double_settle_or_channel_corruption(rabbitmq_url: str) -> None:
+    """H9's exact spec: a sync handler that sleeps past
+    TimeoutMiddleware's deadline and THEN acks itself must not corrupt the
+    pika channel or double-settle the message.
+
+    TimeoutMiddleware runs the handler in a background thread; on timeout
+    the consumer (owner) thread gives up and settles the message itself
+    (AUTO policy -> nack(requeue=True) for the TRANSIENT-classified
+    HandlerTimeoutError) while the abandoned background thread is still
+    running. When that thread eventually finishes and calls msg.ack()
+    itself, that attempt must be discarded — never touching the channel
+    directly from a non-owner thread. Proven end-to-end against a real
+    broker: the connection/channel must stay healthy throughout (no
+    StreamLostError/protocol violation), the redelivered message must be
+    processed exactly once more, and a follow-up publish+consume on the
+    SAME connection afterward must still work.
+    """
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.timeout import TimeoutConfig, TimeoutMiddleware
+    from rabbitkit.sync.broker import SyncBroker
+
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config)
+
+    timeout_mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=0.3))
+    call_count = 0
+    abandoned_ack_attempted = threading.Event()
+
+    @broker.subscriber(queue="integ-h9-timeout-q", middlewares=[timeout_mw])
+    def handle(body: bytes, msg: RabbitMessage) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            time.sleep(0.6)  # exceed the 0.3s deadline -> thread is abandoned
+            msg.ack()  # abandoned thread's own self-ack -- must be discarded
+            abandoned_ack_attempted.set()
+        # Second delivery (after nack+requeue): finishes fast, AUTO acks it.
+
+    broker.start()
+    assert broker._transport is not None
+
+    broker.publish(MessageEnvelope(routing_key="integ-h9-timeout-q", body=b"h9-payload"))
+
+    deadline = time.monotonic() + 15.0
+    while call_count < 2 and time.monotonic() < deadline:
+        broker._transport._connection.process_data_events(time_limit=0.2)
+
+    assert call_count == 2, "expected the timed-out delivery plus one redelivery"
+
+    # Wait for the abandoned thread to actually reach its self-ack attempt
+    # (it may still be sleeping at this point — bound the wait generously).
+    assert abandoned_ack_attempted.wait(timeout=5.0), "background thread never reached its self-ack"
+
+    # No channel corruption: the connection must still be usable. Prove it
+    # conclusively with one more real publish + consume round trip.
+    assert broker._transport.is_connected()
+
+    follow_up: list[bytes] = []
+
+    @broker.subscriber(queue="integ-h9-timeout-followup-q")
+    def handle_followup(body: bytes) -> None:
+        follow_up.append(body)
+
+    broker._declare_topology()
+    broker._start_consumer(broker.routes[-1])
+
+    broker.publish(MessageEnvelope(routing_key="integ-h9-timeout-followup-q", body=b"still-healthy"))
+
+    deadline2 = time.monotonic() + 10.0
+    while not follow_up and time.monotonic() < deadline2:
+        broker._transport._connection.process_data_events(time_limit=0.2)
+
+    assert follow_up == [b"still-healthy"], "channel must still work after the settlement race"
+
+    broker.stop()
 
 
 def test_sync_recover_consumers_resubscribes(rabbitmq_url: str) -> None:

@@ -21,7 +21,7 @@ import json
 from typing import Any
 
 from rabbitkit import ConnectionConfig, MessageEnvelope, RabbitConfig
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 from rabbitkit.fastapi import rabbitkit_lifespan
 from rabbitkit.health import broker_health_check_async
 

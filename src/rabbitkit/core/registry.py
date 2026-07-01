@@ -15,13 +15,18 @@ and validates retry + ack policy + DLX config compatibility.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.route import ResultPublisher, RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
+from rabbitkit.serialization.base import Serializer
+
+if TYPE_CHECKING:
+    from rabbitkit.core.router import RabbitRouter
+    from rabbitkit.middleware.base import BaseMiddleware
 
 
 class DuplicateRouteError(Exception):
@@ -52,8 +57,8 @@ class SubscriberRegistry:
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
         ack_policy: AckPolicy = AckPolicy.AUTO,
-        middlewares: list[Any] | None = None,
-        serializer: Any | None = None,
+        middlewares: list[BaseMiddleware] | None = None,
+        serializer: Serializer[Any] | None = None,
         retry: RetryConfig | RetryDisabled | None = None,
         tags: frozenset[str] | set[str] | None = None,
         description: str = "",
@@ -177,12 +182,15 @@ class SubscriberRegistry:
 
         return decorator
 
-    def include_router(self, router: Any, prefix: str = "") -> None:
+    def include_router(self, router: RabbitRouter, prefix: str = "") -> None:
         """Include routes from a RabbitRouter.
 
         Applies the router's prefix to routing keys and merges
         router-level defaults (exchange, middlewares, serializer, tags).
         """
+        # Duck-typed check retained despite the static RabbitRouter annotation:
+        # this is a public entry point Python won't enforce the type on at
+        # runtime, and a clear TypeError beats an opaque AttributeError below.
         if not hasattr(router, "_registry"):
             raise TypeError(f"Expected a RabbitRouter, got {type(router).__name__}")
 

@@ -177,6 +177,45 @@ class TestTopology:
         channel.declare_queue.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_declare_queue_precondition_failed_raises_configuration_error(self) -> None:
+        """M6: a 406 PRECONDITION_FAILED (e.g. an ops-created queue with
+        different arguments) must raise a typed ConfigurationError naming
+        the conflicting queue -- not an opaque aio-pika channel-closed error."""
+        import aio_pika.exceptions
+
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        channel.declare_queue.side_effect = aio_pika.exceptions.ChannelPreconditionFailed(
+            406, "PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'orders'"
+        )
+
+        queue = RabbitQueue(name="orders")
+        with pytest.raises(ConfigurationError, match="orders") as exc_info:
+            await transport.declare_queue(queue)
+
+        assert "PRECONDITION_FAILED" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, aio_pika.exceptions.ChannelPreconditionFailed)
+
+    @pytest.mark.asyncio
+    async def test_declare_exchange_precondition_failed_raises_configuration_error(self) -> None:
+        """M6: same as the queue case, for exchange declaration."""
+        import aio_pika.exceptions
+
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        channel.declare_exchange.side_effect = aio_pika.exceptions.ChannelPreconditionFailed(
+            406, "PRECONDITION_FAILED - inequivalent arg 'type' for exchange 'events'"
+        )
+
+        exchange = RabbitExchange(name="events")
+        with pytest.raises(ConfigurationError, match="events"):
+            await transport.declare_exchange(exchange)
+
+    @pytest.mark.asyncio
     async def test_declare_queue_passive_mode(self) -> None:
         transport = _make_transport(topology_mode=TopologyMode.PASSIVE_ONLY)
         channel = await self._connect_transport(transport)
@@ -1006,6 +1045,19 @@ class TestBlockedUnblockedCallbacks:
         transport = _make_transport()
         transport._aio_unblocked()  # should not raise
 
+    def test_is_blocked_tracked_without_any_callback(self) -> None:
+        """L15: is_blocked reflects connection.blocked/unblocked frames even
+        with zero on_blocked/on_unblocked callbacks registered -- health.py
+        reads this directly when no FlowController is wired."""
+        transport = _make_transport()
+        assert transport.is_blocked is False
+
+        transport._aio_blocked()
+        assert transport.is_blocked is True
+
+        transport._aio_unblocked()
+        assert transport.is_blocked is False
+
 
 # ── async context manager ─────────────────────────────────────────────────
 
@@ -1347,7 +1399,7 @@ class TestPublishFastPath:
                         )
 
         assert len(ensure_called) == 1
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
 
     @pytest.mark.asyncio
     async def test_publish_no_confirm_fast_path(self) -> None:
@@ -1373,7 +1425,7 @@ class TestPublishFastPath:
                 mock_msg_cls.return_value = MagicMock()
                 outcome = await transport.publish(envelope)
 
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
         mock_exchange.publish.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1394,7 +1446,7 @@ class TestPublishFastPath:
                 mock_msg_cls.return_value = MagicMock()
                 outcome = await transport.publish(envelope)
 
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
         mock_fast_ch.get_exchange.assert_not_called()
         mock_exchange.publish.assert_called_once()
 
@@ -1496,7 +1548,7 @@ class TestReplyToChannelAffinity:
                 mock_msg_cls.return_value = MagicMock()
                 outcome = await transport.publish(envelope)
 
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
         reply_channel.basic_publish.assert_not_called()
         mock_exchange.publish.assert_called_once()
 
@@ -1523,7 +1575,7 @@ class TestReplyToChannelAffinity:
                 mock_msg_cls.return_value = MagicMock()
                 outcome = await transport.publish(envelope)
 
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
         reply_channel.basic_publish.assert_not_called()
         mock_exchange.publish.assert_called_once()
 

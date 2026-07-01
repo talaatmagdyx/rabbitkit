@@ -122,6 +122,11 @@ class RabbitMessage:
         """True if the message has been acked, nacked, or rejected."""
         return self._disposition != "pending"
 
+    @property
+    def disposition(self) -> str:
+        """Final settlement state: "pending", "acked", "nacked", or "rejected" (M2)."""
+        return self._disposition
+
     # ── Sync settlement ───────────────────────────────────────────────────
 
     def ack(self) -> None:

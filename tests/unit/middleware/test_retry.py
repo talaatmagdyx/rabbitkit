@@ -251,6 +251,124 @@ class TestRetryTerminal:
         assert not msg.is_settled
 
 
+# ── M2: retried/dead-lettered metrics ─────────────────────────────────────
+
+
+class TestRetryMetrics:
+    def test_successful_retry_emits_messages_retried_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+        mw = RetryMiddleware(
+            config,
+            publish_fn=lambda env: None,
+            metrics_collector=collector,
+            metrics_config=MetricsConfig(),
+        )
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders-queue"})
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("connection lost")
+
+        mw.consume_scope(failing_handler, msg)
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_messages_retried_total", {"queue": "orders-queue"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_retry_async_emits_messages_retried_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=3, delays=(5, 30, 120))
+
+        async def publish_async(env: MessageEnvelope) -> None:
+            return None
+
+        mw = RetryMiddleware(
+            config,
+            publish_async_fn=publish_async,
+            metrics_collector=collector,
+            metrics_config=MetricsConfig(),
+        )
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders-queue"})
+
+        async def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("connection lost")
+
+        await mw.consume_scope_async(failing_handler, msg)
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_messages_retried_total", {"queue": "orders-queue"}
+        )
+
+    def test_permanent_error_emits_messages_dead_lettered_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
+        mw = RetryMiddleware(config, metrics_collector=collector, metrics_config=MetricsConfig())
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders-queue"})
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ValueError("bad payload")
+
+        with pytest.raises(ValueError):
+            mw.consume_scope(failing_handler, msg)
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue"}
+        )
+
+    def test_exhausted_retries_emits_messages_dead_lettered_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=2, delays=(5, 30))
+        mw = RetryMiddleware(config, metrics_collector=collector, metrics_config=MetricsConfig())
+        msg = _make_message(
+            headers={"x-rabbitkit-retry-count": 2, "x-rabbitkit-original-queue": "orders-queue"}
+        )
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("still failing")
+
+        with pytest.raises(ConnectionResetError):
+            mw.consume_scope(failing_handler, msg)
+
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue"}
+        )
+
+    def test_no_metrics_config_is_noop(self) -> None:
+        """Without metrics_collector/metrics_config wired, no metric call is
+        attempted -- must not raise."""
+        config = RetryConfig(max_retries=1, delays=(5,))
+        mw = RetryMiddleware(config, publish_fn=lambda env: None)
+        msg = _make_message()
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("lost")
+
+        mw.consume_scope(failing_handler, msg)  # must not raise
+
+    def test_metrics_config_without_collector_is_noop(self) -> None:
+        """metrics_config set but metrics_collector None (e.g. a no-op-mode
+        MetricsMiddleware) -- _record_metric itself must no-op, not raise."""
+        from rabbitkit.core.config import MetricsConfig
+
+        config = RetryConfig(max_retries=1, delays=(5,))
+        mw = RetryMiddleware(config, publish_fn=lambda env: None, metrics_config=MetricsConfig())
+        msg = _make_message()
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ConnectionResetError("lost")
+
+        mw.consume_scope(failing_handler, msg)  # must not raise
+
+
 # ── H5: retry-count header is producer-spoofable — clamp + no negative rk ─
 
 
@@ -546,14 +664,28 @@ class TestRetryRouter:
         assert queues[1].arguments["x-message-ttl"] == 30000
 
     def test_delay_queue_has_dlx(self) -> None:
-        """Delay queues have x-dead-letter-exchange pointing to source exchange."""
+        """M5: delay queues dead-letter back to the source queue via the
+        DEFAULT exchange (routing key = queue name always delivers directly
+        to that queue, regardless of the queue's real bindings) -- NOT the
+        source's real exchange, which would only route back correctly if the
+        queue happened to be bound with routing key == its own name."""
         config = RetryConfig(max_retries=1, delays=(5,), per_queue=True)
         router = RetryRouter(config)
 
         queues = router.get_delay_queue_definitions("q", "my-exchange")
 
-        assert queues[0].arguments["x-dead-letter-exchange"] == "my-exchange"
+        assert queues[0].arguments["x-dead-letter-exchange"] == ""
         assert queues[0].arguments["x-dead-letter-routing-key"] == "q"
+
+    def test_delay_queue_dlx_ignores_source_exchange_argument(self) -> None:
+        """M5 regression guard: source_exchange_name must never leak into
+        x-dead-letter-exchange, regardless of its value."""
+        config = RetryConfig(max_retries=1, delays=(5,), per_queue=True)
+        router = RetryRouter(config)
+
+        queues = router.get_delay_queue_definitions("q", "topic-exchange-with-pattern-bindings")
+
+        assert queues[0].arguments["x-dead-letter-exchange"] == ""
 
     def test_delay_queues_are_classic(self) -> None:
         """Delay queues use classic queue type (lightweight, TTL-based)."""

@@ -238,3 +238,78 @@ class TestDecodeGeneralTypedDecoder:
             result = s.decode(data, int)
         # Falls back to untyped json.decode
         assert result == {"key": "val"}
+
+
+# ── M7: max_parse_bytes size cap ─────────────────────────────────────────
+
+
+class TestMaxParseBytes:
+    def test_default_cap_is_64mb_not_none(self) -> None:
+        s = MsgspecSerializer()
+        assert s._max_parse_bytes == 64 * 1024 * 1024
+
+    def test_oversized_input_raises(self) -> None:
+        s = MsgspecSerializer(max_parse_bytes=16)
+        data = msgspec.json.encode({"x": "this is way longer than sixteen bytes"})
+        with pytest.raises(ValueError, match="max_parse_bytes"):
+            s.decode(data, dict)
+
+    def test_within_cap_decodes(self) -> None:
+        s = MsgspecSerializer(max_parse_bytes=100)
+        data = msgspec.json.encode({"a": 1})
+        assert s.decode(data, dict) == {"a": 1}
+
+    def test_explicit_none_opts_out_of_cap(self) -> None:
+        s = MsgspecSerializer(max_parse_bytes=None)
+        data = msgspec.json.encode({"x": "a" * 100_000})
+        assert s.decode(data, dict)["x"] == "a" * 100_000
+
+    def test_cap_applies_before_bytes_passthrough(self) -> None:
+        """The size check runs even for target_type=bytes (no parsing
+        happens, but the cap should still be a uniform guarantee)."""
+        s = MsgspecSerializer(max_parse_bytes=16)
+        with pytest.raises(ValueError, match="max_parse_bytes"):
+            s.decode(b"this is way longer than sixteen bytes", bytes)
+
+
+# ── M10: content_type is advisory; decode errors are clear, not opaque ────
+
+
+class TestContentTypeAdvisoryAndDecodeErrors:
+    def test_content_type_is_application_json(self) -> None:
+        s = MsgspecSerializer()
+        assert s.content_type == "application/json"
+
+    def test_decode_invalid_json_raises_clear_error_naming_target_type(self) -> None:
+        """M10: a body that isn't valid JSON for target_type (e.g. a
+        content_type mismatch -- the actual body is msgpack, plain text,
+        etc.) must raise a clear error naming the target type and hinting
+        at content_type, not a raw msgspec.DecodeError."""
+        s = MsgspecSerializer()
+
+        with pytest.raises(ValueError, match="SampleStruct") as exc_info:
+            s.decode(b"not json at all", SampleStruct)
+
+        assert "content_type" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, msgspec.DecodeError)
+
+    def test_decode_invalid_json_to_dict_raises_clear_error(self) -> None:
+        s = MsgspecSerializer()
+
+        with pytest.raises(ValueError, match="content_type"):
+            s.decode(b"not json at all", dict)
+
+    def test_decode_wrong_shape_for_struct_raises_clear_error(self) -> None:
+        """Valid JSON, but the wrong shape for the target Struct."""
+        s = MsgspecSerializer()
+        data = msgspec.json.encode({"totally": "wrong shape"})
+
+        with pytest.raises(ValueError, match="SampleStruct"):
+            s.decode(data, SampleStruct)
+
+    def test_decode_valid_input_unaffected(self) -> None:
+        """The M10 error-wrapping must not interfere with a normal decode."""
+        s = MsgspecSerializer()
+        data = msgspec.json.encode(SampleStruct(id=1, name="ok"))
+        result = s.decode(data, SampleStruct)
+        assert result == SampleStruct(id=1, name="ok")

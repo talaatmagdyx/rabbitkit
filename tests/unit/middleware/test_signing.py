@@ -679,28 +679,48 @@ class TestTTLSetNonceCache:
         # Only "new-nonce" should remain.
         assert "new-nonce" in cache._entries
 
-    def test_eviction_oldest_after_gc_finds_nothing_expired(self) -> None:
-        """Lines 173-177: eviction of oldest 10% when GC finds no expired entries.
-
-        The inner 'if still at/over capacity' branch (line 173) only runs when
-        GC (line 170-171) did not free enough space. This happens when all
-        entries have long TTLs (none expired) and the cache is full.
-        """
+    def test_full_of_live_entries_rejects_new_nonce_instead_of_evicting(self) -> None:
+        """L4: when GC finds nothing expired (cache genuinely full of LIVE
+        nonces), the new nonce is rejected -- a live entry is NEVER evicted
+        to make room. Before the fix, this evicted the oldest 10% by
+        insertion order regardless of whether they had expired, which let an
+        attacker flood unique nonces to evict a target's still-valid entry
+        and then replay it (it looks "unseen" again once evicted)."""
         cache = TTLSetNonceCache(max_entries=10)
 
-        # Fill cache completely with non-expiring entries.
+        # Fill cache completely with non-expiring (live) entries.
         for i in range(10):
-            cache.seen(f"live-{i}", ttl=9999.0)
+            assert cache.seen(f"live-{i}", ttl=9999.0) is True
 
         assert len(cache._entries) == 10
 
-        # Add one more: at capacity → GC runs (finds nothing expired because
-        # all TTLs are 9999s) → inner check triggers → evict oldest 10%.
-        cache.seen("overflow", ttl=9999.0)
+        # A new nonce arriving while the cache is full of LIVE entries must
+        # be rejected, not accepted-by-evicting-a-live-one.
+        assert cache.seen("overflow", ttl=9999.0) is False
 
-        # After eviction of 10% (1 entry) + insertion of "overflow",
-        # the size should be at most max_entries.
-        assert len(cache._entries) <= 10
+        # No live entry was evicted to make room -- all 10 originals remain,
+        # and "overflow" itself was never recorded.
+        assert len(cache._entries) == 10
+        for i in range(10):
+            assert f"live-{i}" in cache._entries
+        assert "overflow" not in cache._entries
+
+    def test_evicted_scenario_prevented_replay_of_live_nonce(self) -> None:
+        """L4's exact exploit scenario: flooding unique nonces while a
+        target's nonce is still live must NOT make the target's nonce
+        replayable afterward."""
+        cache = TTLSetNonceCache(max_entries=5)
+
+        # A legitimate message's nonce, still well within its replay window.
+        assert cache.seen("victim-nonce", ttl=9999.0) is True
+
+        # Attacker floods unique nonces trying to evict "victim-nonce".
+        for i in range(50):
+            cache.seen(f"flood-{i}", ttl=9999.0)
+
+        # "victim-nonce" must still be tracked as seen -- replaying it must
+        # still be detected and rejected, not accepted as "new".
+        assert cache.seen("victim-nonce", ttl=9999.0) is False
 
 
 # ── H4: shared/multi-process replay protection ────────────────────────────

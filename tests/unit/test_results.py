@@ -192,3 +192,79 @@ class TestResultMiddleware:
 
         assert result == {"data": 1}
         backend.store_async.assert_not_awaited()
+
+
+class TestResultMiddlewareSerializeH13:
+    """H13: no lossy default=str fallback; exceptions get a marked envelope."""
+
+    def test_unencodable_object_raises(self) -> None:
+        backend = MagicMock()
+        mw = ResultMiddleware(backend)
+
+        with pytest.raises(TypeError):
+            mw._serialize({"x": object()})
+
+    def test_unencodable_object_never_reaches_the_backend(self) -> None:
+        backend = MagicMock()
+        mw = ResultMiddleware(backend)
+        msg = _make_message(correlation_id="corr-obj")
+
+        def call_next(m: RabbitMessage) -> dict:
+            return {"x": object()}
+
+        with pytest.raises(TypeError):
+            mw.consume_scope(call_next, msg)
+
+        backend.store.assert_not_called()
+
+    def test_exception_result_is_a_marked_envelope_not_a_plain_string(self) -> None:
+        backend = MagicMock()
+        mw = ResultMiddleware(backend)
+
+        encoded = mw._serialize(ValueError("boom"))
+        decoded = json.loads(encoded)
+
+        assert decoded == {
+            "__rabbitkit_error__": True,
+            "type": "ValueError",
+            "message": "boom",
+        }
+        # Not indistinguishable from a normal string/dict result: an
+        # ordinary "boom" string result would decode to the bare str "boom",
+        # not this envelope.
+        assert decoded != "boom"
+
+    def test_exception_result_stored_via_consume_scope(self) -> None:
+        backend = MagicMock()
+        mw = ResultMiddleware(backend)
+        msg = _make_message(correlation_id="corr-exc")
+
+        def call_next(m: RabbitMessage) -> Exception:
+            return ValueError("boom")
+
+        mw.consume_scope(call_next, msg)
+
+        args = backend.store.call_args
+        decoded = json.loads(args[0][1])
+        assert decoded["__rabbitkit_error__"] is True
+        assert decoded["type"] == "ValueError"
+        assert decoded["message"] == "boom"
+
+    def test_plain_dict_and_bytes_results_unaffected(self) -> None:
+        backend = MagicMock()
+        mw = ResultMiddleware(backend)
+
+        assert json.loads(mw._serialize({"status": "ok"})) == {"status": "ok"}
+        assert mw._serialize(b"raw") == b"raw"
+
+    def test_custom_serializer_still_takes_priority_over_exception_envelope(self) -> None:
+        backend = MagicMock()
+        serializer = MagicMock()
+        serializer.encode.return_value = b"custom-encoded"
+        mw = ResultMiddleware(backend, serializer=serializer)
+
+        exc = ValueError("boom")
+        encoded = mw._serialize(exc)
+
+        serializer.encode.assert_called_once_with(exc)
+        assert encoded == b"custom-encoded"

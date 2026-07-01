@@ -19,8 +19,7 @@ rabbitkit is a RabbitMQ-first production toolkit for Python. Core features:
 # Top-level (recommended for stable APIs)
 from rabbitkit import AsyncBroker, SyncBroker, RabbitConfig
 
-# rabbitkit.aio is a clean alias for rabbitkit.async_
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 
 # Experimental features — may change between releases
 from rabbitkit.experimental import rpc, locking, dashboard

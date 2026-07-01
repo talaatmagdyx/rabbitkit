@@ -145,6 +145,57 @@ class TestDecode:
         result = s.decode(data, int)
         assert result == 42
 
+    def test_decode_dataclass_drops_unknown_extra_key(self) -> None:
+        """H14: an extra key not on the dataclass is dropped, not a raw
+        TypeError from the constructor."""
+
+        @dataclass
+        class Order:
+            id: int
+            name: str
+
+        s = JSONSerializer()
+        data = json.dumps({"id": 1, "name": "test", "extra": "unused"}).encode()
+        result = s.decode(data, Order)
+
+        assert isinstance(result, Order)
+        assert result.id == 1
+        assert result.name == "test"
+        assert not hasattr(result, "extra")
+
+    def test_decode_dataclass_wrong_typed_field_and_extra_key(self) -> None:
+        """H14's exact test spec: an extra key AND a wrong-typed field in the
+        same payload -- documented behavior (extra dropped, type unchecked
+        since stdlib dataclasses do no runtime validation), not a raw
+        TypeError."""
+
+        @dataclass
+        class Order:
+            qty: int
+
+        s = JSONSerializer()
+        data = json.dumps({"qty": "3", "extra": "unused"}).encode()
+        result = s.decode(data, Order)
+
+        assert isinstance(result, Order)
+        assert result.qty == "3"  # not coerced to int -- documented behavior
+        assert not hasattr(result, "extra")
+
+    def test_decode_dataclass_missing_required_field_raises_typed_error(self) -> None:
+        """H14: a genuinely wrong shape still raises, naming the target
+        dataclass instead of a bare constructor TypeError."""
+
+        @dataclass
+        class Order:
+            id: int
+            name: str
+
+        s = JSONSerializer()
+        data = json.dumps({"id": 1}).encode()
+
+        with pytest.raises(TypeError, match="Cannot decode into Order"):
+            s.decode(data, Order)
+
 
 # ── round-trip ───────────────────────────────────────────────────────────
 
@@ -316,9 +367,29 @@ class TestJsonParseSizeCap:
         ser = JSONSerializer(max_parse_bytes=100)
         assert ser.decode(b'{"a": 1}', dict) == {"a": 1}
 
-    def test_default_none_no_cap(self) -> None:
+    def test_default_cap_is_64mb_not_none(self) -> None:
+        """M7: the default is a sane non-None cap (64 MiB), not unbounded --
+        a body well within it still decodes fine."""
         from rabbitkit.serialization.json import JSONSerializer
 
         ser = JSONSerializer()
+        assert ser._max_parse_bytes == 64 * 1024 * 1024
         big = b'{"x": "' + b'a' * 100_000 + b'"}'
         assert ser.decode(big, dict)["x"] == "a" * 100_000
+
+    def test_explicit_none_opts_out_of_cap(self) -> None:
+        """M7: max_parse_bytes=None is still available to opt out entirely."""
+        from rabbitkit.serialization.json import JSONSerializer
+
+        ser = JSONSerializer(max_parse_bytes=None)
+        big = b'{"x": "' + b'a' * 100_000 + b'"}'
+        assert ser.decode(big, dict)["x"] == "a" * 100_000
+
+    def test_default_cap_rejects_oversized_input(self) -> None:
+        """M7: a body genuinely over the 64 MiB default is rejected."""
+        from rabbitkit.serialization.json import JSONSerializer
+
+        ser = JSONSerializer()
+        big = b'{"x": "' + b"a" * (65 * 1024 * 1024) + b'"}'
+        with pytest.raises(ValueError, match="max_parse_bytes"):
+            ser.decode(big, dict)

@@ -35,6 +35,14 @@ class TestManagementConfig:
         with pytest.raises(AttributeError):
             config.url = "http://other"  # type: ignore[misc]
 
+    def test_repr_masks_password(self) -> None:
+        """L2: repr() must not leak the plaintext password."""
+        config = ManagementConfig(username="admin", password="s3cr3t-p4ssw0rd")
+        r = repr(config)
+        assert "s3cr3t-p4ssw0rd" not in r
+        assert "'***'" in r
+        assert "admin" in r  # non-secret fields still shown
+
 
 class TestManagementConfigGuestWarning:
     def test_guest_credentials_warn_for_non_local_host(self) -> None:

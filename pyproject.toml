@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "1.0.0"
+version = "1.1.0"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -55,12 +55,21 @@ dev         = [
     "pytest-timeout>=2.2",
     "ruff>=0.4.0",
     "mypy>=1.10",
+    "hypothesis>=6.100.0",
+    "pre-commit>=3.7.0",
 ]
 integration = [
     "rabbitkit[dev]",
     "testcontainers[rabbitmq]>=4.0.0",
     "docker>=7.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/talaatmagdy/rabbitkit"
+Documentation = "https://github.com/talaatmagdy/rabbitkit"
+Repository = "https://github.com/talaatmagdy/rabbitkit"
+Changelog = "https://github.com/talaatmagdy/rabbitkit/blob/main/CHANGELOG.md"
+Issues = "https://github.com/talaatmagdy/rabbitkit/issues"
 
 [project.scripts]
 rabbitkit = "rabbitkit.cli:app"

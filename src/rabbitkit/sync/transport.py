@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SocketConfig
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
@@ -113,6 +114,20 @@ class SyncTransport:
         self._blocked_callbacks: list[Callable[[], None]] = []
         self._unblocked_callbacks: list[Callable[[], None]] = []
 
+        # L15: passive blocked-state tracking, independent of whether a
+        # FlowController is registered above -- health.broker_health_check
+        # reads this (via the is_blocked property) so a broker/disk/memory
+        # alarm is visible even when the caller never opted into FlowController.
+        self._blocked_state: bool = False
+
+        # L14: fired once per start_consuming() loop iteration (after each
+        # process_data_events() call returns), i.e. once per I/O loop tick --
+        # NOT once per delivered message. The broker uses this to refresh a
+        # liveness heartbeat so a healthy but message-idle consumer doesn't
+        # get mistaken for a wedged one (broker_liveness previously only saw
+        # a heartbeat update when a message was actually delivered).
+        self._io_tick_callbacks: list[Callable[[], None]] = []
+
         # Reconnect bound (H-SRE4): never retry forever. Hardcoded sane default;
         # the broker may override via attribute if desired.
         self.max_reconnect_attempts: int = 0  # 0 == use the time-bounded default below
@@ -126,7 +141,29 @@ class SyncTransport:
         """Register a connection-unblocked callback (e.g. FlowController.on_unblocked)."""
         self._unblocked_callbacks.append(callback)
 
+    @property
+    def is_blocked(self) -> bool:
+        """True if RabbitMQ has sent ``connection.blocked`` (L15) -- e.g. a
+        broker memory/disk alarm. Tracked passively regardless of whether
+        any ``on_blocked``/``on_unblocked`` callback is registered, so
+        ``health.broker_health_check`` can see it even without an opt-in
+        ``FlowController``."""
+        return self._blocked_state
+
+    def on_io_tick(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired once per ``start_consuming()`` loop
+        iteration (L14) -- e.g. the broker's liveness heartbeat refresh."""
+        self._io_tick_callbacks.append(callback)
+
+    def _fire_io_tick(self) -> None:
+        for cb in list(self._io_tick_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never let a cb break the I/O loop
+                logger.exception("io_tick callback raised")
+
     def _pika_blocked(self, _connection: Any, *_args: Any) -> None:
+        self._blocked_state = True
         for cb in list(self._blocked_callbacks):
             try:
                 cb()
@@ -134,6 +171,7 @@ class SyncTransport:
                 logger.exception("blocked callback raised")
 
     def _pika_unblocked(self, _connection: Any, *_args: Any) -> None:
+        self._blocked_state = False
         for cb in list(self._unblocked_callbacks):
             try:
                 cb()
@@ -462,8 +500,14 @@ class SyncTransport:
                 timeout=publish_timeout,
             )
 
+            # M4: only report CONFIRMED when the channel is actually in
+            # publisher-confirm mode -- confirm_delivery=False (unless this
+            # publish is `mandatory`, which always enables confirms via
+            # _ensure_mandatory_confirms above) means basic_publish() is
+            # fire-and-forget and nothing was broker-acknowledged.
+            confirmed = self._confirm_delivery or envelope.mandatory
             return PublishOutcome(
-                status=PublishStatus.CONFIRMED,
+                status=PublishStatus.CONFIRMED if confirmed else PublishStatus.SENT,
                 exchange=envelope.exchange,
                 routing_key=envelope.routing_key,
             )
@@ -567,13 +611,18 @@ class SyncTransport:
 
         kwargs = exchange.to_declare_kwargs()
 
-        if action is TopoAction.PASSIVE:
-            self._channel.exchange_declare(
-                exchange=kwargs["exchange"],
-                passive=True,
-            )
-        else:
-            self._channel.exchange_declare(**kwargs)
+        import pika
+
+        try:
+            if action is TopoAction.PASSIVE:
+                self._channel.exchange_declare(
+                    exchange=kwargs["exchange"],
+                    passive=True,
+                )
+            else:
+                self._channel.exchange_declare(**kwargs)
+        except pika.exceptions.ChannelClosedByBroker as exc:
+            self._raise_precondition_failed_or_reraise("exchange", kwargs["exchange"], exc)
 
     def declare_queue(self, queue: RabbitQueue) -> None:
         """Declare a queue on RabbitMQ."""
@@ -585,13 +634,42 @@ class SyncTransport:
 
         kwargs = queue.to_declare_kwargs()
 
-        if action is TopoAction.PASSIVE:
-            self._channel.queue_declare(
-                queue=kwargs["queue"],
-                passive=True,
-            )
-        else:
-            self._channel.queue_declare(**kwargs)
+        import pika
+
+        try:
+            if action is TopoAction.PASSIVE:
+                self._channel.queue_declare(
+                    queue=kwargs["queue"],
+                    passive=True,
+                )
+            else:
+                self._channel.queue_declare(**kwargs)
+        except pika.exceptions.ChannelClosedByBroker as exc:
+            self._raise_precondition_failed_or_reraise("queue", kwargs["queue"], exc)
+
+    def _raise_precondition_failed_or_reraise(self, kind: str, name: str, exc: Any) -> None:
+        """M6: turn a 406 PRECONDITION_FAILED into a typed, actionable error.
+
+        Declaring a queue/exchange with arguments that conflict with an
+        existing one of the same name (e.g. an ops-created quorum queue
+        where rabbitkit's config declares classic, or a different TTL/DLX)
+        closes the channel with reply_code 406 and an opaque
+        ``ChannelClosedByBroker`` — previously this aborted startup with a
+        low-level pika traceback giving no hint which queue/exchange or
+        argument actually conflicted. Any other reply code is re-raised
+        as-is (not this middleware's concern).
+        """
+        if exc.reply_code == 406:
+            raise ConfigurationError(
+                f"Cannot declare {kind} {name!r}: it already exists with incompatible "
+                f"arguments (broker said: {exc.reply_text}). This usually means it was "
+                f"created outside rabbitkit (e.g. ops tooling) with different arguments "
+                f"(e.g. quorum vs classic queue type, a different TTL, or a different "
+                f"dead-letter exchange). Either delete/reconcile the existing {kind}, "
+                f"adjust its rabbitkit definition to match, or use "
+                f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
+            ) from exc
+        raise exc
 
     def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
         """Bind a queue to an exchange."""
@@ -677,6 +755,11 @@ class SyncTransport:
                 # process_data_events drains ALL channels' consumers + queued
                 # add_callback_threadsafe callbacks (acks from worker threads).
                 self._connection.process_data_events(time_limit=1.0)
+                # L14: process_data_events returning (rather than raising a
+                # connection error) is itself evidence the I/O loop is alive
+                # and pumping -- fire once per tick regardless of whether any
+                # message was actually delivered this iteration.
+                self._fire_io_tick()
                 # Safety: if no consumers are registered, exit (avoids looping
                 # forever in tests/embeds that call start_consuming without a
                 # consumer). Real consumers are cancelled by stop_consuming which

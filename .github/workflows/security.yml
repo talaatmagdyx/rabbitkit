@@ -1,0 +1,49 @@
+# Dependency vulnerability scanning + static analysis (H15).
+#
+# - `pip-audit` checks installed dependencies against the OSV/PyPA advisory
+#   databases and fails the job on a known vulnerability.
+# - CodeQL performs static analysis on the Python source for common
+#   security issues (injection, unsafe deserialization, etc.).
+#
+# Both run on every push/PR to main and on a weekly schedule so a newly
+# disclosed CVE in an existing dependency is caught even without a code
+# change.
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 04:00 UTC.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[all]"
+      - name: pip-audit
+        run: |
+          uv pip install pip-audit
+          .venv/bin/python -m pip_audit --strict
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3

@@ -19,10 +19,14 @@ Mount as a standalone ASGI app with Uvicorn::
     from rabbitkit.dashboard import create_dashboard_app
     from myapp.main import broker      # your AsyncBroker or SyncBroker
 
-    app = create_dashboard_app(broker)
+    app = create_dashboard_app(broker, auth_token="...")  # see SECURITY below
 
-    # Run separately:
-    # uvicorn myapp.dashboard:app --host 0.0.0.0 --port 8080
+    # Run separately, bound to loopback only by default (M8):
+    # uvicorn myapp.dashboard:app --host 127.0.0.1 --port 8080
+    #
+    # Only bind 0.0.0.0 deliberately, behind a NetworkPolicy/firewall/reverse
+    # proxy that terminates auth -- the dashboard exposes full broker
+    # topology (queue/exchange/routing-key names, consumer counts).
 
 CLI shortcut::
 
@@ -83,16 +87,19 @@ def create_dashboard_app(
 ) -> Any:
     """Create an ASGI dashboard application.
 
-    SECURITY: by default this app has NO authentication and exposes broker
-    topology (queue/exchange names, consumer counts). Mount it behind authn
-    (OIDC/reverse proxy) and restrict it to an internal network — never expose
-    it publicly.
+    SECURITY (M8): by default this app has NO authentication and exposes
+    broker topology (queue/exchange/routing-key names, consumer counts).
+    Bind the server to loopback (``127.0.0.1``, not ``0.0.0.0``) by default,
+    and mount it behind authn (OIDC/reverse proxy) plus network restriction
+    for anything beyond local access — never expose it publicly.
 
     For a lightweight built-in guard, pass ``auth_token``: when set, every
-    route requires an ``Authorization: Bearer <auth_token>`` header and
-    returns ``401`` otherwise. When unset (default), all requests pass through
-    and a startup warning is logged reminding you not to expose the dashboard
-    publicly.
+    route requires an ``Authorization: Bearer <auth_token>`` header
+    (compared in constant time via ``hmac.compare_digest``, not a plain
+    string ``!=``, which would leak timing information about the token) and
+    returns ``401`` otherwise. When unset (default), all requests pass
+    through and a startup warning is logged reminding you not to expose the
+    dashboard publicly.
 
     Args:
         broker: A rabbitkit broker instance (SyncBroker or AsyncBroker).
@@ -106,6 +113,8 @@ def create_dashboard_app(
     Raises:
         ImportError: If starlette is not installed.
     """
+    import hmac
+
     try:
         from starlette.applications import Starlette
         from starlette.middleware.base import BaseHTTPMiddleware
@@ -125,7 +134,13 @@ def create_dashboard_app(
     class _BearerAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next: Any) -> Response:
             auth = request.headers.get("Authorization", "")
-            if auth != f"Bearer {auth_token}":
+            expected = f"Bearer {auth_token}"
+            # M8: hmac.compare_digest instead of != -- a plain string
+            # comparison short-circuits on the first mismatched byte, leaking
+            # the token's length (and, over many requests, its prefix) via a
+            # timing side channel. compare_digest runs in constant time
+            # regardless of where the mismatch is.
+            if not hmac.compare_digest(auth, expected):
                 return PlainTextResponse("Unauthorized", status_code=401)
             return await call_next(request)  # type: ignore[no-any-return]
 

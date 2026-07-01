@@ -133,8 +133,10 @@ class TestConsumeScope:
         assert hc.name == MESSAGE_PROCESSING_SECONDS
         assert hc.value >= 0.0
 
-    def test_consume_uses_routing_key_as_queue_label(self) -> None:
-        """Queue label comes from message routing_key."""
+    def test_consume_falls_back_to_routing_key_without_original_queue_header(self) -> None:
+        """M3: without x-rabbitkit-original-queue (e.g. a message built
+        directly rather than delivered through a broker), falls back to
+        routing_key -- the pre-M3 behavior, only as a fallback now."""
         collector = FakeCollector()
         mw = MetricsMiddleware(collector)
         msg = _make_message(routing_key="orders.created")
@@ -156,6 +158,114 @@ class TestConsumeScope:
 
         cc = collector.counter_calls[0]
         assert cc.labels["queue"] == "unknown"
+
+    def test_consume_prefers_bound_queue_name_over_routing_key(self) -> None:
+        """M3: with x-rabbitkit-original-queue set (as the broker's
+        on_message wrapper always sets it before middlewares run), the
+        BOUND queue name is used, not the routing key -- prevents
+        cardinality explosion from a topic/Path() routing key that embeds
+        an unbounded value (tenant id, order id, etc.)."""
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(
+            routing_key="orders.tenant-42.created",
+            headers={"x-rabbitkit-original-queue": "orders-processor"},
+        )
+        call_next = MagicMock(return_value="ok")
+
+        mw.consume_scope(call_next, msg)
+
+        cc = collector.counter_calls[0]
+        assert cc.labels["queue"] == "orders-processor"
+
+    @pytest.mark.asyncio
+    async def test_consume_async_prefers_bound_queue_name_over_routing_key(self) -> None:
+        """M3, async variant."""
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(
+            routing_key="orders.tenant-42.created",
+            headers={"x-rabbitkit-original-queue": "orders-processor"},
+        )
+
+        async def call_next(m: RabbitMessage) -> str:
+            return "ok"
+
+        await mw.consume_scope_async(call_next, msg)
+
+        cc = collector.counter_calls[0]
+        assert cc.labels["queue"] == "orders-processor"
+
+
+# ── record_settlement (M2) ───────────────────────────────────────────────
+
+
+class TestRecordSettlement:
+    def test_acked_emits_messages_acked_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message()
+
+        mw.record_settlement(msg, "acked")
+
+        assert len(collector.counter_calls) == 1
+        cc = collector.counter_calls[0]
+        assert cc.name == MetricsConfig().messages_acked_total
+        assert cc.labels == {"queue": "test.queue"}
+
+    def test_nacked_emits_messages_nacked_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message()
+
+        mw.record_settlement(msg, "nacked")
+
+        cc = collector.counter_calls[0]
+        assert cc.name == MetricsConfig().messages_nacked_total
+
+    def test_rejected_emits_messages_rejected_total(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message()
+
+        mw.record_settlement(msg, "rejected")
+
+        cc = collector.counter_calls[0]
+        assert cc.name == MetricsConfig().messages_rejected_total
+
+    def test_no_collector_is_noop(self) -> None:
+        mw = MetricsMiddleware(None)
+        msg = _make_message()
+
+        mw.record_settlement(msg, "acked")  # must not raise
+
+    def test_uses_bound_queue_name_label(self) -> None:
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(
+            routing_key="orders.tenant-42.created",
+            headers={"x-rabbitkit-original-queue": "orders-processor"},
+        )
+
+        mw.record_settlement(msg, "acked")
+
+        assert collector.counter_calls[0].labels["queue"] == "orders-processor"
+
+    def test_collector_and_config_properties(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = FakeCollector()
+        cfg = MetricsConfig(namespace="custom")
+        mw = MetricsMiddleware(collector, cfg)
+
+        assert mw.collector is collector
+        assert mw.config is cfg
 
 
 # ── Consume scope (async) ────────────────────────────────────────────────

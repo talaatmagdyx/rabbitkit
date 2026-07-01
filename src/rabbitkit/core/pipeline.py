@@ -31,6 +31,61 @@ logger = structlog.stdlib.get_logger(__name__)
 _stdlib_logger = logging.getLogger(__name__)
 
 
+def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> None:
+    """Emit the ack/nack/reject counter for *message*, if a
+    ``MetricsMiddleware`` is present on *route* (M2).
+
+    ``MetricsMiddleware.consume_scope``/``consume_scope_async`` only wrap
+    handler execution; final settlement is decided by this pipeline's own
+    ack-orchestration code, which runs AFTER that wrapped call returns —
+    so the middleware itself can never observe the final disposition, and
+    ``messages_acked_total``/``nacked_total``/``rejected_total`` would
+    otherwise be defined but never emitted. A local, lazy import is used
+    (not a module-level one) so ``core/`` does not gain a hard dependency
+    on ``middleware/`` — this is the one place core reaches up to an
+    optional, purely-observational integration, and only when a
+    ``MetricsMiddleware`` is actually configured on the route.
+
+    A "pending" disposition (e.g. a MANUAL-policy handler that hasn't
+    settled its message yet by the time this runs) emits nothing — there is
+    nothing final to report yet.
+    """
+    if message.disposition == "pending":
+        return
+    from rabbitkit.middleware.metrics import MetricsMiddleware
+
+    for mw in route.route_middlewares:
+        if isinstance(mw, MetricsMiddleware):
+            mw.record_settlement(message, message.disposition)
+            return
+
+
+def _log_result_publish_failure(message: RabbitMessage, outcome: PublishOutcome) -> None:
+    """Log a failed result publish (L1).
+
+    The caller (``_publish_result_sync``/``_publish_result_async``) nacks
+    the source message with ``requeue=True`` on failure, re-running the
+    handler (including any side effects) on redelivery. ``message.redelivered``
+    is ``True`` when THIS delivery is itself already a redelivery — logging
+    at ERROR (vs. WARNING on a first attempt) makes a sustained publish
+    outage, which would otherwise hot-loop this nack+requeue silently,
+    loud and alertable via log-based monitoring instead of only a stream
+    of routine-looking WARNINGs.
+    """
+    log = logger.error if message.redelivered else logger.warning
+    log(
+        "Result publish failed%s: status=%s, exchange=%s, routing_key=%s",
+        " (message already redelivered once -- this nack+requeue is repeating; "
+        "verify broker health and that the handler is idempotent under repeated "
+        "execution)"
+        if message.redelivered
+        else "",
+        outcome.status,
+        outcome.exchange,
+        outcome.routing_key,
+    )
+
+
 # ── AckPolicy strategy dispatch ──────────────────────────────────────────
 # Replaces the per-call if/elif chains over AckPolicy with a single dict
 # lookup. Each strategy owns the success-path ack and the error-path
@@ -56,13 +111,27 @@ class _AutoStrategy:
 
 
 class _ManualStrategy:
-    """MANUAL: handler owns settlement; pipeline re-raises unhandled errors."""
+    """MANUAL: handler owns settlement ENTIRELY; pipeline never auto-settles on success.
+
+    M11: ``on_success`` previously did ``if not msg.is_settled: msg.ack()``
+    — contradicting this class's own documented "handler owns settlement"
+    contract. A MANUAL handler that intentionally defers settlement (e.g.
+    hands the message to another task/thread to ack later) got an
+    unexpected ack right here — a real loss risk: if the process crashes
+    before that deferred settlement actually runs, the message is gone
+    (already acked) instead of being redelivered.
+    """
 
     acks_first: bool = False
 
     def on_success(self, msg: RabbitMessage) -> None:
         if not msg.is_settled:
-            msg.ack()
+            logger.warning(
+                "MANUAL ack policy: handler returned without settling the message "
+                "(no ack()/nack()/reject() called) — left unsettled, not auto-acked. "
+                "If settlement is deferred intentionally, ignore this; otherwise the "
+                "handler is missing a settlement call."
+            )
 
     def on_error(self, msg: RabbitMessage, exc: Exception) -> None:
         logger.error("Unhandled exception in MANUAL mode handler: %s", exc)
@@ -137,11 +206,19 @@ class _AutoStrategyAsync:
 
 
 class _ManualStrategyAsync:
+    """MANUAL: handler owns settlement ENTIRELY (M11 — see ``_ManualStrategy``'s
+    docstring for why ``on_success`` must not auto-ack)."""
+
     acks_first: bool = False
 
     async def on_success(self, msg: RabbitMessage) -> None:
         if not msg.is_settled:
-            await msg.ack_async()
+            logger.warning(
+                "MANUAL ack policy: handler returned without settling the message "
+                "(no ack()/nack()/reject() called) — left unsettled, not auto-acked. "
+                "If settlement is deferred intentionally, ignore this; otherwise the "
+                "handler is missing a settlement call."
+            )
 
     async def on_error(self, msg: RabbitMessage, exc: Exception) -> None:
         logger.error("Unhandled exception in MANUAL mode handler: %s", exc)
@@ -358,6 +435,7 @@ class HandlerPipeline:
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
                 message.nack(requeue=False)
+            _emit_settlement_metric(route, message)
             return
 
         # M-P3: only bind contextvars when DEBUG is emitted — avoids per-message
@@ -409,6 +487,7 @@ class HandlerPipeline:
                 self._handle_sync_exception(route, message, exc)
 
         finally:
+            _emit_settlement_metric(route, message)
             if debug:
                 structlog.contextvars.clear_contextvars()
 
@@ -426,6 +505,7 @@ class HandlerPipeline:
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
                 await message.nack_async(requeue=False)
+            _emit_settlement_metric(route, message)
             return
 
         # M-P3: only bind contextvars when DEBUG is emitted.
@@ -476,6 +556,7 @@ class HandlerPipeline:
                 await self._handle_async_exception(route, message, exc)
 
         finally:
+            _emit_settlement_metric(route, message)
             if debug:
                 structlog.contextvars.clear_contextvars()
 
@@ -815,24 +896,25 @@ class HandlerPipeline:
         return self._auto_resolver
 
     def _handler_needs_di(self, handler: Any) -> bool:
-        """True if any parameter is Annotated with a DI marker. Cached per handler."""
+        """True if any parameter is Annotated with a DI marker. Cached per handler.
+
+        L11: uses the SAME hint-resolution strength as ``DIResolver`` itself
+        (``get_type_hints_with_fallback`` — includes the closure-``localns``
+        retry) so this detector and the resolver it gates never diverge. A
+        weaker, 2-attempt version used to live here; a closure-scoped
+        ``Depends(...)`` annotation could resolve fine for ``DIResolver`` but
+        still be mis-detected as "no DI needed" by this method, silently
+        binding the marked parameter to the message body instead.
+        """
         cached = self._needs_di_cache.get(handler)
         if cached is not None:
             return cached
 
-        import inspect
-        import typing
-
-        try:
-            hints = typing.get_type_hints(handler, include_extras=True)
-        except Exception:
-            try:
-                hints = inspect.get_annotations(handler, eval_str=True)
-            except Exception:
-                hints = getattr(handler, "__annotations__", {})
-
         from rabbitkit.di.context import Context, Header, Path
         from rabbitkit.di.depends import Depends
+        from rabbitkit.di.resolver import get_type_hints_with_fallback
+
+        hints = get_type_hints_with_fallback(handler)
 
         markers = (Depends, Header, Path, Context)
         needs = any(any(isinstance(m, markers) for m in getattr(ann, "__metadata__", ())) for ann in hints.values())
@@ -898,7 +980,19 @@ class HandlerPipeline:
         """Publish handler result (Contract 5 precedence).
 
         Returns False only when a publish was attempted and failed, so the
-        caller can avoid acking a message whose result was lost.
+        caller can avoid acking a message whose result was lost — the
+        caller nacks with ``requeue=True`` instead (see ``process_sync``).
+
+        L1: a nack+requeue here re-runs the handler from scratch on
+        redelivery, including any side effects it already performed —
+        this is only safe if handlers are idempotent (the same baseline
+        assumption at-least-once delivery already requires everywhere
+        else; see ``docs/rabbitmq-retry-architecture.md``). If
+        ``message.redelivered`` is already ``True``, this is not the
+        first time this exact message has hit a failing result publish —
+        logged at ERROR (vs. WARNING for a first attempt) so a sustained
+        publish outage that would otherwise hot-loop silently is loud and
+        alertable via log-based monitoring.
         """
         if publish_fn is None:
             return True
@@ -909,12 +1003,7 @@ class HandlerPipeline:
 
         outcome = self._compose_publish_sync(route, publish_fn)(envelope, publish_fn)
         if not outcome.ok:
-            logger.warning(
-                "Result publish failed: status=%s, exchange=%s, routing_key=%s",
-                outcome.status,
-                outcome.exchange,
-                outcome.routing_key,
-            )
+            _log_result_publish_failure(message, outcome)
             return False
         return True
 
@@ -968,7 +1057,9 @@ class HandlerPipeline:
     ) -> bool:
         """Publish handler result (async, Contract 5 precedence).
 
-        Returns False only when a publish was attempted and failed.
+        Returns False only when a publish was attempted and failed. See
+        :meth:`_publish_result_sync` (L1) for the redelivery-escalation
+        rationale — identical here.
         """
         if publish_fn is None:
             return True
@@ -979,12 +1070,7 @@ class HandlerPipeline:
 
         outcome = await self._compose_publish_async(route, publish_fn)(envelope, publish_fn)
         if not outcome.ok:
-            logger.warning(
-                "Result publish failed: status=%s, exchange=%s, routing_key=%s",
-                outcome.status,
-                outcome.exchange,
-                outcome.routing_key,
-            )
+            _log_result_publish_failure(message, outcome)
             return False
         return True
 

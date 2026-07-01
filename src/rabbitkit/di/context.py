@@ -6,6 +6,20 @@ import contextvars
 from typing import Any
 
 
+class _MissingSentinel:
+    """Distinguishes "no default given" from an explicit ``default=None``
+    (H10) — a plain ``None`` default would be indistinguishable from "not
+    provided" otherwise."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<no default>"
+
+
+_MISSING = _MissingSentinel()
+
+
 class Context:
     """Marker for context value injection.
 
@@ -16,10 +30,23 @@ class Context:
             app_name: Annotated[str, Context("app")],
         ) -> None:
             ...
+
+    H10 — optional values: pass ``default=`` to make a missing context key
+    resolve to that value instead of raising, or simply give the parameter
+    itself a Python default (``app_name: Annotated[str | None, Context("app")]
+    = None``) — the resolver falls back to the parameter default when the
+    marker has none. With neither, a missing key raises
+    ``MissingDependencyError`` (PERMANENT — settles straight to the DLQ,
+    matching the ``KeyError`` this replaces).
     """
 
-    def __init__(self, key: str) -> None:
+    def __init__(self, key: str, *, default: Any = _MISSING) -> None:
         self.key = key
+        self.default = default
+
+    @property
+    def has_default(self) -> bool:
+        return self.default is not _MISSING
 
     def __repr__(self) -> str:
         return f"Context({self.key!r})"
@@ -27,7 +54,7 @@ class Context:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Context):
             return NotImplemented
-        return self.key == other.key
+        return self.key == other.key and self.default == other.default
 
     def __hash__(self) -> int:
         return hash(("Context", self.key))
@@ -43,10 +70,23 @@ class Header:
             tenant: Annotated[str, Header("x-tenant")],
         ) -> None:
             ...
+
+    H10 — optional values: pass ``default=`` to make a missing header
+    resolve to that value instead of raising, or simply give the parameter
+    itself a Python default (``tenant: Annotated[str | None,
+    Header("x-tenant")] = None``) — the resolver falls back to the parameter
+    default when the marker has none. With neither, a missing header raises
+    ``MissingDependencyError`` (PERMANENT — settles straight to the DLQ,
+    matching the ``KeyError`` this replaces).
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, default: Any = _MISSING) -> None:
         self.name = name
+        self.default = default
+
+    @property
+    def has_default(self) -> bool:
+        return self.default is not _MISSING
 
     def __repr__(self) -> str:
         return f"Header({self.name!r})"
@@ -54,7 +94,7 @@ class Header:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Header):
             return NotImplemented
-        return self.name == other.name
+        return self.name == other.name and self.default == other.default
 
     def __hash__(self) -> int:
         return hash(("Header", self.name))
@@ -70,10 +110,23 @@ class Path:
             level: Annotated[str, Path("level")],
         ) -> None:
             ...
+
+    H10 — optional values: pass ``default=`` to make a missing path segment
+    resolve to that value instead of raising, or simply give the parameter
+    itself a Python default (``level: Annotated[str | None, Path("level")]
+    = None``) — the resolver falls back to the parameter default when the
+    marker has none. With neither, a missing segment raises
+    ``MissingDependencyError`` (PERMANENT — settles straight to the DLQ,
+    matching the ``KeyError`` this replaces).
     """
 
-    def __init__(self, segment: str) -> None:
+    def __init__(self, segment: str, *, default: Any = _MISSING) -> None:
         self.segment = segment
+        self.default = default
+
+    @property
+    def has_default(self) -> bool:
+        return self.default is not _MISSING
 
     def __repr__(self) -> str:
         return f"Path({self.segment!r})"
@@ -81,7 +134,7 @@ class Path:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Path):
             return NotImplemented
-        return self.segment == other.segment
+        return self.segment == other.segment and self.default == other.default
 
     def __hash__(self) -> int:
         return hash(("Path", self.segment))

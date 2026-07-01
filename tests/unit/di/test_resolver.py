@@ -4,6 +4,7 @@ from typing import Annotated, Any
 
 import pytest
 
+from rabbitkit.core.errors import MissingDependencyError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.di.context import Context, ContextRepo, Header, Path
 from rabbitkit.di.depends import Depends
@@ -204,7 +205,7 @@ class TestResolveHeader:
 
         msg = _make_message()
         resolver = DIResolver()
-        with pytest.raises(KeyError, match="x-missing"):
+        with pytest.raises(MissingDependencyError, match="x-missing"):
             resolver.resolve(handler, msg, None, b"payload")
 
 
@@ -233,7 +234,7 @@ class TestResolvePath:
 
         msg = _make_message()
         resolver = DIResolver()
-        with pytest.raises(KeyError, match="missing"):
+        with pytest.raises(MissingDependencyError, match="missing"):
             resolver.resolve(handler, msg, None, b"payload")
 
 
@@ -265,7 +266,7 @@ class TestResolveContext:
         msg = _make_message()
         repo = ContextRepo()
         resolver = DIResolver()
-        with pytest.raises(KeyError, match="missing"):
+        with pytest.raises(MissingDependencyError, match="missing"):
             resolver.resolve(handler, msg, repo, b"payload")
 
     def test_context_no_repo_raises(self) -> None:
@@ -279,6 +280,186 @@ class TestResolveContext:
         resolver = DIResolver()
         with pytest.raises(ConfigurationError, match="ContextRepo"):
             resolver.resolve(handler, msg, None, b"payload")
+
+
+# ── resolve — H10: optional Header/Path/Context via default ─────────────
+
+
+class TestResolveOptionalMarkers:
+    """H10 exact spec: an optional Header/Path/Context (with a default,
+    either on the marker or the parameter) must resolve to that default
+    when the message is missing the value — the handler runs normally
+    instead of the message being rejected on a bare KeyError."""
+
+    def test_header_marker_default_used_when_missing(self) -> None:
+        def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant", default="anonymous")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["tenant"] == "anonymous"
+
+    def test_header_marker_default_not_used_when_present(self) -> None:
+        """The marker default must not shadow an ACTUALLY present header."""
+
+        def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-tenant", default="anonymous")],
+        ) -> None:
+            pass
+
+        msg = _make_message()  # headers={"x-tenant": "acme"}
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["tenant"] == "acme"
+
+    def test_header_function_default_used_when_marker_has_none(self) -> None:
+        """H10's own example: Annotated[str | None, Header(...)] = None."""
+
+        def handler(
+            body: bytes,
+            tenant: Annotated[str | None, Header("x-missing-tenant")] = None,
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["tenant"] is None
+
+    def test_header_function_default_non_none_used_when_missing(self) -> None:
+        def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant")] = "default-tenant",
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["tenant"] == "default-tenant"
+
+    def test_marker_default_wins_over_function_default(self) -> None:
+        """When BOTH are present, the marker's own default takes priority."""
+
+        def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant", default="from-marker")] = "from-function",
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["tenant"] == "from-marker"
+
+    def test_path_marker_default_used_when_missing(self) -> None:
+        def handler(
+            body: bytes,
+            level: Annotated[str, Path("missing-segment", default="unknown")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["level"] == "unknown"
+
+    def test_path_function_default_used_when_marker_has_none(self) -> None:
+        def handler(
+            body: bytes,
+            level: Annotated[str | None, Path("missing-segment")] = None,
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, None, b"payload")
+        assert kwargs["level"] is None
+
+    def test_context_marker_default_used_when_missing(self) -> None:
+        def handler(
+            body: bytes,
+            app: Annotated[str, Context("missing-key", default="fallback-app")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        repo = ContextRepo()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, repo, b"payload")
+        assert kwargs["app"] == "fallback-app"
+
+    def test_context_function_default_used_when_marker_has_none(self) -> None:
+        def handler(
+            body: bytes,
+            app: Annotated[str | None, Context("missing-key")] = None,
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        repo = ContextRepo()
+        resolver = DIResolver()
+        kwargs = resolver.resolve(handler, msg, repo, b"payload")
+        assert kwargs["app"] is None
+
+    def test_required_missing_with_no_default_raises_typed_error(self) -> None:
+        """Required (no default anywhere) + missing -> typed
+        MissingDependencyError naming the parameter, not a bare KeyError."""
+
+        def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        with pytest.raises(MissingDependencyError) as exc_info:
+            resolver.resolve(handler, msg, None, b"payload")
+        assert exc_info.value.param_name == "tenant"
+        assert "x-missing-tenant" in str(exc_info.value)
+        assert "tenant" in str(exc_info.value)
+
+    async def test_header_marker_default_used_when_missing_async(self) -> None:
+        async def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant", default="anonymous")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = await resolver.resolve_async(handler, msg, None, b"payload")
+        assert kwargs["tenant"] == "anonymous"
+
+    async def test_header_function_default_used_when_missing_async(self) -> None:
+        async def handler(
+            body: bytes,
+            tenant: Annotated[str | None, Header("x-missing-tenant")] = None,
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        kwargs = await resolver.resolve_async(handler, msg, None, b"payload")
+        assert kwargs["tenant"] is None
+
+    async def test_required_missing_raises_typed_error_async(self) -> None:
+        async def handler(
+            body: bytes,
+            tenant: Annotated[str, Header("x-missing-tenant")],
+        ) -> None:
+            pass
+
+        msg = _make_message()
+        resolver = DIResolver()
+        with pytest.raises(MissingDependencyError):
+            await resolver.resolve_async(handler, msg, None, b"payload")
 
 
 # ── resolve — combined ──────────────────────────────────────────────────
@@ -704,38 +885,31 @@ class TestExtractDiMarkerEmpty:
         assert kwargs["body"] == b"raw"
 
 
-# ── _resolve_marker — unknown marker branch ──────────────────────────────
+# ── _resolve_marker_with_fallback — unknown marker branch ────────────────
 
 
 class TestResolveMarkerUnknown:
     def test_unknown_marker_raises_configuration_error(self) -> None:
-        """Covers line 289: raise ConfigurationError for unknown DI marker."""
+        """Unknown DI marker raises ConfigurationError. Depends() never
+        reaches _resolve_marker_with_fallback -- resolve()/resolve_async()
+        special-case it before calling this (see TestResolveMarkerDepends'
+        old test, removed: that dead dispatch branch no longer exists)."""
+        import inspect
 
         class _UnknownMarker:
             pass
 
         resolver = DIResolver()
         msg = _make_message()
+        param = inspect.Parameter("x", inspect.Parameter.POSITIONAL_OR_KEYWORD)
         with pytest.raises(ConfigurationError, match="Unknown DI marker"):
-            resolver._resolve_marker(  # type: ignore[arg-type]
+            resolver._resolve_marker_with_fallback(
                 _UnknownMarker(),  # type: ignore[arg-type]
+                param,
+                "x",
                 msg,
                 None,
-                {},
             )
-
-
-# ── _resolve_marker — Depends branch (line 282) ──────────────────────────
-
-
-class TestResolveMarkerDepends:
-    def test_resolve_marker_calls_depends(self) -> None:
-        """Covers line 282: _resolve_marker dispatches to _resolve_depends."""
-        marker = Depends(_get_db)
-        resolver = DIResolver()
-        msg = _make_message()
-        result = resolver._resolve_marker(marker, msg, None, {})
-        assert result == "db-session"
 
 
 # ── _resolve_depends — sync generator + async gen error ──────────────────
@@ -904,3 +1078,99 @@ class TestValidateHandlerUnannotatedParam:
             pass
 
         DIResolver().validate_handler(handler)  # must not raise
+
+
+# ── L11: unresolved DI marker annotation raises at registration ──────────
+
+
+class TestValidateHandlerUnresolvedDIMarker:
+    """L11: previously, a DI marker (Depends/Header/Path/Context) annotation
+    that ``typing.get_type_hints()`` couldn't resolve (e.g. a forward ref to
+    a name only reachable via closure, but not actually referenced anywhere
+    in the handler's own executable body) silently fell through to the raw
+    string annotation. A plain string has no ``__metadata__``, so the
+    marker went undetected and the parameter was bound to the message body
+    instead. It's now caught at registration time instead."""
+
+    def test_unresolvable_depends_marker_raises(self) -> None:
+        def make_handler() -> Any:
+            class LocalThing:
+                pass
+
+            def get_thing() -> LocalThing:  # type: ignore[valid-type]
+                return LocalThing()
+
+            # LocalThing/get_thing appear ONLY in the string annotation, never
+            # in the handler's executable body -- so they are not captured as
+            # closure freevars, and none of get_type_hints_with_fallback's
+            # three real resolution attempts can succeed.
+            def handler(body: bytes, thing: "Annotated[LocalThing, Depends(get_thing)]") -> None:  # type: ignore[name-defined]
+                pass
+
+            return handler
+
+        handler = make_handler()
+        with pytest.raises(ConfigurationError, match="DI marker") as exc_info:
+            DIResolver().validate_handler(handler)
+        assert "thing" in str(exc_info.value)
+
+    def test_unresolvable_header_marker_raises(self) -> None:
+        def make_handler() -> Any:
+            class LocalThing:
+                pass
+
+            def handler(body: bytes, tenant: "Annotated[LocalThing, Header('x-tenant')]") -> None:  # type: ignore[name-defined]
+                pass
+
+            return handler
+
+        handler = make_handler()
+        with pytest.raises(ConfigurationError, match="DI marker"):
+            DIResolver().validate_handler(handler)
+
+    def test_unresolvable_non_di_annotation_does_not_raise(self) -> None:
+        """A closure-scoped, unresolvable annotation with NO DI marker call
+        is a pre-existing (valid) pattern -- must not be flagged."""
+
+        def make_handler() -> Any:
+            def handler(thing: "SomeCompletelyUnresolvableName") -> None:  # type: ignore[name-defined]  # noqa: F821
+                pass
+
+            return handler
+
+        handler = make_handler()
+        DIResolver().validate_handler(handler)  # must not raise
+
+    def test_resolvable_depends_marker_does_not_raise(self) -> None:
+        """A DI marker that DOES resolve (the common case) is unaffected."""
+
+        def handler(body: bytes, thing: Annotated[str, Depends(_get_db)]) -> None:
+            pass
+
+        DIResolver().validate_handler(handler)  # must not raise
+
+
+# ── L11: get_type_hints_with_fallback is shared by DIResolver and the ────
+# ── pipeline's own _handler_needs_di detector — they must never diverge ──
+
+
+class TestGetTypeHintsWithFallbackSharedWithPipeline:
+    def test_handler_needs_di_uses_shared_resolution(self) -> None:
+        """HandlerPipeline._handler_needs_di must detect a Depends() marker
+        whenever DIResolver itself can resolve the annotation -- both now
+        delegate to the same get_type_hints_with_fallback()."""
+        from rabbitkit.core.pipeline import HandlerPipeline
+
+        def handler(body: bytes, thing: Annotated[str, Depends(_get_db)]) -> None:
+            pass
+
+        DIResolver().validate_handler(handler)  # sanity: resolves fine
+        assert HandlerPipeline()._handler_needs_di(handler) is True
+
+    def test_handler_needs_di_false_for_marker_free_handler(self) -> None:
+        from rabbitkit.core.pipeline import HandlerPipeline
+
+        def handler(body: bytes) -> None:
+            pass
+
+        assert HandlerPipeline()._handler_needs_di(handler) is False

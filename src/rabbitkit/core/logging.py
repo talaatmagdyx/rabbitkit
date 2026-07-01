@@ -48,11 +48,58 @@ yourself and do not use ``RabbitConfig.logging``:
     configure_structlog(LoggingConfig(render_json=True))
 
 Safe to call multiple times — last call wins.
+
+Secrets and message content (L16)
+----------------------------------
+rabbitkit's own structured log events never include the message body or
+the raw ``headers`` dict — only ``message_id``, ``routing_key``, ``queue``,
+and ``handler`` are bound per message. Bodies/headers may legitimately
+carry credentials or PII, so this is deliberate: none of rabbitkit's
+internal logging can leak them.
+
+That guarantee does not extend to log calls YOU write. If your own
+handler code does e.g. ``logger.info("processing", headers=msg.headers)``,
+whatever is in that dict goes out verbatim. Because ``configure_structlog()``
+sets structlog's *global* processor chain, ``LoggingConfig.redact_keys``
+(enabled by default) applies to those calls too: any top-level event field,
+or field one level deep inside a nested dict (e.g. ``headers={...}``),
+whose key case-insensitively matches an entry in ``redact_keys`` is
+replaced with a fixed redacted marker before rendering. This is a
+best-effort, key-name-based scrubber — not a PII/content scanner, and not a
+substitute for simply not logging bodies/headers containing secrets in the
+first place. Pass ``redact_keys=None`` to disable it, or a custom
+``frozenset`` to redact your own key names instead of (or in addition to)
+the defaults.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import structlog
+
+# L16: common credential/secret-bearing key names, matched case-insensitively.
+# Deliberately name-based (not content-based) -- see the module docstring.
+DEFAULT_REDACT_KEYS: frozenset[str] = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "auth",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "client_secret",
+    }
+)
+
+_REDACTED = "***REDACTED***"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,12 +111,62 @@ class LoggingConfig:
         add_log_level: Include log level in output.
         timestamper_fmt: Timestamp format ("iso", "unix", or None to disable).
         include_caller_info: Add filename/line number to log events.
+        redact_keys: Key names to redact from log events -- checked at the
+            top level and one level deep inside nested dict values (e.g. a
+            ``headers={...}`` field). Matching is case-insensitive and
+            normalizes AMQP-style ``x-`` prefixes/hyphens, so ``api_key``
+            also matches ``X-Api-Key``. Defaults to
+            :data:`DEFAULT_REDACT_KEYS`. Pass ``None`` to disable redaction
+            entirely, or your own ``frozenset`` to customize it. See the
+            module docstring ("Secrets and message content") for scope and
+            limitations.
     """
 
     render_json: bool = False
     add_log_level: bool = True
     timestamper_fmt: str = "iso"
     include_caller_info: bool = False
+    redact_keys: frozenset[str] | None = DEFAULT_REDACT_KEYS
+
+
+def _normalize_key(key: str) -> str:
+    """Normalize a key for comparison (L16).
+
+    AMQP headers conventionally use a ``x-`` prefix and hyphens (e.g.
+    ``x-api-key``), not the Python-style snake_case of
+    :data:`DEFAULT_REDACT_KEYS` (``api_key``). Stripping the ``x-`` prefix
+    and folding hyphens to underscores lets both spellings match the same
+    default entry.
+    """
+    lowered = key.lower()
+    if lowered.startswith("x-"):
+        lowered = lowered[2:]
+    return lowered.replace("-", "_")
+
+
+def _redact_processor(keys: frozenset[str]) -> Any:
+    """Build a structlog processor that redacts *keys* (L16).
+
+    Checks event-dict keys at the top level and one level deep inside any
+    nested ``dict`` value (covers the common ``headers={...}`` shape),
+    normalized via :func:`_normalize_key`. Not a recursive/deep scan -- see
+    the module docstring for why a shallow, name-based approach is the
+    deliberate scope here.
+    """
+    normalized_keys = {_normalize_key(k) for k in keys}
+
+    def processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        for key, value in event_dict.items():
+            if _normalize_key(key) in normalized_keys:
+                event_dict[key] = _REDACTED
+            elif isinstance(value, dict):
+                event_dict[key] = {
+                    nested_key: (_REDACTED if _normalize_key(nested_key) in normalized_keys else nested_value)
+                    for nested_key, nested_value in value.items()
+                }
+        return event_dict
+
+    return processor
 
 
 def configure_structlog(config: LoggingConfig | None = None) -> None:
@@ -88,6 +185,9 @@ def configure_structlog(config: LoggingConfig | None = None) -> None:
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
     ]
+
+    if config.redact_keys:
+        processors.append(_redact_processor(config.redact_keys))
 
     if config.add_log_level:
         processors.append(structlog.stdlib.add_log_level)

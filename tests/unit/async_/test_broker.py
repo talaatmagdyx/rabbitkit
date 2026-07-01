@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,7 +10,7 @@ import pytest
 
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.concurrency import AsyncWorkerPool
-from rabbitkit.core.config import RabbitConfig, RetryConfig, WorkerConfig
+from rabbitkit.core.config import PublisherConfig, RabbitConfig, RetryConfig, WorkerConfig
 from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 
 # ── Registration ─────────────────────────────────────────────────────────
@@ -127,6 +128,47 @@ class TestLifecycle:
         await broker.stop()  # should be no-op, no error
 
     @pytest.mark.asyncio
+    async def test_start_initializes_heartbeat_immediately(self) -> None:
+        """L14: last_heartbeat is set at start(), not left None until the
+        first message/tick -- so a broker wedged from the very start is
+        still caught by health.broker_liveness's staleness check."""
+        broker = AsyncBroker()
+        assert broker.last_heartbeat is None
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        assert broker.last_heartbeat is not None
+        await broker.stop()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_task_ticks_and_is_cancelled_on_stop(self) -> None:
+        """L14: the periodic heartbeat task refreshes last_heartbeat on its
+        own, independent of any message delivery, and is cleaned up by stop()."""
+        broker = AsyncBroker()
+        broker._HEARTBEAT_INTERVAL = 0.01  # instance override -- fast test tick
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.disconnect = AsyncMock()
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+            assert broker._heartbeat_task is not None
+
+            first = broker.last_heartbeat
+            await asyncio.sleep(0.05)  # let several ticks fire
+            assert broker.last_heartbeat is not None
+            assert first is not None
+            assert broker.last_heartbeat > first
+
+            await broker.stop()
+            assert broker._heartbeat_task is None
+
+    @pytest.mark.asyncio
     async def test_start_with_retry_declares_delay_queues(self) -> None:
         config = RabbitConfig(retry=RetryConfig(max_retries=2, delays=(5, 30)))
         broker = AsyncBroker(config)
@@ -155,6 +197,78 @@ class TestLifecycle:
             assert any(isinstance(m, RetryMiddleware) for m in route.route_middlewares), (
                 "retry=RetryConfig(...) must install RetryMiddleware on the route"
             )
+
+    @pytest.mark.asyncio
+    async def test_start_with_retry_and_no_confirms_warns(self) -> None:
+        """M4: a retry-enabled route on a broker with confirm_delivery=False
+        must warn -- RetryMiddleware acks the source as soon as its
+        delay-queue republish is SENT (fire-and-forget), not confirmed."""
+        config = RabbitConfig(
+            retry=RetryConfig(max_retries=1, delays=(5,)),
+            publisher=PublisherConfig(confirm_delivery=False),
+        )
+        broker = AsyncBroker(config)
+
+        @broker.subscriber(queue="orders", exchange="events")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_exchange = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.bind_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+                await broker.start()
+
+    @pytest.mark.asyncio
+    async def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
+        """M4: confirm_delivery=True (the default) must not trigger the warning."""
+        import warnings
+
+        config = RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,)))
+        broker = AsyncBroker(config)
+
+        @broker.subscriber(queue="orders", exchange="events")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_exchange = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.bind_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                await broker.start()  # must not raise (no warning triggered)
+
+    @pytest.mark.asyncio
+    async def test_start_with_result_publisher_and_no_confirms_warns(self) -> None:
+        """M4: a route with a @publisher() result forward on a broker with
+        confirm_delivery=False must warn -- the pipeline settles the source
+        as soon as the result publish is SENT, not confirmed."""
+        config = RabbitConfig(publisher=PublisherConfig(confirm_delivery=False))
+        broker = AsyncBroker(config)
+
+        @broker.subscriber(queue="orders")
+        @broker.publisher(exchange="results", routing_key="done")
+        async def handle(body: bytes) -> str:
+            return "ok"
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+                await broker.start()
 
     @pytest.mark.asyncio
     async def test_wire_retry_skips_route_without_retry(self) -> None:
@@ -1567,6 +1681,104 @@ class TestAsyncOnSignal:
         broker.on_app_shutdown = lambda: called.append(True)
         broker._on_signal()
         assert called == [True]
+
+
+# ── run() joins the drain instead of fire-and-forget (H11) ────────────────
+
+
+class TestAsyncRun:
+    """Tests for AsyncBroker.run() / request_shutdown() (H11)."""
+
+    async def _start_run(self, broker: AsyncBroker) -> Any:
+        import asyncio
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            run_task = asyncio.ensure_future(broker.run())
+            for _ in range(200):
+                if broker._run_waiting:
+                    break
+                await asyncio.sleep(0)
+            else:
+                run_task.cancel()
+                pytest.fail("run() never reached the shutdown wait")
+            return run_task, mock_transport
+
+    @pytest.mark.asyncio
+    async def test_run_returns_only_after_drain_completes(self) -> None:
+        import asyncio
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        run_task, mock_transport = await self._start_run(broker)
+        assert broker._started is True
+
+        broker.request_shutdown()
+        await asyncio.wait_for(run_task, timeout=2.0)
+
+        assert broker._started is False
+        mock_transport.disconnect.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_signal_during_run_does_not_double_stop(self) -> None:
+        """While run() is awaiting shutdown, _trigger_shutdown must not also
+        schedule the fire-and-forget stop() task (H11) — only run()'s own
+        awaited stop() call should settle the broker."""
+        import asyncio
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        run_task, _mock_transport = await self._start_run(broker)
+        assert broker._loop is not None
+        with patch.object(broker._loop, "create_task", wraps=broker._loop.create_task) as spy:
+            broker._on_signal()
+            assert spy.call_count == 0
+
+        await asyncio.wait_for(run_task, timeout=2.0)
+        assert broker._started is False
+
+    @pytest.mark.asyncio
+    async def test_request_shutdown_without_run_falls_back_to_fire_and_forget(self) -> None:
+        """request_shutdown() outside of run() (bare start() usage) still
+        schedules a stop() task, matching the pre-H11 signal-handler path."""
+        import asyncio
+
+        broker = AsyncBroker()
+        broker._loop = asyncio.get_running_loop()
+        broker.request_shutdown()
+        assert broker._shutdown_event.is_set()
+        await asyncio.sleep(0)  # let the scheduled stop() task run (no-op: not started)
+
+    @pytest.mark.asyncio
+    async def test_start_clears_stale_shutdown_event(self) -> None:
+        broker = AsyncBroker()
+        broker._shutdown_event.set()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start(install_signal_handlers=False)
+
+        assert not broker._shutdown_event.is_set()
 
 
 # ── async _wait_in_flight deadline ────────────────────────────────────────

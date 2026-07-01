@@ -136,12 +136,31 @@ class JsonParser:
     (e.g. ``datetime``, ``Decimal``) rather than silently coercing them via
     ``str()``. Pass ``coerce_unknown_to_str=True`` to restore the legacy
     ``default=str`` coercion behaviour.
+
+    M7: caps the input size before ``json.loads`` (64 MiB by default,
+    matching ``CompressionMiddleware``'s ``max_decompressed_size`` default)
+    -- without it, a large uncompressed body is fully materialized with no
+    bound. Pass ``max_parse_bytes=None`` to opt out.
     """
 
-    def __init__(self, *, coerce_unknown_to_str: bool = False) -> None:
+    #: M7: see JSONSerializer's identical default for the rationale.
+    _DEFAULT_MAX_PARSE_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        coerce_unknown_to_str: bool = False,
+        max_parse_bytes: int | None = _DEFAULT_MAX_PARSE_BYTES,
+    ) -> None:
         self._coerce = coerce_unknown_to_str
+        self._max_parse_bytes = max_parse_bytes
+
+    def _check_size(self, data: bytes) -> None:
+        if self._max_parse_bytes is not None and len(data) > self._max_parse_bytes:
+            raise ValueError(f"JSON input size {len(data)} exceeds max_parse_bytes={self._max_parse_bytes}")
 
     def parse(self, data: bytes, content_type: str | None = None) -> Any:
+        self._check_size(data)
         return json.loads(data)
 
     def _default(self, data: Any) -> Any:
@@ -172,13 +191,35 @@ class PydanticDecoder:
 
 
 class DataclassDecoder:
-    """Decoder for stdlib dataclasses."""
+    """Decoder for stdlib dataclasses.
+
+    H14 — no type validation or coercion: unlike ``PydanticDecoder``, this
+    does NOT check field types. A field declared ``qty: int`` silently
+    receives whatever JSON type was actually present (e.g. the string
+    ``"3"``) if the producer sent the wrong type — stdlib dataclasses
+    perform no runtime type checking on construction. **Use
+    ``PydanticDecoder`` (or a msgspec-based decoder) instead for untrusted
+    input where wrong-typed fields must be rejected.**
+
+    Unknown keys in the incoming dict (not a declared field) are silently
+    dropped rather than raising ``TypeError`` — this keeps a producer that
+    adds a new field (forward-compatible) from turning every message into a
+    decode failure (misclassified PERMANENT, straight to the DLQ) until
+    every consumer is upgraded. A genuinely wrong shape (a missing required
+    field, etc.) still raises — as a ``TypeError`` naming the target
+    dataclass, not a bare constructor traceback.
+    """
 
     def decode(self, data: Any, target_type: type) -> Any:
         import dataclasses
 
         if dataclasses.is_dataclass(target_type) and isinstance(data, dict):
-            return target_type(**data)
+            known_fields = {f.name for f in dataclasses.fields(target_type)}
+            filtered = {k: v for k, v in data.items() if k in known_fields}
+            try:
+                return target_type(**filtered)
+            except TypeError as exc:
+                raise TypeError(f"Cannot decode into {target_type.__name__}: {exc}") from exc
         return data
 
     def encode(self, data: Any) -> Any:

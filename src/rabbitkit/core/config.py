@@ -17,6 +17,24 @@ from rabbitkit.core.types import ErrorSeverity, TopologyMode
 # ── Connection ─────────────────────────────────────────────────────────────
 
 
+def _masked_repr(obj: object, *, secret_fields: tuple[str, ...] = ("password",)) -> str:
+    """L2: generic ``__repr__`` for a config dataclass that masks *secret_fields*.
+
+    The default dataclass-generated ``__repr__`` includes every field
+    verbatim — any log line or traceback that reprs a config object (or logs
+    it directly, which falls back to ``__repr__``) leaks the plaintext
+    password. Iterates ``dataclasses.fields()`` generically so a field added
+    later is still included (just not masked unless also listed).
+    """
+    import dataclasses
+
+    parts = []
+    for f in dataclasses.fields(obj):  # type: ignore[arg-type]
+        value = "'***'" if f.name in secret_fields else repr(getattr(obj, f.name))
+        parts.append(f"{f.name}={value}")
+    return f"{type(obj).__name__}({', '.join(parts)})"
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectionConfig:
     """Core connection parameters."""
@@ -35,6 +53,9 @@ class ConnectionConfig:
     reconnect_backoff_base: float = 1.0
     reconnect_backoff_max: float = 30.0
 
+    def __repr__(self) -> str:
+        return _masked_repr(self)
+
     @property
     def url(self) -> str:
         """Build AMQP URL from config fields.
@@ -42,6 +63,9 @@ class ConnectionConfig:
         Username, password and vhost are URL-encoded so credentials containing
         reserved characters (``@:/#`` etc.) cannot corrupt the host/port parse
         (mirrors the encoding done in ``async_/connection.py``).
+
+        SECURITY (L2): this embeds the plaintext password (``user:pass@host``)
+        — never log or repr it. Use :attr:`safe_url` for logging/display.
         """
         if self.vhost == "/":
             vhost = "%2F"
@@ -50,6 +74,16 @@ class ConnectionConfig:
         user = quote(self.username, safe="")
         pwd = quote(self.password, safe="")
         return f"amqp://{user}:{pwd}@{self.host}:{self.port}/{vhost}"
+
+    @property
+    def safe_url(self) -> str:
+        """Like :attr:`url` but with the password masked (L2) — safe to log."""
+        if self.vhost == "/":
+            vhost = "%2F"
+        else:
+            vhost = quote(self.vhost, safe="")
+        user = quote(self.username, safe="")
+        return f"amqp://{user}:***@{self.host}:{self.port}/{vhost}"
 
     def __post_init__(self) -> None:
         # Surface the insecure default-credentials-against-non-local-host mistake
@@ -275,14 +309,6 @@ class MetricsConfig:
         return self.processing_histogram or f"{self.namespace}_message_processing_seconds"
 
     @property
-    def handler_duration_seconds(self) -> str:
-        return self.processing_histogram or f"{self.namespace}_handler_duration_seconds"
-
-    @property
-    def handler_errors_total(self) -> str:
-        return f"{self.namespace}_handler_errors_total"
-
-    @property
     def messages_acked_total(self) -> str:
         return f"{self.namespace}_messages_acked_total"
 
@@ -301,6 +327,22 @@ class MetricsConfig:
     @property
     def messages_dead_lettered_total(self) -> str:
         return f"{self.namespace}_messages_dead_lettered_total"
+
+    @property
+    def dedup_fallback_total(self) -> str:
+        """M9: incremented every time DeduplicationMiddleware falls back to
+        processing a message despite a Redis error (idempotency is not
+        enforced for that message) — see
+        ``DeduplicationConfig.fallback_on_redis_error``."""
+        return f"{self.namespace}_dedup_fallback_total"
+
+    @property
+    def rate_limit_dropped_total(self) -> str:
+        """L5: incremented every time RateLimitMiddleware settles a message
+        without calling the handler — nack/drop policy, or the "wait" policy's
+        deadline elapsing with no token acquired. Labeled by ``reason``
+        (``nack``/``drop``/``wait_deadline_exceeded``)."""
+        return f"{self.namespace}_rate_limit_dropped_total"
 
     @property
     def published_total(self) -> str:
@@ -451,6 +493,23 @@ class WorkerConfig:
     """Consumer concurrency configuration.
 
     Accepted by broker.start(), NOT part of RabbitConfig. Added in 0.2.0.
+
+    ``stop_timeout`` (H12): the drain deadline given to a multi-worker pool's
+    ``stop()`` — it must exceed your slowest handler's expected run time, and
+    should be a few seconds *less* than ``terminationGracePeriodSeconds`` (k8s)
+    so the graceful drain always has a chance to finish before SIGKILL. A
+    handler still running past this deadline is **abandoned, not killed**:
+    the sync pool's daemon thread keeps running in the background (it is
+    never forcibly stopped — Python cannot interrupt an arbitrary thread),
+    and the async pool cancels the task (which does not guarantee the
+    handler reaches its own ack/nack — ``CancelledError`` is a
+    ``BaseException`` and is not caught by the pipeline's exception
+    handling). Either way the abandoned delivery is logged by delivery
+    tag/message id, and — for the async pool — nacked for redelivery
+    immediately rather than relying on the implicit requeue that happens
+    when the connection eventually closes. Because the original handler may
+    still complete its side effects after abandonment, **handlers must be
+    idempotent under at-least-once delivery** regardless of ``stop_timeout``.
     """
 
     worker_count: int = 1

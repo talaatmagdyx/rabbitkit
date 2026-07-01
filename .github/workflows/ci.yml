@@ -38,6 +38,40 @@ jobs:
       # incrementally as new tests close the gap.
       - name: Tests
         run: .venv/bin/pytest tests/unit/ -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+      # L17: security regression scenarios (signing replay, decompression
+      # bombs) and hypothesis property-based round-trip tests. Separate from
+      # the coverage-gated run above -- these test the public API as
+      # standalone scenarios/properties, not line coverage.
+      - name: Security & property tests
+        run: .venv/bin/pytest tests/security/ tests/property/ -q --tb=short
+
+  # Builds the sdist + wheel, validates the long description with `twine
+  # check` (the same check PyPI runs at upload time — catches malformed
+  # README/metadata before a release attempt), then installs the wheel into
+  # a clean venv and does an import smoke test. Catches "works from the repo
+  # checkout but the packaged artifact is broken" (missing package data,
+  # wrong `packages.find` config, etc.) before it reaches a release.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: twine check
+        run: twine check dist/*
+      - name: Install wheel into a clean venv and smoke-test the import
+        run: |
+          python -m venv /tmp/rabbitkit-install-test
+          /tmp/rabbitkit-install-test/bin/pip install dist/*.whl
+          /tmp/rabbitkit-install-test/bin/python -c "import rabbitkit; print(rabbitkit.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
   # Integration tests run against a real RabbitMQ broker. Each test module
   # starts its own disposable container via testcontainers (see

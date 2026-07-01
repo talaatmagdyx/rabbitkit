@@ -18,6 +18,36 @@ from collections.abc import Callable, Sequence
 
 from rabbitkit.core.types import ClassifiedError, ErrorSeverity
 
+# ── Missing DI dependency (H10) ──────────────────────────────────────────
+# Defined before PERMANENT_ERRORS below so it can be listed there directly.
+
+
+class MissingDependencyError(Exception):
+    """Raised at message-processing time when a required ``Header()`` /
+    ``Path()`` / ``Context()`` marker's value is absent from the incoming
+    message and no default is available — neither on the marker itself
+    (``Header("x-tenant", default=...)``) nor the handler's own parameter
+    default (``tenant: Annotated[str | None, Header("x-tenant")] = None``).
+
+    Names the specific parameter and marker so the failure is immediately
+    actionable — unlike the bare ``KeyError`` this replaces, which looked
+    identical to a handler bug (e.g. indexing a dict) and gave no indication
+    which DI marker was the culprit. Classified PERMANENT by
+    :func:`classify_error` (see ``PERMANENT_ERRORS`` below), matching the
+    ``KeyError`` classification it replaces: a missing required value means
+    the message itself is malformed for this handler — retrying will not fix
+    it, so it settles straight to the DLQ rather than looping.
+    """
+
+    def __init__(self, marker_repr: str, param_name: str) -> None:
+        super().__init__(
+            f"{marker_repr} for parameter {param_name!r} is required but missing from the "
+            "message, and no default is available (neither on the marker itself nor as a "
+            "Python parameter default)."
+        )
+        self.param_name = param_name
+
+
 # Generic (stdlib) error categories — transport layers extend these
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     TimeoutError,
@@ -32,6 +62,7 @@ PERMANENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
     UnicodeDecodeError,
     AttributeError,
+    MissingDependencyError,
 )
 
 # Type alias for error predicates

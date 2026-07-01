@@ -59,6 +59,29 @@ class TestMessageConstruction:
         assert msg.is_settled is False
         assert msg._disposition == "pending"
 
+    def test_disposition_property_pending_initially(self) -> None:
+        """M2: public disposition property mirrors the private _disposition."""
+        msg = _make_message()
+        assert msg.disposition == "pending"
+
+    def test_disposition_property_after_ack(self) -> None:
+        msg = _make_message()
+        _wire_sync(msg)
+        msg.ack()
+        assert msg.disposition == "acked"
+
+    def test_disposition_property_after_nack(self) -> None:
+        msg = _make_message()
+        _wire_sync(msg)
+        msg.nack()
+        assert msg.disposition == "nacked"
+
+    def test_disposition_property_after_reject(self) -> None:
+        msg = _make_message()
+        _wire_sync(msg)
+        msg.reject()
+        assert msg.disposition == "rejected"
+
 
 # ── sync ack ──────────────────────────────────────────────────────────────
 

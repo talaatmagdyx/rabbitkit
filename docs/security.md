@@ -1,5 +1,8 @@
 # Security Notes
 
+Found a vulnerability in rabbitkit itself (not just a hardening question)?
+See [SECURITY.md](../SECURITY.md) for how to report it privately.
+
 ## Message Bodies
 
 Do not log message bodies by default. Bodies may contain PII, credentials, or sensitive business data. Enable body logging only in development environments with explicit opt-in.
@@ -51,7 +54,7 @@ Do not let external callers control routing keys directly. A caller that control
 `SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks. Configure it with a secret that is at least 32 bytes:
 
 ```python
-from rabbitkit import SigningConfig
+from rabbitkit.experimental import SigningConfig
 from rabbitkit.middleware.signing import SigningMiddleware
 
 mw = SigningMiddleware(config=SigningConfig(secret_key="a-long-random-secret-at-least-32-bytes"))
@@ -113,5 +116,16 @@ mw = DeduplicationMiddleware(
     config=DeduplicationConfig(key_source="message_id", ttl=3600),
 )
 ```
+
+**Fail-open by default (M9):** `DeduplicationConfig.fallback_on_redis_error`
+defaults to `True` — if Redis is unreachable, messages are processed
+*without* idempotency enforcement rather than blocking the consumer (an
+ERROR-level log and, if you wire a `MetricsCollector`, a
+`dedup_fallback_total` counter are emitted every time this happens, so it's
+observable, not silent). This is the right default for most workloads
+(availability over strict dedup), but for traffic where a duplicate is
+unacceptable — payments, anything non-idempotent at the business layer — set
+`fallback_on_redis_error=False` to fail closed (re-raise the Redis error)
+instead.
 
 Set `mark_policy="on_start"` if you need to prevent concurrent duplicate processing at the cost of retry safety.

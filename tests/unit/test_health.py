@@ -35,6 +35,7 @@ def _make_broker(
     started: bool = True,
     transport: Any | None = "default",
     connected: bool = True,
+    blocked: bool = False,
     routes: list[Any] | None = None,
     worker_pool: Any | None = "default",
     pool_pending: int = 0,
@@ -46,6 +47,10 @@ def _make_broker(
         transport: The ``_transport`` object.  Pass ``None`` to omit, or
             ``"default"`` to create a mock transport.
         connected: Value returned by ``transport.is_connected()``.
+        blocked: Value of the default mock transport's ``is_blocked``
+            property (L15). Explicitly set (not left as an auto-mock
+            attribute, which MagicMock would make truthy by default and
+            spuriously mark every such broker "blocked").
         routes: List of route objects (each may have ``consumer_tag``).
         worker_pool: The ``_worker_pool`` object.  Pass ``None`` to omit,
             or ``"default"`` to create one from *pool_pending*.
@@ -56,6 +61,7 @@ def _make_broker(
     if transport == "default":
         t = MagicMock()
         t.is_connected.return_value = connected
+        t.is_blocked = blocked
         broker._transport = t
     elif transport is None:
         pass  # no _transport attribute at all
@@ -222,6 +228,53 @@ class TestBrokerHealthCheck:
         assert result.consumer_count == 0
         assert result.route_count == 0
 
+    def test_degraded_when_blocked_via_transport(self) -> None:
+        """L15: transport.is_blocked=True -> DEGRADED even with no
+        FlowController wired (broker.flow_controller absent)."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes, blocked=True)
+        assert not hasattr(broker, "flow_controller")
+
+        result = broker_health_check(broker)
+
+        assert result.status == HealthStatus.DEGRADED
+        assert result.blocked is True
+        assert result.connected is True  # blocked is orthogonal to connected
+        assert "blocked" in result.details["reason"]
+
+    def test_healthy_when_not_blocked(self) -> None:
+        """L15: transport.is_blocked=False -> blocked field is False, HEALTHY."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes, blocked=False)
+        result = broker_health_check(broker)
+
+        assert result.status == HealthStatus.HEALTHY
+        assert result.blocked is False
+
+    def test_degraded_when_blocked_via_flow_controller(self) -> None:
+        """L15: broker.flow_controller.is_blocked=True takes priority over
+        (and is checked instead of) the transport's own is_blocked."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes, blocked=False)
+        broker.flow_controller = SimpleNamespace(is_blocked=True)
+
+        result = broker_health_check(broker)
+
+        assert result.status == HealthStatus.DEGRADED
+        assert result.blocked is True
+
+    def test_blocked_takes_priority_over_missing_consumers(self) -> None:
+        """L15: when both blocked AND missing-consumers apply, the blocked
+        reason surfaces (checked first -- more actionable root cause)."""
+        routes = [_make_route(consumer_tag="ctag-1"), _make_route(consumer_tag=None)]
+        broker = _make_broker(started=True, connected=True, routes=routes, blocked=True)
+
+        result = broker_health_check(broker)
+
+        assert result.status == HealthStatus.DEGRADED
+        assert result.blocked is True
+        assert "blocked" in result.details["reason"]
+
     def test_with_worker_pool_no_backlog(self) -> None:
         """Pool exists but pending=0 -> HEALTHY."""
         routes = [_make_route()]
@@ -385,6 +438,7 @@ class TestLivenessVsReadiness:
         if transport is None:
             t = MagicMock()
             t.is_connected.return_value = connected
+            t.is_blocked = False
             transport = t
         broker = SimpleNamespace(_started=True, _transport=transport, routes=routes)
         broker._worker_pool = SimpleNamespace(pending_count=0)
@@ -415,6 +469,18 @@ class TestLivenessVsReadiness:
         assert broker_liveness(broker) is True
         assert broker_readiness(broker) is False
 
+    def test_readiness_false_when_blocked(self) -> None:
+        """L15: a blocked connection is not ready for traffic even though
+        it's technically still connected and has live consumers."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        t = MagicMock()
+        t.is_connected.return_value = True
+        t.is_blocked = True
+        broker = self._broker_with_routes(connected=True, routes=routes, transport=t)
+
+        assert broker_liveness(broker) is True  # blocked is not a liveness failure
+        assert broker_readiness(broker) is False
+
     def test_readiness_false_when_missing_consumers(self) -> None:
         routes = [_make_route(consumer_tag="ctag-1"), _make_route(consumer_tag=None)]
         broker = self._broker_with_routes(connected=True, routes=routes)
@@ -430,6 +496,7 @@ class TestLivenessVsReadiness:
         t = MagicMock()
         t.is_connected.return_value = True  # connection alive
         t.is_consuming.return_value = False  # but channel/consumers gone
+        t.is_blocked = False
         routes = [_make_route(consumer_tag="stale-tag")]  # registered, now dead
         broker = self._broker_with_routes(connected=True, routes=routes, transport=t)
 

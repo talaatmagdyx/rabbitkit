@@ -190,6 +190,13 @@ class ManagementConfig:
     password: str = "guest"
     timeout: float = 10.0
 
+    def __repr__(self) -> str:
+        """L2: mask the password — the default dataclass repr would leak it
+        in plaintext into any log line or traceback that reprs this object."""
+        from rabbitkit.core.config import _masked_repr
+
+        return _masked_repr(self)
+
     def __post_init__(self) -> None:
         scheme = urllib.parse.urlparse(self.url).scheme.lower()
         if scheme not in {"http", "https"}:

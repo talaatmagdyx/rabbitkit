@@ -18,7 +18,7 @@ Requirements:
 import asyncio
 
 from rabbitkit import ConnectionConfig, RabbitConfig, RetryConfig
-from rabbitkit.aio import AsyncBroker
+from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.types import AckPolicy
 from rabbitkit.middleware.retry import RetryMiddleware
 

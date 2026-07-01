@@ -12,17 +12,19 @@ Produced by SubscriberRegistry, consumed by Broker.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import FrozenInstanceError, dataclass, field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
+from rabbitkit.serialization.base import Serializer
 
 if TYPE_CHECKING:
     from rabbitkit.core.message import RabbitMessage
     from rabbitkit.core.protocols import Transport  # noqa: F401
+    from rabbitkit.middleware.base import BaseMiddleware
 
 
 # ── Result publisher ─────────────────────────────────────────────────────
@@ -104,13 +106,13 @@ class RouteDefinition:
     exchange: RabbitExchange | None
     handler: Callable[..., Any]
     ack_policy: AckPolicy = AckPolicy.AUTO
-    route_middlewares: list[Any] = field(default_factory=list)
+    route_middlewares: list[BaseMiddleware] = field(default_factory=list)
 
     # Publisher side (optional)
     result_publisher: ResultPublisher | None = None
 
     # Overrides
-    serializer_override: Any | None = None  # Serializer protocol, typed later
+    serializer_override: Serializer[Any] | None = None
     retry_override: RetryConfig | RetryDisabled | None = None
     prefetch_count: int | None = None  # Per-route prefetch override (None=use global)
     tags: frozenset[str] = field(default_factory=frozenset)
@@ -128,13 +130,16 @@ class RouteDefinition:
     def consumer_tag(self) -> str | None:
         """Active consumer tag for this route (delegates to runtime_state).
 
-        Kept for backward compatibility with callers (e.g. ``health.py``)
-        that read ``route.consumer_tag``. Writes are also supported for
-        backward compatibility — ``route.consumer_tag = x`` delegates to
-        ``route.runtime_state.consumer_tag = x`` via the custom
-        ``__setattr__`` installed below (frozen+slots would otherwise block
-        property setters). New code should prefer writing
-        ``route.runtime_state.consumer_tag`` directly.
+        Read-only (L10) — kept for callers (e.g. ``health.py``) that read
+        ``route.consumer_tag``. To set it, write
+        ``route.runtime_state.consumer_tag = ...`` directly;
+        ``route.consumer_tag = ...`` raises (a ``TypeError``, not a clean
+        ``FrozenInstanceError`` — a side effect of ``frozen=True`` combined
+        with ``slots=True`` and a same-named property) just like assigning
+        any other field on this frozen dataclass. There is no special-cased
+        ``__setattr__`` here — the mutable runtime state lives entirely in
+        the separate :class:`RouteRuntimeState` object, and this class is
+        genuinely frozen.
         """
         return self.runtime_state.consumer_tag
 
@@ -248,38 +253,6 @@ def warn_filter_without_dlx(route_name: str, queue_name: str, dlq_name: str) -> 
         RuntimeWarning,
         stacklevel=3,
     )
-
-
-# ── Backward-compatible ``consumer_tag`` writes on frozen RouteDefinition ─
-#
-# ``@dataclass(frozen=True, slots=True)`` generates a ``__setattr__`` that
-# raises ``FrozenInstanceError`` for every assignment, and (due to a
-# frozen+slots interaction) it also blocks property setters with a misleading
-# ``TypeError``. To keep the public write path
-# ``route.consumer_tag = ...`` working for callers that predate the R13
-# split (and for tests that reset it), we reinstall a thin ``__setattr__``
-# that routes ``consumer_tag`` writes to the mutable ``runtime_state``
-# sub-object and rejects every other assignment (preserving frozen semantics
-# for all registration-metadata fields).
-
-
-def _route_setattr(self: RouteDefinition, name: str, value: object) -> None:
-    if name == "consumer_tag":
-        # Delegate to the mutable runtime-state sub-object.
-        object.__getattribute__(self, "runtime_state").consumer_tag = value
-        return
-    raise FrozenInstanceError(f"cannot assign field {name!r} to {type(self).__name__!r}")
-
-
-def _route_delattr(self: RouteDefinition, name: str) -> None:
-    if name == "consumer_tag":
-        object.__getattribute__(self, "runtime_state").consumer_tag = None
-        return
-    raise FrozenInstanceError(f"cannot delete field {name!r} from {type(self).__name__!r}")
-
-
-RouteDefinition.__setattr__ = _route_setattr  # type: ignore[assignment]
-RouteDefinition.__delattr__ = _route_delattr  # type: ignore[assignment]
 
 
 # ``ConfigurationError`` now lives in ``rabbitkit.core.errors`` (single

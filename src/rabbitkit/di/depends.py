@@ -20,7 +20,10 @@ class Depends:
         ) -> None:
             ...
 
-    Per-message lifetime only (0.1.0). Generator dependencies deferred to 0.2.0.
+    Per-message lifetime: a fresh dependency graph is resolved for each
+    message. A generator (or async generator) dependency is supported too —
+    yield the value; the code after ``yield`` runs as teardown once the
+    handler completes (see :class:`~rabbitkit.di.resolver.DependencyScope`).
     """
 
     def __init__(self, dependency: Callable[..., Any], *, use_cache: bool = True) -> None:

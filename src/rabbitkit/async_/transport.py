@@ -21,6 +21,7 @@ from typing import Any
 
 from rabbitkit.async_.pool import AsyncConnectionPool
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
@@ -107,6 +108,12 @@ class AsyncTransportImpl:
         self._blocked_callbacks: list[Callable[[], None]] = []
         self._unblocked_callbacks: list[Callable[[], None]] = []
 
+        # L15: passive blocked-state tracking, independent of whether a
+        # FlowController is registered above -- health.broker_health_check
+        # reads this (via the is_blocked property) so a broker/disk/memory
+        # alarm is visible even when the caller never opted into FlowController.
+        self._blocked_state: bool = False
+
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
         self._blocked_callbacks.append(callback)
@@ -115,7 +122,17 @@ class AsyncTransportImpl:
         """Register a connection-unblocked callback (e.g. FlowController.on_unblocked)."""
         self._unblocked_callbacks.append(callback)
 
+    @property
+    def is_blocked(self) -> bool:
+        """True if RabbitMQ has sent ``connection.blocked`` (L15) -- e.g. a
+        broker memory/disk alarm. Tracked passively regardless of whether
+        any ``on_blocked``/``on_unblocked`` callback is registered, so
+        ``health.broker_health_check`` can see it even without an opt-in
+        ``FlowController``."""
+        return self._blocked_state
+
     def _aio_blocked(self, *_args: Any) -> None:
+        self._blocked_state = True
         for cb in list(self._blocked_callbacks):
             try:
                 cb()
@@ -123,6 +140,7 @@ class AsyncTransportImpl:
                 logger.exception("blocked callback raised")
 
     def _aio_unblocked(self, *_args: Any) -> None:
+        self._blocked_state = False
         for cb in list(self._unblocked_callbacks):
             try:
                 cb()
@@ -473,8 +491,10 @@ class AsyncTransportImpl:
                     routing_key=envelope.routing_key,
                     mandatory=envelope.mandatory,
                 )
+                # M4: SENT, not CONFIRMED -- this channel has publisher_confirms=False,
+                # so nothing was actually acknowledged by the broker.
                 return PublishOutcome(
-                    status=PublishStatus.CONFIRMED,
+                    status=PublishStatus.SENT,
                     exchange=envelope.exchange,
                     routing_key=envelope.routing_key,
                 )
@@ -574,17 +594,22 @@ class AsyncTransportImpl:
 
         kwargs = exchange.to_declare_kwargs()
 
-        if action is TopoAction.PASSIVE:
-            await self._topology_channel.get_exchange(kwargs["exchange"], ensure=True)
-        else:
-            await self._topology_channel.declare_exchange(
-            name=kwargs["exchange"],
-            type=kwargs.get("exchange_type", "direct"),
-            durable=kwargs.get("durable", True),
-            auto_delete=kwargs.get("auto_delete", False),
-            internal=kwargs.get("internal", False),
-            arguments=kwargs.get("arguments"),
-        )
+        import aio_pika.exceptions
+
+        try:
+            if action is TopoAction.PASSIVE:
+                await self._topology_channel.get_exchange(kwargs["exchange"], ensure=True)
+            else:
+                await self._topology_channel.declare_exchange(
+                    name=kwargs["exchange"],
+                    type=kwargs.get("exchange_type", "direct"),
+                    durable=kwargs.get("durable", True),
+                    auto_delete=kwargs.get("auto_delete", False),
+                    internal=kwargs.get("internal", False),
+                    arguments=kwargs.get("arguments"),
+                )
+        except aio_pika.exceptions.ChannelPreconditionFailed as exc:
+            self._raise_precondition_failed("exchange", kwargs["exchange"], exc)
 
     async def declare_queue(self, queue: RabbitQueue) -> None:
         """Declare a queue on the topology channel."""
@@ -597,16 +622,43 @@ class AsyncTransportImpl:
 
         kwargs = queue.to_declare_kwargs()
 
-        if action is TopoAction.PASSIVE:
-            await self._topology_channel.get_queue(kwargs["queue"], ensure=True)
-        else:
-            await self._topology_channel.declare_queue(
-                name=kwargs["queue"],
-                durable=kwargs.get("durable", True),
-                exclusive=kwargs.get("exclusive", False),
-                auto_delete=kwargs.get("auto_delete", False),
-                arguments=kwargs.get("arguments"),
-            )
+        import aio_pika.exceptions
+
+        try:
+            if action is TopoAction.PASSIVE:
+                await self._topology_channel.get_queue(kwargs["queue"], ensure=True)
+            else:
+                await self._topology_channel.declare_queue(
+                    name=kwargs["queue"],
+                    durable=kwargs.get("durable", True),
+                    exclusive=kwargs.get("exclusive", False),
+                    auto_delete=kwargs.get("auto_delete", False),
+                    arguments=kwargs.get("arguments"),
+                )
+        except aio_pika.exceptions.ChannelPreconditionFailed as exc:
+            self._raise_precondition_failed("queue", kwargs["queue"], exc)
+
+    def _raise_precondition_failed(self, kind: str, name: str, exc: BaseException) -> None:
+        """M6: turn a 406 PRECONDITION_FAILED into a typed, actionable error.
+
+        Declaring a queue/exchange with arguments that conflict with an
+        existing one of the same name (e.g. an ops-created quorum queue
+        where rabbitkit's config declares classic, or a different TTL/DLX)
+        closes the channel with reply_code 406 --
+        ``aio_pika.exceptions.ChannelPreconditionFailed`` specifically.
+        Previously this aborted startup with a low-level channel-closed
+        traceback giving no hint which queue/exchange or argument actually
+        conflicted.
+        """
+        raise ConfigurationError(
+            f"Cannot declare {kind} {name!r}: it already exists with incompatible "
+            f"arguments (broker said: {exc}). This usually means it was created "
+            f"outside rabbitkit (e.g. ops tooling) with different arguments (e.g. "
+            f"quorum vs classic queue type, a different TTL, or a different "
+            f"dead-letter exchange). Either delete/reconcile the existing {kind}, "
+            f"adjust its rabbitkit definition to match, or use "
+            f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
+        ) from exc
 
     async def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
         """Bind a queue to an exchange on the topology channel."""

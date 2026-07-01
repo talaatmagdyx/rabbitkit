@@ -260,6 +260,14 @@ async def handle(body: bytes) -> None:
 
 Or use `TopologyMode.MANUAL` to skip auto-declaration (you manage topology externally).
 
+**Declaring a queue/exchange with different arguments than an existing one
+(M6)** — e.g. ops tooling created a quorum queue but your config declares
+classic — raises a `ConfigurationError` naming the conflicting queue/exchange
+and quoting the broker's own error (AMQP 406 PRECONDITION_FAILED), instead
+of an opaque low-level channel-closed traceback. Delete/reconcile the
+existing object, adjust your `RabbitQueue`/`RabbitExchange` definition to
+match, or use `TopologyMode.PASSIVE_ONLY` to just verify it exists.
+
 ---
 
 ## 3. Configuration
@@ -571,6 +579,13 @@ async def handle(
 > **Note:** `ContextRepo` uses `contextvars.ContextVar` (not `threading.local`) for correct
 > isolation across async coroutines. Each in-flight message gets its own context snapshot.
 
+**Optional values (H10):** `Header()`/`Path()`/`Context()` are required by
+default -- a missing value raises `MissingDependencyError` (PERMANENT,
+straight to the DLQ). Make one optional with `default=` on the marker
+(`Header("x-tenant", default="anonymous")`) or a Python default on the
+parameter (`Annotated[str | None, Header("x-tenant")] = None`) -- the marker's
+own default wins if both are given.
+
 ---
 
 ## 7. Middleware
@@ -594,6 +609,19 @@ list is outermost). The chain is **cached per route** for performance.
 | `TimeoutMiddleware` | Handler execution timeout |
 | `ResultMiddleware` | Store results in a backend (Redis) |
 | `LockMiddleware` | Distributed locking for single-consumer |
+
+**`MetricsMiddleware` metrics (M2/M3):** emits
+`messages_consumed_total`/`message_processing_seconds` (handler success/error
++ duration) and `messages_published_total`/`message_publish_seconds`
+directly from its own `consume_scope`/`publish_scope`. It ALSO emits
+`messages_acked_total`/`messages_nacked_total`/`messages_rejected_total`
+(via a hook `HandlerPipeline` calls once a message's disposition is final)
+and, when a `RetryMiddleware` is also on the route,
+`messages_retried_total`/`messages_dead_lettered_total`. The `queue` label
+on every consume-side metric is the BOUND queue name, not the raw routing
+key — a topic/`Path()` routing key can embed an unbounded per-message value
+(tenant id, order id, etc.), which would otherwise blow up your metrics
+backend's cardinality.
 
 ### Using middleware
 
@@ -893,7 +921,7 @@ response = broker.request(
 ### RPCClient / AsyncRPCClient (direct)
 
 ```python
-from rabbitkit import RPCClient, AsyncRPCClient
+from rabbitkit.experimental import RPCClient, AsyncRPCClient
 
 # Sync
 client = RPCClient(transport, max_reply_bytes=1_000_000)
@@ -990,7 +1018,7 @@ start_metrics_server(port=9090)  # defaults to 127.0.0.1; pass host="0.0.0.0" fo
 ## 14. Distributed Locking
 
 ```python
-from rabbitkit import RedisLock, LockMiddleware
+from rabbitkit.experimental import RedisLock, LockMiddleware
 
 # Redis-backed distributed lock
 lock = RedisLock(redis_client, ttl=30)
@@ -1073,7 +1101,7 @@ async def handle(body: bytes) -> None:
 ## 17. Message Signing
 
 ```python
-from rabbitkit import SigningMiddleware, SigningConfig
+from rabbitkit.experimental import SigningMiddleware, SigningConfig
 
 @broker.subscriber(
     queue="secure-events",
@@ -1135,7 +1163,7 @@ OOM attacks.
 ## 19. Result Backends
 
 ```python
-from rabbitkit import ResultMiddleware
+from rabbitkit.experimental import ResultMiddleware
 from rabbitkit.results import RedisResultBackend
 
 backend = RedisResultBackend(redis_client, ttl=3600)
@@ -1157,7 +1185,7 @@ result = await backend.fetch(correlation_id)
 ## 20. Stream Queues
 
 ```python
-from rabbitkit import StreamOffset, StreamOffsetType, StreamConsumerConfig
+from rabbitkit.experimental import StreamOffset, StreamOffsetType, StreamConsumerConfig
 
 @broker.subscriber(
     queue=RabbitQueue(name="telemetry", queue_type=QueueType.STREAM),
@@ -1230,7 +1258,7 @@ queues = await client.list_queues_async(vhost="/")
 ## 23. Monitoring Dashboard
 
 ```python
-from rabbitkit import create_dashboard_app
+from rabbitkit.experimental import create_dashboard_app
 
 # Create a Starlette ASGI dashboard app
 app = create_dashboard_app(
@@ -1483,6 +1511,9 @@ spec:
   installs a signal-safe handler that drains in-flight work).
 - Async `broker.start()` installs SIGTERM handlers by default (pass
   `install_signal_handlers=False` when driven by `RabbitApp.run_async()`).
+  `start()` alone is fire-and-forget on signal -- use `asyncio.run(broker.run())`
+  when the async broker is used directly (not via `RabbitApp`), so the drain
+  is joined before the process exits (H11).
 
 ---
 

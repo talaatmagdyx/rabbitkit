@@ -632,6 +632,14 @@ Delay queue topology (per_queue=True):
 - `{source_queue}.retry.{attempt}` -- delay queues with TTL
 - `{source_queue}.dlq` -- dead-letter queue for exhausted messages
 
+The `x-rabbitkit-retry-count` header is read from the inbound message and is
+not trusted input -- it is clamped to `[0, max_retries]` regardless of what a
+producer sets it to, so a spoofed negative value can't reset the counter (or
+produce a non-existent negative delay-queue routing key) and a spoofed huge
+value can't skip straight to the DLQ beyond the configured cap. See
+`docs/retry-and-dlq.md` for details and a broker-enforced backstop
+(`x-delivery-limit` on quorum queues).
+
 #### CompressionMiddleware
 
 Compresses outgoing message bodies and decompresses incoming ones. Supports gzip (built-in) and zstd (optional).
@@ -645,6 +653,19 @@ comp_mw = CompressionMiddleware(CompressionConfig(
     threshold=1024,      # only compress bodies >= 1KB
     level=6,
 ))
+
+# Publish side — same distinction as signing (see Message Signing Middleware
+# above): pass to the BROKER constructor to compress every broker.publish()
+# call, or to @subscriber(middlewares=[...]) to compress that route's
+# handler-result/@publisher output.
+broker = AsyncBroker(config, middlewares=[comp_mw])
+await broker.publish(routing_key="orders.created", body=large_payload)
+
+# Consume side — attach to the subscriber so on_receive_async decompresses
+# incoming bodies automatically; the handler always sees the original body.
+@broker.subscriber(queue="orders-input", middlewares=[comp_mw])
+async def handle_order(body: bytes) -> None:
+    ...  # body is already decompressed
 ```
 
 #### TracedConsumerMiddleware (obskit)
@@ -1145,14 +1166,24 @@ spec:
 
 - **Sync consumers** should use `broker.run(worker_config=…)`, which blocks on
   the consume loop and installs a safe SIGTERM handler on a daemon thread
-  that triggers `broker.stop()` (cancels consumers and drains the worker pool
-  within `ConsumerConfig.graceful_timeout`). Do **not** wire
+  that triggers `broker.stop()` (cancels consumers *before* draining the
+  worker pool, within `ConsumerConfig.graceful_timeout` — this ordering is
+  enforced by both brokers so no new message can be delivered into a pool
+  that is already mid-shutdown). Do **not** wire
   `signal.signal(signal.SIGTERM, lambda *_: broker.stop())` yourself: a
   `signal.signal` handler runs in a signal context where it is **not
   async-signal-safe** — `broker.stop()` performs threading and I/O (channel
   closes, futures) that can deadlock the interpreter. `RabbitApp.run_async()`
   installs SIGINT/SIGTERM handlers for the async lifecycle the same safe way
   (via the running loop's `add_signal_handler`).
+- `SyncBroker.stop()` must be called from the same thread that is driving the
+  consume loop (exactly what `broker.run()` does — `start_consuming()` and the
+  `finally: self.stop()` that follows it share one thread). With
+  `worker_config=WorkerConfig(worker_count>1)`, worker threads' acks/nacks are
+  marshaled onto that thread during the drain, and `stop()` briefly pumps the
+  connection between waits to drain them; calling `stop()` from a *different*
+  thread than the one that ran `start_consuming()` reintroduces an unsafe
+  cross-thread pika call.
 - **Async** consumers: `RabbitApp.run_async()` starts the app, waits for
   SIGINT/SIGTERM, and stops cleanly. `broker.stop()` cancels consumers and
   drains in-flight work; `terminationGracePeriodSeconds` must exceed
@@ -1604,6 +1635,40 @@ async def handle_result(body: bytes) -> None:
 
 `InvalidSignatureError` is raised on verification failure. Combined with
 the default error classifier, it goes straight to the DLQ (permanent error).
+
+The default signature covers `exchange`, `routing_key`, `content_encoding`,
+and `reply_to` in addition to `timestamp`/`nonce`/`body` — not just the body.
+Mutating any of those fields on a captured, validly-signed message (re-routing
+it, redirecting an RPC reply, or flipping `content_encoding`) invalidates the
+signature. See `docs/security.md` for exactly what is and isn't covered.
+
+The default nonce cache (`TTLSetNonceCache`) is per-process/in-memory — a
+replay landing on a different process/pod is invisible to it. Use
+`nonce_cache=RedisNonceCache(redis.Redis(...))` to share replay state across
+processes (a `RuntimeWarning` is emitted if you don't); see `docs/security.md`
+for the full recipe.
+
+**Which publish path does `middlewares=[signing_mw]` cover?** `@subscriber(middlewares=[...])`
+(as in `process_order` above) only wraps that route's HANDLER-RETURN-VALUE
+publish (`@publisher`/RPC replies — Contract 5). It does **not** apply to
+`broker.publish(...)`, the primary producer API most services actually call to
+send a message. To sign (or otherwise transform) every `broker.publish()`
+call, pass `middlewares=[...]` to the **broker constructor** instead:
+
+```python
+signing_mw = SigningMiddleware(SigningConfig(secret_key="shared-secret"))
+
+# Applies to every broker.publish() call, not just handler-result publishes.
+broker = AsyncBroker(config, middlewares=[signing_mw])
+
+await broker.start()
+await broker.publish(routing_key="orders.created", body=b'{"order_id": 123}')
+# ^ this envelope is signed before it reaches the transport.
+```
+
+The two `middlewares=` lists are independent and commonly both set: route-level
+for replies/results, broker-level for direct publishes. See
+`broker.publish_middlewares` to inspect what's configured.
 
 ## Handler Timeout Middleware
 

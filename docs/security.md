@@ -48,16 +48,56 @@ Do not let external callers control routing keys directly. A caller that control
 
 ## HMAC Signing
 
-`SigningMiddleware` signs and verifies message bodies using HMAC-SHA256. It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks. Configure it with a secret that is at least 32 bytes:
+`SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks. Configure it with a secret that is at least 32 bytes:
 
 ```python
 from rabbitkit import SigningConfig
 from rabbitkit.middleware.signing import SigningMiddleware
 
-mw = SigningMiddleware(config=SigningConfig(secret="a-long-random-secret-at-least-32-bytes"))
+mw = SigningMiddleware(config=SigningConfig(secret_key="a-long-random-secret-at-least-32-bytes"))
 ```
 
+The default (`require_freshness=True`) signature covers `timestamp`, `nonce`,
+`exchange`, `routing_key`, `content_encoding`, and `reply_to`, in addition to
+the body — not just the body. Without this, an attacker who cannot forge the
+signature could still capture a validly-signed message and re-publish it
+under a different routing key, redirect an RPC reply via `reply_to`, or flip
+`content_encoding` to hit a different decompression path, all while the
+signature still verified. Headers other than the signature/timestamp/nonce
+triplet itself are **not** covered — do not use freeform headers for
+security-critical routing decisions. The legacy body-only signature path
+(only reachable with `require_freshness=False`, kept for interop with
+producers that predate the freshness headers) has none of these protections;
+avoid it for security-sensitive traffic.
+
 Rotate the signing secret periodically. Store it in a secrets manager, not in environment variables that may be logged.
+
+### Shared nonce store for multi-process/multi-pod deployments
+
+`SigningMiddleware`'s default nonce cache (`TTLSetNonceCache`) is a
+per-process, in-memory dict. In any deployment with more than one consumer
+process — pods behind a Deployment, multiple worker processes, or a restart —
+a nonce recorded by one process is invisible to every other one, and a
+replayed message that lands on a different process passes the nonce check.
+`SigningMiddleware` emits a `RuntimeWarning` at construction time for exactly
+this reason whenever `require_freshness=True` and no explicit `nonce_cache`
+is supplied.
+
+Use `RedisNonceCache` to share the seen-set across every process:
+
+```python
+import redis
+from rabbitkit.middleware.signing import RedisNonceCache, SigningConfig
+
+cache = RedisNonceCache(redis.Redis(host="redis", port=6379))
+config = SigningConfig(secret_key="shared-secret", nonce_cache=cache)
+```
+
+It records each nonce with an atomic `SET NX EX`, so two processes racing on
+the same nonce can never both pass. For payments or other high-value traffic,
+also use a tight `max_skew` (default 60s) to shrink the replay window, and
+always pair it with a shared `nonce_cache` — the in-memory default is not
+sufficient once there is more than one consumer process.
 
 ## Replay Attack Prevention
 

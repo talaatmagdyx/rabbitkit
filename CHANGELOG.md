@@ -68,6 +68,180 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes onto it — `RPCClient`/`AsyncRPCClient` and their callers need no
   changes. Validated end-to-end against a real broker (not a mock) via
   `RPCClient.call()`/`AsyncRPCClient.call()` and `broker.request()`.
+- **`broker.publish()` bypassed all publish-side middleware (C3, critical)** —
+  `publish_scope`/`publish_scope_async` only ever composed for a route's
+  HANDLER-RETURN-VALUE publish (`@publisher`/RPC replies, Contract 5).
+  `broker.publish()`, the primary producer API, went straight to the transport
+  with zero middleware applied, so e.g. `SigningMiddleware` never signed
+  anything sent via direct publish. Both brokers now accept a `middlewares=`
+  constructor param applied to every `broker.publish()` call (composed via new
+  `HandlerPipeline.compose_broker_publish_sync`/`_async`, cached like the
+  existing route-level chains); exposed via `broker.publish_middlewares`.
+  Middleware wraps outside flow control and (async) batching, so the
+  transformed envelope is what gets rate-limited/batched/sent. Validated
+  end-to-end against a real broker with `SigningMiddleware` on both brokers.
+- **`CompressionMiddleware` was dead code — never compressed anything (C4,
+  critical)** — `transform_envelope()` (the method that actually compresses an
+  envelope and sets `content_encoding`) had zero callers anywhere in the
+  pipeline: it implemented neither `publish_scope` nor `publish_scope_async`,
+  so attaching it to a route or to `broker.publish_middlewares` (C3)
+  compressed nothing. `CompressionMiddleware` now implements both hooks,
+  delegating to the existing `transform_envelope()` — this wires it into the
+  route-level Contract-5 result-publish chain *and* the broker-level direct-
+  publish chain (C3) with no other changes needed. The consume-side
+  `on_receive`/`on_receive_async` decompression path was already correct
+  whenever the middleware was attached to a subscriber; only the publish side
+  was inert. Validated end-to-end against a real broker: `broker.publish()`
+  actually compresses on the wire, and a subscriber with the middleware
+  attached decompresses automatically. Rewrote the prior "roundtrip" test,
+  which manually called `transform_envelope()`/`gzip.decompress()` outside the
+  pipeline and so never exercised (or caught the absence of) real wiring.
+- **Graceful shutdown drained the worker pool before cancelling consumers (C5,
+  critical)** — both brokers' `stop()` called `worker_pool.stop()` (which waits
+  for in-flight work, up to the full `graceful_timeout`) *before* cancelling
+  consumers, so the consumer stayed active for the entire wait. A message
+  delivered in that window was submitted to a pool already mid-shutdown: sync
+  either raised an uncaught `RuntimeError` from `SyncWorkerPool.submit()` or,
+  once `.stop()` had fully returned, silently ran the handler *inline* on the
+  pika I/O thread; async's `AsyncWorkerPool.submit()` creates a task
+  unconditionally (it never checked `_running`) and would add it to a
+  `_tasks` set `.stop()` had already cleared — an orphaned task nothing would
+  ever await. Either way the message was never cleanly settled before
+  `disconnect()`. `stop()` now cancels all consumers *first* in both brokers,
+  so the pool only ever drains work that was already in flight — closing off
+  new deliveries before touching the pool at all. Validated with an explicit
+  call-order unit test (regression-checked: reverting the order makes it fail)
+  and a real-broker integration test that calls `stop()` deliberately early
+  under load and confirms every published message is eventually processed —
+  none permanently lost, whether by the original broker or a follow-up
+  consumer picking up whatever was left queued or abandoned at the deadline.
+- **Unroutable `mandatory=True` publishes were reported CONFIRMED, never
+  RETURNED (H1, high)** — `PublishStatus.RETURNED` existed on the enum but no
+  transport ever produced it. Sync's `basic_publish()` can only raise
+  `UnroutableError`/`NackError` when the channel has `confirm_delivery()`
+  enabled; on the (default) non-confirm path a `mandatory=True` publish to a
+  missing binding was unconditionally reported CONFIRMED. Async needed both
+  `publisher_confirms=True` *and* `on_return_raises=True`; the fast path (no
+  confirms) and the regular confirm pool (confirms only if
+  `confirm_delivery=True`, and even then without `on_return_raises`) could
+  each silently resolve a return as success. Sync now upgrades whichever
+  channel a `mandatory=True` publish lands on to confirm mode on demand
+  (idempotent, tracked per-channel) regardless of the broker's global
+  `confirm_delivery` setting — this also covers the RPC direct-reply-to
+  channel "for free" since the upgrade is channel-agnostic. Async now routes
+  every `mandatory=True` publish (outside of direct-reply-to) through a
+  dedicated, always-confirmed channel with `on_return_raises=True`. Both
+  transports now map an unroutable return to `PublishStatus.RETURNED` and a
+  broker `Basic.Nack` to `PublishStatus.NACKED`, so `PublishOutcome.ok` is
+  `False` for either — retry-publish and result-publish paths that key off
+  `.ok` automatically treat a lost mandatory publish as a failure with no
+  further changes. Known gap: an RPC request that is *also* `mandatory=True`
+  (a narrow combination) still uses async's non-upgradable reply-to channel
+  and can silently report success on a return; sync has no such gap. Validated
+  against a real broker: publishing `mandatory=True` to a nonexistent binding
+  on both transports, with `confirm_delivery` both `True` and `False`, always
+  returns `RETURNED`, never `CONFIRMED`.
+- **Sync worker-pool acks could run inline, cross-thread, on the pika
+  connection during shutdown drain (H2, high)** — `SyncTransport.
+  _run_on_io_thread()` fell back to running a channel call *inline* whenever
+  `not self._consuming`, on the theory that nothing was left to marshal onto.
+  But `_consuming` goes `False` the instant the consume loop stops pumping —
+  including for the entire window between consumers being cancelled and
+  `SyncBroker.stop()`'s worker-pool drain finishing, while worker threads may
+  still be mid-handler. A worker thread's ack/nack/reject in that window ran
+  directly against the shared pika `BlockingConnection`/`BlockingChannel` from
+  a non-owner thread, unsynchronized with other worker threads acking the
+  same consumer channel — confirmed to corrupt the AMQP stream under load
+  (`StreamLostError` / `IncompatibleProtocolError` on the next real-broker
+  round-trip). `_run_on_io_thread` now gates marshaling on a new
+  `_ever_consumed` flag (`True` for the connection's whole lifetime once a
+  consume loop has run at all, not just while it's actively pumping) instead
+  of `_consuming` — a cross-thread call always marshals once a consume loop
+  has ever started, and fails fast with `TimeoutError` rather than falling
+  back to an unsafe inline call. To keep those marshaled callbacks from
+  simply timing out with nothing left pumping, `SyncTransport.pump()` briefly
+  drives the connection's I/O loop, and `SyncWorkerPool.stop()` / `SyncBroker.
+  _wait_in_flight()` now poll in short slices calling it between waits — both
+  require `stop()` to run on the transport's owner thread, matching `SyncBroker.
+  run()`'s existing call pattern. Separately audited (not changed):
+  `PublishStatus.CONFIRMED` was already positively backed by pika's own
+  `basic_publish()` contract in confirm mode (it blocks and asserts a
+  `Basic.Ack` internally before returning; `NackError`/`UnroutableError` are
+  raised otherwise) — verified this holds unchanged across the cross-thread
+  marshal path with a dedicated test. Validated with a real-broker test that
+  drives a worker-pool consumer through a SIGTERM-style drain (cancel
+  consumers, then drain the pool) while instrumenting the real pika channel's
+  `basic_ack` to record the calling thread — every ack lands on the owner
+  thread, never a worker thread; reverting the fix reproduces the exact
+  stream-corruption failure against a live broker.
+- **`SigningMiddleware`'s HMAC covered only the body — routing key, exchange,
+  reply_to, content_encoding were unprotected (H3, high)** — the
+  replay-protected signature was computed over `timestamp:nonce:body` only.
+  An attacker who could not forge the signature could still capture a
+  validly-signed message and re-publish it under a different routing key,
+  redirect an RPC reply via `reply_to`, or flip `content_encoding` to hit a
+  different decompression path — the signature still verified, and a
+  different consumer instance's own nonce cache wouldn't catch the replay
+  either. The signature now additionally covers `exchange`, `routing_key`,
+  `content_encoding`, and `reply_to` (NUL-delimited, so field concatenation
+  can't make two different splits collide), computed from the outgoing
+  envelope on publish and from the delivered message's broker-reported
+  routing metadata on receive — changing any of those fields on a captured
+  message now invalidates the signature even with the body, timestamp, and
+  nonce unchanged. This is a breaking change to the signature format for
+  anyone using `require_freshness=True` (the default): producer and consumer
+  must both be upgraded together, or run with `require_freshness=False`
+  during rollout. The legacy body-only path (only reachable with
+  `require_freshness=False`, kept for interop with signers that predate the
+  freshness headers) is unchanged and remains body-only by design — it has no
+  replay protection either and should not be used for security-sensitive
+  traffic. Documented exactly what is and isn't covered in the module
+  docstring and `docs/security.md`.
+- **Replay protection was per-process/in-memory by default, with no warning
+  (H4, high)** — `SigningMiddleware`'s default `TTLSetNonceCache` is a plain
+  in-process dict. In any multi-process/multi-pod deployment (the norm for a
+  consumer with more than one replica) or after a restart, a replayed message
+  landing on a *different* worker than the original passed the nonce check —
+  the module docstring's "works out of the box" was misleading for exactly
+  this common case. Added `RedisNonceCache`, a shared nonce store using an
+  atomic `SET NX EX` so two processes racing on the same nonce can never both
+  "win" — pass it as `SigningConfig(nonce_cache=RedisNonceCache(redis_client))`
+  to share replay state across every process verifying signatures for the
+  same producer. `SigningMiddleware.__init__` now emits a `RuntimeWarning`
+  whenever the default in-memory cache is left in place with
+  `require_freshness=True` (the risky combination this finding describes) —
+  it can't detect an actual multi-process deployment, so it fires
+  unconditionally for that combination rather than silently claiming
+  out-of-the-box protection. Also: `max_skew` (which doubles as the nonce
+  replay-window TTL) default tightened from 300s to 60s — shrink further for
+  payments/high-value traffic; and the nonce is now always a fresh
+  `uuid4().hex`, never derived from the caller-supplied `message_id` (which
+  may be reused across retries, weakening the seen-set's uniqueness
+  guarantee). Not a release blocker on its own, but documented loudly in the
+  module docstring, `docs/security.md`, and `docs/guide/full-guide.md` with a
+  shared-store recipe — do not rely on the in-memory default for
+  multi-process/multi-pod deployments or high-value traffic.
+- **Retry-count header was producer-spoofable with no independent cap (H5,
+  high)** — `RetryMiddleware._get_retry_count()` read the
+  `x-rabbitkit-retry-count` header verbatim from the inbound message with no
+  bounds checking. A producer setting it negative reset the effective attempt
+  count while also making `_build_retry_envelope()` compute a negative
+  attempt number, producing a delay-queue routing key like `orders.retry.-4`
+  that was never declared — the retry publish silently targeted a
+  non-existent queue on the default exchange and the message was lost rather
+  than retried (not merely "resets the counter": it drops the message).
+  Setting it absurdly large forced the message straight to the DLQ, skipping
+  every retry. `_get_retry_count()` now clamps to `[0, max_retries]`
+  regardless of what the header claims, and treats a non-numeric/malformed
+  value the same as missing (`0`) rather than raising and crashing the
+  pipeline mid-exception-handling. This makes `max_retries` an enforced
+  ceiling independent of the header's trustworthiness. Documented (not
+  implemented as a default) a broker-enforced backstop on top of this: prefer
+  quorum source queues with `x-delivery-limit` — see
+  `docs/retry-and-dlq.md`. Validated against a real broker: a spoofed huge
+  count dead-letters on the very first delivery (no retry happens at all) and
+  a spoofed negative count clamps to 0 and retries through the real,
+  declared `retry.1` delay queue rather than being silently dropped.
 
 ### Performance
 

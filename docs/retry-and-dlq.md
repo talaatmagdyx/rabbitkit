@@ -56,6 +56,38 @@ Headers are preserved across re-deliveries. If `x-retry-count` is absent, it is 
 
 ---
 
+## The Retry-Count Header Is Not Trusted Input (H5)
+
+The retry-count header is read verbatim from an inbound AMQP message — there
+is no broker-side attestation distinguishing a value this middleware wrote
+during its own delay-queue round trip from one a producer set directly.
+`RetryMiddleware` clamps every value read from the header to `[0,
+max_retries]` before using it, regardless of what the header claims:
+
+- A negative value (e.g. a producer trying to reset the counter for
+  unbounded retries) clamps to `0` and is treated as a fresh first attempt —
+  it can never produce a negative attempt number, which would otherwise
+  target a delay queue like `orders.retry.-4` that was never declared (the
+  publish would silently target a non-existent queue on the default exchange
+  and the message would be lost, not retried).
+- An absurdly large value (e.g. a producer trying to force every message
+  straight to the DLQ, skipping retries) clamps to `max_retries` and is
+  treated as exhausted.
+- A non-numeric/malformed value is treated the same as a missing header (`0`)
+  rather than raising, so a garbage header degrades gracefully instead of
+  crashing the pipeline.
+
+This makes `max_retries` an enforced ceiling independent of the header's
+configured value being read from a trusted or untrusted source — but it is
+still an application-level check, not a broker-enforced one. For a
+broker-enforced backstop on top of this (e.g. against a misbehaving consumer
+that never settles a message, independent of anything RetryMiddleware does),
+prefer **quorum queues** for the source queue and set `x-delivery-limit` — the
+broker itself dead-letters a message after that many redeliveries, with no
+dependency on any header at all.
+
+---
+
 ## What Happens After max_retries
 
 When `x-retry-count` equals `max_retries` and the handler raises again (or the

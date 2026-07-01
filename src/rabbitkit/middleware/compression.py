@@ -203,6 +203,25 @@ class CompressionMiddleware(BaseMiddleware):
         # body, so never inline-decompress on the event loop.
         message.body = await asyncio.to_thread(self.decompress, message.body, message.content_encoding)
 
+    def publish_scope(self, call_next: Any, envelope: MessageEnvelope) -> Any:
+        """Compress the envelope body before publishing (sync).
+
+        C4: without this override, ``transform_envelope`` had no caller —
+        attaching ``CompressionMiddleware`` to a route or a broker's
+        ``middlewares=[...]`` compressed nothing.
+        """
+        return call_next(self.transform_envelope(envelope))
+
+    async def publish_scope_async(self, call_next: Any, envelope: MessageEnvelope) -> Any:
+        """Async variant — compress the envelope body before publishing.
+
+        Compression runs inline (not offloaded to a worker thread) — unlike
+        ``on_receive_async``'s decompression, the body size here is caller-
+        controlled, not attacker-controlled, so there is no zip-bomb-style
+        amplification risk to guard against by offloading.
+        """
+        return await call_next(self.transform_envelope(envelope))
+
     def transform_envelope(self, envelope: MessageEnvelope) -> MessageEnvelope:
         """Compress envelope body and set content_encoding header."""
         compressed, encoding = self.compress(envelope.body)

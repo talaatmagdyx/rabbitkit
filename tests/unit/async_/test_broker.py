@@ -274,6 +274,171 @@ class TestPublishing:
             mock_transport.publish.assert_called_once_with(envelope)
 
 
+# ── C3: broker-level publish middleware (signing on the primary produce path) ──
+
+
+class TestPublishWithMiddlewares:
+    """C3: broker.publish() must apply middlewares=[...] (e.g. signing) —
+    previously only handler-result/RPC-reply publishing went through publish_scope_async."""
+
+    async def _start_broker(self, middlewares: list[Any] | None = None) -> tuple[AsyncBroker, AsyncMock]:
+        broker = AsyncBroker(middlewares=middlewares)
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start(install_signal_handlers=False)
+
+        return broker, mock_transport
+
+    @pytest.mark.asyncio
+    async def test_publish_signs_envelope_via_broker_middleware(self) -> None:
+        """A SigningMiddleware passed to the broker constructor must sign
+        every broker.publish() call — the primary producer API."""
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
+
+        captured: list[MessageEnvelope] = []
+
+        async def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        mock_transport.publish = capture_publish
+
+        outcome = await broker.publish(routing_key="orders", body=b"order-data")
+
+        assert outcome.ok
+        assert len(captured) == 1
+        assert "x-rabbitkit-signature" in captured[0].headers
+
+    @pytest.mark.asyncio
+    async def test_publish_compresses_envelope_via_broker_middleware(self) -> None:
+        """C4: a CompressionMiddleware passed to the broker constructor must
+        compress every broker.publish() call above threshold — matches the
+        exact test the C4 finding requested."""
+        import gzip
+
+        from rabbitkit.core.config import CompressionConfig
+        from rabbitkit.middleware.compression import CompressionMiddleware
+
+        compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+        broker, mock_transport = await self._start_broker(middlewares=[compression_mw])
+
+        large_body = b"order-payload " * 200
+        captured: list[MessageEnvelope] = []
+
+        async def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        mock_transport.publish = capture_publish
+
+        outcome = await broker.publish(routing_key="orders", body=large_body)
+
+        assert outcome.ok
+        assert len(captured) == 1
+        assert captured[0].content_encoding == "gzip"
+        assert captured[0].body != large_body
+        assert gzip.decompress(captured[0].body) == large_body
+
+    @pytest.mark.asyncio
+    async def test_publish_without_middlewares_sends_envelope_unmodified(self) -> None:
+        """No middlewares configured -> publish() is a pure pass-through (no
+        regression to the pre-C3 fast path when middlewares=None)."""
+        broker, mock_transport = await self._start_broker(middlewares=None)
+        assert broker.publish_middlewares == []
+
+        captured: list[MessageEnvelope] = []
+
+        async def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        mock_transport.publish = capture_publish
+
+        outcome = await broker.publish(routing_key="orders", body=b"plain-data")
+
+        assert outcome.ok
+        assert captured[0].body == b"plain-data"
+        assert captured[0].headers == {}
+
+    @pytest.mark.asyncio
+    async def test_publish_middleware_runs_with_flow_control(self) -> None:
+        """Middleware wraps the flow-controlled publish — the transformed
+        (signed) envelope is what gets rate-limited/sent, not the original."""
+        from rabbitkit.highload.backpressure import FlowController
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
+        broker.flow_controller = FlowController()
+
+        captured: list[MessageEnvelope] = []
+
+        async def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        mock_transport.publish = capture_publish
+
+        outcome = await broker.publish(routing_key="orders", body=b"order-data")
+
+        assert outcome.ok
+        assert "x-rabbitkit-signature" in captured[0].headers
+
+    @pytest.mark.asyncio
+    async def test_publish_middleware_applies_with_batch_publisher(self) -> None:
+        """Middleware must wrap the batch publisher's publish too, not just
+        the raw transport — batching and signing are independent features."""
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker, _mock_transport = await self._start_broker(middlewares=[signing_mw])
+
+        captured: list[MessageEnvelope] = []
+
+        async def capture_batch_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        mock_batch_publisher = AsyncMock()
+        mock_batch_publisher.publish = capture_batch_publish
+        broker._batch_publisher = mock_batch_publisher
+
+        outcome = await broker.publish(routing_key="orders", body=b"order-data")
+
+        assert outcome.ok
+        assert len(captured) == 1
+        assert "x-rabbitkit-signature" in captured[0].headers
+
+    @pytest.mark.asyncio
+    async def test_publish_middleware_chain_is_cached_across_calls(self) -> None:
+        """The composed chain must be built once and reused (not rebuilt per
+        publish), matching the route-level publish chain's caching behavior."""
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
+        mock_transport.publish = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        await broker.publish(routing_key="orders", body=b"one")
+        chain_after_first = broker._pipeline._broker_publish_chain_async_cache[id(broker._publish_middlewares)]
+        await broker.publish(routing_key="orders", body=b"two")
+        chain_after_second = broker._pipeline._broker_publish_chain_async_cache[id(broker._publish_middlewares)]
+
+        assert chain_after_first is chain_after_second
+
+
 # ── WorkerPool integration ───────────────────────────────────────────────
 
 
@@ -328,7 +493,7 @@ class TestAsyncBrokerWorkerPool:
 
     @pytest.mark.asyncio
     async def test_worker_pool_stops_on_broker_stop(self) -> None:
-        """Pool stop() called before consumer cancel."""
+        """Pool stop() is called, and consumer cancel happens first (C5)."""
         broker = self._make_broker_with_route()
         mock_transport = self._make_mock_transport()
 
@@ -338,11 +503,26 @@ class TestAsyncBrokerWorkerPool:
             pool = broker.worker_pool
             assert pool is not None
 
-            with patch.object(pool, "stop", new_callable=AsyncMock) as mock_pool_stop:
+            order: list[str] = []
+
+            async def _tracked_cancel_consumer(*args: Any, **kwargs: Any) -> None:
+                order.append("cancel_consumer")
+
+            async def _tracked_pool_stop(*args: Any, **kwargs: Any) -> None:
+                order.append("worker_pool.stop")
+
+            mock_transport.cancel_consumer.side_effect = _tracked_cancel_consumer
+            with patch.object(pool, "stop", side_effect=_tracked_pool_stop) as mock_pool_stop:
                 await broker.stop()
 
                 # Pool stop was called
                 mock_pool_stop.assert_called_once()
+
+            # C5: cancel_consumer must precede worker_pool.stop — draining the
+            # pool while the consumer is still active lets aio-pika deliver new
+            # messages into a pool that's mid-shutdown (see AsyncBroker.stop()
+            # docstring).
+            assert order == ["cancel_consumer", "worker_pool.stop"]
 
             # After stop, worker_pool should be None
             assert broker.worker_pool is None

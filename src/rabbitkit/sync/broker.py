@@ -66,8 +66,19 @@ class SyncBroker:
         serializer: Any | None = None,
         di_resolver: Any | None = None,
         context_repo: Any | None = None,
+        middlewares: list[Any] | None = None,
     ) -> None:
         self._config = config or RabbitConfig()
+        # C3: middlewares applied to every broker.publish() call — the primary
+        # producer API. Distinct from @subscriber(middlewares=[...]), which
+        # only wraps a route's HANDLER-RESULT publishes (Contract 5); without
+        # this, e.g. SigningMiddleware never signed anything published via
+        # broker.publish() directly. The composed chain is cached by this
+        # list's identity (see HandlerPipeline.compose_broker_publish_sync), so
+        # set the full list via this constructor param — mutating it in place
+        # after the first publish() call would silently reuse the stale
+        # pre-mutation chain.
+        self._publish_middlewares: list[Any] = middlewares or []
         # Private mutable view of consumer config — brokers may apply a
         # prefetch override derived from WorkerConfig.prefetch_per_worker.
         # Stored separately so the caller's frozen RabbitConfig is never mutated.
@@ -120,6 +131,16 @@ class SyncBroker:
     @property
     def config(self) -> RabbitConfig:
         return self._config
+
+    @property
+    def publish_middlewares(self) -> list[Any]:
+        """Middlewares applied to every ``broker.publish()`` call (e.g. signing).
+
+        Set via the constructor's ``middlewares=`` param. See the comment on
+        ``self._publish_middlewares`` for why reassigning (not mutating) is
+        required to change this after construction.
+        """
+        return self._publish_middlewares
 
     @property
     def routes(self) -> list[RouteDefinition]:
@@ -291,18 +312,31 @@ class SyncBroker:
                 self._in_flight_cond.notify_all()
 
     def _wait_in_flight(self, deadline: float | None) -> None:
-        """Wait for inline in-flight handlers to finish (bounded by deadline)."""
+        """Wait for in-flight handlers to finish (bounded by deadline).
+
+        H2: polls in short slices and pumps the transport's I/O loop between
+        them (rather than one long condvar wait) so a worker thread's
+        ack/nack/reject — marshaled onto the transport's owner thread via
+        ``_run_on_io_thread`` once a consume loop has run — actually gets
+        drained instead of stalling for the whole wait. Safe only because
+        ``stop()`` (and therefore this method) runs on the transport's owner
+        thread, matching ``SyncBroker.run()``'s call pattern.
+        """
+        transport = self._transport
+        poll = 0.05
         with self._in_flight_cond:
             if self._in_flight == 0:
                 return
             while self._in_flight > 0:
+                if transport is not None:
+                    transport.pump(poll)
                 if deadline is None:
-                    self._in_flight_cond.wait()
+                    self._in_flight_cond.wait(timeout=poll)
                     continue
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining <= 0:
                     break
-                self._in_flight_cond.wait(timeout=remaining)
+                self._in_flight_cond.wait(timeout=min(poll, remaining))
             if self._in_flight > 0:
                 logger.warning(
                     "SyncBroker.stop: %d in-flight handler(s) still running after "
@@ -311,12 +345,22 @@ class SyncBroker:
                 )
 
     def stop(self, timeout: float | None = None) -> None:
-        """Stop the broker - stop pool, cancel consumers, drain, disconnect.
+        """Stop the broker - cancel consumers, drain pool, drain in-flight, disconnect.
 
         ``timeout`` defaults to ``ConsumerConfig.graceful_timeout`` (C-2). The
-        whole stop sequence is bounded by an overall deadline: cancel consumers,
-        wait for in-flight inline handlers to reach 0 (or the deadline), then
-        disconnect. The worker-pool stop path is also bounded by this deadline.
+        whole stop sequence is bounded by an overall deadline.
+
+        C5: consumers are cancelled FIRST, before the worker pool is drained.
+        Draining the pool before cancelling left the consumer active for the
+        entire (potentially graceful_timeout-long) drain wait — a message
+        delivered in that window was submitted to a pool already mid-shutdown:
+        ``SyncWorkerPool.submit()`` either raises ``RuntimeError`` (uncaught,
+        propagating into pika's callback machinery) or, once ``.stop()`` has
+        fully returned, silently runs the handler *inline* on the pika I/O
+        thread — either way the message is never cleanly settled before
+        ``disconnect()``, so it is redelivered (duplicate-processing risk) on
+        the next connection. Cancelling first stops new deliveries outright,
+        so the pool only ever drains work that was already in flight.
         """
         if not self._started:
             return
@@ -324,18 +368,22 @@ class SyncBroker:
         effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
         deadline = None if effective is None else time.monotonic() + effective
 
-        # Stop worker pool first (let in-flight tasks finish), bounded by the
-        # outer deadline.
-        if self._worker_pool is not None:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            self._worker_pool.stop(timeout=remaining)
-            self._worker_pool = None
-
-        # Cancel all consumers (stop new deliveries before draining).
+        # Cancel all consumers FIRST — stop new deliveries before draining
+        # anything, so nothing new arrives while the pool/in-flight drain runs.
         assert self._transport is not None
         for route in self._registry.routes:
             if route.consumer_tag:
                 self._transport.cancel_consumer(route.consumer_tag)
+
+        # Drain the worker pool (let in-flight pooled tasks finish), bounded by
+        # the outer deadline. H2: pass the transport's pump so a worker
+        # thread's marshaled ack/nack/reject is actually drained during the
+        # wait, instead of the transport falling back to an unsafe inline
+        # cross-thread call once the consume loop has stopped.
+        if self._worker_pool is not None:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._worker_pool.stop(timeout=remaining, pump=self._transport.pump)
+            self._worker_pool = None
 
         # Drain inline in-flight handlers (C-2).
         self._wait_in_flight(deadline)
@@ -454,6 +502,12 @@ class SyncBroker:
         = fc``), a publish slot is acquired before and released after the
         transport publish so backpressure/rate-limiting applies to the hot path.
         Without a controller this is a plain pass-through.
+
+        When ``middlewares=[...]`` was passed to the constructor, each
+        middleware's ``publish_scope`` wraps this call (e.g. ``SigningMiddleware``
+        signs the envelope) — see ``publish_middlewares``. Middleware wraps
+        OUTSIDE the flow-control gate, so a middleware-transformed envelope is
+        what gets rate-limited/blocked, and what the transport actually sends.
         """
         if envelope is None:
             import json as _json
@@ -478,21 +532,30 @@ class SyncBroker:
 
         if self._transport is None:
             raise RuntimeError("Broker not started. Call start() first.")
-        fc = self._flow_controller
-        if fc is not None:
-            if not fc.acquire():
-                # Dropped by backpressure policy (drop/timeout). Do not publish.
-                return PublishOutcome(
-                    status=PublishStatus.ERROR,
-                    exchange=envelope.exchange,
-                    routing_key=envelope.routing_key,
-                    error=BackpressureError("publish dropped by backpressure policy"),
-                )
-            try:
-                return self._transport.publish(envelope)
-            finally:
-                fc.release()
-        return self._transport.publish(envelope)
+        transport = self._transport  # narrowed local capture for the closure below
+
+        def do_transport_publish(env: MessageEnvelope) -> PublishOutcome:
+            fc = self._flow_controller
+            if fc is not None:
+                if not fc.acquire():
+                    # Dropped by backpressure policy (drop/timeout). Do not publish.
+                    return PublishOutcome(
+                        status=PublishStatus.ERROR,
+                        exchange=env.exchange,
+                        routing_key=env.routing_key,
+                        error=BackpressureError("publish dropped by backpressure policy"),
+                    )
+                try:
+                    return transport.publish(env)
+                finally:
+                    fc.release()
+            return transport.publish(env)
+
+        if self._publish_middlewares:
+            chain = self._pipeline.compose_broker_publish_sync(self._publish_middlewares)
+            outcome: PublishOutcome = chain(envelope, do_transport_publish)
+            return outcome
+        return do_transport_publish(envelope)
 
     def request(
         self,

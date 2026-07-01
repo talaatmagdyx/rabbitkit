@@ -617,3 +617,101 @@ class TestAsyncWorkerPoolStopTimeout:
         assert cancelled_flag == [True]
         # Pool cleaned up
         assert pool.pending_count == 0
+
+
+# ── H2: SyncWorkerPool.stop(pump=...) ─────────────────────────────────────
+
+
+class TestSyncWorkerPoolPump:
+    """H2: stop()'s pump= parameter polls in short slices, calling pump()
+    between them, instead of one blocking concurrent.futures.wait(). This is
+    what lets a worker thread's transport-marshaled ack actually get drained
+    by the owner thread during SyncBroker.stop()'s drain window."""
+
+    def test_pump_is_called_while_waiting_for_a_slow_task(self) -> None:
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2, stop_timeout=5.0))
+        pool.start()
+
+        release = threading.Event()
+
+        def slow_task() -> None:
+            release.wait(timeout=2.0)
+
+        future = pool._executor.submit(slow_task)  # type: ignore[union-attr]
+        with pool._futures_lock:
+            pool._futures.add(future)
+
+        pump_calls: list[int] = []
+
+        def pump() -> None:
+            pump_calls.append(1)
+            if len(pump_calls) >= 2:
+                release.set()
+
+        pool.stop(timeout=5.0, pump=pump)
+
+        # pump() was called at least twice (enough to eventually release the
+        # task) and the task actually completed before stop() returned.
+        assert len(pump_calls) >= 2
+        assert pool.pending_count == 0
+
+    def test_pump_not_called_when_no_futures_pending(self) -> None:
+        """No in-flight tasks -> the pump path is skipped entirely (falls
+        back to the plain concurrent.futures.wait branch, a no-op wait)."""
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+
+        pump_calls: list[int] = []
+        pool.stop(pump=lambda: pump_calls.append(1))
+
+        assert pump_calls == []
+
+    def test_pump_final_drain_called_after_all_tasks_done(self) -> None:
+        """A final pump() call happens after the wait loop exits, to drain a
+        just-marshaled callback from a task that finished on the last poll."""
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2, stop_timeout=5.0))
+        pool.start()
+
+        done = threading.Event()
+
+        def quick_task() -> None:
+            done.set()
+
+        future = pool._executor.submit(quick_task)  # type: ignore[union-attr]
+        with pool._futures_lock:
+            pool._futures.add(future)
+        done.wait(timeout=2.0)
+
+        pump_calls: list[int] = []
+        pool.stop(timeout=5.0, pump=lambda: pump_calls.append(1))
+
+        # Called at least once for the final drain even though the task was
+        # already done by the time stop() was invoked.
+        assert len(pump_calls) >= 1
+
+    def test_pump_abandons_and_warns_after_deadline(self) -> None:
+        """If the task never finishes, the pump-loop still respects the
+        overall deadline and logs the same abandonment warning as the
+        non-pump path."""
+        from unittest.mock import patch
+
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2, stop_timeout=5.0))
+        pool.start()
+
+        started = threading.Event()
+
+        def never_finishes() -> None:
+            started.set()
+            time.sleep(5)  # longer than the stop timeout below
+
+        future = pool._executor.submit(never_finishes)  # type: ignore[union-attr]
+        with pool._futures_lock:
+            pool._futures.add(future)
+        started.wait(timeout=1.0)
+
+        with patch("rabbitkit.concurrency.logger") as mock_logger:
+            pool.stop(timeout=0.1, pump=lambda: None)
+
+        mock_logger.warning.assert_called_once()
+        assert "did not complete" in mock_logger.warning.call_args[0][0]
+        future.cancel()

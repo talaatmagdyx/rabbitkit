@@ -52,6 +52,40 @@ Without publisher confirms, there is no way to distinguish a successful publish 
 
 ---
 
+## Mandatory Publishes and Unroutable Messages
+
+`MessageEnvelope(mandatory=True)` asks the broker to return the message instead of
+silently dropping it when no queue is bound to match the routing key. `broker.publish()`
+reports this via `PublishOutcome.status`:
+
+| Status | Meaning |
+|---|---|
+| `PublishStatus.CONFIRMED` | Broker accepted and routed the message. `outcome.ok` is `True`. |
+| `PublishStatus.RETURNED` | `mandatory=True` and the broker could not route it to any queue (`Basic.Return`). |
+| `PublishStatus.NACKED` | Broker rejected the message (`Basic.Nack`) — e.g. an internal broker error. |
+| `PublishStatus.TIMEOUT` | No confirm arrived within `confirm_timeout`. |
+| `PublishStatus.ERROR` | Any other publish-time failure (connection error, serialization, etc). |
+
+`PublishOutcome.ok` is `True` only for `CONFIRMED` — treat `RETURNED`/`NACKED`/`TIMEOUT`/`ERROR`
+the same way you would treat a failed publish (e.g. don't ack an upstream message on the
+strength of an outcome that isn't `.ok`).
+
+A `mandatory=True` publish always detects an unroutable message and reports `RETURNED`,
+regardless of the broker's `confirm_delivery` setting — `SyncBroker` upgrades the target
+channel to confirm mode on demand, and `AsyncBroker` routes the publish through a dedicated,
+always-confirmed channel.
+
+```python
+outcome = await broker.publish(
+    MessageEnvelope(routing_key="orders.created", body=b"...", mandatory=True)
+)
+if not outcome.ok:
+    # outcome.status is RETURNED if no queue was bound to "orders.created"
+    logger.error("order publish not routed: %s", outcome.status)
+```
+
+---
+
 ## Manual Ack Policy for Full Settlement Control
 
 When you need precise control over when acknowledgement happens — for example, after writing to a database — use `AckPolicy.MANUAL`. You receive the `RabbitMessage` directly and call `.ack()`, `.nack()`, or `.reject()` yourself.
@@ -96,3 +130,4 @@ With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your h
 | Manual ack: handler returns without acking | Message remains unacked; redelivered when channel closes |
 | Connection drops mid-processing | Broker redelivers; duplicate delivery is possible and expected |
 | Publisher confirms disabled (unsupported path) | Not supported for retry/DLQ paths; confirms are always required |
+| `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED`; `.ok` is `False` — never reported as `CONFIRMED` |

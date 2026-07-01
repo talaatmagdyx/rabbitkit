@@ -16,6 +16,7 @@ import concurrent.futures
 import logging
 import queue
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -173,7 +174,7 @@ class SyncWorkerPool:
         )
         logger.info("SyncWorkerPool started with %d workers", self._config.worker_count)
 
-    def stop(self, timeout: float | None = None) -> None:
+    def stop(self, timeout: float | None = None, pump: Callable[[], None] | None = None) -> None:
         """Stop the worker pool, waiting for in-flight tasks.
 
         Cancels pending (not-yet-started) futures and bounds the wait for
@@ -181,13 +182,39 @@ class SyncWorkerPool:
         Because workers are daemon threads, any task that does not finish in
         time is abandoned and the process can still exit cleanly — SIGKILL is
         no longer required as a backstop.
+
+        H2: when *pump* is given (``SyncBroker.stop()`` passes
+        ``SyncTransport.pump``), the wait is polled in short slices with
+        *pump* called between them, instead of one blocking
+        ``concurrent.futures.wait(timeout=effective)``. A worker thread
+        finishing its handler acks/nacks by marshaling onto the transport's
+        owner thread via ``_run_on_io_thread`` — without something draining
+        the connection's I/O loop while this method blocks, those marshaled
+        callbacks would never run (they'd eventually time out on the worker
+        side, or — before this fix — the transport fell back to an unsafe
+        inline cross-thread call). *pump* must be safe to call from whichever
+        thread calls ``stop()`` (i.e. ``stop()`` must run on the transport's
+        owner thread when *pump* is given). Without *pump*, behavior is
+        unchanged: a single blocking wait for the full *effective* timeout.
         """
         if self._executor is None:
             return
         effective = timeout if timeout is not None else self._config.stop_timeout
         with self._futures_lock:
             futures_snapshot = list(self._futures)
-        _done, not_done = concurrent.futures.wait(futures_snapshot, timeout=effective)
+        if pump is None or not futures_snapshot:
+            _done, not_done = concurrent.futures.wait(futures_snapshot, timeout=effective)
+        else:
+            poll = 0.05
+            deadline = time.monotonic() + effective
+            not_done = set(futures_snapshot)
+            while not_done:
+                pump()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                _done, not_done = concurrent.futures.wait(not_done, timeout=min(poll, remaining))
+            pump()  # final drain in case the last ack was just marshaled
         if not_done:
             logger.warning(
                 "SyncWorkerPool: %d tasks did not complete within timeout; "

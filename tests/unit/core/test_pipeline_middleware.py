@@ -134,6 +134,36 @@ async def test_compose_publish_async_applies_route_publish_scope() -> None:
     assert outcome.ok
 
 
+def test_compression_middleware_compresses_handler_result_publish() -> None:
+    """C4: CompressionMiddleware (not a generic probe) actually compresses a
+    handler's @publisher result via the real publish_scope chain end-to-end,
+    through TestBroker. Before wiring publish_scope, this middleware's
+    transform_envelope() had no caller anywhere in the pipeline."""
+    import gzip
+
+    from rabbitkit.core.config import CompressionConfig
+    from rabbitkit.middleware.compression import CompressionMiddleware
+
+    compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+    broker = TestBroker()
+
+    large_body = b"order-payload " * 200
+
+    @broker.subscriber(queue="source-q", middlewares=[compression_mw])
+    @broker.publisher(exchange="", routing_key="target-q")
+    def handle(body: bytes) -> bytes:
+        return large_body
+
+    broker.start()
+    broker.publish("source-q", b"trigger")
+
+    assert len(broker.published_messages) == 1
+    published = broker.published_messages[0]
+    assert published.content_encoding == "gzip"
+    assert published.body != large_body
+    assert gzip.decompress(published.body) == large_body
+
+
 # ── M-P1: middleware chain cached per route ───────────────────────────────
 
 

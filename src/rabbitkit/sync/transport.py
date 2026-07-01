@@ -75,6 +75,16 @@ class SyncTransport:
         self._consumer_tags: dict[str, str] = {}  # queue_name → consumer_tag
         self._owner_ident: int | None = None  # thread that owns the connection
         self._consuming = False  # True while the I/O loop is running
+        # H2: True once start_consuming() has ever run on this connection, and
+        # never reset to False until disconnect(). Unlike _consuming (which
+        # goes False the instant the loop stops pumping — including during
+        # SyncBroker.stop()'s worker-pool drain, while workers may still be
+        # mid-handler), this stays True for the connection's whole lifetime
+        # once a consume loop has run. _run_on_io_thread uses THIS (not
+        # _consuming) to decide whether a cross-thread call must marshal —
+        # a worker thread's ack must never run inline just because the loop
+        # has momentarily stopped pumping (see _run_on_io_thread).
+        self._ever_consumed = False
 
         # Per-queue consumer channels (H-SRE1): each queue gets its own channel
         # so per-queue basic_qos does not overwrite other consumers and fair
@@ -89,6 +99,14 @@ class SyncTransport:
         # does not exist") — publish() checks this to route RPC requests
         # correctly without RPCClient needing to know about channels at all.
         self._reply_to_channel: Any = None
+
+        # H1: channels (by id) that have had confirm_delivery() enabled.
+        # Detecting an unroutable Basic.Return via pika's UnroutableError
+        # requires confirms — in non-confirm mode basic_publish() has no way
+        # to report a return at all (see pika's own basic_publish docstring).
+        # A mandatory=True publish upgrades its target channel to confirm mode
+        # on demand (once, idempotently) regardless of confirm_delivery.
+        self._confirmed_channel_ids: set[int] = set()
 
         # Backpressure callbacks (FlowController registers here). Each is a
         # zero-arg callable; pika's blocked/unblocked frames are adapted to it.
@@ -151,6 +169,7 @@ class SyncTransport:
         self._channel = self._connection.channel()
         if self._confirm_delivery:
             self._channel.confirm_delivery()
+            self._confirmed_channel_ids.add(id(self._channel))
 
         # Register connection blocked/unblocked callbacks (C-6) so a
         # FlowController can throttle publishes when RabbitMQ raises an alarm.
@@ -197,8 +216,10 @@ class SyncTransport:
             self._connection = None
             self._channel = None
             self._reply_to_channel = None
+            self._confirmed_channel_ids.clear()
             self._connected = False
             self._owner_ident = None
+            self._ever_consumed = False
             logger.info("Disconnected from RabbitMQ")
 
     def is_connected(self) -> bool:
@@ -294,14 +315,33 @@ class SyncTransport:
         (worker_count > 1) acks/nacks/publishes, marshal the call onto the I/O
         loop via add_callback_threadsafe and block for its result/exception.
         When already on the owner thread (single worker / publisher), or when
-        no consume loop is running to drain callbacks, run inline.
+        no consume loop has EVER run on this connection (a pure producer with
+        no consumers — nothing else can be concurrently driving the socket),
+        run inline.
+
+        H2: deliberately does NOT fall back to inline just because the I/O
+        loop has momentarily stopped pumping (``not self._consuming``) once a
+        consume loop has run at least once (``self._ever_consumed``) — that
+        used to be true for the whole SyncBroker.stop() drain window (consumers
+        already cancelled, worker pool still finishing in-flight handlers),
+        so a worker thread's ack/nack/reject ran INLINE, cross-thread, on the
+        pika connection — unsynchronized with, and possibly concurrent with,
+        other worker threads' acks on the same consumer channel or the owner
+        thread's own disconnect(). Once ``_ever_consumed`` is True we always
+        marshal and rely on the owner thread pumping the I/O loop during drain
+        (see ``pump()``, called from ``SyncBroker.stop()``); if nothing pumps,
+        we fail fast with ``TimeoutError`` below rather than run unsafely.
 
         *timeout* bounds the wait for the I/O loop to drain the callback (R-3):
         on expiry we raise ``TimeoutError`` AND mark the callback cancelled so a
         late drain (after the caller has already nacked+requeued and moved on)
         becomes a no-op instead of settling an already-redelivered message.
         """
-        if not self._consuming or self._owner_ident is None or threading.get_ident() == self._owner_ident:
+        if (
+            self._owner_ident is None
+            or threading.get_ident() == self._owner_ident
+            or not self._ever_consumed
+        ):
             return fn()
 
         result: list[_T] = []
@@ -364,10 +404,28 @@ class SyncTransport:
 
         return self._publish_on_channel(channel, envelope)
 
+    def _ensure_mandatory_confirms(self, channel: Any) -> None:
+        """Enable publisher confirms on *channel* if not already active.
+
+        H1: detecting an unroutable ``Basic.Return`` via pika's
+        ``UnroutableError`` requires confirm mode — in non-confirm mode
+        ``basic_publish()`` has no way to report a return at all. Idempotent
+        and tracked per-channel (by id) so a repeat call is a no-op rather than
+        pika logging a spurious "confirmation was already enabled" error.
+        Marshaled like ``basic_publish`` since it drives blocking I/O.
+        """
+        if id(channel) in self._confirmed_channel_ids:
+            return
+        self._run_on_io_thread(channel.confirm_delivery)
+        self._confirmed_channel_ids.add(id(channel))
+
     def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish *envelope* on a specific already-open channel."""
         try:
             import pika
+
+            if envelope.mandatory:
+                self._ensure_mandatory_confirms(channel)
 
             properties = pika.BasicProperties(
                 message_id=envelope.message_id,
@@ -408,6 +466,33 @@ class SyncTransport:
                 status=PublishStatus.CONFIRMED,
                 exchange=envelope.exchange,
                 routing_key=envelope.routing_key,
+            )
+
+        except pika.exceptions.UnroutableError as e:
+            logger.warning(
+                "Publish returned as unroutable (mandatory=True, no matching binding): "
+                "exchange=%s routing_key=%s",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return PublishOutcome(
+                status=PublishStatus.RETURNED,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=e,
+            )
+
+        except pika.exceptions.NackError as e:
+            logger.warning(
+                "Publish nacked by broker: exchange=%s routing_key=%s",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return PublishOutcome(
+                status=PublishStatus.NACKED,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=e,
             )
 
         except Exception as e:
@@ -585,6 +670,7 @@ class SyncTransport:
         """
         self._ensure_connected()
         self._consuming = True
+        self._ever_consumed = True
         self._owner_ident = threading.get_ident()
         try:
             while self._consuming:
@@ -636,6 +722,22 @@ class SyncTransport:
                 "stop_consuming marshal timed out (I/O loop stalled); "
                 "leaving settlement to broker recovery / redelivery"
             )
+
+    def pump(self, time_limit: float = 0.05) -> None:
+        """Briefly drive the connection's I/O loop.
+
+        H2: once ``start_consuming()``'s loop has exited (consumers cancelled,
+        ``_consuming`` is False), nothing drains callbacks scheduled via
+        ``add_callback_threadsafe`` anymore — including worker-thread
+        acks/nacks marshaled by ``_run_on_io_thread``. ``SyncBroker.stop()``
+        calls this between waits during its worker-pool/in-flight drain so
+        those marshaled callbacks still get executed on the owner thread
+        instead of stalling until ``_run_on_io_thread``'s timeout. MUST be
+        called from the connection's owner thread — same requirement as any
+        other direct pika call.
+        """
+        if self._connection is not None and self._connection.is_open:
+            self._connection.process_data_events(time_limit=time_limit)
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 

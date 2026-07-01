@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -192,18 +193,34 @@ class TestSyncBrokerWorkerPool:
         assert broker.worker_pool.worker_count == 4
 
     def test_worker_pool_stops_on_broker_stop(self) -> None:
-        """Pool stop() called before consumer cancel."""
+        """Pool stop() is called, and consumer cancel happens first (C5)."""
         broker = self._make_broker_with_route()
         mock_channel = self._start_broker(broker, worker_config=WorkerConfig(worker_count=4))
 
         pool = broker.worker_pool
         assert pool is not None
 
-        with patch.object(pool, "stop", wraps=pool.stop) as mock_pool_stop:
+        order: list[str] = []
+        real_pool_stop = pool.stop
+
+        def _tracked_basic_cancel(*args: Any, **kwargs: Any) -> None:
+            order.append("cancel_consumer")
+
+        def _tracked_pool_stop(*args: Any, **kwargs: Any) -> Any:
+            order.append("worker_pool.stop")
+            return real_pool_stop(*args, **kwargs)
+
+        mock_channel.basic_cancel.side_effect = _tracked_basic_cancel
+        with patch.object(pool, "stop", side_effect=_tracked_pool_stop) as mock_pool_stop:
             broker.stop()
 
             # Pool stop was called
             mock_pool_stop.assert_called_once()
+
+        # C5: cancel_consumer must precede worker_pool.stop — draining the pool
+        # while the consumer is still active lets RabbitMQ deliver new messages
+        # into a pool that's mid-shutdown (see SyncBroker.stop() docstring).
+        assert order == ["cancel_consumer", "worker_pool.stop"]
 
         # After stop, worker_pool should be None
         assert broker.worker_pool is None
@@ -1284,6 +1301,149 @@ class TestPublishWithFlowController:
         assert fc.in_flight == 0  # slot released after publish
 
 
+# ── C3: broker-level publish middleware (signing on the primary produce path) ──
+
+
+class TestPublishWithMiddlewares:
+    """C3: broker.publish() must apply middlewares=[...] (e.g. signing) —
+    previously only handler-result/RPC-reply publishing went through publish_scope."""
+
+    def _start_broker(self, middlewares: list[Any] | None = None) -> SyncBroker:
+        broker = SyncBroker(middlewares=middlewares)
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        return broker
+
+    def test_publish_signs_envelope_via_broker_middleware(self) -> None:
+        """A SigningMiddleware passed to the broker constructor must sign
+        every broker.publish() call — the primary producer API."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker = self._start_broker(middlewares=[signing_mw])
+
+        captured: list[MessageEnvelope] = []
+
+        def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        broker._transport.publish = capture_publish  # type: ignore[union-attr]
+
+        outcome = broker.publish(routing_key="orders", body=b"order-data")
+
+        assert outcome.ok
+        assert len(captured) == 1
+        assert "x-rabbitkit-signature" in captured[0].headers
+
+    def test_publish_compresses_envelope_via_broker_middleware(self) -> None:
+        """C4: a CompressionMiddleware passed to the broker constructor must
+        compress every broker.publish() call above threshold — matches the
+        exact test the C4 finding requested."""
+        import gzip
+
+        from rabbitkit.core.config import CompressionConfig
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+        from rabbitkit.middleware.compression import CompressionMiddleware
+
+        compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
+        broker = self._start_broker(middlewares=[compression_mw])
+
+        large_body = b"order-payload " * 200
+        captured: list[MessageEnvelope] = []
+
+        def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        broker._transport.publish = capture_publish  # type: ignore[union-attr]
+
+        outcome = broker.publish(routing_key="orders", body=large_body)
+
+        assert outcome.ok
+        assert len(captured) == 1
+        assert captured[0].content_encoding == "gzip"
+        assert captured[0].body != large_body
+        assert gzip.decompress(captured[0].body) == large_body
+
+    def test_publish_without_middlewares_sends_envelope_unmodified(self) -> None:
+        """No middlewares configured -> publish() is a pure pass-through (no
+        regression to the pre-C3 fast path when middlewares=None)."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+
+        broker = self._start_broker(middlewares=None)
+        assert broker.publish_middlewares == []
+
+        captured: list[MessageEnvelope] = []
+
+        def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        broker._transport.publish = capture_publish  # type: ignore[union-attr]
+
+        outcome = broker.publish(routing_key="orders", body=b"plain-data")
+
+        assert outcome.ok
+        assert captured[0].body == b"plain-data"
+        assert captured[0].headers == {}
+
+    def test_publish_middleware_runs_outside_flow_control(self) -> None:
+        """Middleware wraps the flow-controlled publish — the transformed
+        (signed) envelope is what gets rate-limited/sent, not the original."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+        from rabbitkit.highload.backpressure import FlowController
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker = self._start_broker(middlewares=[signing_mw])
+        broker.flow_controller = FlowController()
+
+        captured: list[MessageEnvelope] = []
+
+        def capture_publish(env: MessageEnvelope) -> PublishOutcome:
+            captured.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, exchange=env.exchange, routing_key=env.routing_key)
+
+        broker._transport.publish = capture_publish  # type: ignore[union-attr]
+
+        outcome = broker.publish(routing_key="orders", body=b"order-data")
+
+        assert outcome.ok
+        assert "x-rabbitkit-signature" in captured[0].headers
+
+    def test_publish_middleware_chain_is_cached_across_calls(self) -> None:
+        """The composed chain must be built once and reused (not rebuilt per
+        publish), matching the route-level publish chain's caching behavior."""
+        from rabbitkit.core.types import PublishOutcome, PublishStatus
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        broker = self._start_broker(middlewares=[signing_mw])
+        broker._transport.publish = MagicMock(  # type: ignore[union-attr]
+            return_value=PublishOutcome(status=PublishStatus.CONFIRMED)
+        )
+
+        broker.publish(routing_key="orders", body=b"one")
+        chain_after_first = broker._pipeline._broker_publish_chain_cache[id(broker._publish_middlewares)]
+        broker.publish(routing_key="orders", body=b"two")
+        chain_after_second = broker._pipeline._broker_publish_chain_cache[id(broker._publish_middlewares)]
+
+        assert chain_after_first is chain_after_second
+
+
 # ── _recover_consumers ────────────────────────────────────────────────────
 
 
@@ -1384,4 +1544,49 @@ class TestWaitInFlightUncoveredLines:
 
         # in_flight is 0, so no warning
         mock_logger.warning.assert_not_called()
+        assert broker._in_flight == 0
+
+
+# ── H2: _wait_in_flight pumps the transport while waiting ─────────────────
+
+
+class TestWaitInFlightPumpsTransport:
+    """H2: _wait_in_flight() must pump the transport's I/O loop between
+    condvar waits so a worker thread's ack — marshaled onto the transport's
+    owner thread once a consume loop has run — actually gets drained instead
+    of stalling for the whole drain window."""
+
+    def test_wait_in_flight_calls_transport_pump_while_waiting(self) -> None:
+        import threading
+        import time
+
+        broker = SyncBroker()
+        mock_transport = MagicMock()
+        broker._transport = mock_transport
+        broker._in_flight = 1
+
+        def decrement_after_delay() -> None:
+            time.sleep(0.15)
+            broker._in_flight_dec()
+
+        t = threading.Thread(target=decrement_after_delay, daemon=True)
+        t.start()
+
+        broker._wait_in_flight(deadline=time.monotonic() + 5.0)
+
+        t.join(timeout=2.0)
+
+        assert broker._in_flight == 0
+        assert mock_transport.pump.call_count >= 1
+        mock_transport.pump.assert_called_with(0.05)
+
+    def test_wait_in_flight_skips_pump_when_no_transport(self) -> None:
+        """broker._transport is None (never started) -- no AttributeError."""
+        broker = SyncBroker()
+        broker._transport = None
+        broker._in_flight = 1
+        broker._in_flight_dec()
+
+        broker._wait_in_flight(deadline=None)
+
         assert broker._in_flight == 0

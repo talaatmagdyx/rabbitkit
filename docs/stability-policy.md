@@ -1,8 +1,10 @@
 # Stability Policy
 
-## Where rabbitkit actually is (as of 1.1.0)
+## Where rabbitkit actually is (as of 1.2.0)
 
-rabbitkit is currently at `1.1.1`. The `1.1.0` version number was a
+rabbitkit is currently at `1.2.0` (a production-hardening release; see
+`CHANGELOG.md`'s `[1.2.0]` entry and `PRODUCTION_AUDIT.md`). The `1.1.0`
+version number was a
 **version-integrity correction**, not a deliberate stability freeze — the
 tree had accumulated post-1.0.0 public API and behavior changes while still
 tagged `1.0.0`, and 1.1.0 fixed the mismatch (see `CHANGELOG.md`'s `[1.1.0]`

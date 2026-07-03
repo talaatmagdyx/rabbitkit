@@ -5,6 +5,522 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.2.0] — 2026-07-04
+
+Production-hardening release implementing the full `PRODUCTION_AUDIT.md`
+remediation: all 4 critical, 6 high-risk, and 18 medium findings, the
+low-severity list, and the fixes surfaced by re-verifying the audit's own
+"resolved-by-design" and "verified strengths" claims against the actual
+code. Every known message-loss path in the library's own code is closed;
+remaining failure modes are duplicate-or-requeue under at-least-once
+delivery (idempotent handlers remain mandatory — see
+`docs/production/idempotency.md`).
+
+Several **breaking defaults** — see the inline migration notes: auto-DLX
+provisioning for every rejecting route (`SafetyConfig.reject_without_dlx`),
+rejection of `RetryConfig(per_queue=False)`, `SecurityConfig.mechanism`
+validation, and signing+retry now failing fast at startup.
+
+### Added
+
+- **`ConnectionConfig.credentials_provider`** (audit M13) — credential
+  rotation without a redeploy. An optional `() -> (username, password)`
+  callable, called at each (re)connect (sync + async), so a rotated secret
+  (Vault, short-lived IAM, etc.) is picked up on the next reconnect instead
+  of requiring the process to restart with a new frozen config. Falls back to
+  the static `username`/`password` when unset.
+- **`SafetyConfig.on_topology_conflict="warn_continue"`** (audit M14) — a
+  per-conflict warn-and-continue mode for topology drift. When a queue/
+  exchange declaration 406s because it already exists with incompatible
+  arguments (ops created it, or a prior version, with a different
+  type/TTL/DLX), the default `"raise"` fails startup with a typed error;
+  `"warn_continue"` logs a warning and continues using the EXISTING
+  definition (reopening the broker-closed channel). Unlike
+  `TopologyMode.PASSIVE_ONLY` (which skips declaration for *every* queue),
+  this still actively declares non-conflicting queues and only tolerates the
+  drifted ones — the gap PASSIVE_ONLY couldn't fill. Both transports.
+- **`ConsumerConfig.reject_transient_on_redelivery`** (audit M6) — opt-in
+  2-strike cap on the transient hot-loop for retry-less AUTO routes. By
+  default (False) a transient error nack-requeues unbounded (legitimate
+  "wait for the downstream to recover"). When True, a transient error on a
+  message the broker has *already redelivered* (`redelivered=True`) is
+  rejected to the DLQ instead of requeued again — using the broker's
+  redelivered flag, the only per-message redelivery signal available without
+  republishing. For a higher cap or delays, use retry or a quorum source
+  queue with `x-delivery-limit`. Needs a dead-letter path (the default
+  `reject_without_dlx="auto_provision"` gives AUTO routes one).
+
+- **Multi-host / cluster failover via `ConnectionConfig.nodes`** (audit M9) —
+  a tuple of additional `"host"` or `"host:port"` cluster nodes. Sync (pika)
+  tries them natively via a `ConnectionParameters` list; async cycles
+  endpoints on the initial connect (`connect_robust` then pins to the chosen
+  node — front with a load balancer / DNS for per-reconnect failover). A dead
+  configured primary no longer takes the client down at startup. Malformed
+  node entries fail fast at construction.
+
+- **`PublishOutcome.raise_for_status()`** (audit M1) — opt-in exception for the
+  publish path. `broker.publish()` still returns a `PublishOutcome` (never
+  raises on its own), but code that prefers exceptions can now write
+  `broker.publish(...).raise_for_status()`, which raises the new `PublishError`
+  (carrying the outcome) on NACKED/TIMEOUT/RETURNED/ERROR and returns the
+  outcome otherwise. Guards against silent loss when a caller ignores the
+  return value.
+
+- **Queue-depth / consumer-lag metrics via `QueueMetricsPoller`** (audit H5).
+  The consume/publish counters only see messages *this process* handles — a
+  queue could accumulate millions of messages (consumer fell behind or died)
+  while every rabbitkit metric read healthy. `QueueMetricsPoller` polls the
+  management API and emits gauges labeled by queue: `queue_messages_ready`
+  (backlog), `queue_messages_unacked`, `queue_messages_total`, and
+  `queue_consumers` (0 = nothing draining — the DLQ/lag alert signal).
+  Sync (`start()`/`stop()` daemon thread) and async (`run_async()` task)
+  loops; management errors are swallowed so a transient outage doesn't crash
+  the poller. `MetricsCollector` gained `set_gauge`; `PrometheusCollector`
+  implements it.
+
+
+- **`broker_health_check`/`broker_readiness` (+ async variants) accept an
+  optional `management_client`** (`RabbitManagementClient`). The existing
+  checks are entirely process-local — this process can hold a perfectly
+  live connection to one RabbitMQ node while the rest of a partitioned
+  cluster is unreachable, and the local checks alone can't see that. When
+  given, a failing `.health_check()`/`.health_check_async()` downgrades an
+  otherwise-HEALTHY result to DEGRADED (never overrides an already-
+  UNHEALTHY local result); `broker_readiness` treats that downgrade as
+  not-ready. Fully opt-in — omitting the parameter preserves the original
+  process-local-only behavior exactly. The async variants call
+  `.health_check_async()`, not the sync method, so readiness/health checks
+  never block the event loop on a network round-trip.
+
+### Changed
+
+- **The critical restart-mid-consume chaos scenarios now gate CI** (audit
+  M15). `benchmarks/chaos_suite.py` takes a scenario-name filter, and a new
+  gating CI step runs the sync+async "restart mid-consume" scenarios with a
+  checked exit code — a reconnect/redelivery regression breaks the build
+  instead of merging green. The full chaos suite stays best-effort.
+- **Async large-body deserialization is offloaded off the event loop** (audit
+  M10). Bodies ≥ 256 KiB are now decoded in a worker thread
+  (`asyncio.to_thread`) so a multi-MB JSON/msgspec/pydantic parse no longer
+  blocks heartbeats, publisher confirms, and other consumers sharing the loop.
+  Smaller bodies still decode inline.
+- **`PublisherConfig.max_message_bytes`** (audit M10) — opt-in publish-side
+  size guard (default 0 = disabled). When set, `broker.publish()` raises
+  `ValueError` for a body over the cap, catching the large-message anti-pattern
+  before it hits the wire.
+- **`WorkerConfig.max_queue_size`** (audit M11) — opt-in bound on the sync
+  worker pool's internal work queue (default 0 = unbounded, unchanged). In
+  practice prefetch already caps in-flight; this is a defensive ceiling. Also
+  added `WorkerConfig.__post_init__` validation (`worker_count >= 1`,
+  `max_queue_size >= 0`).
+- **Async reconnect interval is now jittered per process** (audit H4). aio-pika's
+  `connect_robust` uses a FIXED reconnect interval with no backoff — a fleet
+  restarted together (broker bounce under N pods) retried in lockstep every
+  `reconnect_backoff_base` seconds, a thundering herd against the recovering
+  node. The interval is now randomized per process over
+  `[base, base + min(base, backoff_max - base)]` to de-synchronize retries.
+  (Exponential backoff still isn't available through `connect_robust`; jitter
+  addresses the herd.)
+- **Single-worker sync consumers now warn at start** (audit H2). A
+  `worker_count=1` sync consumer runs handlers inline on the I/O thread, so a
+  handler running longer than ~2× the heartbeat starves heartbeats and the
+  broker drops the connection mid-handler (→ redelivery + duplicate side
+  effects). `SyncBroker.start()` now emits a `RuntimeWarning` when consuming
+  single-worker with heartbeats enabled, pointing at
+  `WorkerConfig(worker_count=N)` or a higher heartbeat.
+- **Sync confirmed-publish throughput ceiling (~0.9k msg/s) documented**
+  (audit H6) in the README, `SyncBroker.publish` docstring, and the batch
+  helper — it is RTT-bound per-message on a single channel and does not scale
+  with `worker_count`; use `AsyncBroker`/`AsyncBatchPublisher` or more
+  processes to drain backlogs. (No behavior change — pika BlockingConnection
+  cannot pipeline confirms.)
+- **`PublisherConfig.mandatory` / `.persistent` are now honored** by the
+  kwargs form of `publish()` (audit M2) — previously dead config. Persistent
+  maps to `delivery_mode` (2/1); mandatory sets the envelope flag. Envelope-
+  form callers keep full control.
+- **`amqps://` URLs now warn and default to port 5671** in
+  `ConnectionConfig.from_url` (audit M3). rabbitkit enables TLS via
+  `SecurityConfig(ssl=SSLConfig(enabled=True))`, not the URL scheme — so an
+  `amqps://` URL without that would previously connect PLAINTEXT silently.
+  Now it warns and targets the AMQPS port, so an un-TLS'd connection fails
+  fast instead of leaking plaintext.
+- **`SSLConfig(cert_reqs="CERT_NONE")` now warns** (audit M2/M13) — disabling
+  certificate verification is MITM-able and was previously silent.
+- **`SecurityConfig.mechanism` other than `"PLAIN"` now raises** at
+  construction (audit M2) — SASL EXTERNAL is not implemented, so accepting it
+  was "config that lies." (mTLS for encryption is still available via
+  `SSLConfig`.)
+- **`RetryConfig.jitter_factor` documented as reserved/no-op** (audit M2) —
+  queue-based retry uses a fixed per-queue TTL, so jitter would require
+  per-message TTL (head-of-line blocking); the field never affected timing.
+- **Removed the misleading `channel_pool_size` warnings** from
+  `SyncBroker.start()` (audit M2) — the default publish path uses a single
+  dedicated channel, not `SyncChannelPool`, so those warnings pointed at a
+  deadlock/throughput knob that has no effect on that path.
+
+
+- **`mark_policy="on_start"` is now documented as advanced/dangerous**: a
+  process crash after the mark but before the handler finishes loses the
+  message (the redelivery is skipped as a duplicate). Prefer the default
+  `on_success`, or `claim` when concurrent duplicate suppression is needed.
+
+### Fixed
+
+- **Retry delay-queue publishes are now `mandatory`** (audit M4) — a
+  runtime-deleted/missing `{queue}.retry.N` queue used to broker-confirm the
+  retry publish into the void and ack the source (silent loss). With
+  `mandatory=True` the publish RETURNs (outcome not-ok), and the existing
+  route-to-delay-queue path nack-requeues instead of acking.
+- **`REQUEUED_FOR_RETRY` sentinel no longer leaks into result/RPC publishing**
+  (audit M7) — a retried message on a route with a `result_publisher` or
+  `reply_to` used to serialize the sentinel as a bogus reply (once per retry
+  attempt). The pipeline now skips result-publishing for the sentinel.
+- **A MANUAL-policy handler exception no longer stops the whole sync broker**
+  (audit M12) — a `AckPolicy.MANUAL` handler that raised without settling used
+  to propagate out of the delivery callback and halt `start_consuming()` (one
+  bad handler took down the consumer). It is now contained: logged and
+  nack-requeued if unsettled, matching the pooled/async paths.
+- **`SigningMiddleware` no longer destroys legitimately-redelivered or
+  retried messages** (audit H1). Two independent losses: (a) a broker
+  redelivery (nack/requeue of an unacked message) tripped the nonce
+  replay-check and was rejected → dead-lettered/discarded; now a duplicate
+  nonce on a message with `redelivered=True` is allowed (the broker sets that
+  flag, an attacker's re-publish arrives as a fresh delivery so replay
+  protection still holds). (b) signing + retry is fundamentally incompatible
+  — retry re-publishes via the default exchange with a different routing key,
+  which the signature covers, so every retried signed message fails
+  verification; the brokers now raise `ConfigurationError` at startup when a
+  route has both, instead of silently destroying each retried message.
+- **`RetryConfig(per_queue=False)` (shared retry mode) now rejected at
+  construction** (audit H3). Shared delay queues bake a single
+  `x-dead-letter-routing-key` per queue, so with >1 subscriber they either
+  406 at startup or dead-letter every queue's failures back to whichever
+  queue declared first (orders' failures reappearing on payments). A shared
+  delay queue cannot route each message back to its own varying source with
+  static broker config, so there is no safe shared topology — `per_queue`
+  must be `True` (the default, isolated `<queue>.retry.N`/`<queue>.dlq`).
+- **Async batch confirm-timeout no longer corrupts sibling in-flight
+  publishes** (audit M17). `_publish_on_channel`'s confirm-timeout handler
+  used to close the channel it was passed — but `AsyncBatchPublisher._flush`
+  gathers several concurrent calls onto one shared channel, so one publish's
+  own timeout closed the channel out from under every sibling publish still
+  awaiting its own confirm on it, even ones that would have confirmed
+  cleanly a moment later. Closing now happens in the caller instead, after
+  that caller's own usage of the channel is fully resolved: the batch flush
+  closes the shared channel only once `asyncio.gather` has settled every
+  publish in the batch, and the mandatory/pooled-channel publish paths close
+  their (non-shared) channel only after their own single call returns.
+- **`RetryMiddleware` and result/RPC-reply publishes now honor the broker's
+  `FlowController`** (audit M18). Both previously used raw
+  `transport.publish`, bypassing publish-side backpressure entirely — a
+  broker configured with `max_in_flight`/rate limits to protect itself under
+  load gave zero protection to its own retry republishes or handler-result
+  publishes. The new `_flow_controlled_internal_publish` (sync + async)
+  wraps `FlowController.acquire`/`release` around these paths, and
+  deliberately never lets `BackpressureError` escape as an exception — under
+  any `on_blocked` policy (including `"raise"`) a blocked/dropped slot
+  resolves as a failed `PublishOutcome` instead, since `RetryMiddleware` and
+  the pipeline's result-publish only understand that return shape; an
+  escaped exception would be misclassified `PERMANENT` by the default error
+  classifier and destroy the message instead of nack-requeuing it.
+
+- **`SafetyConfig.reject_without_dlx` — no more silently discarded poison
+  messages** (audit C3). Previously a DLQ was auto-provisioned only for
+  retry-enabled (or `filter_fn`) routes; a plain `@subscriber(queue="orders")`
+  whose handler raised a permanent error (`ValueError`, validation failure,
+  or ANY unknown exception type) rejected with `requeue=False` into a queue
+  with no DLX — RabbitMQ discarded the message forever with only a log line.
+  Now every route that can reject gets a dead-letter path, governed by
+  `RabbitConfig(safety=SafetyConfig(reject_without_dlx=...))` — a
+  `RejectWithoutDLXPolicy` enum or string:
+  ``"auto_provision"`` (default — declares `{queue}.dlq`, same
+  default-exchange convention as retry topology), ``"error"`` (startup fails
+  with the new `UnsafeTopologyError`, for externally-managed topology), or
+  ``"discard"`` (explicit opt-in to loss; warns once per route unless
+  `warn_on_discard=False`). Per-route override via
+  `@subscriber(reject_without_dlx=...)`. Retry-enabled routes, manually
+  configured DLX queues, and `ACK_FIRST` routes (which never reject) are
+  unaffected; the policy applies only under `TopologyMode.AUTO_DECLARE`.
+  The filter-route special case (H6) is folded into this general mechanism —
+  its `RuntimeWarning` is replaced by an INFO log, and
+  `warn_filter_without_dlx` was removed.
+  **Migration note:** the default changes existing plain queues' declare
+  arguments (DLX args injected). Re-declaring an existing queue with
+  different arguments 406s at startup with a clear `ConfigurationError` —
+  delete/re-create the queue, mirror the args via a broker policy, opt the
+  route into `"discard"`/`"error"`, or use `TopologyMode.PASSIVE_ONLY`.
+
+- **`mark_policy="claim"` for `DeduplicationMiddleware`** — a two-state
+  dedup policy that blocks concurrent duplicate execution AND is crash-safe.
+  Before the handler runs, the key is atomically claimed as ``in-flight``
+  with `DeduplicationConfig.processing_timeout` (default 300 s) as its TTL;
+  on handler success it is flipped to ``completed`` with the full `ttl`. A
+  concurrent copy that sees a live in-flight claim is handled per
+  `DeduplicationConfig.on_in_flight`: `"nack_requeue"` (default — the copy
+  comes back and retries, so it is not lost if the claiming consumer dies)
+  or `"ack_skip"`. A crash mid-handler simply lets the claim expire, after
+  which the broker's redelivery re-claims and processes. Keys written by
+  `on_success`/`on_start` deployments (value ``"1"``) are read as completed,
+  so switching an existing deployment to `claim` is safe. Caveat:
+  `processing_timeout` must comfortably exceed the worst-case handler
+  duration, or a duplicate can start while the original is still running.
+  The duck-typed Redis client needs `.get()` for this policy.
+- **`DeduplicationMarkPolicy` enum** (`on_success` / `on_start` / `claim`)
+  in `core/types.py`, exported at top level; `DeduplicationConfig.mark_policy`
+  accepts the enum or its string value and now fail-fast validates
+  `mark_policy`, `on_in_flight`, and `processing_timeout` at construction.
+
+
+- **Headers-exchange bindings now actually reach the broker** (audit C4,
+  silent misrouting). `RabbitQueue.bind_arguments` was never passed by
+  either broker — `bind_queue()` had no arguments parameter — so a headers
+  binding declared with `{"x-match": "all", "type": "order"}` bound
+  argument-less, which RabbitMQ treats as match-everything: the queue
+  received the full firehose (or missed selective routing) with zero
+  errors. Both transports' `bind_queue()` now accept and forward
+  `arguments`, and both brokers pass `queue.bind_arguments`. Registration
+  now also fail-fast validates headers routes: binding to a HEADERS
+  exchange without `bind_arguments` raises `ConfigurationError`, as does an
+  invalid `x-match` value (must be `all`/`any`/`all-with-x`/`any-with-x`;
+  absent defaults to `all` per RabbitMQ).
+- **`DLQInspector.replay`/`replay_async` no longer ack a DLQ message when the
+  republish failed** (audit C2, message loss). Previously the original was
+  acked immediately after `transport.publish(...)` — but both transports
+  report failures as a *returned* `PublishOutcome`
+  (NACKED/TIMEOUT/RETURNED/ERROR), not an exception, so a connection blip or
+  unroutable target mid-replay removed the message from the DLQ while the
+  republish went nowhere: permanent loss from the recovery tool itself.
+  Replay now checks `outcome.ok` before acking; failed republishes are
+  nack-requeued (they stay on the DLQ) and reported. Republish envelopes are
+  now `mandatory=True`, so an unroutable target surfaces as RETURNED instead
+  of being broker-confirmed into the void. The return type is
+  `ReplayResult` — an `int` subclass carrying the replayed count (existing
+  `count = inspector.replay(...)` callers are unaffected) plus `.failed`
+  (left on the DLQ) and `.requeued` (non-matching) counts. New opt-in
+  `reset_retry_count=True` strips `x-rabbitkit-retry-count` so a replayed
+  message gets a fresh retry ladder — by default a previously max-retried
+  message is terminal after one failed attempt and returns to the DLQ.
+- **`rabbitkit dlq replay` (CLI) had the same loss window, worse**: it
+  published on a non-confirm channel (fire-and-forget) and acked
+  immediately. The channel now runs with publisher confirms and
+  `mandatory=True`; an unroutable/nacked publish is nack-requeued (message
+  stays on the DLQ), reported on stderr, and the command exits non-zero.
+- **`DeduplicationMiddleware` `mark_policy="on_success"` no longer writes the
+  dedup key before the handler runs** (audit C1, message loss). Previously the
+  Redis `SET NX` executed *before* `call_next`, with a `DELETE` rollback on
+  exception — so a consumer killed mid-handler (OOM/SIGKILL, where no rollback
+  can run) left the key marked, and the broker's redelivery of the unacked
+  message was acked-and-skipped as a "duplicate": the message was silently
+  lost for the dedup TTL (default 24 h). `on_success` now checks with
+  `EXISTS` (no write) before the handler and writes the key only after the
+  handler returns successfully. A crash at any point leaves no mark, so the
+  redelivery is processed. Trade-off (already documented): concurrent
+  deliveries of the same message may both pass the check — standard
+  at-least-once semantics. Two behavioural consequences: a failed handler no
+  longer triggers a Redis `DELETE` (there is nothing to delete, and deleting
+  could erase a concurrent delivery's legitimate mark), and a Redis failure
+  while writing the success-mark is logged/metered but never raised — the
+  handler's side effects are already committed, and raising would nack →
+  redeliver → a guaranteed duplicate execution (applies even with
+  `fallback_on_redis_error=False`). The duck-typed Redis client now also
+  needs `.exists()` alongside `.set()`/`.delete()`.
+- **`DeduplicationMiddleware` local LRU cache is now thread-safe.** The
+  optional `local_cache_size` `OrderedDict` was mutated without a lock from
+  sync worker-pool daemon threads; concurrent `move_to_end`/`popitem` during
+  eviction could raise `KeyError` (classified PERMANENT → message
+  dead-lettered/dropped for a bookkeeping race). All cache operations now
+  take an internal `threading.Lock`.
+- **Retry republish and DLQ replay no longer drop message properties.**
+  `_build_retry_envelope`/`_build_replay_envelope` only copied a handful of
+  `MessageEnvelope` fields — `priority`, `expiration`, `type`, `app_id`,
+  `user_id`, and `reply_to` were silently lost on every retry or DLQ
+  replay. A priority-queue message lost its priority on its first retry; an
+  RPC request's `reply_to` never survived long enough for a retried/
+  replayed reply to route back. `RabbitMessage` gained `priority`/
+  `expiration`/`user_id` slots (it already carried `type`/`app_id`/
+  `reply_to`), both transports now populate them from the incoming
+  delivery, and both envelope builders copy all six through. The async
+  transport re-encodes aio-pika's decoded-seconds `expiration` back to the
+  ms-string convention used everywhere else, so it round-trips correctly
+  regardless of which transport originally received the message.
+- **Oversized routing keys/exchange/queue names now fail fast with a clear
+  error** instead of an opaque broker connection error at declare/publish
+  time. AMQP 0-9-1 encodes these as shortstr (a 1-byte length prefix — 255
+  bytes is a hard protocol ceiling). `MessageEnvelope.__post_init__` (every
+  publish path funnels through this one construction point) and
+  `RabbitQueue`/`RabbitExchange.validate()` now raise `ValueError` for any
+  value exceeding `AMQP_SHORTSTR_MAX_BYTES` (255), measured in encoded
+  UTF-8 bytes.
+- **`RabbitQueue(lazy=True)` now warns it's a no-op on RabbitMQ ≥3.12.**
+  `x-queue-mode=lazy` is a classic-queue-v1-era argument; RabbitMQ ≥3.12
+  defaults classic queues to CQv2, which already keeps message bodies out
+  of memory without it — the argument is silently ignored there. Still has
+  effect pre-3.12 or on a queue explicitly downgraded to v1.
+- **`rabbitkit topology validate`/`diff --url` no longer accepts arbitrary
+  URL schemes.** `_live_resources` passed the CLI-supplied management URL
+  straight to `urlopen`, which would happily dispatch `file://`, `ftp://`,
+  or any other registered urllib scheme — not just `http(s)://` the
+  management API actually uses. The scheme is now validated (`http`/
+  `https` only) before any request is made.
+- **`rabbitkit dlq replay` gained `--reset-retry-count` / `--retry-count-header`.**
+  `DLQInspector.replay(reset_retry_count=True)` already existed at the
+  Python API level, but the CLI's `dlq replay` command is a separate,
+  hand-rolled raw-pika implementation that never calls `DLQInspector` — so
+  an operator using the CLI (the realistic way "replay this stuck,
+  max-retried message" gets done) had no way to strip the retry-count
+  header at all, and a replayed message carrying `x-rabbitkit-retry-count`
+  at its max was instantly terminal on the next failure. `--reset-retry-count`
+  strips the header (default `x-rabbitkit-retry-count`, overridable via
+  `--retry-count-header` to match a customized `RetryConfig.retry_header`)
+  before publishing.
+- **`PydanticDecoder` no longer skips validation for a non-dict payload.**
+  `decode()` had an `isinstance(data, dict)` guard that skipped
+  `model_validate` entirely for a non-dict top-level parse result (a
+  producer sending a JSON array/string/number instead of an object) and
+  silently handed the handler raw, un-validated data instead. Pydantic's
+  own `model_validate` already raises a clean `ValidationError` for a
+  non-dict input — the guard only suppressed the exact validation this
+  decoder exists to provide over `DataclassDecoder` for untrusted input.
+  Removed; `model_validate` now always runs when `target_type` supports it.
+- **Log redaction now catches compound secret-bearing key names.**
+  `LoggingConfig.redact_keys` matching was exact-string-only: a configured
+  key like `token` did NOT match a target key that normalizes to
+  `auth_token`, so common compound names (`x-auth-token`, `session-token`,
+  `x-secret-key`, `bearer-token`, `api-token`, ...) were logged in the
+  clear even though `auth`/`token`/`secret` are each individually in
+  `DEFAULT_REDACT_KEYS`. Matching is now word-set based: a target key
+  matches when it contains ALL of some configured key's underscore-
+  separated words, checked per configured key (not pooled into one flat
+  word set — pooling would turn `api_key`'s `key` into a standalone
+  matcher and misfire on benign fields like `primary_key`/`cache_key`).
+  The documented depth limit (top level + one nested dict) is unchanged.
+- **`configure_structlog()` now bridges Python's `warnings` module into
+  `logging`/`structlog`.** All 37 of rabbitkit's `warnings.warn()` calls
+  (topology drift, retry-without-confirms, unsafe TLS, dashboard auth,
+  `lazy=True`, ...) previously wrote straight to `sys.stderr` in their own
+  format, completely bypassing whatever log pipeline `LoggingConfig` set
+  up — a "loud warning" was only actually loud if something was watching
+  raw stderr in dev; in a production JSON-logging deployment (rabbitkit's
+  own recommended config) it was invisible unless the application
+  separately called `logging.captureWarnings(True)` itself (undocumented).
+  New `LoggingConfig.capture_warnings` (default `True`) calls
+  `logging.captureWarnings()` during `configure_structlog()`; set `False`
+  if your application already manages this itself.
+
+
+- **Async broker: in-flight handlers abandoned past `graceful_timeout` are
+  now cancelled and nacked, not silently left unacked.** This already
+  worked for the pooled-worker path (`AsyncWorkerPool.stop()`); the
+  *inline* path (no `worker_config`, the default) only logged a count and
+  disconnected, same as the sync broker's unavoidable behavior — except the
+  async inline path *can* safely cancel the task first. `AsyncBroker` now
+  tracks inline in-flight tasks (`_inflight_tasks`) and, on drain-deadline
+  timeout, cancels + nacks (`requeue=True`) any still-running ones with
+  delivery-tag/message-id logging, matching the pooled path.
+- **Sync transport: a publish confirm that never arrives now reports
+  `PublishStatus.TIMEOUT`, not `PublishStatus.ERROR`.** `_run_on_io_thread`
+  bounds the cross-thread `basic_publish` marshal by `confirm_timeout` and
+  raises `TimeoutError` on expiry — but `_publish_on_channel` had no
+  dedicated handler for it, so it fell through to the generic
+  `except Exception` branch. This contradicted `docs/message-safety.md`'s
+  documented contract (`TIMEOUT`: "no confirm arrived within
+  `confirm_timeout`") and diverged from the async transport, which already
+  correctly maps its equivalent `asyncio.timeout(confirm_timeout)` expiry
+  to `TIMEOUT`. A caller checking `status == PublishStatus.TIMEOUT` (the
+  documented pattern for this exact scenario) silently never saw it on the
+  sync transport.
+- **Sync transport: a publish confirm that never arrives no longer hangs
+  the calling thread forever.** `pika.BlockingChannel.basic_publish()` has
+  no timeout parameter, and when running fully inline (the default
+  single-worker / pure-producer path — most sync usage), its confirm-wait
+  looped via `process_data_events` with no aggregate time bound;
+  `confirm_timeout` only ever bounded the *cross-thread marshal* case
+  (`worker_count>1`), not this one. A broker that accepted the TCP
+  connection but never sent the confirm frame back (disk full, internally
+  wedged) hung the publish call forever regardless of configuration. Now
+  bounded via a dedicated one-shot helper thread whenever no consume loop
+  can be sharing the connection (pure producer, or nothing has consumed
+  yet); on timeout the connection is discarded (never closed from the
+  timing-out thread — that would itself be a second thread touching a
+  `BlockingConnection`, which pika doesn't support) and transparently
+  re-established on the next call, the same recovery path as a genuine
+  network failure. One case remains genuinely unsafe to bound and is
+  unchanged, documented in `docs/message-safety.md`: a publish from the
+  connection's owner thread while that same thread is also actively
+  driving `start_consuming()`'s dispatch loop (the default single-worker
+  consumer publishing a result/retry from inside a handler) — interrupting
+  it risks two threads touching the same connection the instant the
+  caller gives up and dispatch resumes. Mitigation: `worker_count>1`
+  routes a handler's publish through the already-bounded cross-thread
+  path instead.
+- **`TracedConsumerMiddleware` now warns when tracing can't actually run.**
+  Adding it without `obskit` installed (or with obskit installed but
+  tracing not configured) silently made every span a permanent no-op with
+  zero signal — easily mistaken for "nothing to trace yet" rather than
+  "tracing was never active." Now logs a warning once, at construction,
+  naming which of the two conditions applies.
+- **New counters: `rabbitkit_messages_redelivered_total` and
+  `rabbitkit_reconnects_total`** — the last two observability gaps from
+  the audit's H5 finding. `messages_redelivered_total` (labeled by
+  `queue`) is incremented by `MetricsMiddleware` whenever the broker flags
+  a delivery `redelivered=True` — the signal that handlers are dying or
+  timing out before acking (crash loops, heartbeat kills), which the
+  success/error consume counters alone can't distinguish from ordinary
+  traffic. `reconnects_total` counts transport re-connections: both
+  transports gained an `on_reconnect(callback)` hook (sync fires on every
+  successful connect after the first; async adapts aio-pika's
+  `RobustConnection.reconnect_callbacks` on both the publisher and
+  consumer connections), and both brokers wire it to the first route
+  `MetricsMiddleware`'s collector at `start()` — reconnects were
+  previously logged but never counted, so a flapping broker/network was
+  invisible to metrics-based alerting.
+
+### Documentation
+
+- **`BatchAcker`'s usage example no longer shows a real thread-safety bug.**
+  The docstring (and `docs/guide/full-guide.md`) wired a raw pika
+  `channel.basic_ack` directly as `ack_fn` — but `flush_interval_ms`'s timer
+  fires `flush()` from a background `threading.Timer` thread, not pika's
+  I/O thread, so a verbatim copy of the old example was a real cross-thread
+  violation (the exact thing `_run_on_io_thread` exists elsewhere in this
+  codebase to prevent). Both examples now wrap `ack_fn` with
+  `connection.add_callback_threadsafe`; noted that the async path
+  (`asyncio.create_task` on the same loop aio-pika already runs on) has no
+  such hazard.
+- **`docs/kubernetes.md`** now covers KEDA queue-depth-based autoscaling
+  under the HPA section, with a `ScaledObject`/`TriggerAuthentication`
+  example and the rationale for why CPU-based HPA is the wrong signal for a
+  queue consumer with a slow downstream dependency.
+- **`docs/security.md`** gained a "Least-privilege consumers with
+  `TopologyMode.PASSIVE_ONLY`" section explaining the RabbitMQ
+  `configure`/`write`/`read` permission model and how `PASSIVE_ONLY` lets a
+  consumer run without `configure`, with a dedicated topology-owning
+  process/credential declaring the real topology instead.
+- **`docs/rabbitmq-retry-architecture.md`**'s graceful-shutdown section now
+  spells out what happens when a handler is still running past
+  `graceful_timeout`: the async broker cancels the task and nacks its
+  message (delivery-tag logged, immediate redelivery); the sync broker has
+  no safe way to interrupt a thread-bound handler, so it logs a count and
+  disconnects, leaving the message unacked for the broker to notice and
+  redeliver on its own. Either way, the abandoned handler may still be
+  running its own side effects when the redelivered copy starts — handlers
+  must be idempotent under at-least-once delivery regardless of transport.
+- **`docs/production/checklist.md` brought current with everything this
+  release shipped** — it's the "blessed production profile" and several
+  items described pre-1.2.0 behavior: the DLQ item still documented the
+  old filter-route-only auto-declare (now `reject_without_dlx`
+  auto-provisions for every rejecting route); added
+  `reject_transient_on_redelivery`, `raise_for_status()` +
+  `CONFIRMED`-vs-`SENT` outcome checking, the sync ~0.9k msg/s
+  confirmed-publish ceiling → use-`AsyncBroker` guidance,
+  `ConnectionConfig.nodes` cluster failover, `credentials_provider`
+  rotation, `PASSIVE_ONLY` least-privilege pointer, `QueueMetricsPoller`
+  (without which the "alert on DLQ depth" item had no metric to alert
+  on), the new `messages_redelivered_total`/`reconnects_total` alerts,
+  and partition-aware readiness via `management_client`.
+
 ## [1.1.1] — 2026-07-03
 
 ### Added

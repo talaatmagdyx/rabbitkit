@@ -199,6 +199,27 @@ class TestTopology:
         assert isinstance(exc_info.value.__cause__, aio_pika.exceptions.ChannelPreconditionFailed)
 
     @pytest.mark.asyncio
+    async def test_declare_queue_406_warn_continue(self) -> None:
+        """M14: on_topology_conflict='warn_continue' warns and continues with
+        the existing definition, reopening the topology channel."""
+        import aio_pika.exceptions
+
+        transport = _make_transport(on_topology_conflict="warn_continue")
+        channel = await self._connect_transport(transport)
+        channel.declare_queue.side_effect = aio_pika.exceptions.ChannelPreconditionFailed(
+            406, "PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'orders'"
+        )
+        # Make the reopen return a distinct channel so we can assert it happened.
+        reopened = AsyncMock()
+        new_conn = AsyncMock()
+        new_conn.channel = AsyncMock(return_value=reopened)
+        transport._conn_pool.get_consumer_connection = AsyncMock(return_value=new_conn)
+
+        await transport.declare_queue(RabbitQueue(name="orders"))  # must NOT raise
+
+        assert transport._topology_channel is reopened  # reopened for further declares
+
+    @pytest.mark.asyncio
     async def test_declare_exchange_precondition_failed_raises_configuration_error(self) -> None:
         """M6: same as the queue case, for exchange declaration."""
         import aio_pika.exceptions
@@ -237,7 +258,22 @@ class TestTopology:
 
         await transport.bind_queue("orders", "events", "orders.created")
 
-        mock_queue.bind.assert_called_once_with(mock_exchange, routing_key="orders.created")
+        mock_queue.bind.assert_called_once_with(mock_exchange, routing_key="orders.created", arguments=None)
+
+    async def test_bind_queue_passes_arguments(self) -> None:
+        """C4: headers-exchange match criteria must reach the broker."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+        mock_exchange = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+        channel.get_exchange = AsyncMock(return_value=mock_exchange)
+
+        args = {"x-match": "any", "type": "order"}
+        await transport.bind_queue("orders.headers", "events.headers", "", arguments=args)
+
+        mock_queue.bind.assert_called_once_with(mock_exchange, routing_key="", arguments=args)
 
     @pytest.mark.asyncio
     async def test_bind_queue_manual_mode_skips(self) -> None:
@@ -563,6 +599,31 @@ class TestConsume:
 # ── Message Building ────────────────────────────────────────────────────
 
 
+class TestReconnectCallbacks:
+    """Connection-churn metric hook: on_reconnect registers callbacks that
+    _aio_reconnected (adapted from aio-pika's reconnect_callbacks) fires."""
+
+    def test_reconnect_callback_fires(self) -> None:
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_reconnect(lambda: fired.append(1))
+
+        transport._aio_reconnected()
+        transport._aio_reconnected(MagicMock())  # aio-pika passes the sender
+
+        assert fired == [1, 1]
+
+    def test_reconnect_callback_exception_does_not_break_others(self) -> None:
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_reconnect(lambda: (_ for _ in ()).throw(RuntimeError("cb boom")))
+        transport.on_reconnect(lambda: fired.append(1))
+
+        transport._aio_reconnected()  # must not raise
+
+        assert fired == [1]
+
+
 class TestBuildMessage:
     def test_build_message_surfaces_timestamp(self) -> None:
         """Regression: msg.timestamp was never populated on consume (always None)."""
@@ -609,6 +670,40 @@ class TestBuildMessage:
         assert message.exchange == "events"
         assert message.delivery_tag == 42
         assert message.redelivered is False
+
+    def test_build_message_surfaces_priority_user_id_and_reencodes_expiration(self) -> None:
+        """priority/expiration/user_id used to be dropped entirely on consume
+        (RabbitMessage had no slots for them). expiration additionally needs
+        re-encoding: aio-pika decodes the wire's ms-string expiration into
+        seconds (float) on IncomingMessage, but RabbitMessage/MessageEnvelope
+        use the ms-string convention everywhere else (matching pika's raw
+        properties.expiration) -- passing the decoded seconds value straight
+        through would silently corrupt a retry/DLQ-replay envelope's TTL by
+        1000x."""
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.priority = 8
+        mock_aio_msg.expiration = 60.0  # aio-pika: decoded seconds
+        mock_aio_msg.user_id = "guest"
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.priority == 8
+        assert message.expiration == "60000"  # re-encoded to ms-string
+        assert message.user_id == "guest"
+
+    def test_build_message_expiration_none_stays_none(self) -> None:
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.expiration = None
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.expiration is None
 
     def test_build_message_wires_async_settlement(self) -> None:
         transport = _make_transport()
@@ -1356,6 +1451,133 @@ class TestPublishOnChannelTimeout:
 
         assert outcome.status == PublishStatus.TIMEOUT
         assert outcome.error is not None
+
+    @pytest.mark.asyncio
+    async def test_publish_on_channel_does_not_close_channel_itself(self) -> None:
+        """M17: closing on timeout is the CALLER's responsibility now (see
+        publish()'s mandatory/pool branches and AsyncBatchPublisher._flush) —
+        _publish_on_channel itself must never close a channel it doesn't own
+        exclusively."""
+        transport = _make_transport(confirm_timeout=0.01)
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_exchange = AsyncMock()
+        mock_exchange.publish.side_effect = TimeoutError("timeout")
+        mock_channel.get_exchange = AsyncMock(return_value=mock_exchange)
+        mock_channel.close = AsyncMock()
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"x", exchange="ex")
+
+        with patch("aio_pika.Message"), patch("aio_pika.DeliveryMode"):
+            outcome = await transport._publish_on_channel(mock_channel, envelope)
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        mock_channel.close.assert_not_called()
+
+
+class TestMandatoryChannelClosedOnTimeout:
+    """M17: publish()'s mandatory=True branch closes the (shared, persistent)
+    mandatory channel AFTER its own call resolves -- not from inside
+    _publish_on_channel, which cannot know if it's the sole user."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_closes_mandatory_channel_for_next_publish(self) -> None:
+        transport = _make_transport(confirm_timeout=0.01)
+        mock_conn = _make_mock_connection()
+        transport._conn_pool._publisher_connection = mock_conn
+
+        timed_out_channel = AsyncMock()
+        timed_out_channel.is_closed = False
+
+        async def _close() -> None:
+            timed_out_channel.is_closed = True  # real aio-pika flips this on close()
+
+        timed_out_channel.close = AsyncMock(side_effect=_close)
+        fresh_channel = AsyncMock()
+        fresh_channel.is_closed = False
+
+        mock_conn.channel = AsyncMock(side_effect=[timed_out_channel, fresh_channel])
+
+        with patch.object(
+            transport, "_publish_on_channel", new_callable=AsyncMock
+        ) as mock_pub:
+            mock_pub.return_value = PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
+            envelope = MessageEnvelope(routing_key="q", body=b"x", mandatory=True)
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        timed_out_channel.close.assert_called_once()
+        # Next mandatory publish must get a FRESH channel (the old one was
+        # closed, so _get_mandatory_channel()'s is_closed check reopens it).
+        next_ch = await transport._get_mandatory_channel()
+        assert next_ch is fresh_channel
+
+    @pytest.mark.asyncio
+    async def test_confirmed_mandatory_publish_does_not_close_channel(self) -> None:
+        transport = _make_transport(confirm_timeout=0.01)
+        mock_conn = _make_mock_connection()
+        transport._conn_pool._publisher_connection = mock_conn
+        channel = AsyncMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+        mock_conn.channel = AsyncMock(return_value=channel)
+
+        with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
+            mock_pub.return_value = PublishOutcome(status=PublishStatus.CONFIRMED, exchange="", routing_key="q")
+            envelope = MessageEnvelope(routing_key="q", body=b"x", mandatory=True)
+            await transport.publish(envelope)
+
+        channel.close.assert_not_called()
+
+
+class TestPooledChannelClosedOnTimeout:
+    """M17: the confirmed-pool publish path closes a timed-out channel before
+    releasing it back to the pool, so the pool doesn't hand out a wedged
+    channel on the next acquire."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_closes_channel_before_release(self) -> None:
+        transport = _make_transport(confirm_delivery=True, confirm_timeout=0.01)
+        channel = AsyncMock()
+        channel.is_closed = False
+
+        async def _close() -> None:
+            channel.is_closed = True  # real aio-pika flips this on close()
+
+        channel.close = AsyncMock(side_effect=_close)
+        transport._conn_pool.acquire_publisher_channel = AsyncMock(return_value=channel)
+        release_calls: list[Any] = []
+
+        async def release(channel: Any) -> None:
+            release_calls.append(channel.is_closed)
+
+        transport._conn_pool.release_publisher_channel = release
+        transport._connected = True
+
+        with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
+            mock_pub.return_value = PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
+            outcome = await transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        channel.close.assert_called_once()
+        # Released AFTER being closed, so the pool sees is_closed=True.
+        assert release_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_publish_does_not_close_pooled_channel(self) -> None:
+        transport = _make_transport(confirm_delivery=True, confirm_timeout=0.01)
+        channel = AsyncMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+        transport._conn_pool.acquire_publisher_channel = AsyncMock(return_value=channel)
+        transport._conn_pool.release_publisher_channel = AsyncMock()
+        transport._connected = True
+
+        with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
+            mock_pub.return_value = PublishOutcome(status=PublishStatus.CONFIRMED, exchange="", routing_key="q")
+            await transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        channel.close.assert_not_called()
 
 
 # ── publish fast-path (no confirm) ───────────────────────────────────────

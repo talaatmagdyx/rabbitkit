@@ -65,6 +65,7 @@ class SubscriberRegistry:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reject_without_dlx: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator to register a message handler for a queue.
 
@@ -80,6 +81,9 @@ class SubscriberRegistry:
             description: Human-readable route description.
             name: Explicit route name (auto-generated if None).
             prefetch_count: Per-route prefetch override (None=use global).
+            reject_without_dlx: Per-route override of
+                ``SafetyConfig.reject_without_dlx`` — 'auto_provision',
+                'error', or 'discard' (None=inherit broker default).
         """
         # Normalize queue
         if isinstance(queue, str):
@@ -139,6 +143,7 @@ class SubscriberRegistry:
                 tags=tags,
                 description=description,
                 filter_fn=filter_fn,
+                reject_without_dlx=reject_without_dlx,
             )
 
             # Validate at registration time (fail fast)

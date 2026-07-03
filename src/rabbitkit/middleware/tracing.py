@@ -47,6 +47,21 @@ class TracedConsumerMiddleware(BaseMiddleware):
         self._available = (
             self._tracing is not None and self._tracing.is_tracing_available()
         )
+        if not self._available:
+            # A caller who explicitly adds this middleware is opting into
+            # tracing -- silently no-oping every span forever (the previous
+            # behavior) means trace propagation "goes dark" with zero
+            # signal, easily mistaken for "tracing is working, just nothing
+            # to show yet" until someone notices spans never appear. Loud
+            # once, at construction, not per-message.
+            reason = "obskit is not installed" if self._tracing is None else "obskit tracing is not configured"
+            logger.warning(
+                "TracedConsumerMiddleware(service_name=%r) added but %s -- "
+                "every consume/publish span will be a silent no-op. Install "
+                "obskit and configure tracing, or remove this middleware.",
+                self._service_name,
+                reason,
+            )
 
     @property
     def is_available(self) -> bool:

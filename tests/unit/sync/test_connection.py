@@ -13,7 +13,42 @@ from rabbitkit.sync.connection import (
     apply_socket_options,
     build_ssl_context,
     get_connection_errors,
+    make_pika_connection_params,
 )
+
+
+class TestMultiHostParams:
+    """M9: nodes produce a pika ConnectionParameters LIST for native failover."""
+
+    def test_single_host_returns_single_params(self) -> None:
+        pytest.importorskip("pika")
+        params = make_pika_connection_params(
+            ConnectionConfig(host="h1", port=5672), SocketConfig(), SecurityConfig()
+        )
+        assert not isinstance(params, list)
+        assert params.host == "h1"
+
+    def test_nodes_return_params_list_in_order(self) -> None:
+        pytest.importorskip("pika")
+        params = make_pika_connection_params(
+            ConnectionConfig(host="h1", port=5672, nodes=("h2", "h3:5673")),
+            SocketConfig(),
+            SecurityConfig(),
+        )
+        assert isinstance(params, list)
+        assert [(p.host, p.port) for p in params] == [("h1", 5672), ("h2", 5672), ("h3", 5673)]
+
+    def test_credentials_provider_used(self) -> None:
+        """M13: rotated credentials from the provider reach pika."""
+        pytest.importorskip("pika")
+        cfg = ConnectionConfig(
+            host="h", username="static", password="static",
+            credentials_provider=lambda: ("rotated-user", "rotated-pass"),
+        )
+        params = make_pika_connection_params(cfg, SocketConfig(), SecurityConfig())
+        assert params.credentials.username == "rotated-user"
+        assert params.credentials.password == "rotated-pass"
+
 
 # ── get_connection_errors ────────────────────────────────────────────────
 
@@ -69,6 +104,18 @@ class TestBuildSSLContext:
         ctx = build_ssl_context(config)
         assert ctx is not None
         assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    def test_cert_none_warns(self) -> None:
+        """M13: disabling verification is MITM-able — warn loudly."""
+        import warnings
+
+        with pytest.warns(RuntimeWarning, match="MITM"):
+            build_ssl_context(SSLConfig(enabled=True, cert_reqs="CERT_NONE"))
+
+        # CERT_REQUIRED must NOT warn.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            build_ssl_context(SSLConfig(enabled=True, cert_reqs="CERT_REQUIRED"))
 
 
 # ── apply_socket_options ─────────────────────────────────────────────────

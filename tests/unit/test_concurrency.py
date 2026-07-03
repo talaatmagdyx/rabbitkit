@@ -28,6 +28,25 @@ def _make_message(**kwargs: Any) -> RabbitMessage:
 # ── SyncWorkerPool ────────────────────────────────────────────────────────
 
 
+class TestBoundedWorkQueue:
+    """M11: WorkerConfig.max_queue_size bounds the sync pool's work queue
+    (default 0 = unbounded, unchanged)."""
+
+    def test_default_queue_is_unbounded(self) -> None:
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        assert pool._executor is not None
+        assert pool._executor._work.maxsize == 0  # unbounded
+        pool.stop()
+
+    def test_max_queue_size_bounds_the_queue(self) -> None:
+        pool = SyncWorkerPool(WorkerConfig(worker_count=2, max_queue_size=64))
+        pool.start()
+        assert pool._executor is not None
+        assert pool._executor._work.maxsize == 64
+        pool.stop()
+
+
 class TestSyncWorkerPool:
     def test_single_worker_runs_directly(self) -> None:
         """worker_count=1 runs callback in current thread."""

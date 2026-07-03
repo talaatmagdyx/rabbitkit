@@ -102,10 +102,32 @@ class TestPydanticDecoder:
         assert result.name == "test"
         assert result.value == 42
 
-    def test_decode_non_dict_passthrough(self) -> None:
+    def test_decode_non_dict_rejects_instead_of_passthrough(self) -> None:
+        """A non-dict payload against a pydantic-like target_type must go
+        through model_validate (and be rejected) rather than being handed
+        to the handler unvalidated -- silently passing it through was the
+        same class of gap PydanticDecoder exists to close relative to
+        DataclassDecoder for untrusted input, just for the top-level shape
+        instead of a field's type."""
         decoder = PydanticDecoder()
-        result = decoder.decode("plain-string", FakePydanticModel)
-        assert result == "plain-string"
+        with pytest.raises(TypeError):
+            decoder.decode("plain-string", FakePydanticModel)
+
+    def test_decode_real_pydantic_model_rejects_non_dict(self) -> None:
+        """Same as above, against a real pydantic BaseModel: confirms
+        model_validate's own ValidationError is what surfaces, not a
+        silent passthrough."""
+        from pydantic import BaseModel, ValidationError
+
+        class Order(BaseModel):
+            id: int
+            item: str
+
+        decoder = PydanticDecoder()
+        with pytest.raises(ValidationError):
+            decoder.decode("plain-string", Order)
+        with pytest.raises(ValidationError):
+            decoder.decode([1, 2, 3], Order)
 
     def test_decode_non_pydantic_type_passthrough(self) -> None:
         decoder = PydanticDecoder()

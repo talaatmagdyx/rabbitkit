@@ -158,6 +158,37 @@ class ConfigurationError(Exception):
     """
 
 
+# ── Unsafe topology error ────────────────────────────────────────────────
+
+
+class UnsafeTopologyError(ConfigurationError):
+    """Raised at startup when ``RejectWithoutDLXPolicy.ERROR`` is active and a
+    route can ``reject(requeue=False)`` but its queue has no dead-letter
+    exchange — RabbitMQ would silently discard rejected messages.
+
+    Subclasses :class:`ConfigurationError` so existing catch-alls for
+    registration/startup misconfiguration keep working.
+    """
+
+
+# ── Publish error (opt-in) ───────────────────────────────────────────────
+
+
+class PublishError(Exception):
+    """Raised by ``PublishOutcome.raise_for_status()`` on a failed publish.
+
+    ``broker.publish()`` never raises on its own — it returns a
+    ``PublishOutcome`` so callers can decide how to handle NACKED / TIMEOUT /
+    RETURNED / ERROR. Code that prefers exceptions can opt in with
+    ``broker.publish(...).raise_for_status()``. Carries the ``outcome`` for
+    inspection (status, routing_key, underlying error).
+    """
+
+    def __init__(self, outcome: object) -> None:
+        self.outcome = outcome
+        super().__init__(str(outcome))
+
+
 # ── Backpressure error ───────────────────────────────────────────────────
 
 

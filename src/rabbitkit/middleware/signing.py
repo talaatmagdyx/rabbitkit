@@ -179,6 +179,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import MessageEnvelope
 from rabbitkit.middleware.base import BaseMiddleware
@@ -619,7 +620,20 @@ class SigningMiddleware(BaseMiddleware):
             # Nonce replay check — mark after signature verifies so bogus
             # messages can't burn nonces. TTL covers the replay window.
             if not self._nonce_cache.seen(str(nonce), self._config.max_skew):
-                raise InvalidSignatureError("Replay detected: duplicate nonce")
+                # Duplicate nonce. H1: a BROKER REDELIVERY (redelivered=True) of
+                # an unacked message legitimately carries the same nonce — a
+                # transient handler failure → nack/requeue → redelivery must not
+                # be destroyed as a "replay". Only a FRESH delivery
+                # (redelivered=False) reusing a seen nonce is a real replay: an
+                # attacker re-publishing a captured message arrives as a new
+                # delivery, not a broker redelivery (the redelivered flag is set
+                # by the broker, not the publisher, so it can't be forged).
+                if not message.redelivered:
+                    raise InvalidSignatureError("Replay detected: duplicate nonce")
+                logger.debug(
+                    "Duplicate nonce on a broker redelivery (redelivered=True) — "
+                    "allowed as a legitimate redelivery, not a replay."
+                )
             return
 
         # No freshness headers — legacy producer.
@@ -640,3 +654,29 @@ class SigningMiddleware(BaseMiddleware):
     async def on_receive_async(self, message: RabbitMessage) -> None:
         """Async variant — verify signature."""
         self.on_receive(message)
+
+
+def check_signing_retry_conflict(route_name: str, route_middlewares: list[Any]) -> None:
+    """H1: signing and retry are mutually exclusive on the same route.
+
+    A signed message's signature covers its exchange + routing_key, but
+    ``RetryMiddleware`` re-enters a retried message via the default exchange
+    with ``routing_key=<queue-name>`` — so verification fails on every
+    post-delay redelivery and the message dead-letters instead of retrying.
+    (The nonce would also be freshly re-checked.) There is no correct
+    behavior for the combination, so fail fast at startup with a clear
+    message rather than silently destroying every retried signed message.
+
+    Called by the brokers for any route that has retry enabled. ``on_receive``
+    verification failures on signed routes should be given a dead-letter path
+    (the default ``reject_without_dlx='auto_provision'`` provides one).
+    """
+    if any(isinstance(mw, SigningMiddleware) for mw in route_middlewares):
+        raise ConfigurationError(
+            f"Route '{route_name}': SigningMiddleware is incompatible with retry. "
+            "Retry re-publishes a failed message via the default exchange with a "
+            "different routing key, which the signature covers — so a retried signed "
+            "message never re-verifies and dead-letters instead of retrying. Use one "
+            "or the other on this route: disable retry (retry=RETRY_DISABLED), or drop "
+            "SigningMiddleware and verify signatures at the trust boundary instead."
+        )

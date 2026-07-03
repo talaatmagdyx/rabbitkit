@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from rabbitkit.concurrency import SyncWorkerPool
-from rabbitkit.core.config import RabbitConfig, WorkerConfig
-from rabbitkit.core.types import MessageEnvelope
+from rabbitkit.core.config import (
+    RETRY_DISABLED,
+    ConnectionConfig,
+    PublisherConfig,
+    RabbitConfig,
+    WorkerConfig,
+)
+from rabbitkit.core.errors import BackpressureError
+from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.sync.broker import SyncBroker
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -889,9 +898,12 @@ class TestDeclareTopologyEdgeCases:
                 mock_channel.is_open = True
                 mock_conn.return_value.channel.return_value = mock_channel
                 mock_conn.return_value.is_open = True
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-                    broker.start()  # must not raise (no warning triggered)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    broker.start()
+                # M4: no confirm-related warning. (A separate H2 single-worker
+                # heartbeat warning is expected here and is not what M4 checks.)
+                assert not any("confirm" in str(w.message).lower() for w in caught)
 
     def test_start_with_result_publisher_and_no_confirms_warns(self) -> None:
         """M4: a route with a @publisher() result forward on a broker with
@@ -988,14 +1000,15 @@ class TestDeclareTopologyEdgeCases:
 
 
 class TestFilterWithoutDLX:
-    """H6: filter_fn rejections nack(requeue=False) — without a DLX RabbitMQ
-    discards them. A filter route with no retry and no manual DLX must get
-    an auto-declared '<queue>.dlq' and a loud warning, not silent loss."""
+    """H6 (now generalized by C3): filter_fn rejections nack(requeue=False) —
+    without a DLX RabbitMQ discards them. Under the default
+    reject_without_dlx='auto_provision' policy, every rejecting route (filter
+    or not) gets an auto-declared '<queue>.dlq', not silent loss."""
 
     def _filter_fn(self, msg: object) -> bool:
         return True
 
-    def test_filter_without_retry_or_dlx_warns_and_auto_declares_dlq(self) -> None:
+    def test_filter_without_retry_or_dlx_auto_declares_dlq(self) -> None:
         broker = SyncBroker()  # no broker-wide retry
 
         @broker.subscriber(queue="orders", filter_fn=self._filter_fn)
@@ -1003,9 +1016,7 @@ class TestFilterWithoutDLX:
             pass
 
         broker._transport = MagicMock()
-
-        with pytest.warns(RuntimeWarning, match="auto-declared 'orders.dlq'"):
-            broker._declare_topology()
+        broker._declare_topology()
 
         # Source queue re-declared with the auto-DLX pointing at orders.dlq.
         declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
@@ -1073,8 +1084,10 @@ class TestFilterWithoutDLX:
         assert source.dead_letter_routing_key == "my-dlq"
         assert not any(q.name == "orders.dlq" for q in declared_queues)
 
-    def test_no_filter_fn_no_warning_no_extra_dlq(self) -> None:
-        """A route with no filter_fn at all must be entirely unaffected."""
+    def test_plain_route_also_gets_auto_dlq(self) -> None:
+        """C3: a plain route (no filter_fn) can still reject poison messages
+        (permanent errors) — under the default auto_provision policy it gets
+        a DLQ too, so nothing is silently discarded."""
         broker = SyncBroker()
 
         @broker.subscriber(queue="orders")
@@ -1082,16 +1095,165 @@ class TestFilterWithoutDLX:
             pass
 
         broker._transport = MagicMock()
+        broker._declare_topology()
 
-        import warnings
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        source = next(q for q in declared_queues if q.name == "orders")
+        assert source.dead_letter_exchange == ""
+        assert source.dead_letter_routing_key == "orders.dlq"
+        assert any(q.name == "orders.dlq" for q in declared_queues)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+
+class TestRejectWithoutDLXPolicy:
+    """C3: SafetyConfig.reject_without_dlx policy behaviors."""
+
+    def test_error_policy_fails_startup(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.errors import UnsafeTopologyError
+
+        broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="error")))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+
+        with pytest.raises(UnsafeTopologyError, match="orders"):
             broker._declare_topology()
 
-        assert not any("auto-declared" in str(w.message) for w in caught)
+    def test_discard_policy_warns_and_declares_no_dlq(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard")))
+
+        @broker.subscriber(queue="telemetry")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+
+        with pytest.warns(RuntimeWarning, match="permanently discarded"):
+            broker._declare_topology()
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        assert not any(q.name == "telemetry.dlq" for q in declared_queues)
+        source = next(q for q in declared_queues if q.name == "telemetry")
+        assert source.dead_letter_exchange is None  # untouched
+
+    def test_per_route_override_beats_broker_default(self) -> None:
+        broker = SyncBroker()  # broker default: auto_provision
+
+        @broker.subscriber(queue="telemetry", reject_without_dlx="discard")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+
+        with pytest.warns(RuntimeWarning, match="permanently discarded"):
+            broker._declare_topology()
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        assert not any(q.name == "telemetry.dlq" for q in declared_queues)
+
+    def test_ack_first_route_without_filter_gets_no_dlq(self) -> None:
+        """ACK_FIRST acks before the handler — it can never reject, so no
+        DLQ is provisioned and the error policy does not trip."""
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.types import AckPolicy
+
+        broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="error")))
+
+        @broker.subscriber(queue="fire-and-forget", ack_policy=AckPolicy.ACK_FIRST)
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()  # must NOT raise
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        assert not any(q.name == "fire-and-forget.dlq" for q in declared_queues)
+
+    def test_passive_only_mode_skips_policy(self) -> None:
+        """In PASSIVE_ONLY mode rabbitkit does not own queue arguments and
+        cannot know whether an external DLX exists — the policy is skipped."""
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.types import TopologyMode
+
+        broker = SyncBroker(
+            RabbitConfig(
+                topology_mode=TopologyMode.PASSIVE_ONLY,
+                safety=SafetyConfig(reject_without_dlx="error"),
+            )
+        )
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()  # must NOT raise
+
         declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
         assert not any(q.name == "orders.dlq" for q in declared_queues)
+
+    def test_custom_dlq_suffix(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        broker = SyncBroker(RabbitConfig(safety=SafetyConfig(dlq_suffix=".dead")))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()
+
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        assert any(q.name == "orders.dead" for q in declared_queues)
+
+
+class TestBindArguments:
+    """C4: queue bind_arguments must reach the transport bind call."""
+
+    def test_bind_arguments_passed_to_transport(self) -> None:
+        from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+        from rabbitkit.core.types import ExchangeType
+
+        broker = SyncBroker()
+
+        @broker.subscriber(
+            queue=RabbitQueue(
+                name="orders.headers",
+                bind_arguments={"x-match": "all", "type": "order"},
+            ),
+            exchange=RabbitExchange(name="events.headers", type=ExchangeType.HEADERS),
+        )
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()
+
+        broker._transport.bind_queue.assert_called_once_with(
+            queue="orders.headers",
+            exchange="events.headers",
+            routing_key="",
+            arguments={"x-match": "all", "type": "order"},
+        )
+
+    def test_non_headers_binding_passes_none_arguments(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", exchange="events", routing_key="orders.created")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()
+
+        kwargs = broker._transport.bind_queue.call_args.kwargs
+        assert kwargs["arguments"] is None
 
 
 # ── _start_consumer edge cases ────────────────────────────────────────────
@@ -1266,10 +1428,11 @@ class TestStartConsumerEdgeCases:
 
 
 class TestWorkerCountWarning:
-    """Test that a warning is emitted when worker_count > channel_pool_size."""
+    """M2: the old worker_count > channel_pool_size deadlock warning was
+    removed — the default publish path does not use the channel pool, so it
+    could never cause the described deadlock. It must NOT warn about that."""
 
-    def test_warns_when_worker_count_exceeds_pool_size(self) -> None:
-        """RuntimeWarning emitted when worker_count > channel_pool_size."""
+    def test_no_misleading_pool_size_warning(self) -> None:
         from rabbitkit.core.config import PoolConfig
 
         config = RabbitConfig(pool=PoolConfig(channel_pool_size=2))
@@ -1292,9 +1455,8 @@ class TestWorkerCountWarning:
                     warnings.simplefilter("always")
                     broker.start(worker_config=WorkerConfig(worker_count=5))
 
-        assert any(issubclass(warning.category, RuntimeWarning) for warning in w)
         warning_messages = [str(warning.message) for warning in w]
-        assert any("worker_count" in msg and "channel_pool_size" in msg for msg in warning_messages)
+        assert not any("channel_pool_size" in msg for msg in warning_messages)
 
 
 # ── flow_controller property ──────────────────────────────────────────────
@@ -1875,3 +2037,390 @@ class TestWaitInFlightPumpsTransport:
         broker._wait_in_flight(deadline=None)
 
         assert broker._in_flight == 0
+
+
+class TestPublisherConfigDefaults:
+    """M2: kwargs-form publish honors PublisherConfig.mandatory/.persistent
+    (previously dead config)."""
+
+    def _publish_and_capture(self, broker: SyncBroker) -> MessageEnvelope:
+        captured: list[MessageEnvelope] = []
+        transport = MagicMock()
+        transport.publish.side_effect = lambda env: captured.append(env) or MagicMock(ok=True)
+        broker._transport = transport
+        broker._started = True
+        broker.publish(routing_key="orders", body=b"x")
+        return captured[0]
+
+    def test_persistent_true_sets_delivery_mode_2(self) -> None:
+        broker = SyncBroker(RabbitConfig(publisher=PublisherConfig(persistent=True)))
+        env = self._publish_and_capture(broker)
+        assert env.delivery_mode == 2
+
+    def test_persistent_false_sets_delivery_mode_1(self) -> None:
+        broker = SyncBroker(RabbitConfig(publisher=PublisherConfig(persistent=False)))
+        env = self._publish_and_capture(broker)
+        assert env.delivery_mode == 1
+
+    def test_mandatory_flag_honored(self) -> None:
+        broker = SyncBroker(RabbitConfig(publisher=PublisherConfig(mandatory=True)))
+        env = self._publish_and_capture(broker)
+        assert env.mandatory is True
+
+
+class TestRejectTransientOnRedeliveryWiring:
+    """M6: ConsumerConfig.reject_transient_on_redelivery reaches the pipeline."""
+
+    def test_flag_threaded_to_pipeline(self) -> None:
+        from rabbitkit.core.config import ConsumerConfig
+
+        broker = SyncBroker(RabbitConfig(consumer=ConsumerConfig(reject_transient_on_redelivery=True)))
+        assert broker._pipeline._reject_transient_on_redelivery is True
+
+    def test_default_off(self) -> None:
+        assert SyncBroker()._pipeline._reject_transient_on_redelivery is False
+
+
+class TestPublishSizeGuard:
+    """M10: reject oversized bodies at publish time when a cap is set."""
+
+    def _broker(self, max_bytes: int) -> SyncBroker:
+        broker = SyncBroker(RabbitConfig(publisher=PublisherConfig(max_message_bytes=max_bytes)))
+        broker._transport = MagicMock()
+        broker._transport.publish.return_value = MagicMock(ok=True)
+        broker._started = True
+        return broker
+
+    def test_oversized_body_raises(self) -> None:
+        broker = self._broker(max_bytes=10)
+        with pytest.raises(ValueError, match="exceeds"):
+            broker.publish(routing_key="orders", body=b"way-too-long-body")
+
+    def test_within_limit_publishes(self) -> None:
+        broker = self._broker(max_bytes=1000)
+        broker.publish(routing_key="orders", body=b"small")
+        broker._transport.publish.assert_called_once()
+
+    def test_disabled_by_default_allows_large(self) -> None:
+        broker = self._broker(max_bytes=0)  # disabled
+        broker.publish(routing_key="orders", body=b"x" * 100_000)
+        broker._transport.publish.assert_called_once()
+
+
+class TestQuorumDeliveryLimitBackstop:
+    """M5: a quorum source queue with delivery_limit keeps both the quorum
+    type AND the delivery limit after retry re-declares it with DLX args — so
+    crash-loop redeliveries (which bypass the header retry count) are
+    eventually dead-lettered by the broker's x-delivery-limit."""
+
+    def test_quorum_and_delivery_limit_survive_retry_redeclare(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.topology import RabbitQueue
+        from rabbitkit.core.types import QueueType
+
+        broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
+
+        @broker.subscriber(
+            queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=10)
+        )
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._declare_topology()
+
+        declared = [c.args[0] for c in broker._transport.declare_queue.call_args_list]
+        source = next(q for q in declared if q.name == "orders")
+        assert source.queue_type == QueueType.QUORUM
+        assert source.delivery_limit == 10  # backstop preserved
+        # And retry still wired its DLX routing onto the same queue.
+        assert source.dead_letter_routing_key == "orders.dlq"
+
+
+class TestManualHandlerExceptionContainment:
+    """M12: a MANUAL-policy handler that raises without settling must NOT kill
+    the whole consumer loop — it is contained and nack-requeued."""
+
+    def test_handler_exception_does_not_escape_callback(self) -> None:
+        from rabbitkit.core.types import AckPolicy
+
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+        def handle(message: RabbitMessage) -> None:
+            raise ValueError("boom")  # MANUAL: handler owns settlement, but raised
+
+        captured: dict[str, Any] = {}
+        transport = MagicMock()
+
+        def _consume(queue: str, callback: Any, prefetch: int = 10) -> str:
+            captured["callback"] = callback
+            return "tag"
+
+        transport.consume.side_effect = _consume
+        broker._transport = transport
+        broker._start_consumer(broker.routes[0])
+
+        msg = RabbitMessage(body=b"x", routing_key="orders", headers={})
+        msg._nack_fn = MagicMock()
+
+        # The delivery callback must swallow the handler exception (not raise).
+        captured["callback"](msg)
+
+        msg._nack_fn.assert_called_once_with(True)  # nacked for redelivery
+
+
+class TestWireReconnectMetric:
+    """Connection-churn counter: _wire_reconnect_metric registers a
+    transport.on_reconnect callback that increments reconnects_total via
+    the first route MetricsMiddleware's collector. Reconnects were logged
+    but never counted -- a flapping broker/network was invisible to
+    metrics-based alerting."""
+
+    def test_registers_callback_when_metrics_middleware_present(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_reconnect.assert_called_once()
+        # Fire the registered callback -> counter increments.
+        registered_cb = broker._transport.on_reconnect.call_args.args[0]
+        registered_cb()
+        collector.inc_counter.assert_called_once()
+        name = collector.inc_counter.call_args.args[0]
+        assert name.endswith("_reconnects_total")
+
+    def test_noop_without_metrics_middleware(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_reconnect.assert_not_called()
+
+    def test_noop_without_transport(self) -> None:
+        broker = SyncBroker()
+        broker._transport = None
+        broker._wire_reconnect_metric()  # must not raise
+
+
+class TestFlowControlledInternalPublish:
+    """M18: RetryMiddleware's delay-queue republish and the pipeline's
+    result-publish previously bypassed FlowController entirely -- a broker
+    configured to protect itself under load did not protect these paths.
+    _flow_controlled_internal_publish closes that gap, with one deliberate
+    safety property: it must NEVER let BackpressureError escape as an
+    exception (both RetryMiddleware and the pipeline's result-publish only
+    understand a returned PublishOutcome, checked via .ok — an escaped
+    exception would be misclassified PERMANENT and destroy the message
+    instead of the existing safe nack+requeue-on-failure behavior)."""
+
+    def test_no_flow_controller_passes_through_directly(self) -> None:
+        broker = SyncBroker()
+        broker._transport = MagicMock()
+        broker._transport.publish.return_value = PublishOutcome(status=PublishStatus.CONFIRMED)
+        env = MessageEnvelope(routing_key="q", body=b"x")
+
+        outcome = broker._flow_controlled_internal_publish(env)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        broker._transport.publish.assert_called_once_with(env)
+
+    def test_flow_controller_acquires_and_releases_on_success(self) -> None:
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+        broker._transport = MagicMock()
+        broker._transport.publish.return_value = PublishOutcome(status=PublishStatus.CONFIRMED)
+        broker.flow_controller = FlowController()
+        env = MessageEnvelope(routing_key="q", body=b"x")
+
+        outcome = broker._flow_controlled_internal_publish(env)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        assert broker.flow_controller.in_flight == 0  # released after publish
+
+    def test_drop_policy_returns_failed_outcome_without_publishing(self) -> None:
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+        broker._transport = MagicMock()
+        broker.flow_controller = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="drop"))
+        broker.flow_controller.acquire()  # saturate the single slot
+
+        env = MessageEnvelope(routing_key="q", body=b"x")
+        outcome = broker._flow_controlled_internal_publish(env)
+
+        assert not outcome.ok
+        assert isinstance(outcome.error, BackpressureError)
+        broker._transport.publish.assert_not_called()  # never sent, not lost silently
+
+    def test_raise_policy_never_escapes_as_exception(self) -> None:
+        """The critical safety property: even with on_blocked='raise'
+        configured, this method must return a failed outcome, not raise --
+        otherwise RetryMiddleware/result-publish would see an uncaught
+        BackpressureError, classify it PERMANENT, and destroy the message."""
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = SyncBroker()
+        broker._transport = MagicMock()
+        broker.flow_controller = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="raise"))
+        broker.flow_controller.acquire()  # saturate the single slot
+
+        env = MessageEnvelope(routing_key="q", body=b"x")
+        outcome = broker._flow_controlled_internal_publish(env)  # must NOT raise
+
+        assert not outcome.ok
+        assert isinstance(outcome.error, BackpressureError)
+        broker._transport.publish.assert_not_called()
+
+    def test_retry_middleware_wired_with_flow_controlled_publish_not_raw(self) -> None:
+        """The actual gap being closed: RetryMiddleware must receive the
+        flow-controlled wrapper, not raw transport.publish."""
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_retry_middleware()
+
+        retry_mw = next(
+            mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware)
+        )
+        assert retry_mw._publish_fn == broker._flow_controlled_internal_publish
+
+    def test_result_publish_uses_flow_controlled_publish(self) -> None:
+        """The result-publish path (Contract 5 / RPC replies) must also go
+        through the flow-controlled wrapper, not raw transport.publish."""
+        broker = SyncBroker()
+        captured: dict[str, Any] = {}
+
+        def _consume(queue: str, callback: Any, prefetch: int = 10) -> str:
+            return "tag"
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._transport.consume.side_effect = _consume
+
+        def spy_process_sync(route: Any, message: Any, publish_fn: Any = None) -> None:
+            captured["publish_fn"] = publish_fn
+
+        broker._pipeline.process_sync = spy_process_sync  # type: ignore[method-assign]
+        broker._start_consumer(broker.routes[0])
+
+        msg = RabbitMessage(body=b"x", routing_key="orders", headers={})
+        # Invoke the delivery callback captured by consume().
+        callback = broker._transport.consume.call_args.kwargs["callback"]
+        callback(msg)
+
+        assert captured["publish_fn"] == broker._flow_controlled_internal_publish
+
+
+class TestSigningRetryConflict:
+    """H1: signing + retry on the same route destroys every retried message —
+    fail fast at wiring time."""
+
+    def test_signing_plus_retry_raises(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.errors import ConfigurationError
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        broker = SyncBroker()
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+
+        @broker.subscriber(queue="orders", retry=RetryConfig(max_retries=1, delays=(5,)), middlewares=[signing])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        with pytest.raises(ConfigurationError, match="SigningMiddleware is incompatible with retry"):
+            broker._wire_retry_middleware()
+
+    def test_signing_without_retry_is_fine(self) -> None:
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        broker = SyncBroker()
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+
+        @broker.subscriber(queue="orders", retry=RETRY_DISABLED, middlewares=[signing])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_retry_middleware()  # must NOT raise
+
+
+class TestSingleWorkerHeartbeatWarning:
+    """H2: single-worker sync consumers run handlers inline on the I/O thread —
+    long handlers starve heartbeats. Warn at start()."""
+
+    def _start_mocked(self, broker: SyncBroker, **start_kwargs: object) -> None:
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start(**start_kwargs)  # type: ignore[arg-type]
+
+    def test_single_worker_consumer_warns(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with pytest.warns(RuntimeWarning, match="starve heartbeats"):
+            self._start_mocked(broker)
+
+    def test_multi_worker_does_not_warn(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            # worker_count>1 runs handlers off the I/O thread — no starvation.
+            self._start_mocked(broker, worker_config=WorkerConfig(worker_count=4))
+
+    def test_publish_only_broker_does_not_warn(self) -> None:
+        """No consumer routes → no inline handlers → no heartbeat starvation."""
+        broker = SyncBroker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            self._start_mocked(broker)
+
+    def test_heartbeat_disabled_does_not_warn(self) -> None:
+        broker = SyncBroker(RabbitConfig(connection=ConnectionConfig(heartbeat=0)))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            self._start_mocked(broker)

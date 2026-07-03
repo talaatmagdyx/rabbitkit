@@ -70,6 +70,11 @@ class TestBuildSSLContext:
         assert ctx is not None
         assert ctx.verify_mode == ssl.CERT_REQUIRED
 
+    def test_cert_none_warns(self) -> None:
+        """M13: disabling verification is MITM-able — warn loudly."""
+        with pytest.warns(RuntimeWarning, match="MITM"):
+            build_ssl_context(SSLConfig(enabled=True, cert_reqs="CERT_NONE"))
+
 
 # ── make_aio_pika_connect_kwargs ─────────────────────────────────────────
 
@@ -108,8 +113,10 @@ class TestMakeAioPikaConnectKwargs:
 
         assert "heartbeat=17" in kwargs["url"]
 
-    def test_reconnect_interval_from_backoff_base(self) -> None:
-        """connect_robust gets a reconnect interval from reconnect_backoff_base."""
+    def test_reconnect_interval_is_jittered_within_bounds(self) -> None:
+        """H4: reconnect_interval is jittered per process over
+        [base, base + min(base, backoff_max - base)] to de-synchronize a fleet
+        reconnecting after a broker bounce (thundering-herd avoidance)."""
         try:
             import aio_pika  # noqa: F401
         except ImportError:
@@ -117,10 +124,78 @@ class TestMakeAioPikaConnectKwargs:
 
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
-        conn = ConnectionConfig(host="h", reconnect_backoff_base=3.5)
-        kwargs = make_aio_pika_connect_kwargs(conn, SecurityConfig())
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=2.0, reconnect_backoff_max=30.0)
+        intervals = [
+            make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)
+        ]
+        # Never below base (don't hammer faster than configured)...
+        assert all(i >= 2.0 for i in intervals)
+        # ...and bounded by base + min(base, max-base) = 4.0.
+        assert all(i <= 4.0 for i in intervals)
+        # Jitter actually varies (not a fixed constant) — de-synchronizes pods.
+        assert len(set(intervals)) > 1
 
-        assert kwargs["reconnect_interval"] == 3.5
+    def test_reconnect_jitter_bounded_by_backoff_max(self) -> None:
+        """When backoff_max is close to base, the jitter span shrinks so the
+        interval never exceeds backoff_max."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=1.0, reconnect_backoff_max=1.3)
+        intervals = [
+            make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)
+        ]
+        assert all(1.0 <= i <= 1.3 for i in intervals)
+
+    def test_credentials_provider_used_in_url(self) -> None:
+        """M13: rotated credentials from the provider reach the aio-pika URL."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        cfg = ConnectionConfig(
+            host="h", username="static", password="static",
+            credentials_provider=lambda: ("rot-user", "rot-pass"),
+        )
+        kwargs = make_aio_pika_connect_kwargs(cfg, SecurityConfig())
+        assert "rot-user:rot-pass@" in kwargs["url"]
+        assert "static" not in kwargs["url"]
+
+    def test_host_port_override_targets_specific_node(self) -> None:
+        """M9: the pool passes a specific cluster endpoint via override kwargs."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="primary", port=5672, nodes=("backup:5673",))
+        kwargs = make_aio_pika_connect_kwargs(
+            conn, SecurityConfig(), host_override="backup", port_override=5673
+        )
+        assert "backup:5673" in kwargs["url"]
+        assert "primary" not in kwargs["url"]
+
+    def test_reconnect_jitter_survives_misconfigured_max_below_base(self) -> None:
+        """A misconfigured backoff_max <= base must not crash or drop below base."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=5.0, reconnect_backoff_max=1.0)
+        interval = make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"]
+        assert interval == 5.0  # zero jitter span, pinned at base
 
     def test_url_contains_host(self) -> None:
         try:

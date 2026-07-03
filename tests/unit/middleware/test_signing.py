@@ -357,6 +357,38 @@ class TestReplayProtection:
         with pytest.raises(InvalidSignatureError, match="Replay detected"):
             mw.on_receive(msg)
 
+    def test_broker_redelivery_with_seen_nonce_is_allowed(self) -> None:
+        """H1: a broker REDELIVERY (redelivered=True) of an unacked message
+        reuses its nonce legitimately — a transient handler failure →
+        nack/requeue → redelivery must NOT be destroyed as a replay."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True, max_skew=300.0)
+        mw = SigningMiddleware(cfg)
+        ts = time.time()
+        msg = self._fresh_message(mw, b"process me", timestamp=ts, nonce="nonce-redeliver")
+        mw.on_receive(msg)  # first delivery: accepted, nonce recorded
+
+        # Same message, redelivered by the broker after a nack/requeue.
+        redelivered = _make_message(
+            body=b"process me",
+            headers=dict(msg.headers),
+            redelivered=True,
+        )
+        mw.on_receive(redelivered)  # must NOT raise
+
+    def test_fresh_delivery_with_seen_nonce_is_still_replay(self) -> None:
+        """H1: replay protection still holds — a FRESH delivery
+        (redelivered=False, i.e. an attacker re-publishing a captured message)
+        reusing a seen nonce is still rejected."""
+        cfg = SigningConfig(secret_key=SECRET, require_freshness=True, max_skew=300.0)
+        mw = SigningMiddleware(cfg)
+        ts = time.time()
+        msg = self._fresh_message(mw, b"replay me", timestamp=ts, nonce="nonce-attack")
+        mw.on_receive(msg)
+        # redelivered=False (default) — an attacker's re-publish, not a broker redelivery
+        replay = _make_message(body=b"replay me", headers=dict(msg.headers), redelivered=False)
+        with pytest.raises(InvalidSignatureError, match="Replay detected"):
+            mw.on_receive(replay)
+
     def test_replay_rejected_with_explicit_cache(self) -> None:
         """A pluggable NonceCache is honoured."""
         cache = TTLSetNonceCache()

@@ -43,13 +43,20 @@ class _DaemonWorkerPool:
     giving true ``max_workers`` parallelism under bursts (R-1/R-2 fix).
     """
 
-    def __init__(self, max_workers: int, thread_name_prefix: str = "rabbitkit-worker") -> None:
+    def __init__(
+        self,
+        max_workers: int,
+        thread_name_prefix: str = "rabbitkit-worker",
+        max_queue_size: int = 0,
+    ) -> None:
         self._max_workers = max_workers
         self._thread_name_prefix = thread_name_prefix
-        # (future, fn, args, kwargs)
+        # (future, fn, args, kwargs). M11: maxsize=0 is unbounded (default);
+        # >0 bounds the backlog. put() blocks when full — the caller (the pika
+        # I/O thread) should keep max_queue_size >= prefetch so it never fills.
         self._work: queue.Queue[
             tuple[concurrent.futures.Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
-        ] = queue.Queue()
+        ] = queue.Queue(maxsize=max_queue_size)
         self._threads: list[threading.Thread] = []
         self._shutdown = False
         self._idle_count = 0
@@ -175,6 +182,7 @@ class SyncWorkerPool:
         self._executor = _DaemonWorkerPool(
             max_workers=self._config.worker_count,
             thread_name_prefix="rabbitkit-worker",
+            max_queue_size=self._config.max_queue_size,
         )
         logger.info("SyncWorkerPool started with %d workers", self._config.worker_count)
 

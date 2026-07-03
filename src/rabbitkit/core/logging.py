@@ -63,13 +63,18 @@ whatever is in that dict goes out verbatim. Because ``configure_structlog()``
 sets structlog's *global* processor chain, ``LoggingConfig.redact_keys``
 (enabled by default) applies to those calls too: any top-level event field,
 or field one level deep inside a nested dict (e.g. ``headers={...}``),
-whose key case-insensitively matches an entry in ``redact_keys`` is
-replaced with a fixed redacted marker before rendering. This is a
-best-effort, key-name-based scrubber — not a PII/content scanner, and not a
-substitute for simply not logging bodies/headers containing secrets in the
-first place. Pass ``redact_keys=None`` to disable it, or a custom
-``frozenset`` to redact your own key names instead of (or in addition to)
-the defaults.
+whose key case-insensitively matches -- or contains all the underscore-
+separated words of -- an entry in ``redact_keys`` is replaced with a fixed
+redacted marker before rendering. The word-based matching is what catches
+compound key names like ``x-auth-token`` or ``session-token`` against the
+standalone ``token``/``auth`` defaults, without treating a partial word
+from a compound default (e.g. ``key`` from ``api_key``) as a standalone
+matcher -- that would misfire on unrelated fields like ``primary_key``.
+This is a best-effort, key-name-based scrubber — not a PII/content
+scanner, and not a substitute for simply not logging bodies/headers
+containing secrets in the first place. Pass ``redact_keys=None`` to
+disable it, or a custom ``frozenset`` to redact your own key names instead
+of (or in addition to) the defaults.
 """
 
 from __future__ import annotations
@@ -120,6 +125,17 @@ class LoggingConfig:
             entirely, or your own ``frozenset`` to customize it. See the
             module docstring ("Secrets and message content") for scope and
             limitations.
+        capture_warnings: Route Python's ``warnings`` module (used for every
+            rabbitkit safety warning -- topology drift, retry-without-
+            confirms, unsafe TLS, dashboard auth, ...) through the standard
+            ``logging`` module via ``logging.captureWarnings()``. Without
+            this, ``warnings.warn()`` writes directly to ``sys.stderr`` in
+            its own format, completely bypassing whatever log pipeline
+            ``render_json``/handlers were set up for -- a "loud warning" is
+            only actually loud if something is watching raw stderr in dev;
+            in a production JSON-logging deployment it's invisible unless
+            this is enabled. Default ``True``. Set ``False`` if your
+            application already manages ``captureWarnings`` itself.
     """
 
     render_json: bool = False
@@ -127,6 +143,7 @@ class LoggingConfig:
     timestamper_fmt: str = "iso"
     include_caller_info: bool = False
     redact_keys: frozenset[str] | None = DEFAULT_REDACT_KEYS
+    capture_warnings: bool = True
 
 
 def _normalize_key(key: str) -> str:
@@ -152,16 +169,36 @@ def _redact_processor(keys: frozenset[str]) -> Any:
     normalized via :func:`_normalize_key`. Not a recursive/deep scan -- see
     the module docstring for why a shallow, name-based approach is the
     deliberate scope here.
+
+    Matching a normalized key against *keys* is a word-set match, not an
+    exact-string match: a configured key may itself be a compound
+    (``api_key``, ``access_token``), so a target key matches when it
+    contains ALL of some configured key's underscore-separated words (in
+    any order) -- e.g. ``x-auth-token`` normalizes to ``auth_token``,
+    which contains the words of the standalone ``token`` entry, so it
+    matches even though ``auth_token`` itself isn't literally one of the
+    configured names. Exact-string matching alone let common compound
+    secret-bearing names (``x-auth-token``, ``session-token``,
+    ``x-secret-key``, ``bearer-token``, ...) slip through untouched.
+    Splitting each configured key into its OWN word-set (rather than
+    pooling every word from every configured key into one flat set) is
+    what keeps this from over-matching: naively treating ``api_key``'s
+    ``key`` as a standalone matcher would redact totally benign fields
+    like ``primary_key``/``cache_key``, since neither contains ``api``.
     """
-    normalized_keys = {_normalize_key(k) for k in keys}
+    redact_word_sets = [frozenset(_normalize_key(k).split("_")) for k in keys]
+
+    def matches(normalized_key: str) -> bool:
+        key_words = frozenset(normalized_key.split("_"))
+        return any(words <= key_words for words in redact_word_sets)
 
     def processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
         for key, value in event_dict.items():
-            if _normalize_key(key) in normalized_keys:
+            if matches(_normalize_key(key)):
                 event_dict[key] = _REDACTED
             elif isinstance(value, dict):
                 event_dict[key] = {
-                    nested_key: (_REDACTED if _normalize_key(nested_key) in normalized_keys else nested_value)
+                    nested_key: (_REDACTED if matches(_normalize_key(nested_key)) else nested_value)
                     for nested_key, nested_value in value.items()
                 }
         return event_dict
@@ -175,10 +212,17 @@ def configure_structlog(config: LoggingConfig | None = None) -> None:
     Safe to call multiple times — last call wins.
     If config is None, uses defaults (console renderer, ISO timestamps).
     """
+    import logging
+
     import structlog
 
     if config is None:
         config = LoggingConfig()
+
+    # L16 follow-up: bridge warnings.warn() (every rabbitkit safety warning)
+    # into the standard logging module -- otherwise it bypasses this whole
+    # pipeline entirely, writing straight to sys.stderr in its own format.
+    logging.captureWarnings(config.capture_warnings)
 
     processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,

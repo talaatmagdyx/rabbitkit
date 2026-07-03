@@ -15,10 +15,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from rabbitkit.core.config import RetryConfig, RetryDisabled
-from rabbitkit.core.errors import ConfigurationError
+from rabbitkit.core.config import RetryConfig, RetryDisabled, SafetyConfig
+from rabbitkit.core.errors import ConfigurationError, UnsafeTopologyError
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy
+from rabbitkit.core.types import AckPolicy, ExchangeType, RejectWithoutDLXPolicy
 from rabbitkit.serialization.base import Serializer
 
 if TYPE_CHECKING:
@@ -121,6 +121,9 @@ class RouteDefinition:
     # Filter predicate — reject messages before deserialization
     filter_fn: Callable[[RabbitMessage], bool] | None = None
 
+    # Per-route override of SafetyConfig.reject_without_dlx (None = inherit)
+    reject_without_dlx: str | None = None
+
     # ── Runtime state (mutable sub-object; populated by broker) ──
     runtime_state: RouteRuntimeState = field(default_factory=RouteRuntimeState)
 
@@ -217,6 +220,39 @@ class RouteDefinition:
                 "To use custom DLQ routing, disable retry via retry=RETRY_DISABLED."
             )
 
+    def validate_headers_binding(self) -> None:
+        """Validate headers-exchange bindings at registration time (C4).
+
+        A headers exchange routes on binding *arguments*, not routing keys —
+        an argument-less binding matches everything (silent firehose /
+        misrouting). Require ``bind_arguments`` with a valid ``x-match``.
+        """
+        if self.exchange is None or self.exchange.type != ExchangeType.HEADERS:
+            return
+        if not self.queue.bind_arguments:
+            raise ConfigurationError(
+                f"Route '{self.name}': queue '{self.queue.name}' binds to headers "
+                f"exchange '{self.exchange.name}' without bind_arguments. A headers "
+                "binding with no arguments matches EVERY message. Set "
+                "RabbitQueue(bind_arguments={'x-match': 'all'|'any', ...})."
+            )
+        x_match = self.queue.bind_arguments.get("x-match", "all")
+        if x_match not in ("all", "any", "all-with-x", "any-with-x"):
+            raise ConfigurationError(
+                f"Route '{self.name}': bind_arguments['x-match'] must be 'all', "
+                f"'any', 'all-with-x', or 'any-with-x'; got {x_match!r}."
+            )
+
+    def validate_reject_without_dlx_value(self) -> None:
+        """Validate the per-route reject_without_dlx override value."""
+        if self.reject_without_dlx is None:
+            return
+        if self.reject_without_dlx not in ("auto_provision", "error", "discard"):
+            raise ConfigurationError(
+                f"Route '{self.name}': reject_without_dlx must be one of "
+                f"'auto_provision', 'error', 'discard'; got {self.reject_without_dlx!r}."
+            )
+
     def validate(self, broker_retry: RetryConfig | None = None) -> None:
         """Run all route validations.
 
@@ -224,35 +260,67 @@ class RouteDefinition:
         """
         self.validate_retry_ack_compatibility(broker_retry)
         self.validate_retry_dlx_conflict(broker_retry)
+        self.validate_headers_binding()
+        self.validate_reject_without_dlx_value()
 
+    def can_reject_without_dlx(self, broker_retry: RetryConfig | None = None) -> bool:
+        """True when this route can ``reject(requeue=False)`` into a queue
+        with no dead-letter path — i.e. RabbitMQ would discard the message.
 
-def warn_filter_without_dlx(route_name: str, queue_name: str, dlq_name: str) -> None:
-    """Warn that a filter-only route's DLQ was auto-declared (H6).
+        Retry-enabled routes get a DLX from RetryRouter; a manually
+        configured ``dead_letter_exchange`` is a dead-letter path already.
+        ACK_FIRST routes without a filter ack before the handler runs, so
+        they never reject. Everything else (AUTO/NACK_ON_ERROR/MANUAL,
+        filter_fn, permanent-error classification) can reject.
+        """
+        if self.effective_retry_config(broker_retry) is not None:
+            return False
+        if self.queue.dead_letter_exchange is not None:
+            return False
+        return not (self.ack_policy == AckPolicy.ACK_FIRST and self.filter_fn is None)
 
-    ``filter_fn`` returning ``False`` settles the message with
-    ``nack(requeue=False)``. Without a dead-letter-exchange configured on the
-    queue, RabbitMQ just discards a message nacked that way — silent, easy to
-    hit (no retry needed to trigger it, just one filtered message). Retry-
-    enabled routes already get a DLX from ``RetryRouter``; routes with a
-    manually-configured ``dead_letter_exchange`` are respected and left
-    alone. Otherwise the broker auto-declares *dlq_name* and wires the source
-    queue's DLX to it (see ``_declare_topology``) so the message is preserved
-    rather than lost — this warning is informational (the loss is already
-    prevented), not a call to action, but surfaced loudly so the extra queue
-    isn't a surprise.
-    """
-    import warnings
+    def resolve_safety_dlq(
+        self,
+        safety: SafetyConfig,
+        broker_retry: RetryConfig | None = None,
+    ) -> str | None:
+        """Apply the reject-without-DLX safety policy to this route (C3).
 
-    warnings.warn(
-        f"Route {route_name!r} has filter_fn set but no dead-letter-exchange and "
-        f"retry is disabled. Without one, RabbitMQ silently discards filter-rejected "
-        f"messages (nack(requeue=False) with no DLX). rabbitkit auto-declared "
-        f"{dlq_name!r} and routed rejected messages from {queue_name!r} there. To use "
-        "a different target, set dead_letter_exchange/dead_letter_routing_key on the "
-        "queue yourself.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
+        Returns the DLQ name to auto-provision, or ``None`` when nothing is
+        needed (route already has a dead-letter path, cannot reject, or the
+        policy is ``discard``). Raises :class:`UnsafeTopologyError` under the
+        ``error`` policy.
+
+        Called by brokers during topology declaration, only under
+        ``TopologyMode.AUTO_DECLARE``.
+        """
+        if not self.can_reject_without_dlx(broker_retry):
+            return None
+
+        policy = self.reject_without_dlx or safety.reject_without_dlx
+        if policy == RejectWithoutDLXPolicy.AUTO_PROVISION:
+            return f"{self.queue.name}{safety.dlq_suffix}"
+        if policy == RejectWithoutDLXPolicy.ERROR:
+            raise UnsafeTopologyError(
+                f"Queue '{self.queue.name}' (route '{self.name}') can reject "
+                "messages with requeue=False, but no dead-letter exchange is "
+                "configured — RabbitMQ would discard them permanently. Configure "
+                "a DLX/DLQ on the queue, use reject_without_dlx='auto_provision', "
+                "or explicitly opt into loss with reject_without_dlx='discard'."
+            )
+        # policy == DISCARD: explicit opt-in to loss
+        if safety.warn_on_discard:
+            import warnings
+
+            warnings.warn(
+                f"Route {self.name!r}: reject_without_dlx='discard' — messages "
+                f"rejected with requeue=False on queue {self.queue.name!r} will be "
+                "permanently discarded by RabbitMQ (no dead-letter exchange). Use "
+                "this only when message loss is acceptable.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return None
 
 
 # ``ConfigurationError`` now lives in ``rabbitkit.core.errors`` (single

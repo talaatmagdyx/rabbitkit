@@ -22,13 +22,27 @@ import structlog
 from rabbitkit.core.errors import classify_error
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage, is_rabbit_message_annotation
 from rabbitkit.core.route import RouteDefinition
-from rabbitkit.core.types import AckPolicy, AckStrategy, ErrorSeverity, MessageEnvelope, PublishOutcome
+from rabbitkit.core.types import (
+    REQUEUED_FOR_RETRY,
+    AckPolicy,
+    AckStrategy,
+    ErrorSeverity,
+    MessageEnvelope,
+    PublishOutcome,
+)
 from rabbitkit.di.context import ContextRepo
 from rabbitkit.di.resolver import DependencyScope, DIResolver
 from rabbitkit.serialization.base import Serializer
 
 logger = structlog.stdlib.get_logger(__name__)
 _stdlib_logger = logging.getLogger(__name__)
+
+# M10: on the async path, bodies at/above this size are decoded in a worker
+# thread (asyncio.to_thread) so a large JSON/msgspec/pydantic parse doesn't
+# block the event loop. Below it, inline decode is faster than the thread hop.
+# ponytail: fixed 256 KiB threshold — make it configurable only if a workload
+# proves the cutoff wrong.
+_DECODE_OFFLOAD_THRESHOLD_BYTES = 256 * 1024
 
 
 def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> None:
@@ -280,10 +294,13 @@ class HandlerPipeline:
         serializer: Serializer[Any] | None = None,
         di_resolver: DIResolver | None = None,
         context_repo: ContextRepo | None = None,
+        reject_transient_on_redelivery: bool = False,
     ) -> None:
         self._serializer = serializer
         self._di_resolver = di_resolver
         self._context_repo = context_repo
+        # M6: opt-in 2-strike cap on transient hot-loops (see ConsumerConfig).
+        self._reject_transient_on_redelivery = reject_transient_on_redelivery
         # Per-handler caches so the hot path avoids inspect.signature() per message.
         self._body_type_cache: dict[Any, type | None] = {}
         self._sig_cache: dict[Any, Any] = {}  # handler -> inspect.Signature (fallback resolver)
@@ -460,8 +477,16 @@ class HandlerPipeline:
                 # Resolve parameters and call handler (through the middleware chain)
                 result = self._run_consume_sync(route, message)
 
-                # Publish result if needed (Contract 5)
-                if result is not None and not self._publish_result_sync(route, message, result, publish_fn):
+                # Publish result if needed (Contract 5). M7: the
+                # REQUEUED_FOR_RETRY sentinel is NOT a handler return value —
+                # an inner RetryMiddleware requeued the message and already
+                # settled it. Publishing it would serialize the sentinel as a
+                # bogus RPC reply/result (once per retry attempt). Skip it.
+                if (
+                    result is not None
+                    and result is not REQUEUED_FOR_RETRY
+                    and not self._publish_result_sync(route, message, result, publish_fn)
+                ):
                     # Result lost — don't ack. Nack+requeue for redelivery
                     # (handlers are idempotent under at-least-once delivery).
                     if not message.is_settled:
@@ -529,8 +554,13 @@ class HandlerPipeline:
                 # Resolve parameters and call handler (through the middleware chain)
                 result = await self._run_consume_async(route, message)
 
-                # Publish result if needed (Contract 5)
-                if result is not None and not await self._publish_result_async(route, message, result, publish_fn):
+                # Publish result if needed (Contract 5). M7: skip the
+                # REQUEUED_FOR_RETRY sentinel (see the sync path above).
+                if (
+                    result is not None
+                    and result is not REQUEUED_FOR_RETRY
+                    and not await self._publish_result_async(route, message, result, publish_fn)
+                ):
                     # Result lost — don't ack. Nack+requeue for redelivery
                     # (handlers are idempotent under at-least-once delivery).
                     if not message.is_settled:
@@ -715,7 +745,7 @@ class HandlerPipeline:
 
     async def _invoke_handler_async(self, route: RouteDefinition, message: RabbitMessage) -> Any:
         """Deserialize, resolve params, call handler (async)."""
-        body = self._deserialize_body(route, message)
+        body = await self._deserialize_body_async(route, message)
 
         resolver = self._effective_resolver(route.handler)
         scope: DependencyScope | None = None
@@ -758,6 +788,33 @@ class HandlerPipeline:
         if can_decode:
             target_type = self._get_body_type(route)
             if target_type is not None and target_type is not bytes:
+                return serializer.decode(message.body, target_type)
+        return message.body
+
+    async def _deserialize_body_async(self, route: RouteDefinition, message: RabbitMessage) -> Any:
+        """Async body deserialization (M10).
+
+        Identical to :meth:`_deserialize_body`, except a large body is decoded
+        in a worker thread via ``asyncio.to_thread`` so a multi-MB
+        JSON/msgspec/pydantic parse doesn't block the event loop — which would
+        otherwise stall heartbeats, publisher confirms, and every other
+        consumer sharing the loop. Small bodies decode inline (the thread hop
+        costs more than the parse).
+        """
+        serializer = route.serializer_override or self._serializer
+        if serializer is None:
+            return message.body
+        can_decode = self._has_decode_cache.get(serializer)
+        if can_decode is None:
+            can_decode = hasattr(serializer, "decode")
+            self._has_decode_cache[serializer] = can_decode
+        if can_decode:
+            target_type = self._get_body_type(route)
+            if target_type is not None and target_type is not bytes:
+                if len(message.body) >= _DECODE_OFFLOAD_THRESHOLD_BYTES:
+                    import asyncio
+
+                    return await asyncio.to_thread(serializer.decode, message.body, target_type)
                 return serializer.decode(message.body, target_type)
         return message.body
 
@@ -1177,6 +1234,24 @@ class HandlerPipeline:
             message.reject(requeue=False)
             return
 
+        # M6: 2-strike cap on the transient hot-loop. A transient error on a
+        # message the broker has already redelivered escalates to the DLQ
+        # instead of an unbounded nack-requeue. Only AUTO requeues transients;
+        # opt-in via ConsumerConfig.reject_transient_on_redelivery.
+        if (
+            self._reject_transient_on_redelivery
+            and message.redelivered
+            and route.ack_policy == AckPolicy.AUTO
+            and classify_error(exc).severity == ErrorSeverity.TRANSIENT
+        ):
+            logger.warning(
+                "Transient error on an already-redelivered message; rejecting to DLQ "
+                "instead of requeuing again (reject_transient_on_redelivery)",
+                exc_info=True,
+            )
+            message.reject(requeue=False)
+            return
+
         _ACK_STRATEGIES[route.ack_policy].on_error(message, exc)
 
     async def _handle_async_exception(
@@ -1193,6 +1268,21 @@ class HandlerPipeline:
         # See _handle_sync_exception: terminal (exhausted/permanent) failures
         # dead-letter directly instead of being re-classified into a hot loop.
         if getattr(exc, "_rabbitkit_terminal", False) and route.ack_policy != AckPolicy.MANUAL:
+            await message.reject_async(requeue=False)
+            return
+
+        # M6: 2-strike cap on the transient hot-loop (see _handle_sync_exception).
+        if (
+            self._reject_transient_on_redelivery
+            and message.redelivered
+            and route.ack_policy == AckPolicy.AUTO
+            and classify_error(exc).severity == ErrorSeverity.TRANSIENT
+        ):
+            logger.warning(
+                "Transient error on an already-redelivered message; rejecting to DLQ "
+                "instead of requeuing again (reject_transient_on_redelivery)",
+                exc_info=True,
+            )
             await message.reject_async(requeue=False)
             return
 

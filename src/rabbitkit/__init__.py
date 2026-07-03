@@ -23,12 +23,18 @@ from rabbitkit.core.config import (
     RabbitConfig,
     RetryConfig,
     RetryDisabled,
+    SafetyConfig,
     SecurityConfig,
     SocketConfig,
     SSLConfig,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError, ConfigurationError, MissingDependencyError
+from rabbitkit.core.errors import (
+    BackpressureError,
+    ConfigurationError,
+    MissingDependencyError,
+    UnsafeTopologyError,
+)
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.router import RabbitRouter
@@ -36,17 +42,19 @@ from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
     ClassifiedError,
+    DeduplicationMarkPolicy,
     ErrorSeverity,
     ExchangeType,
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
     QueueType,
+    RejectWithoutDLXPolicy,
     TopologyMode,
 )
 from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
 from rabbitkit.di.resolver import DependencyScope
-from rabbitkit.dlq import DLQInspector
+from rabbitkit.dlq import DLQInspector, ReplayResult
 from rabbitkit.fastapi import rabbitkit_lifespan
 from rabbitkit.health import (
     BrokerHealthResult,
@@ -72,6 +80,7 @@ from rabbitkit.middleware.metrics import (
 )
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
+from rabbitkit.queue_metrics import QueueMetricsPoller
 from rabbitkit.serialization.pipeline import (
     DataclassDecoder,
     JsonParser,
@@ -113,6 +122,7 @@ __all__ = [
     "DLQInspector",
     "DataclassDecoder",
     "DeduplicationConfig",
+    "DeduplicationMarkPolicy",
     "DeduplicationMiddleware",
     "DependencyScope",
     "Depends",
@@ -140,6 +150,7 @@ __all__ = [
     "PublishStatus",
     "PublisherConfig",
     "PydanticDecoder",
+    "QueueMetricsPoller",
     "QueueType",
     "RabbitApp",
     "RabbitConfig",
@@ -152,9 +163,12 @@ __all__ = [
     "RateLimitMiddleware",
     "RawDecoder",
     "RejectMessage",
+    "RejectWithoutDLXPolicy",
+    "ReplayResult",
     "RetryConfig",
     "RetryDisabled",
     "SSLConfig",
+    "SafetyConfig",
     "SecurityConfig",
     "SerializationPipeline",
     "SocketConfig",
@@ -162,6 +176,7 @@ __all__ = [
     "SyncWorkerPool",
     "TopologyMode",
     "TracedConsumerMiddleware",
+    "UnsafeTopologyError",
     "WorkerConfig",
     "__version__",
     "broker_health_check",

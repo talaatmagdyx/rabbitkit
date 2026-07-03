@@ -26,6 +26,30 @@ from rabbitkit.core.message import RabbitMessage
 # publish. Single canonical constant so rpc.py and both transports agree.
 DIRECT_REPLY_TO_QUEUE = "amq.rabbitmq.reply-to"
 
+# AMQP 0-9-1 encodes exchange names, queue names, and routing keys as
+# shortstr: a 1-byte length prefix, so 255 bytes is a hard protocol ceiling
+# (not a RabbitMQ convention). Exceeding it previously surfaced as an opaque
+# frame-encoding error from the client library or a connection-level
+# PRECONDITION_FAILED from the broker at declare/publish time, far from the
+# line that actually set the oversized value.
+AMQP_SHORTSTR_MAX_BYTES = 255
+
+
+def validate_amqp_shortstr(field_name: str, value: str) -> None:
+    """Raise ``ValueError`` if ``value`` exceeds the AMQP shortstr limit.
+
+    Length is measured in encoded UTF-8 bytes (the wire unit), not
+    characters -- a 255-character string using multi-byte code points can
+    already be oversized.
+    """
+    encoded_len = len(value.encode("utf-8"))
+    if encoded_len > AMQP_SHORTSTR_MAX_BYTES:
+        msg = (
+            f"{field_name} is {encoded_len} bytes, exceeding the AMQP shortstr "
+            f"limit of {AMQP_SHORTSTR_MAX_BYTES} bytes: {value[:40]!r}..."
+        )
+        raise ValueError(msg)
+
 
 class _RequeuedForRetrySentinel:
     """Sentinel type for :data:`REQUEUED_FOR_RETRY` (H8)."""
@@ -102,6 +126,50 @@ class AckPolicy(str, Enum):
     ACK_FIRST = "ack_first"
 
 
+class DeduplicationMarkPolicy(str, Enum):
+    """When DeduplicationMiddleware records the dedup key.
+
+    - ON_SUCCESS (default): check before the handler (no write), mark only
+      after it succeeds. Crash-safe; concurrent duplicates may both process.
+    - ON_START: mark before the handler. Blocks concurrent duplicates but a
+      crash mid-handler LOSES the message (redelivery is skipped as a
+      duplicate). Advanced/dangerous — use only when duplicate execution is
+      worse than message loss.
+    - CLAIM: two-state — an "in-flight" claim (expires after
+      ``processing_timeout``) before the handler, flipped to "completed"
+      (full ``ttl``) on success. Blocks concurrent duplicates AND survives
+      crashes, provided ``processing_timeout`` comfortably exceeds the
+      worst-case handler duration.
+    """
+
+    ON_SUCCESS = "on_success"
+    ON_START = "on_start"
+    CLAIM = "claim"
+
+
+class RejectWithoutDLXPolicy(str, Enum):
+    """What to do when a route can ``reject(requeue=False)`` but its queue
+    has no dead-letter exchange (RabbitMQ silently DISCARDS such rejects).
+
+    - AUTO_PROVISION (default): declare ``{queue}.dlq`` and wire the source
+      queue's DLX to it (default exchange + queue-name routing, same
+      convention as retry topology). Safe by default — a poison message
+      lands in the DLQ instead of vanishing.
+    - ERROR: refuse to start — raises ``UnsafeTopologyError``. For teams
+      that manage topology externally and want unsafe config to fail fast.
+    - DISCARD: explicitly allow RabbitMQ to discard rejected messages
+      (warns once per route). For low-value/ephemeral workloads only.
+
+    Applied only under ``TopologyMode.AUTO_DECLARE`` — in PASSIVE_ONLY and
+    MANUAL modes rabbitkit does not own queue arguments and cannot know
+    whether an externally-managed DLX exists.
+    """
+
+    AUTO_PROVISION = "auto_provision"
+    ERROR = "error"
+    DISCARD = "discard"
+
+
 class TopologyMode(str, Enum):
     """Topology declaration modes.
 
@@ -166,6 +234,24 @@ class PublishOutcome:
         """
         return self.status in (PublishStatus.CONFIRMED, PublishStatus.SENT)
 
+    def raise_for_status(self) -> PublishOutcome:
+        """Raise ``PublishError`` if the publish failed; else return self (M1).
+
+        ``broker.publish()`` never raises — it returns this outcome so a
+        failed publish (NACKED / TIMEOUT / RETURNED / ERROR) can't be lost by
+        code that simply ignores the return value. Callers who prefer
+        exceptions opt in::
+
+            broker.publish(envelope).raise_for_status()
+
+        Chains so ``outcome = broker.publish(...).raise_for_status()`` works.
+        """
+        if not self.ok:
+            from rabbitkit.core.errors import PublishError
+
+            raise PublishError(self)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:
@@ -194,6 +280,14 @@ class MessageEnvelope:
     type: str | None = None
     user_id: str | None = None
     app_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # Catches an oversized routing_key/exchange at construction time --
+        # the same choke point every publish (broker.publish, retry
+        # republish, DLQ replay, batch) goes through -- instead of an
+        # opaque broker connection error later.
+        validate_amqp_shortstr("routing_key", self.routing_key)
+        validate_amqp_shortstr("exchange", self.exchange)
 
 
 @dataclass(frozen=True, slots=True)

@@ -103,6 +103,52 @@ class TestConsumeScope:
         assert cc.name == MESSAGES_CONSUMED_TOTAL
         assert cc.labels == {"queue": "test.queue", "status": "error"}
 
+    def test_redelivered_message_increments_redelivered_counter(self) -> None:
+        """Broker-redelivery rate: a redelivered=True consume increments the
+        dedicated counter -- the signal that handlers are dying/timing out
+        before acking, which success/error counts alone can't distinguish
+        from ordinary traffic. Previously the redelivered flag was never
+        counted at all."""
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(redelivered=True)
+
+        mw.consume_scope(MagicMock(return_value="ok"), msg)
+
+        redelivered_calls = [
+            c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")
+        ]
+        assert len(redelivered_calls) == 1
+        assert redelivered_calls[0].labels == {"queue": "test.queue"}
+
+    def test_fresh_delivery_does_not_increment_redelivered_counter(self) -> None:
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(redelivered=False)
+
+        mw.consume_scope(MagicMock(return_value="ok"), msg)
+
+        assert not any(
+            c.name.endswith("_messages_redelivered_total") for c in collector.counter_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_redelivered_counter_async(self) -> None:
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        msg = _make_message(redelivered=True)
+
+        async def handler(m: RabbitMessage) -> str:
+            return "ok"
+
+        await mw.consume_scope_async(handler, msg)
+
+        redelivered_calls = [
+            c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")
+        ]
+        assert len(redelivered_calls) == 1
+        assert redelivered_calls[0].labels == {"queue": "test.queue"}
+
     def test_consume_records_histogram(self) -> None:
         """Consume records processing duration in histogram."""
         collector = FakeCollector()

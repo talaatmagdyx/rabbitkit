@@ -111,6 +111,49 @@ class TestRedactProcessor:
         result = processor(None, "info", event_dict)
         assert result == {"tags": ["a", "b"], "count": 3}
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "x-auth-token",
+            "session-token",
+            "x-secret-key",
+            "bearer-token",
+            "auth-secret",
+            "api-token",
+            "private-token",
+        ],
+    )
+    def test_redacts_compound_secret_names_against_default_keys(self, key: str) -> None:
+        """Exact-string matching alone let common compound secret-bearing
+        names slip through untouched -- e.g. 'x-auth-token' normalizes to
+        'auth_token', which isn't itself a DEFAULT_REDACT_KEYS entry, even
+        though 'auth' and 'token' both are individually. Word-set matching
+        closes this without needing to enumerate every compound spelling."""
+        processor = _redact_processor(DEFAULT_REDACT_KEYS)
+        event_dict = {key: "sensitive-value", "routing_key": "orders"}
+        result = processor(None, "info", event_dict)
+        assert result[key] == "***REDACTED***"
+        assert result["routing_key"] == "orders"  # unrelated field untouched
+
+    @pytest.mark.parametrize("key", ["primary_key", "cache_key", "partition_key", "client_id"])
+    def test_does_not_over_redact_unrelated_compound_fields(self, key: str) -> None:
+        """Word-set matching must check ALL of a configured key's words
+        together, not pool every word from every configured key into one
+        flat matcher -- otherwise 'key' (from 'api_key') or 'client' (from
+        'client_secret') would each become standalone matchers and redact
+        totally benign fields like 'primary_key' or 'client_id'."""
+        processor = _redact_processor(DEFAULT_REDACT_KEYS)
+        event_dict = {key: "not-a-secret"}
+        result = processor(None, "info", event_dict)
+        assert result[key] == "not-a-secret"
+
+    def test_compound_matching_works_one_level_deep_too(self) -> None:
+        processor = _redact_processor(DEFAULT_REDACT_KEYS)
+        event_dict = {"headers": {"x-auth-token": "abc", "x-tenant": "acme"}}
+        result = processor(None, "info", event_dict)
+        assert result["headers"]["x-auth-token"] == "***REDACTED***"
+        assert result["headers"]["x-tenant"] == "acme"
+
 
 class TestConfigureStructlogRedaction:
     """L16: end-to-end -- the processor configure_structlog wires in
@@ -146,6 +189,42 @@ class TestConfigureStructlogRedaction:
         configure_structlog(LoggingConfig(render_json=True, redact_keys=None))
         processors = _structlog.get_config()["processors"]
         assert not any(getattr(p, "__qualname__", "") == "_redact_processor.<locals>.processor" for p in processors)
+
+
+class TestCaptureWarnings:
+    """L16 follow-up: warnings.warn() (every rabbitkit safety warning --
+    topology drift, retry-without-confirms, unsafe TLS, ...) bypasses
+    logging/structlog entirely unless bridged via logging.captureWarnings().
+    A "loud warning" that only reaches raw stderr in dev is invisible in a
+    production JSON-logging deployment -- configure_structlog() must not
+    silently leave that gap.
+
+    Verified against logging.captureWarnings() being CALLED with the right
+    argument (a monkeypatched spy), not against the resulting global
+    warnings.showwarning identity -- pytest's own warnings-capture plugin
+    also manipulates that global hook around each test, which fights with
+    an end-to-end assertion here without actually indicating a real bug.
+    """
+
+    def test_capture_warnings_enabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import logging
+
+        calls: list[bool] = []
+        monkeypatch.setattr(logging, "captureWarnings", calls.append)
+
+        configure_structlog(LoggingConfig(render_json=True))
+
+        assert calls == [True]
+
+    def test_capture_warnings_can_be_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import logging
+
+        calls: list[bool] = []
+        monkeypatch.setattr(logging, "captureWarnings", calls.append)
+
+        configure_structlog(LoggingConfig(capture_warnings=False))
+
+        assert calls == [False]
 
 
 class TestConfigureStructlog:

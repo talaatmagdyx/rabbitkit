@@ -25,7 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import BatchPublishConfig
-from rabbitkit.core.types import MessageEnvelope, PublishOutcome
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 
 if TYPE_CHECKING:
     from rabbitkit.async_.transport import AsyncTransportImpl
@@ -46,6 +46,17 @@ class AsyncBatchPublisher:
     Unlike ``highload.batch.BatchPublisher`` (a timing/buffering helper that
     publishes each message individually), this class pipelines confirms: all
     messages in a batch share one channel and their ACKs are awaited together.
+
+    Blast-radius note (M17): because a batch shares one channel, an
+    AMQP-channel-level failure (e.g. a confirm timeout that closes the channel)
+    fails EVERY in-flight publish in that batch — each caller's future is
+    settled with the error (never silently lost), and the channel is replaced
+    before the next batch, but a single slow confirm can amplify into
+    batch-wide errors. This is inherent to sharing a channel for pipelined
+    confirms; there is no per-message isolation without giving up batching. To
+    bound the blast radius, lower ``BatchPublishConfig.batch_size`` (fewer
+    siblings share a channel) — or use direct ``broker.publish()`` for
+    publishes that must fail independently.
     """
 
     def __init__(self, transport: AsyncTransportImpl, config: BatchPublishConfig) -> None:
@@ -185,3 +196,18 @@ class AsyncBatchPublisher:
                     fut.set_exception(outcome)
                 else:
                     fut.set_result(outcome)
+
+        # M17: _publish_on_channel no longer closes the channel itself on a
+        # confirm timeout (that used to fire from INSIDE one of the concurrent
+        # calls above, corrupting sibling in-flight confirms sharing this same
+        # channel). Instead, close it HERE — every concurrent publish in this
+        # batch has already resolved by this point, so closing can no longer
+        # amplify this batch's failure onto a message that would have
+        # confirmed fine. The flush loop's post-_flush check (channel.is_closed)
+        # still replaces it for the next batch, preserving the original
+        # "don't reuse a wedged channel" protection.
+        if not channel.is_closed and any(
+            not isinstance(o, BaseException) and o.status == PublishStatus.TIMEOUT for o in outcomes
+        ):
+            with contextlib.suppress(Exception):
+                await channel.close()

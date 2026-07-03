@@ -260,12 +260,9 @@ class RetryMiddleware(BaseMiddleware):
         """Build envelope for the delay queue."""
         # Determine delay queue name
         attempt = retry_count + 1
-        if self._config.per_queue:
-            # Extract source queue from consumer context
-            source_queue = message.headers.get("x-rabbitkit-original-queue", "unknown")
-            delay_queue_rk = f"{source_queue}.retry.{attempt}"
-        else:
-            delay_queue_rk = f"rabbitkit.retry.{attempt}"
+        # Always per-queue (shared mode is rejected by RetryConfig — H3).
+        source_queue = message.headers.get("x-rabbitkit-original-queue", "unknown")
+        delay_queue_rk = f"{source_queue}.retry.{attempt}"
 
         # Preserve original headers + add retry metadata
         headers = dict(message.headers)
@@ -286,6 +283,24 @@ class RetryMiddleware(BaseMiddleware):
             correlation_id=message.correlation_id,
             content_type=message.content_type or "application/octet-stream",
             content_encoding=message.content_encoding,
+            # Preserve the remaining original message properties -- these used
+            # to be silently dropped on every retry republish, so e.g. a
+            # priority-queue message lost its priority on its first retry, and
+            # an RPC request's reply_to/type/app_id/user_id never survived
+            # long enough for the eventual (retried) reply to route back.
+            reply_to=message.reply_to,
+            priority=message.priority,
+            expiration=message.expiration,
+            type=message.type,
+            app_id=message.app_id,
+            user_id=message.user_id,
+            # M4: mandatory so a runtime-deleted/missing delay queue comes back
+            # as RETURNED (outcome not-ok) instead of being broker-confirmed
+            # into the void. The route-to-delay-queue path checks outcome.ok
+            # and nack-requeues on failure, so this turns silent loss into a
+            # redelivery. (Requires publisher confirms + basic.return handling,
+            # which both transports wire up.)
+            mandatory=True,
         )
 
     def _route_to_delay_queue_sync(self, message: RabbitMessage, retry_count: int) -> None:
@@ -398,10 +413,12 @@ class RetryRouter:
         self._config = config
 
     def get_dlq_name(self, source_queue_name: str) -> str:
-        """Return the DLQ name for a given source queue."""
-        if self._config.per_queue:
-            return f"{source_queue_name}.dlq"
-        return "rabbitkit.dlq"
+        """Return the DLQ name for a given source queue.
+
+        Always per-queue — shared mode (per_queue=False) is rejected by
+        RetryConfig (H3), so there is no shared-DLQ branch.
+        """
+        return f"{source_queue_name}.dlq"
 
     def get_source_queue_dlq_arguments(self, source_queue_name: str) -> dict[str, str]:
         """Return x-dead-letter arguments to add to the source queue declaration.
@@ -447,10 +464,8 @@ class RetryRouter:
         for attempt in range(1, self._config.max_retries + 1):
             delay_ms = self._get_delay_ms(attempt - 1)
 
-            if self._config.per_queue:
-                q_name = f"{source_queue_name}.retry.{attempt}"
-            else:
-                q_name = f"rabbitkit.retry.{attempt}"
+            # Always per-queue (shared mode is rejected by RetryConfig — H3).
+            q_name = f"{source_queue_name}.retry.{attempt}"
 
             queue = RabbitQueue(
                 name=q_name,

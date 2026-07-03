@@ -110,8 +110,15 @@ jobs:
       # ran), which is treated as a failure so missing tests surface loudly.
       - name: Integration tests
         run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short
-      # BEST-EFFORT: the chaos/benchmark suite is allowed to fail without
-      # breaking the pipeline (`continue-on-error: true` on this step only).
+      # GATING (M15): the critical restart-mid-consume scenarios (sync+async)
+      # must pass — a reconnect/redelivery regression should break the build,
+      # not merge green. Exit code is checked (no continue-on-error).
+      - name: Chaos gate (restart mid-consume)
+        env:
+          RK_CHAOS_PORT: "32778"
+        run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
+      # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
+      # without breaking the pipeline (`continue-on-error: true` on this step).
       - name: Chaos suite (best-effort)
         continue-on-error: true
         env:

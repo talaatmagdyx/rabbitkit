@@ -8,14 +8,31 @@ If Redis is unavailable, behaviour depends on ``fallback_on_redis_error``:
   - ``False``: re-raise the Redis error (fail fast)
 
 Mark policy (``DeduplicationConfig.mark_policy``):
-  - ``"on_success"`` (default): mark the key only after the handler succeeds.
-    Safer for retry flows — a failed handler can be retried. Risk: concurrent
-    delivery of the same message may both pass the dedup check.
+  - ``"on_success"`` (default): check for the key before the handler (no
+    write), mark it only after the handler returns successfully. Crash-safe:
+    a consumer killed mid-handler (OOM/SIGKILL) leaves no mark, so the
+    broker's redelivery is processed rather than dropped as a duplicate.
+    Risk: concurrent deliveries of the same message may both pass the dedup
+    check and both process (at-least-once).
   - ``"on_start"``: mark before calling the handler, preventing concurrent
-    duplicate processing. Risk: if the handler fails and no RetryMiddleware
-    is on the route (or the route's classifier calls it permanent), the
-    retry may be skipped — see the H8 note below for the one case this
-    middleware CAN detect and correct for.
+    duplicate processing. WARNING — can cause MESSAGE LOSS: if the process
+    crashes after marking but before the handler finishes, the broker's
+    redelivery is skipped as a duplicate. Use only when duplicate execution
+    is worse than losing a message. Also: if the handler fails and no
+    RetryMiddleware is on the route (or the route's classifier calls it
+    permanent), the retry may be skipped — see the H8 note below for the one
+    case this middleware CAN detect and correct for.
+  - ``"claim"``: two-state. Before the handler, atomically claim the key as
+    ``in-flight`` with ``processing_timeout`` as its TTL; on success flip it
+    to ``completed`` with the full ``ttl``. A concurrent duplicate that sees
+    a live in-flight claim is handled per ``on_in_flight``:
+    ``"nack_requeue"`` (default — the copy comes back and retries, so it is
+    NOT lost if the claiming consumer dies) or ``"ack_skip"``. A crash
+    mid-handler simply lets the claim expire, after which the redelivery is
+    processed. Blocks concurrent duplicates AND is crash-safe — provided
+    ``processing_timeout`` comfortably exceeds the worst-case handler
+    duration; a handler that outlives its claim lets a duplicate start
+    while it is still running.
 
 Composing with RetryMiddleware (H8)
 ------------------------------------
@@ -43,6 +60,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -53,6 +71,12 @@ from rabbitkit.core.types import REQUEUED_FOR_RETRY
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
+
+# Redis values for mark_policy="claim". Anything OTHER than the in-flight
+# marker (including the legacy "1" written by on_success/on_start) is treated
+# as completed, so switching an existing deployment to "claim" is safe.
+_IN_FLIGHT = "in-flight"
+_COMPLETED = "completed"
 
 
 class DeduplicationMiddleware(BaseMiddleware):
@@ -97,6 +121,9 @@ class DeduplicationMiddleware(BaseMiddleware):
         self._local_cache: OrderedDict[str, None] | None = (
             OrderedDict() if self._config.local_cache_size > 0 else None
         )
+        # The cache is mutated from sync worker-pool daemon threads; OrderedDict
+        # mutation is not atomic (move_to_end/popitem can corrupt mid-eviction).
+        self._local_lock = threading.Lock()
 
     def _record_fallback(self, message: RabbitMessage) -> None:
         """M9: log at ERROR (not WARNING — idempotency being silently
@@ -122,21 +149,24 @@ class DeduplicationMiddleware(BaseMiddleware):
         """True if key is already in the local cache (= confirmed processed)."""
         if self._local_cache is None:
             return False
-        return key in self._local_cache
+        with self._local_lock:
+            return key in self._local_cache
 
     def _local_mark(self, key: str) -> None:
         """Record key in the local LRU; evicts oldest when at capacity."""
         if self._local_cache is None:
             return
-        self._local_cache[key] = None
-        self._local_cache.move_to_end(key)
-        if len(self._local_cache) > self._config.local_cache_size:
-            self._local_cache.popitem(last=False)
+        with self._local_lock:
+            self._local_cache[key] = None
+            self._local_cache.move_to_end(key)
+            if len(self._local_cache) > self._config.local_cache_size:
+                self._local_cache.popitem(last=False)
 
     def _local_remove(self, key: str) -> None:
         """Remove key from local cache (called when handler fails, key deleted from Redis)."""
         if self._local_cache is not None:
-            self._local_cache.pop(key, None)
+            with self._local_lock:
+                self._local_cache.pop(key, None)
 
     def _cleanup_key_after_non_success(self, key: str) -> None:
         """Delete *key* from Redis + the local cache after a non-success
@@ -248,6 +278,9 @@ class DeduplicationMiddleware(BaseMiddleware):
         """Sync: check dedup → skip duplicate → call handler."""
         key = self._extract_key(message)
 
+        if self._config.mark_policy == "claim":
+            return self._consume_claim_sync(call_next, message, key)
+
         if self._config.mark_policy == "on_start":
             # _mark_key checks local cache first, then Redis
             is_new = self._mark_key(key, message)
@@ -264,7 +297,13 @@ class DeduplicationMiddleware(BaseMiddleware):
                 self._cleanup_key_after_non_success(key)
             return result
 
-        # mark_policy == "on_success": local cache check, then Redis, then handler
+        # mark_policy == "on_success": check (no write) → handler → mark.
+        # The key is written only AFTER the handler returns successfully, so a
+        # consumer killed mid-handler (OOM/SIGKILL) leaves no mark and the
+        # broker's redelivery is processed instead of dropped as a duplicate.
+        # A handler exception likewise leaves nothing behind — no cleanup
+        # needed (and deleting here could erase a concurrent delivery's
+        # legitimate success-mark).
         if self._local_is_dup(key):
             logger.debug("Duplicate message detected in local cache (key=%s); acking and skipping", key)
             if not message.is_settled:
@@ -272,7 +311,7 @@ class DeduplicationMiddleware(BaseMiddleware):
             return None
 
         try:
-            already_seen = not bool(self._redis.set(key, "1", nx=True, ex=self._config.ttl))
+            already_seen = bool(self._redis.exists(key))
         except Exception:
             if not self._config.fallback_on_redis_error:
                 raise
@@ -285,20 +324,22 @@ class DeduplicationMiddleware(BaseMiddleware):
                 message.ack()
             return None
 
-        try:
-            result = call_next(message)
-        except Exception:
-            # Handler failed — delete the key so a retry can re-enter
-            self._cleanup_key_after_non_success(key)
-            raise
+        result = call_next(message)
         if result is REQUEUED_FOR_RETRY:
-            # H8: an inner RetryMiddleware requeued the failed handler
-            # (delay-queue publish, or nack+redeliver) instead of it actually
-            # succeeding. Delete the key so the retry redelivery (same dedup
-            # key) is NOT treated as a duplicate and silently dropped.
-            self._cleanup_key_after_non_success(key)
+            # H8: an inner RetryMiddleware requeued the failed handler instead
+            # of it actually succeeding. Nothing was marked yet, so the retry
+            # redelivery (same dedup key) passes the dedup check — just skip
+            # the mark.
             return result
-        # Handler succeeded — record in local cache so next duplicate skips Redis
+        # Handler succeeded — mark now. Never raise past this point, even with
+        # fallback_on_redis_error=False: the handler's side effects are done,
+        # and raising would nack → redeliver → a GUARANTEED duplicate
+        # execution, worse than the unmarked-key window it would signal.
+        try:
+            self._redis.set(key, "1", nx=True, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return result
         self._local_mark(key)
         return result
 
@@ -309,6 +350,9 @@ class DeduplicationMiddleware(BaseMiddleware):
     ) -> Any:
         """Async: check dedup → skip duplicate → call handler."""
         key = self._extract_key(message)
+
+        if self._config.mark_policy == "claim":
+            return await self._consume_claim_async(call_next, message, key)
 
         if self._config.mark_policy == "on_start":
             # _mark_key_async checks local cache first, then Redis
@@ -326,7 +370,8 @@ class DeduplicationMiddleware(BaseMiddleware):
                 await self._cleanup_key_after_non_success_async(key)
             return result
 
-        # mark_policy == "on_success": local cache check, then Redis, then handler
+        # mark_policy == "on_success": check (no write) → handler → mark.
+        # See the sync variant above for the crash-safety rationale.
         if self._local_is_dup(key):
             logger.debug("Duplicate message detected in local cache (key=%s); acking and skipping", key)
             if not message.is_settled:
@@ -334,7 +379,7 @@ class DeduplicationMiddleware(BaseMiddleware):
             return None
 
         try:
-            already_seen = not bool(await self._redis.set(key, "1", nx=True, ex=self._config.ttl))
+            already_seen = bool(await self._redis.exists(key))
         except Exception:
             if not self._config.fallback_on_redis_error:
                 raise
@@ -347,19 +392,181 @@ class DeduplicationMiddleware(BaseMiddleware):
                 await message.ack_async()
             return None
 
+        result = await call_next(message)
+        if result is REQUEUED_FOR_RETRY:
+            # H8: an inner RetryMiddleware requeued the failed handler instead
+            # of it actually succeeding. Nothing was marked yet, so the retry
+            # redelivery (same dedup key) passes the dedup check — just skip
+            # the mark.
+            return result
+        # Handler succeeded — mark now. Never raise past this point, even with
+        # fallback_on_redis_error=False: raising would nack → redeliver → a
+        # GUARANTEED duplicate execution.
+        try:
+            await self._redis.set(key, "1", nx=True, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return result
+        self._local_mark(key)
+        return result
+
+    # ── mark_policy == "claim" ────────────────────────────────────────────
+
+    @staticmethod
+    def _is_in_flight(raw: Any) -> bool:
+        """True when a GET result is a live in-flight claim.
+
+        ``None`` (the key expired between the failed SET NX and this GET)
+        also counts — requeueing lets the redelivery claim it cleanly.
+        Any other value (``"completed"``, or the legacy ``"1"`` written by
+        on_success/on_start deployments) means completed.
+        """
+        if raw is None:
+            return True
+        value = raw.decode() if isinstance(raw, bytes) else raw
+        return bool(value == _IN_FLIGHT)
+
+    def _handle_in_flight_duplicate_sync(self, message: RabbitMessage, key: str) -> None:
+        """A concurrent copy hit another consumer's live claim (sync)."""
+        if self._config.on_in_flight == "ack_skip":
+            logger.debug("Duplicate of in-flight message (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                message.ack()
+            return
+        # "nack_requeue" (default): the copy comes back and retries, so it is
+        # NOT lost if the claiming consumer dies mid-handler.
+        # ponytail: immediate requeue — the duplicate redelivers in a tight
+        # loop until the claim resolves, bounded by prefetch and the
+        # handler's duration; add a delay queue if that churn ever matters.
+        logger.debug("Duplicate of in-flight message (key=%s); nack-requeueing", key)
+        if not message.is_settled:
+            message.nack(requeue=True)
+
+    def _consume_claim_sync(
+        self,
+        call_next: Callable[[RabbitMessage], Any],
+        message: RabbitMessage,
+        key: str,
+    ) -> Any:
+        """Sync claim flow: atomically claim in-flight → handler → flip to
+        completed. Crash mid-handler lets the claim expire; the redelivery
+        then re-claims and processes."""
+        if self._local_is_dup(key):
+            logger.debug("Duplicate message detected in local cache (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                message.ack()
+            return None
+
+        try:
+            claimed = bool(
+                self._redis.set(key, _IN_FLIGHT, nx=True, ex=self._config.processing_timeout)
+            )
+        except Exception:
+            if not self._config.fallback_on_redis_error:
+                raise
+            self._record_fallback(message)
+            return call_next(message)
+
+        if not claimed:
+            try:
+                raw = self._redis.get(key)
+            except Exception:
+                if not self._config.fallback_on_redis_error:
+                    raise
+                self._record_fallback(message)
+                return call_next(message)
+            if self._is_in_flight(raw):
+                self._handle_in_flight_duplicate_sync(message, key)
+                return None
+            logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                message.ack()
+            return None
+
+        try:
+            result = call_next(message)
+        except Exception:
+            # Release the claim so a retry redelivery can re-claim immediately
+            # instead of waiting out processing_timeout.
+            self._cleanup_key_after_non_success(key)
+            raise
+        if result is REQUEUED_FOR_RETRY:
+            # H8: release the claim for the delayed retry redelivery.
+            self._cleanup_key_after_non_success(key)
+            return result
+        # Handler succeeded — flip the claim to completed with the full TTL.
+        # Never raise past this point (side effects are committed; raising
+        # would nack → redeliver → a guaranteed duplicate execution).
+        try:
+            self._redis.set(key, _COMPLETED, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return result
+        self._local_mark(key)
+        return result
+
+    async def _handle_in_flight_duplicate_async(self, message: RabbitMessage, key: str) -> None:
+        """A concurrent copy hit another consumer's live claim (async)."""
+        if self._config.on_in_flight == "ack_skip":
+            logger.debug("Duplicate of in-flight message (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                await message.ack_async()
+            return
+        logger.debug("Duplicate of in-flight message (key=%s); nack-requeueing", key)
+        if not message.is_settled:
+            await message.nack_async(requeue=True)
+
+    async def _consume_claim_async(
+        self,
+        call_next: Callable[[RabbitMessage], Awaitable[Any]],
+        message: RabbitMessage,
+        key: str,
+    ) -> Any:
+        """Async variant of :meth:`_consume_claim_sync`."""
+        if self._local_is_dup(key):
+            logger.debug("Duplicate message detected in local cache (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                await message.ack_async()
+            return None
+
+        try:
+            claimed = bool(
+                await self._redis.set(key, _IN_FLIGHT, nx=True, ex=self._config.processing_timeout)
+            )
+        except Exception:
+            if not self._config.fallback_on_redis_error:
+                raise
+            self._record_fallback(message)
+            return await call_next(message)
+
+        if not claimed:
+            try:
+                raw = await self._redis.get(key)
+            except Exception:
+                if not self._config.fallback_on_redis_error:
+                    raise
+                self._record_fallback(message)
+                return await call_next(message)
+            if self._is_in_flight(raw):
+                await self._handle_in_flight_duplicate_async(message, key)
+                return None
+            logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
+            if not message.is_settled:
+                await message.ack_async()
+            return None
+
         try:
             result = await call_next(message)
         except Exception:
-            # Handler failed — delete the key so a retry can re-enter
             await self._cleanup_key_after_non_success_async(key)
             raise
         if result is REQUEUED_FOR_RETRY:
-            # H8: an inner RetryMiddleware requeued the failed handler
-            # (delay-queue publish, or nack+redeliver) instead of it actually
-            # succeeding. Delete the key so the retry redelivery (same dedup
-            # key) is NOT treated as a duplicate and silently dropped.
             await self._cleanup_key_after_non_success_async(key)
             return result
-        # Handler succeeded — record in local cache so next duplicate skips Redis
+        try:
+            await self._redis.set(key, _COMPLETED, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return result
         self._local_mark(key)
         return result

@@ -261,17 +261,35 @@ class BatchAcker:
     - Handlers MUST NOT call ``msg.ack()`` when BatchAcker is active
     - Compatible with AUTO and NACK_ON_ERROR policies only
 
-    Usage::
+    Usage (sync / pika) — ``ack_fn`` MUST NOT be a raw ``channel.basic_ack``.
+    The interval timer fires ``flush()`` from a background
+    ``threading.Timer`` thread, not pika's connection I/O thread; pika
+    channel methods are not thread-safe, so a direct ``channel.basic_ack``
+    reference here is a real cross-thread violation waiting to happen the
+    first time the timer (rather than ``add()``) triggers the flush.
+    Marshal onto the I/O thread instead, e.g. via
+    ``connection.add_callback_threadsafe``::
+
+        def safe_ack(delivery_tag: int, multiple: bool = False) -> None:
+            connection.add_callback_threadsafe(
+                lambda: channel.basic_ack(delivery_tag=delivery_tag, multiple=multiple)
+            )
 
         ba = BatchAcker(
             config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
-            ack_fn=channel.basic_ack,
+            ack_fn=safe_ack,
         )
         ba.add(delivery_tag=1)
         ba.add(delivery_tag=2)
         ...
         ba.flush()  # ack(max_tag, multiple=True)
         ba.close()  # flush remaining + cancel timer
+
+    The async path (``add_async``/``flush_async``) has no such hazard —
+    ``_interval_loop_async`` schedules via ``asyncio.create_task`` on the
+    same event loop the aio-pika channel already runs on, so an aio-pika
+    ``channel.basic_ack`` (a coroutine function) can be passed directly as
+    ``ack_fn``.
     """
 
     def __init__(

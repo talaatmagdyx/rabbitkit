@@ -6,8 +6,8 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope
-from rabbitkit.dlq import DLQInspector
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.dlq import DLQInspector, ReplayResult
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -208,6 +208,34 @@ class TestReplay:
         assert published.headers["x-tenant"] == "acme"
         assert published.headers["x-retry"] == "3"
 
+    def test_replay_preserves_message_properties(self) -> None:
+        """Replay used to silently drop priority/expiration/type/app_id/
+        user_id/reply_to -- e.g. a priority-queue message lost its priority
+        on replay, and an RPC request's reply_to never survived the replay
+        for the eventual reply to route back."""
+        msgs = [
+            _make_message(
+                reply_to="amq.rabbitmq.reply-to",
+                priority=9,
+                expiration="30000",
+                type="order.created",
+                app_id="order-service",
+                user_id="guest",
+            )
+        ]
+        transport = _FakeTransport(messages=msgs)
+        inspector = DLQInspector(transport)
+
+        inspector.replay("dlq", target_queue="target")
+
+        published = transport.published[0]
+        assert published.reply_to == "amq.rabbitmq.reply-to"
+        assert published.priority == 9
+        assert published.expiration == "30000"
+        assert published.type == "order.created"
+        assert published.app_id == "order-service"
+        assert published.user_id == "guest"
+
 
 # ── purge tests ──────────────────────────────────────────────────────────
 
@@ -315,3 +343,154 @@ class TestReplayAsyncPredicate:
 
         assert count == 0
         nack_async_mock.assert_called_once_with(True)
+
+
+# ── C2 regression: failed republish must NOT ack the DLQ original ─────────
+
+
+class _OutcomeTransport(_FakeTransport):
+    """Fake transport whose publish returns a real PublishOutcome, failing
+    when ``fail_when(envelope)`` is True."""
+
+    def __init__(
+        self,
+        messages: list[RabbitMessage] | None = None,
+        fail_when: Any = None,
+    ) -> None:
+        super().__init__(messages)
+        self._fail_when = fail_when or (lambda env: False)
+
+    def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        self.published.append(envelope)
+        if self._fail_when(envelope):
+            return PublishOutcome(status=PublishStatus.ERROR)
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+
+class _AsyncOutcomeTransport(_FakeAsyncTransport):
+    def __init__(
+        self,
+        messages: list[RabbitMessage] | None = None,
+        fail_when: Any = None,
+    ) -> None:
+        super().__init__(messages)
+        self._fail_when = fail_when or (lambda env: False)
+
+    async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        self.published.append(envelope)
+        if self._fail_when(envelope):
+            return PublishOutcome(status=PublishStatus.ERROR)
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+
+class TestReplayPublishOutcome:
+    def test_failed_publish_keeps_message_on_dlq(self) -> None:
+        """C2 regression: a failed republish must nack-requeue the original
+        (message stays on the DLQ), never ack it."""
+        msg = _make_message()
+        transport = _OutcomeTransport(messages=[msg], fail_when=lambda env: True)
+        inspector = DLQInspector(transport)
+
+        result = inspector.replay("dlq")
+
+        msg._ack_fn.assert_not_called()
+        msg._nack_fn.assert_called_once_with(True)  # stays on the DLQ
+        assert result == 0  # nothing replayed (int-compatible)
+        assert result.failed == 1
+
+    def test_partial_failure_counts_and_settles_correctly(self) -> None:
+        """One publish fails, one succeeds: the failure is requeued, the
+        success is acked, and both are reported."""
+        ok_msg = _make_message(routing_key="good")
+        bad_msg = _make_message(routing_key="bad")
+        transport = _OutcomeTransport(
+            messages=[ok_msg, bad_msg],
+            fail_when=lambda env: env.routing_key == "bad",
+        )
+        inspector = DLQInspector(transport)
+
+        result = inspector.replay("dlq")
+
+        ok_msg._ack_fn.assert_called_once()
+        bad_msg._ack_fn.assert_not_called()
+        bad_msg._nack_fn.assert_called_once_with(True)
+        assert result == 1
+        assert result.failed == 1
+
+    def test_replay_envelope_is_mandatory(self) -> None:
+        """Republishes use mandatory=True so an unroutable target comes back
+        as RETURNED instead of being confirmed into the void."""
+        transport = _OutcomeTransport(messages=[_make_message()])
+        inspector = DLQInspector(transport)
+
+        inspector.replay("dlq")
+
+        assert transport.published[0].mandatory is True
+
+    def test_reset_retry_count_strips_header(self) -> None:
+        """reset_retry_count=True grants a fresh retry ladder; default
+        preserves headers verbatim."""
+        headers = {"x-rabbitkit-retry-count": 4, "x-other": "kept"}
+        msg1 = _make_message(headers=dict(headers))
+        msg2 = _make_message(headers=dict(headers))
+        transport = _OutcomeTransport(messages=[msg1])
+        inspector = DLQInspector(transport)
+
+        inspector.replay("dlq", reset_retry_count=True)
+        assert "x-rabbitkit-retry-count" not in transport.published[0].headers
+        assert transport.published[0].headers["x-other"] == "kept"
+
+        transport2 = _OutcomeTransport(messages=[msg2])
+        DLQInspector(transport2).replay("dlq")  # default: preserved
+        assert transport2.published[0].headers["x-rabbitkit-retry-count"] == 4
+
+    def test_replay_result_is_int_compatible(self) -> None:
+        result = ReplayResult(3, failed=2, requeued=1)
+        assert result == 3
+        assert isinstance(result, int)
+        assert result + 1 == 4
+        assert result.failed == 2
+        assert result.requeued == 1
+        assert repr(result) == "ReplayResult(replayed=3, failed=2, requeued=1)"
+
+    def test_predicate_rejections_counted_as_requeued(self) -> None:
+        transport = _OutcomeTransport(messages=[_make_message(), _make_message()])
+        inspector = DLQInspector(transport)
+
+        result = inspector.replay("dlq", predicate=lambda m: False)
+
+        assert result == 0
+        assert result.requeued == 2
+        assert result.failed == 0
+
+    async def test_async_failed_publish_keeps_message_on_dlq(self) -> None:
+        from unittest.mock import AsyncMock
+
+        msg = _make_message()
+        ack_async = AsyncMock()
+        nack_async = AsyncMock()
+        msg._ack_async_fn = ack_async
+        msg._nack_async_fn = nack_async
+
+        transport = _AsyncOutcomeTransport(messages=[msg], fail_when=lambda env: True)
+        inspector = DLQInspector(transport)
+
+        result = await inspector.replay_async("dlq")
+
+        ack_async.assert_not_called()
+        nack_async.assert_called_once_with(True)
+        assert result == 0
+        assert result.failed == 1
+
+    async def test_async_reset_retry_count_strips_header(self) -> None:
+        from unittest.mock import AsyncMock
+
+        msg = _make_message(headers={"x-rabbitkit-retry-count": 4})
+        msg._ack_async_fn = AsyncMock()
+        transport = _AsyncOutcomeTransport(messages=[msg])
+        inspector = DLQInspector(transport)
+
+        result = await inspector.replay_async("dlq", reset_retry_count=True)
+
+        assert result == 1
+        assert "x-rabbitkit-retry-count" not in transport.published[0].headers

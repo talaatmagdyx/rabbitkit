@@ -11,6 +11,7 @@ import pytest
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.concurrency import AsyncWorkerPool
 from rabbitkit.core.config import PublisherConfig, RabbitConfig, RetryConfig, WorkerConfig
+from rabbitkit.core.errors import BackpressureError
 from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 
 # ── Registration ─────────────────────────────────────────────────────────
@@ -77,7 +78,8 @@ class TestLifecycle:
 
             mock_transport.connect.assert_called_once()
             mock_transport.declare_exchange.assert_called_once()
-            mock_transport.declare_queue.assert_called_once()
+            # C3: source queue + auto-provisioned orders.dlq
+            assert mock_transport.declare_queue.call_count == 2
             mock_transport.bind_queue.assert_called_once()
             mock_transport.consume.assert_called_once()
 
@@ -345,7 +347,7 @@ class TestFilterWithoutDLX:
         return True
 
     @pytest.mark.asyncio
-    async def test_filter_without_retry_or_dlx_warns_and_auto_declares_dlq(self) -> None:
+    async def test_filter_without_retry_or_dlx_auto_declares_dlq(self) -> None:
         broker = AsyncBroker()  # no broker-wide retry
 
         @broker.subscriber(queue="orders", filter_fn=self._filter_fn)
@@ -353,9 +355,7 @@ class TestFilterWithoutDLX:
             pass
 
         broker._transport = AsyncMock()
-
-        with pytest.warns(RuntimeWarning, match="auto-declared 'orders.dlq'"):
-            await broker._declare_topology()
+        await broker._declare_topology()
 
         declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
         source = next(q for q in declared_queues if q.name == "orders")
@@ -422,8 +422,10 @@ class TestFilterWithoutDLX:
         assert not any(q.name == "orders.dlq" for q in declared_queues)
 
     @pytest.mark.asyncio
-    async def test_no_filter_fn_no_warning_no_extra_dlq(self) -> None:
-        """A route with no filter_fn at all must be entirely unaffected."""
+    async def test_plain_route_also_gets_auto_dlq(self) -> None:
+        """C3: a plain route (no filter_fn) can still reject poison messages
+        (permanent errors) — under the default auto_provision policy it gets
+        a DLQ too, so nothing is silently discarded."""
         broker = AsyncBroker()
 
         @broker.subscriber(queue="orders")
@@ -431,16 +433,79 @@ class TestFilterWithoutDLX:
             pass
 
         broker._transport = AsyncMock()
+        await broker._declare_topology()
 
-        import warnings
+        declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
+        source = next(q for q in declared_queues if q.name == "orders")
+        assert source.dead_letter_exchange == ""
+        assert source.dead_letter_routing_key == "orders.dlq"
+        assert any(q.name == "orders.dlq" for q in declared_queues)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+
+class TestRejectWithoutDLXPolicyAsync:
+    """C3: SafetyConfig.reject_without_dlx on the async broker."""
+
+    @pytest.mark.asyncio
+    async def test_error_policy_fails_startup(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.errors import UnsafeTopologyError
+
+        broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="error")))
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        with pytest.raises(UnsafeTopologyError, match="orders"):
             await broker._declare_topology()
 
-        assert not any("auto-declared" in str(w.message) for w in caught)
+    @pytest.mark.asyncio
+    async def test_discard_policy_warns_and_declares_no_dlq(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard")))
+
+        @broker.subscriber(queue="telemetry")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+
+        with pytest.warns(RuntimeWarning, match="permanently discarded"):
+            await broker._declare_topology()
+
         declared_queues = [call.args[0] for call in broker._transport.declare_queue.call_args_list]
-        assert not any(q.name == "orders.dlq" for q in declared_queues)
+        assert not any(q.name == "telemetry.dlq" for q in declared_queues)
+
+    @pytest.mark.asyncio
+    async def test_bind_arguments_passed_to_transport(self) -> None:
+        """C4: headers-exchange bind_arguments must reach the transport."""
+        from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+        from rabbitkit.core.types import ExchangeType
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(
+            queue=RabbitQueue(
+                name="orders.headers",
+                bind_arguments={"x-match": "any", "type": "order"},
+            ),
+            exchange=RabbitExchange(name="events.headers", type=ExchangeType.HEADERS),
+        )
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = AsyncMock()
+        await broker._declare_topology()
+
+        broker._transport.bind_queue.assert_called_once_with(
+            queue="orders.headers",
+            exchange="events.headers",
+            routing_key="",
+            arguments={"x-match": "any", "type": "order"},
+        )
 
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -1807,6 +1872,89 @@ class TestAsyncWaitInFlightDeadline:
         await broker._wait_in_flight(time.monotonic() + 10.0)
 
 
+class TestAsyncWaitInFlightCancelsAndNacksStragglers:
+    """A drain-deadline timeout used to just log a count and abandon inline
+    (non-pooled) in-flight handlers unacked -- unlike AsyncWorkerPool's
+    pooled path, which explicitly cancels + nacks with delivery-tag logging.
+    _wait_in_flight now does the same for the inline (default, no
+    worker_config) path."""
+
+    async def _make_stuck_task_and_message(self, broker: AsyncBroker, *, settled: bool = False) -> Any:
+        message = MagicMock()
+        message.delivery_tag = 42
+        message.message_id = "msg-stuck"
+        message.is_settled = settled
+        message.nack_async = AsyncMock()
+
+        task = asyncio.create_task(asyncio.sleep(100))
+        broker._inflight_tasks[task] = message
+        broker._in_flight = 1
+        return task, message
+
+    @pytest.mark.asyncio
+    async def test_cancels_task_and_nacks_unsettled_message(self) -> None:
+        import time
+
+        broker = AsyncBroker()
+        task, message = await self._make_stuck_task_and_message(broker)
+        deadline = time.monotonic() - 1.0  # already past
+
+        await broker._wait_in_flight(deadline)
+
+        assert task.cancelled()
+        message.nack_async.assert_awaited_once_with(requeue=True)
+
+    @pytest.mark.asyncio
+    async def test_does_not_nack_already_settled_message(self) -> None:
+        """The handler reached its own ack/nack before being cut off --
+        must not double-settle."""
+        import time
+
+        broker = AsyncBroker()
+        task, message = await self._make_stuck_task_and_message(broker, settled=True)
+        deadline = time.monotonic() - 1.0
+
+        await broker._wait_in_flight(deadline)
+
+        assert task.cancelled()
+        message.nack_async.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_logs_delivery_tag_of_abandoned_message(self) -> None:
+        import time
+
+        broker = AsyncBroker()
+        _task, message = await self._make_stuck_task_and_message(broker)
+        deadline = time.monotonic() - 1.0
+
+        with patch("rabbitkit.async_.broker.logger") as mock_logger:
+            await broker._wait_in_flight(deadline)
+
+        warning_calls = [c for c in mock_logger.warning.call_args_list if "delivery_tag" in c.args[0]]
+        assert len(warning_calls) == 1
+        assert warning_calls[0].args[1] == message.delivery_tag
+        assert warning_calls[0].args[2] == message.message_id
+
+    @pytest.mark.asyncio
+    async def test_nack_raising_is_logged_not_raised(self) -> None:
+        """A dead channel can make the abandonment nack itself raise --
+        that must not abort the drain (the message redelivers via
+        connection-loss anyway), just get logged."""
+        import time
+
+        broker = AsyncBroker()
+        _task, message = await self._make_stuck_task_and_message(broker)
+        message.nack_async = AsyncMock(side_effect=RuntimeError("channel closed"))
+        deadline = time.monotonic() - 1.0
+
+        with patch("rabbitkit.async_.broker.logger") as mock_logger:
+            await broker._wait_in_flight(deadline)  # must NOT raise
+
+        assert any(
+            "nack on abandoned handler" in c.args[0] for c in mock_logger.warning.call_args_list
+        )
+
+
 # ── async publish() kwargs form ───────────────────────────────────────────
 
 
@@ -2027,3 +2175,156 @@ class TestAsyncWaitInFlightDeadlineNotExpired:
 
         # in_flight still 1 — drained via timeout, not via dec.
         assert broker._in_flight == 1
+
+
+class TestPublishSizeGuardAsync:
+    """M10: async publish rejects oversized bodies when a cap is set."""
+
+    async def test_oversized_body_raises(self) -> None:
+        from rabbitkit.core.config import PublisherConfig
+
+        broker = AsyncBroker(RabbitConfig(publisher=PublisherConfig(max_message_bytes=10)))
+        broker._transport = AsyncMock()
+        broker._started = True
+        with pytest.raises(ValueError, match="exceeds"):
+            await broker.publish(routing_key="orders", body=b"way-too-long-body")
+
+
+class TestWireReconnectMetricAsync:
+    """Async mirror of the sync TestWireReconnectMetric -- connection-churn
+    counter wiring via the first route MetricsMiddleware's collector."""
+
+    def test_registers_callback_when_metrics_middleware_present(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_reconnect.assert_called_once()
+        registered_cb = broker._transport.on_reconnect.call_args.args[0]
+        registered_cb()
+        collector.inc_counter.assert_called_once()
+        assert collector.inc_counter.call_args.args[0].endswith("_reconnects_total")
+
+    def test_noop_without_metrics_middleware(self) -> None:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_reconnect.assert_not_called()
+
+    def test_noop_without_transport(self) -> None:
+        broker = AsyncBroker()
+        broker._transport = None
+        broker._wire_reconnect_metric()  # must not raise
+
+
+class TestFlowControlledInternalPublishAsync:
+    """M18 async mirror — see the sync test class docstring for rationale."""
+
+    async def test_no_flow_controller_passes_through_directly(self) -> None:
+        broker = AsyncBroker()
+        broker._transport = AsyncMock()
+        broker._transport.publish.return_value = PublishOutcome(status=PublishStatus.CONFIRMED)
+        env = MessageEnvelope(routing_key="q", body=b"x")
+
+        outcome = await broker._flow_controlled_internal_publish(env)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        broker._transport.publish.assert_called_once_with(env)
+
+    async def test_flow_controller_acquires_and_releases_on_success(self) -> None:
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = AsyncBroker()
+        broker._transport = AsyncMock()
+        broker._transport.publish.return_value = PublishOutcome(status=PublishStatus.CONFIRMED)
+        broker.flow_controller = FlowController()
+        env = MessageEnvelope(routing_key="q", body=b"x")
+
+        outcome = await broker._flow_controlled_internal_publish(env)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        assert broker.flow_controller.in_flight == 0  # released after publish
+
+    async def test_drop_policy_returns_failed_outcome_without_publishing(self) -> None:
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = AsyncBroker()
+        broker._transport = AsyncMock()
+        broker.flow_controller = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="drop"))
+        await broker.flow_controller.acquire_async()  # saturate the single slot
+
+        env = MessageEnvelope(routing_key="q", body=b"x")
+        outcome = await broker._flow_controlled_internal_publish(env)
+
+        assert not outcome.ok
+        assert isinstance(outcome.error, BackpressureError)
+        broker._transport.publish.assert_not_called()
+
+    async def test_raise_policy_never_escapes_as_exception(self) -> None:
+        """Critical safety property: on_blocked='raise' must still return a
+        failed outcome, not raise -- see the sync test for why."""
+        from rabbitkit.core.config import BackpressureConfig
+        from rabbitkit.highload.backpressure import FlowController
+
+        broker = AsyncBroker()
+        broker._transport = AsyncMock()
+        broker.flow_controller = FlowController(BackpressureConfig(max_in_flight=1, on_blocked="raise"))
+        await broker.flow_controller.acquire_async()  # saturate the single slot
+
+        env = MessageEnvelope(routing_key="q", body=b"x")
+        outcome = await broker._flow_controlled_internal_publish(env)  # must NOT raise
+
+        assert not outcome.ok
+        assert isinstance(outcome.error, BackpressureError)
+        broker._transport.publish.assert_not_called()
+
+    def test_retry_middleware_wired_with_flow_controlled_publish_not_raw(self) -> None:
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        broker = AsyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_retry_middleware()
+
+        retry_mw = next(
+            mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware)
+        )
+        assert retry_mw._publish_async_fn == broker._flow_controlled_internal_publish
+
+
+class TestSigningRetryConflictAsync:
+    """H1: signing + retry on the same route destroys every retried message."""
+
+    def test_signing_plus_retry_raises(self) -> None:
+        from rabbitkit.core.errors import ConfigurationError
+        from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
+
+        broker = AsyncBroker()
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+
+        @broker.subscriber(queue="orders", retry=RetryConfig(max_retries=1, delays=(5,)), middlewares=[signing])
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        with pytest.raises(ConfigurationError, match="SigningMiddleware is incompatible with retry"):
+            broker._wire_retry_middleware()

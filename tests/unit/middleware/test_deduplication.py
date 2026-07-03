@@ -9,7 +9,12 @@ import pytest
 
 from rabbitkit.core.config import DeduplicationConfig
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import REQUEUED_FOR_RETRY, PublishOutcome, PublishStatus
+from rabbitkit.core.types import (
+    REQUEUED_FOR_RETRY,
+    DeduplicationMarkPolicy,
+    PublishOutcome,
+    PublishStatus,
+)
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 from rabbitkit.middleware.retry import RetryMiddleware
 
@@ -38,6 +43,14 @@ class _FakeRedis:
     def __init__(self) -> None:
         self._store: dict[str, str] = {}
         self.set_calls: list[dict] = []
+        self.exists_calls: list[str] = []
+
+    def exists(self, key: str) -> int:
+        self.exists_calls.append(key)
+        return 1 if key in self._store else 0
+
+    def get(self, key: str) -> str | None:
+        return self._store.get(key)
 
     def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
         self.set_calls.append({"key": key, "value": value, "nx": nx, "ex": ex})
@@ -49,6 +62,7 @@ class _FakeRedis:
     def clear(self) -> None:
         self._store.clear()
         self.set_calls.clear()
+        self.exists_calls.clear()
 
 
 class _FakeAsyncRedis:
@@ -57,6 +71,14 @@ class _FakeAsyncRedis:
     def __init__(self) -> None:
         self._store: dict[str, str] = {}
         self.set_calls: list[dict] = []
+        self.exists_calls: list[str] = []
+
+    async def exists(self, key: str) -> int:
+        self.exists_calls.append(key)
+        return 1 if key in self._store else 0
+
+    async def get(self, key: str) -> str | None:
+        return self._store.get(key)
 
     async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
         self.set_calls.append({"key": key, "value": value, "nx": nx, "ex": ex})
@@ -67,14 +89,20 @@ class _FakeAsyncRedis:
 
 
 class _ErrorRedis:
-    """Redis mock that always raises on set."""
+    """Redis mock that always raises on exists/set."""
+
+    def exists(self, *args: object, **kwargs: object) -> None:
+        raise ConnectionError("Redis is down")
 
     def set(self, *args: object, **kwargs: object) -> None:
         raise ConnectionError("Redis is down")
 
 
 class _AsyncErrorRedis:
-    """Async Redis mock that always raises on set."""
+    """Async Redis mock that always raises on exists/set."""
+
+    async def exists(self, *args: object, **kwargs: object) -> None:
+        raise ConnectionError("Redis is down")
 
     async def set(self, *args: object, **kwargs: object) -> None:
         raise ConnectionError("Redis is down")
@@ -963,9 +991,12 @@ class _AsyncDeleteErrorRedis(_FakeAsyncRedis):
         raise ConnectionError("async delete failed")
 
 
-class TestHandlerFailureKeyCleanup:
-    def test_handler_failure_deletes_key(self) -> None:
-        """on_success: when handler raises, the dedup key is deleted from Redis."""
+class TestHandlerFailureLeavesNoMark:
+    """on_success: the key is written only AFTER handler success, so a failed
+    handler leaves nothing in Redis — no mark, no cleanup delete — and the
+    redelivery is processed for real."""
+
+    def test_handler_failure_leaves_no_mark_and_redelivery_processes(self) -> None:
         redis = _DeleteTrackingRedis()
         mw = DeduplicationMiddleware(redis_client=redis)
 
@@ -978,24 +1009,16 @@ class TestHandlerFailureKeyCleanup:
         with pytest.raises(ValueError, match="handler error"):
             mw.consume_scope(failing_handler, msg)
 
-        assert key in redis.delete_calls
+        assert key not in redis._store  # nothing was marked
+        assert redis.delete_calls == []  # and nothing needed cleanup
 
-    def test_handler_failure_delete_error_logged_not_raised(self) -> None:
-        """on_success: when handler fails AND Redis delete fails, error is logged (not re-raised)."""
-        redis = _DeleteErrorRedis()
-        mw = DeduplicationMiddleware(redis_client=redis)
+        # Redelivery is processed, not dropped as a duplicate
+        msg2 = _make_message(message_id="fail-msg")
+        handler = MagicMock(return_value="processed")
+        assert mw.consume_scope(handler, msg2) == "processed"
+        handler.assert_called_once()
 
-        msg = _make_message(message_id="fail-delete-msg")
-
-        def failing_handler(m: RabbitMessage) -> str:
-            raise ValueError("handler error")
-
-        # The original handler error should propagate, not the delete error
-        with pytest.raises(ValueError, match="handler error"):
-            mw.consume_scope(failing_handler, msg)
-
-    async def test_async_handler_failure_deletes_key(self) -> None:
-        """on_success async: when handler raises, the dedup key is deleted from Redis."""
+    async def test_async_handler_failure_leaves_no_mark_and_redelivery_processes(self) -> None:
         redis = _AsyncDeleteTrackingRedis()
         mw = DeduplicationMiddleware(redis_client=redis)
 
@@ -1008,20 +1031,203 @@ class TestHandlerFailureKeyCleanup:
         with pytest.raises(ValueError, match="async handler error"):
             await mw.consume_scope_async(failing_handler, msg)
 
-        assert key in redis.delete_calls
+        assert key not in redis._store
+        assert redis.delete_calls == []
 
-    async def test_async_handler_failure_delete_error_logged_not_raised(self) -> None:
-        """on_success async: delete error after handler failure is logged, not re-raised."""
-        redis = _AsyncDeleteErrorRedis()
+        msg2 = _make_message(message_id="async-fail-msg")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "processed"
+
+        assert await mw.consume_scope_async(handler, msg2) == "processed"
+
+
+# ── C1 regression: crash mid-handler must not lose the redelivery ─────────
+
+
+class TestCrashSafety:
+    """Regression for the C1 audit finding: with mark_policy="on_success" the
+    dedup key must NOT be written before the handler runs. A consumer killed
+    mid-handler (OOM/SIGKILL — no except/finally runs) must leave no mark, so
+    the broker's redelivery of the unacked message is processed, not
+    acked-and-skipped as a duplicate."""
+
+    def test_crash_mid_handler_does_not_drop_redelivery(self) -> None:
+        redis = _FakeRedis()
         mw = DeduplicationMiddleware(redis_client=redis)
 
-        msg = _make_message(message_id="async-fail-delete-msg")
+        msg = _make_message(message_id="crash-msg")
+        key = mw._extract_key(msg)
 
-        async def failing_handler(m: RabbitMessage) -> str:
-            raise ValueError("async handler error")
+        def crashing_handler(m: RabbitMessage) -> str:
+            # The core invariant: no write happened before the handler. If a
+            # SIGKILL landed here, Redis must hold nothing for this key.
+            assert key not in redis._store
+            assert redis.set_calls == []
+            # BaseException — bypasses any `except Exception` cleanup, the
+            # closest in-process simulation of abrupt death.
+            raise KeyboardInterrupt("simulated OOM-kill")
 
-        with pytest.raises(ValueError, match="async handler error"):
-            await mw.consume_scope_async(failing_handler, msg)
+        with pytest.raises(KeyboardInterrupt):
+            mw.consume_scope(crashing_handler, msg)
+
+        assert key not in redis._store
+
+        # The broker redelivers the unacked message → it must be processed
+        msg2 = _make_message(message_id="crash-msg")
+        handler = MagicMock(return_value="processed")
+        assert mw.consume_scope(handler, msg2) == "processed"
+        handler.assert_called_once()
+
+    async def test_async_crash_mid_handler_does_not_drop_redelivery(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis)
+
+        msg = _make_message(message_id="async-crash-msg")
+        key = mw._extract_key(msg)
+
+        async def crashing_handler(m: RabbitMessage) -> str:
+            assert key not in redis._store
+            assert redis.set_calls == []
+            raise KeyboardInterrupt("simulated OOM-kill")
+
+        with pytest.raises(KeyboardInterrupt):
+            await mw.consume_scope_async(crashing_handler, msg)
+
+        assert key not in redis._store
+
+        msg2 = _make_message(message_id="async-crash-msg")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "processed"
+
+        assert await mw.consume_scope_async(handler, msg2) == "processed"
+
+    def test_mark_happens_only_after_handler_success(self) -> None:
+        """Ordering check: zero Redis writes before/inside the handler, exactly
+        one (the success mark) after it returns."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis)
+        msg = _make_message(message_id="ordering-msg")
+
+        def handler(m: RabbitMessage) -> str:
+            assert redis.set_calls == []
+            return "ok"
+
+        assert mw.consume_scope(handler, msg) == "ok"
+        assert len(redis.set_calls) == 1
+
+
+# ── success-mark Redis error must never raise after the handler ran ───────
+
+
+class _SetErrorRedis:
+    """exists() works; set() raises — simulates Redis dying between the dedup
+    check and the success-mark."""
+
+    def exists(self, key: str) -> int:
+        return 0
+
+    def set(self, *args: object, **kwargs: object) -> None:
+        raise ConnectionError("Redis died before mark")
+
+
+class _AsyncSetErrorRedis:
+    async def exists(self, key: str) -> int:
+        return 0
+
+    async def set(self, *args: object, **kwargs: object) -> None:
+        raise ConnectionError("Redis died before mark")
+
+
+class TestSuccessMarkError:
+    """A Redis failure while writing the success-mark must never raise — the
+    handler's side effects are already done; raising would nack → redeliver →
+    a guaranteed duplicate execution. Applies even with
+    fallback_on_redis_error=False."""
+
+    @pytest.mark.parametrize("fallback", [True, False])
+    def test_mark_error_after_success_returns_result(self, fallback: bool) -> None:
+        mw = DeduplicationMiddleware(
+            redis_client=_SetErrorRedis(),
+            config=DeduplicationConfig(fallback_on_redis_error=fallback),
+        )
+        msg = _make_message(message_id="mark-err-msg")
+        result = mw.consume_scope(MagicMock(return_value="done"), msg)
+        assert result == "done"
+
+    @pytest.mark.parametrize("fallback", [True, False])
+    async def test_async_mark_error_after_success_returns_result(self, fallback: bool) -> None:
+        mw = DeduplicationMiddleware(
+            redis_client=_AsyncSetErrorRedis(),
+            config=DeduplicationConfig(fallback_on_redis_error=fallback),
+        )
+        msg = _make_message(message_id="async-mark-err-msg")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "done"
+
+        assert await mw.consume_scope_async(handler, msg) == "done"
+
+
+# ── on_start: sentinel cleanup delete error is logged, not raised ─────────
+
+
+class TestOnStartCleanupError:
+    def test_on_start_sentinel_cleanup_delete_error_logged_not_raised(self) -> None:
+        redis = _DeleteErrorRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=DeduplicationConfig(mark_policy="on_start"))
+        msg = _make_message(message_id="onstart-cleanup-err")
+
+        result = mw.consume_scope(lambda m: REQUEUED_FOR_RETRY, msg)
+        assert result is REQUEUED_FOR_RETRY  # delete error swallowed, sentinel intact
+
+    async def test_on_start_async_sentinel_cleanup_delete_error_logged_not_raised(self) -> None:
+        redis = _AsyncDeleteErrorRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=DeduplicationConfig(mark_policy="on_start"))
+        msg = _make_message(message_id="onstart-async-cleanup-err")
+
+        async def inner(m: RabbitMessage) -> Any:
+            return REQUEUED_FOR_RETRY
+
+        result = await mw.consume_scope_async(inner, msg)
+        assert result is REQUEUED_FOR_RETRY
+
+
+# ── local LRU thread safety ───────────────────────────────────────────────
+
+
+class TestLocalCacheThreadSafety:
+    def test_concurrent_mark_check_remove_do_not_corrupt(self) -> None:
+        """The local cache is mutated from sync worker-pool daemon threads;
+        concurrent mark/check/remove with eviction pressure must not raise
+        (unlocked OrderedDict mutation can KeyError mid-eviction)."""
+        import threading
+
+        redis = _FakeRedis()
+        config = DeduplicationConfig(local_cache_size=8)
+        mw = DeduplicationMiddleware(redis_client=redis, config=config)
+        errors: list[BaseException] = []
+
+        def hammer(worker: int) -> None:
+            try:
+                for i in range(2000):
+                    key = f"k-{worker}-{i % 32}"
+                    mw._local_mark(key)
+                    mw._local_is_dup(key)
+                    mw._local_remove(f"k-{worker}-{(i + 7) % 32}")
+            except BaseException as exc:  # collect for assertion on the main thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert mw._local_cache is not None
+        assert len(mw._local_cache) <= config.local_cache_size
 
 
 # ── H8: dedup + retry composition must not silently drop the retry ────────
@@ -1067,16 +1273,15 @@ class TestRetryRequeueComposition:
             return "ok"
 
         # First delivery: handler fails, retry requeues (acks + delay-queue
-        # publish). dedup must see this as "not done" and delete its key.
+        # publish). dedup must see this as "not done" and skip the mark.
         result1 = mw.consume_scope(lambda m: retry_mw.consume_scope(handler, m), msg)
         assert result1 is REQUEUED_FOR_RETRY
         assert call_count == 1
-        assert key in redis.delete_calls
         assert key not in redis._store  # key was NOT left marked
 
         # Second delivery (the "retry"): same dedup key, message_id
         # preserved by RetryMiddleware's own envelope construction. Because
-        # the key was cleaned up, this is NOT treated as a duplicate --
+        # the key was never marked, this is NOT treated as a duplicate --
         # the handler actually runs and processes it.
         msg2 = _make_message(message_id="h8-msg")  # same key as msg
         msg2._ack_fn = MagicMock()
@@ -1108,7 +1313,6 @@ class TestRetryRequeueComposition:
         result1 = await mw.consume_scope_async(inner1, msg)
         assert result1 is REQUEUED_FOR_RETRY
         assert call_count == 1
-        assert key in redis.delete_calls
         assert key not in redis._store
 
         msg2 = _make_message(message_id="h8-async-msg")
@@ -1162,10 +1366,10 @@ class TestRetryRequeueComposition:
         assert key in redis.delete_calls
         assert key not in redis._store
 
-    def test_permanent_failure_still_propagates_and_deletes_key(self) -> None:
+    def test_permanent_failure_still_propagates_and_leaves_no_mark(self) -> None:
         """Sanity check: a PERMANENT (non-retryable) failure still raises
-        through retry (terminal path) and dedup's normal exception-cleanup
-        branch handles it -- REQUEUED_FOR_RETRY is only for the requeued case."""
+        through retry (terminal path); dedup never marked anything, so the
+        message can dead-letter and be replayed without a stale dedup key."""
         redis = _DeleteTrackingRedis()
         mw = DeduplicationMiddleware(redis_client=redis)
         retry_mw = self._retry_mw_that_requeues()
@@ -1179,8 +1383,438 @@ class TestRetryRequeueComposition:
         with pytest.raises(ValueError, match="permanent"):
             mw.consume_scope(lambda m: retry_mw.consume_scope(failing_handler, m), msg)
 
-        assert key in redis.delete_calls
+        assert key not in redis._store
 
 
 def test_requeued_for_retry_repr() -> None:
     assert repr(REQUEUED_FOR_RETRY) == "REQUEUED_FOR_RETRY"
+
+
+# ── claim mark_policy ─────────────────────────────────────────────────────
+
+
+def _claim_config(**overrides: object) -> DeduplicationConfig:
+    defaults: dict[str, object] = {"mark_policy": "claim", "processing_timeout": 60, "ttl": 3600}
+    defaults.update(overrides)
+    return DeduplicationConfig(**defaults)  # type: ignore[arg-type]
+
+
+class TestClaimPolicy:
+    def test_fresh_message_claims_then_completes(self) -> None:
+        """claim: in-flight written before the handler (with processing_timeout),
+        completed written after success (with full ttl)."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-fresh")
+        key = mw._extract_key(msg)
+
+        def handler(m: RabbitMessage) -> str:
+            # While the handler runs, the key must be a live in-flight claim
+            assert redis._store[key] == "in-flight"
+            return "ok"
+
+        assert mw.consume_scope(handler, msg) == "ok"
+
+        claim_call, complete_call = redis.set_calls
+        assert claim_call == {"key": key, "value": "in-flight", "nx": True, "ex": 60}
+        assert complete_call == {"key": key, "value": "completed", "nx": False, "ex": 3600}
+        assert redis._store[key] == "completed"
+
+    def test_enum_member_selects_claim(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(
+            redis_client=redis,
+            config=DeduplicationConfig(mark_policy=DeduplicationMarkPolicy.CLAIM),
+        )
+        msg = _make_message(message_id="claim-enum")
+        assert mw.consume_scope(MagicMock(return_value="ok"), msg) == "ok"
+        assert redis.set_calls[0]["value"] == "in-flight"
+
+    def test_in_flight_duplicate_is_nack_requeued(self) -> None:
+        """A concurrent copy that sees a live claim is requeued (NOT acked),
+        so it survives if the claiming consumer dies mid-handler."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-inflight")
+        key = mw._extract_key(msg)
+        redis._store[key] = "in-flight"  # another consumer's live claim
+
+        msg._ack_fn = MagicMock()
+        msg._nack_fn = MagicMock()
+        handler = MagicMock()
+
+        result = mw.consume_scope(handler, msg)
+
+        assert result is None
+        handler.assert_not_called()
+        msg._nack_fn.assert_called_once_with(True)  # requeue=True
+        msg._ack_fn.assert_not_called()
+
+    def test_in_flight_duplicate_ack_skip_mode(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config(on_in_flight="ack_skip"))
+
+        msg = _make_message(message_id="claim-ackskip")
+        redis._store[mw._extract_key(msg)] = "in-flight"
+        msg._ack_fn = MagicMock()
+        msg._nack_fn = MagicMock()
+
+        assert mw.consume_scope(MagicMock(), msg) is None
+        msg._ack_fn.assert_called_once()
+        msg._nack_fn.assert_not_called()
+
+    def test_completed_duplicate_is_acked_and_skipped(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-completed")
+        redis._store[mw._extract_key(msg)] = "completed"
+        msg._ack_fn = MagicMock()
+        handler = MagicMock()
+
+        assert mw.consume_scope(handler, msg) is None
+        handler.assert_not_called()
+        msg._ack_fn.assert_called_once()
+
+    def test_legacy_on_success_value_treated_as_completed(self) -> None:
+        """A key written as "1" by an on_success/on_start deployment must read
+        as completed, so switching an existing deployment to claim is safe."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-legacy")
+        redis._store[mw._extract_key(msg)] = "1"
+        msg._ack_fn = MagicMock()
+        handler = MagicMock()
+
+        assert mw.consume_scope(handler, msg) is None
+        handler.assert_not_called()
+        msg._ack_fn.assert_called_once()
+
+    def test_bytes_in_flight_value_recognized(self) -> None:
+        """Real redis clients (decode_responses=False) return bytes from GET."""
+        assert DeduplicationMiddleware._is_in_flight(b"in-flight") is True
+        assert DeduplicationMiddleware._is_in_flight(b"completed") is False
+        assert DeduplicationMiddleware._is_in_flight(b"1") is False
+        assert DeduplicationMiddleware._is_in_flight("in-flight") is True
+        # None = claim expired between the failed SET NX and the GET —
+        # treated as in-flight so the requeued copy re-claims cleanly.
+        assert DeduplicationMiddleware._is_in_flight(None) is True
+
+    def test_handler_failure_releases_claim_and_redelivery_reprocesses(self) -> None:
+        redis = _DeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-fail")
+        key = mw._extract_key(msg)
+
+        def failing_handler(m: RabbitMessage) -> str:
+            raise ValueError("handler error")
+
+        with pytest.raises(ValueError, match="handler error"):
+            mw.consume_scope(failing_handler, msg)
+
+        assert key in redis.delete_calls  # claim released for immediate retry
+        assert key not in redis._store
+
+        msg2 = _make_message(message_id="claim-fail")
+        handler = MagicMock(return_value="processed")
+        assert mw.consume_scope(handler, msg2) == "processed"
+
+    def test_retry_sentinel_releases_claim_without_completing(self) -> None:
+        redis = _DeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-sentinel")
+        key = mw._extract_key(msg)
+
+        result = mw.consume_scope(lambda m: REQUEUED_FOR_RETRY, msg)
+
+        assert result is REQUEUED_FOR_RETRY
+        assert key in redis.delete_calls
+        assert key not in redis._store
+
+    def test_crash_mid_handler_leaves_only_expiring_claim(self) -> None:
+        """C1-equivalent for claim: a crash mid-handler leaves ONLY the
+        in-flight claim (which Redis expires after processing_timeout) —
+        never a completed mark, so the redelivery is eventually processed."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="claim-crash")
+        key = mw._extract_key(msg)
+
+        def crashing_handler(m: RabbitMessage) -> str:
+            raise KeyboardInterrupt("simulated OOM-kill")  # BaseException: no cleanup
+
+        with pytest.raises(KeyboardInterrupt):
+            mw.consume_scope(crashing_handler, msg)
+
+        assert redis._store[key] == "in-flight"  # not completed
+        assert redis.set_calls[0]["ex"] == 60  # bounded by processing_timeout
+
+        # Simulate the claim expiring, then the broker redelivering
+        del redis._store[key]
+        msg2 = _make_message(message_id="claim-crash")
+        handler = MagicMock(return_value="processed")
+        assert mw.consume_scope(handler, msg2) == "processed"
+
+    def test_completed_flip_error_never_raises(self) -> None:
+        """Redis dying between handler success and the completed-flip must not
+        raise — the handler's side effects are committed."""
+
+        class _FlipErrorRedis(_FakeRedis):
+            def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+                if value == "completed":
+                    raise ConnectionError("Redis died before completed-flip")
+                return super().set(key, value, nx=nx, ex=ex)
+
+        mw = DeduplicationMiddleware(
+            redis_client=_FlipErrorRedis(),
+            config=_claim_config(fallback_on_redis_error=False),
+        )
+        msg = _make_message(message_id="claim-flip-err")
+        assert mw.consume_scope(MagicMock(return_value="done"), msg) == "done"
+
+    def test_claim_redis_error_fallback_and_fail_closed(self) -> None:
+        mw_open = DeduplicationMiddleware(
+            redis_client=_ErrorRedis(), config=_claim_config(fallback_on_redis_error=True)
+        )
+        msg = _make_message(message_id="claim-redis-err")
+        assert mw_open.consume_scope(MagicMock(return_value="ok"), msg) == "ok"
+
+        mw_closed = DeduplicationMiddleware(
+            redis_client=_ErrorRedis(), config=_claim_config(fallback_on_redis_error=False)
+        )
+        with pytest.raises(ConnectionError, match="Redis is down"):
+            mw_closed.consume_scope(MagicMock(), _make_message(message_id="claim-redis-err-2"))
+
+    def test_local_cache_short_circuits_claim(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config(local_cache_size=10))
+
+        msg1 = _make_message(message_id="claim-lc")
+        mw.consume_scope(MagicMock(return_value="ok"), msg1)
+        calls_before = len(redis.set_calls)
+
+        msg2 = _make_message(message_id="claim-lc")
+        msg2._ack_fn = MagicMock()
+        handler = MagicMock()
+        assert mw.consume_scope(handler, msg2) is None
+        handler.assert_not_called()
+        msg2._ack_fn.assert_called_once()
+        assert len(redis.set_calls) == calls_before  # Redis never touched
+
+    # ── async variants ────────────────────────────────────────────────────
+
+    async def test_async_fresh_message_claims_then_completes(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="async-claim-fresh")
+        key = mw._extract_key(msg)
+
+        async def handler(m: RabbitMessage) -> str:
+            assert redis._store[key] == "in-flight"
+            return "ok"
+
+        assert await mw.consume_scope_async(handler, msg) == "ok"
+        assert redis._store[key] == "completed"
+        assert redis.set_calls[0]["ex"] == 60
+        assert redis.set_calls[1]["ex"] == 3600
+
+    async def test_async_in_flight_duplicate_is_nack_requeued(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="async-claim-inflight")
+        redis._store[mw._extract_key(msg)] = "in-flight"
+
+        nack_args: list[bool] = []
+
+        async def nack_fn(requeue: bool) -> None:
+            nack_args.append(requeue)
+
+        msg._nack_async_fn = nack_fn
+        call_count = 0
+
+        async def handler(m: RabbitMessage) -> str:
+            nonlocal call_count
+            call_count += 1
+            return "should not run"
+
+        assert await mw.consume_scope_async(handler, msg) is None
+        assert call_count == 0
+        assert nack_args == [True]
+
+    async def test_async_in_flight_duplicate_ack_skip_mode(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config(on_in_flight="ack_skip"))
+
+        msg = _make_message(message_id="async-claim-ackskip")
+        redis._store[mw._extract_key(msg)] = "in-flight"
+
+        ack_called = False
+
+        async def ack_fn() -> None:
+            nonlocal ack_called
+            ack_called = True
+
+        msg._ack_async_fn = ack_fn
+
+        assert await mw.consume_scope_async(MagicMock(), msg) is None
+        assert ack_called is True
+
+    async def test_async_completed_duplicate_is_acked_and_skipped(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="async-claim-completed")
+        redis._store[mw._extract_key(msg)] = "completed"
+
+        ack_called = False
+
+        async def ack_fn() -> None:
+            nonlocal ack_called
+            ack_called = True
+
+        msg._ack_async_fn = ack_fn
+
+        assert await mw.consume_scope_async(MagicMock(), msg) is None
+        assert ack_called is True
+
+    async def test_async_handler_failure_releases_claim(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="async-claim-fail")
+        key = mw._extract_key(msg)
+
+        async def failing_handler(m: RabbitMessage) -> str:
+            raise ValueError("async handler error")
+
+        with pytest.raises(ValueError, match="async handler error"):
+            await mw.consume_scope_async(failing_handler, msg)
+
+        assert key in redis.delete_calls
+        assert key not in redis._store
+
+    async def test_async_retry_sentinel_releases_claim(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+
+        msg = _make_message(message_id="async-claim-sentinel")
+        key = mw._extract_key(msg)
+
+        async def inner(m: RabbitMessage) -> Any:
+            return REQUEUED_FOR_RETRY
+
+        result = await mw.consume_scope_async(inner, msg)
+        assert result is REQUEUED_FOR_RETRY
+        assert key in redis.delete_calls
+        assert key not in redis._store
+
+    async def test_async_completed_flip_error_never_raises(self) -> None:
+        class _AsyncFlipErrorRedis(_FakeAsyncRedis):
+            async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+                if value == "completed":
+                    raise ConnectionError("Redis died before completed-flip")
+                return await super().set(key, value, nx=nx, ex=ex)
+
+        mw = DeduplicationMiddleware(
+            redis_client=_AsyncFlipErrorRedis(),
+            config=_claim_config(fallback_on_redis_error=False),
+        )
+        msg = _make_message(message_id="async-claim-flip-err")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "done"
+
+        assert await mw.consume_scope_async(handler, msg) == "done"
+
+    async def test_async_claim_redis_error_fallback(self) -> None:
+        mw = DeduplicationMiddleware(
+            redis_client=_AsyncErrorRedis(), config=_claim_config(fallback_on_redis_error=True)
+        )
+        msg = _make_message(message_id="async-claim-redis-err")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "ok"
+
+        assert await mw.consume_scope_async(handler, msg) == "ok"
+
+    async def test_async_local_cache_short_circuits_claim(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config(local_cache_size=10))
+
+        msg1 = _make_message(message_id="async-claim-lc")
+
+        async def handler(m: RabbitMessage) -> str:
+            return "ok"
+
+        await mw.consume_scope_async(handler, msg1)
+        calls_before = len(redis.set_calls)
+
+        msg2 = _make_message(message_id="async-claim-lc")
+        ack_called = False
+
+        async def ack_fn() -> None:
+            nonlocal ack_called
+            ack_called = True
+
+        msg2._ack_async_fn = ack_fn
+
+        assert await mw.consume_scope_async(handler, msg2) is None
+        assert ack_called is True
+        assert len(redis.set_calls) == calls_before
+
+    async def test_async_claim_redis_error_fail_closed_raises(self) -> None:
+        mw = DeduplicationMiddleware(
+            redis_client=_AsyncErrorRedis(), config=_claim_config(fallback_on_redis_error=False)
+        )
+
+        async def handler(m: RabbitMessage) -> str:
+            return "unreached"
+
+        with pytest.raises(ConnectionError, match="Redis is down"):
+            await mw.consume_scope_async(handler, _make_message(message_id="async-claim-closed"))
+
+    def test_get_error_after_failed_claim_fallback_and_fail_closed(self) -> None:
+        """SET NX says the key exists, then GET fails: fallback processes,
+        fail-closed raises."""
+
+        class _GetErrorRedis(_FakeRedis):
+            def get(self, key: str) -> str | None:
+                raise ConnectionError("Redis is down")
+
+        redis = _GetErrorRedis()
+        msg = _make_message(message_id="claim-get-err")
+        mw_open = DeduplicationMiddleware(redis_client=redis, config=_claim_config(fallback_on_redis_error=True))
+        redis._store[mw_open._extract_key(msg)] = "in-flight"
+
+        assert mw_open.consume_scope(MagicMock(return_value="ok"), msg) == "ok"
+
+        mw_closed = DeduplicationMiddleware(redis_client=redis, config=_claim_config(fallback_on_redis_error=False))
+        with pytest.raises(ConnectionError, match="Redis is down"):
+            mw_closed.consume_scope(MagicMock(), _make_message(message_id="claim-get-err"))
+
+    async def test_async_get_error_after_failed_claim_fallback_and_fail_closed(self) -> None:
+        class _AsyncGetErrorRedis(_FakeAsyncRedis):
+            async def get(self, key: str) -> str | None:
+                raise ConnectionError("Redis is down")
+
+        redis = _AsyncGetErrorRedis()
+        msg = _make_message(message_id="async-claim-get-err")
+        mw_open = DeduplicationMiddleware(redis_client=redis, config=_claim_config(fallback_on_redis_error=True))
+        redis._store[mw_open._extract_key(msg)] = "in-flight"
+
+        async def handler(m: RabbitMessage) -> str:
+            return "ok"
+
+        assert await mw_open.consume_scope_async(handler, msg) == "ok"
+
+        mw_closed = DeduplicationMiddleware(redis_client=redis, config=_claim_config(fallback_on_redis_error=False))
+        with pytest.raises(ConnectionError, match="Redis is down"):
+            await mw_closed.consume_scope_async(handler, _make_message(message_id="async-claim-get-err"))

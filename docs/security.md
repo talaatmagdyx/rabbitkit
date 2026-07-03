@@ -1,7 +1,8 @@
 # Security Notes
 
 Found a vulnerability in rabbitkit itself (not just a hardening question)?
-See [SECURITY.md](../SECURITY.md) for how to report it privately.
+See [SECURITY.md](https://github.com/talaatmagdy/rabbitkit/blob/main/SECURITY.md)
+for how to report it privately.
 
 ## Safe defaults at a glance
 
@@ -56,6 +57,62 @@ config = RabbitConfig(
 ## Credentials
 
 Use separate RabbitMQ credentials per service. Do not share a single admin account across services. Apply the principle of least privilege: each service should only have permission to publish/consume on its own exchanges and queues.
+
+### Credential rotation
+
+For short-lived / rotated secrets (Vault, IAM), pass a `credentials_provider`
+instead of static `username`/`password`. It is called at every (re)connect,
+so a rotated secret is picked up on the next reconnect with no redeploy:
+
+```python
+from rabbitkit import RabbitConfig, ConnectionConfig
+
+config = RabbitConfig(
+    connection=ConnectionConfig(
+        host="rabbit",
+        credentials_provider=lambda: vault.read("rabbitmq/creds"),  # -> (user, password)
+    )
+)
+```
+
+The provider must be quick and non-blocking (it runs on the connect path).
+Cache the secret and refresh it out-of-band; the reconnect just reads the
+current value.
+
+### Least-privilege consumers with `TopologyMode.PASSIVE_ONLY`
+
+The default `TopologyMode.AUTO_DECLARE` issues `queue.declare`/
+`exchange.declare`/`queue.bind` for every route at startup — which requires
+the connecting user to hold RabbitMQ's **configure** permission on those
+resources, in addition to **write** (publish) and **read** (consume).
+Granting `configure` to every consumer service means any of them could
+redeclare, rebind, or delete topology it doesn't own.
+
+`TopologyMode.PASSIVE_ONLY` only ever *checks* that a queue/exchange already
+exists (`passive=True` declares, which RabbitMQ permits with the read/write
+permissions alone) — it never creates or mutates topology. A dedicated
+topology-owning process/deploy step declares the real topology once (with a
+`configure`-scoped credential), and every consumer/producer service instead
+connects with a credential scoped to just `write`/`read` on its own
+queues/exchanges (via RabbitMQ's per-vhost `set_permissions <user> <conf>
+<write> <read>` regex patterns — an empty or narrowly-scoped `configure`
+pattern):
+
+```python
+from rabbitkit import RabbitConfig, ConnectionConfig
+from rabbitkit.core.types import TopologyMode
+
+config = RabbitConfig(
+    connection=ConnectionConfig(host="rabbit", username="orders-consumer"),
+    topology_mode=TopologyMode.PASSIVE_ONLY,
+)
+```
+
+If the expected topology doesn't exist, `PASSIVE_ONLY` fails fast at startup
+with a clear error instead of silently trying (and being denied permission)
+to create it. `TopologyMode.MANUAL` goes further — it skips topology
+declaration/checking entirely, for callers that manage topology completely
+out-of-band (e.g. via `rabbitmqadmin`/Terraform).
 
 ## Header Validation
 
@@ -144,4 +201,12 @@ unacceptable — payments, anything non-idempotent at the business layer — set
 `fallback_on_redis_error=False` to fail closed (re-raise the Redis error)
 instead.
 
-Set `mark_policy="on_start"` if you need to prevent concurrent duplicate processing at the cost of retry safety.
+If you need to prevent concurrent duplicate processing, use
+`mark_policy="claim"`: it takes an atomic in-flight claim (expiring after
+`processing_timeout`) before the handler and flips it to completed on
+success, so concurrent copies are requeued rather than double-executed and a
+crash mid-handler never loses the message — set `processing_timeout`
+comfortably above your worst-case handler duration. Avoid
+`mark_policy="on_start"` unless you explicitly accept that a crash after the
+mark but before the handler finishes **loses the message** (the redelivery is
+skipped as a duplicate).

@@ -37,13 +37,23 @@ jobs:
       # Do NOT raise this to 100 — it would break the pipeline. Raise it
       # incrementally as new tests close the gap.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as
       # standalone scenarios/properties, not line coverage.
       - name: Security & property tests
         run: .venv/bin/pytest tests/security/ tests/property/ -q --tb=short
+      # Loop Engineering Review: execute README.md's own code blocks
+      # (syntax + import-path resolution for every block, full execution of
+      # the TestBroker example) so the docs can't silently drift from actual
+      # behavior. Given its own step (not buried in the coverage-gated run
+      # above) so a failure here reads unambiguously as "the README is
+      # wrong," not "some unit test broke." This is the class of check that
+      # would have caught C1 (retry=RetryConfig(...) documented as working
+      # while the middleware was never actually installed) sooner.
+      - name: Docs examples
+        run: .venv/bin/pytest tests/unit/test_readme_examples.py -q --tb=short
 
   # Builds the sdist + wheel, validates the long description with `twine
   # check` (the same check PyPI runs at upload time — catches malformed

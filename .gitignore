@@ -45,3 +45,4 @@ coverage.xml
 
 # Local-only production-readiness review notes — never committed
 PRODUCTION_READINESS_REVIEW.md
+LOOP_ENGINEERING_REVIEW.md

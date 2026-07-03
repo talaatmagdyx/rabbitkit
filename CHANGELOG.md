@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1] — 2026-07-03
 
 ### Added
 
@@ -33,6 +33,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshes `last_heartbeat`). Regression-verified by reverting and
   confirming all 6 new tests fail (`AttributeError` on the now-missing
   `pump_idle`/`ensure_connected`).
+
+- **Loop Engineering Review implementation** — a full documentation and
+  reliability-testing pass following the project's own strategic review
+  (`LOOP_ENGINEERING_REVIEW.md`, not tracked in git). Highlights:
+  - **README rewritten from 2,290 to ~240 lines**, cut down to the Stable
+    Core story only (install, minimal consumer/publisher, retry+DLQ,
+    `TestBroker`, FastAPI). Every advanced/experimental feature (RPC,
+    locking, signing, results, streams, the dashboard, the management
+    client, batch publishing/backpressure, the CLI, AsyncAPI generation)
+    moved to `docs/guide/full-guide.md`'s existing numbered sections, with
+    the tier each belongs to stated explicitly instead of read flat as
+    equally "core." This also caught a real bug in the old README: its
+    Quick Start FastAPI example imported from `rabbitkit.integrations.fastapi`,
+    a module that has never existed — the correct path is `rabbitkit.fastapi`.
+  - **`docs/stability-policy.md` rewritten** from a 2-tier (Stable/Experimental)
+    policy that still described the project as "pre-1.0" while shipping
+    `1.1.0`, to a 3-tier taxonomy (Stable Core / Advanced Stable /
+    Experimental) that retroactively formalizes the `1.1.0` freeze for
+    Stable Core specifically, states explicit promotion criteria for an
+    Experimental feature to graduate, and demotes `CircuitBreakerMiddleware`
+    to Advanced Stable (it's a no-op without an external `obskit`-compatible
+    circuit breaker — that dependency was previously undocumented next to a
+    "stable" label).
+  - **New docs**: `docs/production/idempotency.md` (the "at-least-once
+    delivery means your handler can run more than once" contract, with a
+    concrete before/after example), `docs/production/checklist.md`
+    (a public, scannable pre-production checklist), `docs/troubleshooting.md`
+    (symptom → cause → fix), `docs/migration.md` (breaking-change log for
+    Stable/Advanced Stable APIs, seeded with the `rabbitkit.aio` →
+    `rabbitkit.async_` rename), and a new "Sync vs. async: two different
+    connection models" section in `docs/guide/full-guide.md` explaining why
+    `pump_idle()` exists on `SyncBroker` but has no `AsyncBroker` equivalent.
+  - **`docs/security.md` gained a safe-defaults table** (Feature | Safe by
+    default? | What you must configure) consolidating guidance that was
+    previously scattered across docstrings and README prose.
+  - **Corrected stale/incorrect examples found while cross-checking
+    `docs/guide/full-guide.md` against more recently-fixed behavior**: the
+    Message Signing example used non-existent `SigningConfig` kwargs
+    (`key=`/`algorithm="sha256"` instead of the real `secret_key=`/
+    `"hmac-sha256"`); the nonce-cache description still described the L4-era
+    vulnerable behavior (evict-oldest-10%) instead of the fixed
+    reject-when-full-of-live-entries behavior; the Retry section didn't
+    mention retry-count header clamping, the auto-install-middleware
+    behavior, or the quorum-queue `x-delivery-limit` backstop; the
+    Deduplication section didn't mention the `RetryMiddleware`-composition
+    sentinel; the Health Checks section didn't mention the `blocked` field.
+  - **New tests**: `tests/unit/test_public_api.py::TestSyncAsyncBrokerAPIParity`
+    (asserts `SyncBroker`/`AsyncBroker`'s public method surface stays in
+    sync, with an explicit, comment-justified allowlist for the two real
+    asymmetries — `pump_idle`/`request_shutdown`); `tests/unit/test_readme_examples.py`
+    (extracts every ```` ```python ```` block from README.md and checks
+    syntax validity + that every `from rabbitkit... import X` resolves to a
+    real symbol, plus fully executes the `TestBroker` example end-to-end —
+    verified this actually catches a regression by re-introducing the
+    `rabbitkit.integrations.fastapi` bug and confirming the test fails);
+    two new real-broker integration tests in `tests/integration/test_real_rabbitmq.py`:
+    a quorum-queue `x-delivery-limit` test proving the broker-side backstop
+    dead-letters an endlessly-`nack(requeue=True)`'d message with **no**
+    app-level `retry=` configured at all, and `DLQInspector.replay()`
+    coverage against a real broker (previously only unit-tested against a
+    mock transport) including its `predicate=` filter.
+  - **CI**: a new "Docs examples" step in `ci.yml` running
+    `test_readme_examples.py` as its own visible checkpoint (excluded from
+    the coverage-gated unit run so a failure reads unambiguously as "the
+    README is wrong," not "some unit test broke"); a new nightly
+    `dependency-matrix.yml` workflow testing both the pinned-minimum and
+    latest-resolved versions of `pika`/`aio-pika` (2×2 matrix) — building
+    this surfaced a real bug (see Fixed, below).
+  - **`.gitignore`** already covered the local review doc; no change needed
+    there.
+
+### Fixed
+
+- **`DLQInspector.replay()`/`replay_async()` could hang forever when a
+  `predicate=` filter rejected any message.** Both methods nacked
+  (`requeue=True`) non-matching messages *immediately*, inside the same
+  still-running `while True: basic_get(...)` fetch loop. With nothing else
+  consuming from the queue, requeuing mid-loop meant the very next
+  `basic_get()` call could immediately re-fetch that exact message —
+  an infinite cycle for any predicate that ever returns `False`. Existing
+  mock-transport unit tests in `tests/unit/test_dlq.py` never caught this
+  because the mock doesn't simulate real broker requeue/redelivery timing;
+  it only surfaced once a new real-broker integration test
+  (`test_dlq_inspector_replay_async_real_transport`, exercising
+  `predicate=`) was run against an actual RabbitMQ instance, where it hung
+  for 73 seconds before failing with `asyncio.TimeoutError`. Fixed by
+  collecting non-matching messages into a list during the fetch loop and
+  only nacking them with `requeue=True` after the loop has fully exhausted
+  the queue (`basic_get()` returns `None`) — held-but-unsettled messages
+  are invisible to further `basic_get()` calls, so this guarantees
+  termination regardless of how many messages the predicate rejects.
+  Verified against a real broker: both
+  `test_dlq_inspector_replay_sync_real_transport` and
+  `test_dlq_inspector_replay_async_real_transport` now pass, and the
+  existing mock-based `tests/unit/test_dlq.py` suite still passes unchanged
+  against the refactored implementation.
+- **`aio-pika>=9.0.0` (the documented minimum) is broken on any modern
+  Python environment** — `aio-pika==9.0.0` imports `pkg_resources` at
+  module load time, which `setuptools>=81` no longer ships (`pkg_resources`
+  is being removed entirely). Any fresh install that happens to resolve to
+  exactly `9.0.0`, or an old lockfile pinning it, gets a bare
+  `ModuleNotFoundError` importing rabbitkit's own async transport — through
+  no fault of rabbitkit's code. `9.1.0` and later don't have this problem.
+  Found by actually running the new dependency-matrix job against the
+  stated minimum rather than only ever testing whatever pip currently
+  resolves. Bumped the documented minimum from `aio-pika>=9.0.0,<10.0.0` to
+  `aio-pika>=9.1.0,<10.0.0` in `pyproject.toml`, updated the README's
+  Compatibility section and `docs/troubleshooting.md` accordingly, and
+  corrected the new dependency-matrix job's own "minimum" matrix leg to
+  `9.1.0` (it would otherwise permanently red on a problem that has nothing
+  to do with rabbitkit).
 
 ## [1.1.0] — 2026-07-01
 

@@ -97,18 +97,31 @@ class DLQInspector:
 
         Returns:
             Number of messages replayed.
+
+        Loop Engineering Review, Reliability: a non-matching message is
+        **not** nacked (requeued) until after this method's fetch loop has
+        fully exhausted the queue. ``basic_get`` has no natural "already
+        seen this delivery" tracking of its own -- if a non-matching
+        message were requeued immediately, and nothing else is consuming
+        from this queue, the very next ``basic_get`` call in this same loop
+        could immediately re-fetch that exact message, forever, for any
+        predicate that ever returns ``False``. Held-but-unsettled messages
+        are invisible to further ``basic_get`` calls (the broker still
+        considers them delivered-but-unacked), so deferring the nack until
+        after the loop truly exits guarantees termination regardless of how
+        many messages the predicate rejects.
         """
         replayed = 0
+        non_matching: list[RabbitMessage] = []
 
         while True:
             msg = self._transport.basic_get(queue)
             if msg is None:
                 break
 
-            # Apply predicate filter
+            # Apply predicate filter -- hold, don't nack yet (see docstring).
             if predicate is not None and not predicate(msg):
-                if not msg.is_settled:
-                    msg.nack(requeue=True)
+                non_matching.append(msg)
                 continue
 
             # Determine target
@@ -133,6 +146,12 @@ class DLQInspector:
                 msg.ack()
 
             replayed += 1
+
+        # The fetch loop is done (basic_get returned None) -- now it's safe
+        # to requeue non-matching messages; this loop can no longer re-fetch them.
+        for msg in non_matching:
+            if not msg.is_settled:
+                msg.nack(requeue=True)
 
         return replayed
 
@@ -169,8 +188,11 @@ class DLQInspector:
         target_queue: str | None = None,
         target_exchange: str | None = None,
     ) -> int:
-        """Async variant of ``replay``."""
+        """Async variant of ``replay`` -- see its docstring for why
+        non-matching messages are held, not nacked, until the fetch loop
+        has fully exhausted the queue (termination guarantee)."""
         replayed = 0
+        non_matching: list[RabbitMessage] = []
 
         while True:
             msg = await self._transport.basic_get(queue)
@@ -178,8 +200,7 @@ class DLQInspector:
                 break
 
             if predicate is not None and not predicate(msg):
-                if not msg.is_settled:
-                    await msg.nack_async(requeue=True)
+                non_matching.append(msg)
                 continue
 
             rk = target_queue or msg.headers.get("x-rabbitkit-original-queue", msg.routing_key)
@@ -201,6 +222,10 @@ class DLQInspector:
                 await msg.ack_async()
 
             replayed += 1
+
+        for msg in non_matching:
+            if not msg.is_settled:
+                await msg.nack_async(requeue=True)
 
         return replayed
 

@@ -1,0 +1,50 @@
+# Loop Engineering Review, Testing: rabbitkit pins pika/aio-pika to ranges
+# (pika>=1.3.0,<2.0.0; aio-pika>=9.0.0,<10.0.0 -- see pyproject.toml) but the
+# regular CI jobs only ever install whatever pip currently resolves within
+# that range, which drifts toward "latest" over time and never actually
+# exercises the pinned MINIMUM. This job tests both ends of the range
+# nightly, so a real incompatibility at either boundary is caught before a
+# user hits it, not after.
+name: Dependency matrix
+
+on:
+  schedule:
+    # Nightly, 02:00 UTC.
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pika-version: ["1.3.0", "latest"]
+        # 9.1.0, not 9.0.0: aio-pika 9.0.0 imports pkg_resources, which
+        # setuptools>=81 no longer ships -- see pyproject.toml and
+        # docs/troubleshooting.md. This IS the pinned floor, corrected.
+        aio-pika-version: ["9.1.0", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[dev]"
+      - name: Pin pika to matrix version
+        if: matrix.pika-version != 'latest'
+        run: uv pip install "pika==${{ matrix.pika-version }}"
+      - name: Pin aio-pika to matrix version
+        if: matrix.aio-pika-version != 'latest'
+        run: uv pip install "aio-pika==${{ matrix.aio-pika-version }}"
+      - name: Report resolved versions
+        run: .venv/bin/python -c "import pika, aio_pika; print('pika', pika.__version__); print('aio-pika', aio_pika.__version__)"
+      # Unit suite only -- mocked transports, no real broker needed. This
+      # job is about import/API compatibility across the pinned range, not
+      # a full integration re-run (the `integration` job in ci.yml already
+      # covers real-broker behavior on every push, against whatever
+      # currently resolves).
+      - name: Tests
+        run: .venv/bin/pytest tests/unit/ -q --tb=short

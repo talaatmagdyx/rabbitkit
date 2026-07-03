@@ -17,6 +17,7 @@ import pytest
 from rabbitkit.async_.pool import AsyncChannelPool, AsyncConnectionPool
 from rabbitkit.core.config import (
     BackpressureConfig,
+    ConnectionConfig,
     PoolConfig,
     RetryConfig,
     WorkerConfig,
@@ -298,23 +299,16 @@ class TestH3DLQSourceQueueArguments:
         assert args["x-dead-letter-exchange"] == ""
         assert args["x-dead-letter-routing-key"] == "orders.dlq"
 
-    def test_get_source_queue_dlq_arguments_shared(self) -> None:
-        """H3: Shared mode points to shared DLQ."""
-        config = RetryConfig(max_retries=2, delays=(5, 30), per_queue=False)
-        router = RetryRouter(config)
-        args = router.get_source_queue_dlq_arguments("orders")
-
-        assert args["x-dead-letter-routing-key"] == "rabbitkit.dlq"
+    def test_shared_mode_rejected(self) -> None:
+        """H3: shared mode (per_queue=False) misroutes across queues and is
+        now rejected at config construction."""
+        with pytest.raises(ValueError, match="per_queue=False"):
+            RetryConfig(max_retries=2, delays=(5, 30), per_queue=False)
 
     def test_get_dlq_name_per_queue(self) -> None:
         config = RetryConfig(max_retries=1, delays=(5,), per_queue=True)
         router = RetryRouter(config)
         assert router.get_dlq_name("my-queue") == "my-queue.dlq"
-
-    def test_get_dlq_name_shared(self) -> None:
-        config = RetryConfig(max_retries=1, delays=(5,), per_queue=False)
-        router = RetryRouter(config)
-        assert router.get_dlq_name("my-queue") == "rabbitkit.dlq"
 
     def test_dlq_declaration_is_present(self) -> None:
         """H3: DLQ is declared as a durable queue (no TTL)."""
@@ -602,7 +596,7 @@ class TestH1AsyncConnectionPool:
             return conn
 
         pool = AsyncConnectionPool(
-            connection_config=MagicMock(),
+            connection_config=ConnectionConfig(),
             security_config=MagicMock(),
         )
 
@@ -620,7 +614,7 @@ class TestH1AsyncConnectionPool:
     async def test_publisher_channel_pool_is_available(self) -> None:
         """H1: publisher channel pool is created on connect."""
         pool = AsyncConnectionPool(
-            connection_config=MagicMock(),
+            connection_config=ConnectionConfig(),
             security_config=MagicMock(),
         )
 
@@ -634,7 +628,7 @@ class TestH1AsyncConnectionPool:
     async def test_acquire_release_publisher_channel(self) -> None:
         """H1: acquire/release publisher channel round-trips correctly."""
         pool = AsyncConnectionPool(
-            connection_config=MagicMock(),
+            connection_config=ConnectionConfig(),
             security_config=MagicMock(),
             pool_config=PoolConfig(channel_pool_size=2),
         )

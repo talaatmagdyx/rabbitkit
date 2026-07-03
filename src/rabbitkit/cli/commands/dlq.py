@@ -93,11 +93,28 @@ def dlq_replay(
     limit: int = typer.Option(10, "--limit", "-n", help="Maximum messages to replay"),
     routing_key: str | None = typer.Option(None, "--routing-key", "-k", help="Override routing key"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be replayed without publishing"),
+    reset_retry_count: bool = typer.Option(
+        False,
+        "--reset-retry-count",
+        help=(
+            "Strip the retry-count header before replaying, so the message gets a fresh "
+            "retry ladder instead of resuming at its old count (default: preserve headers "
+            "verbatim -- a previously max-retried message is terminal after one more failed "
+            "attempt and returns straight to the DLQ)."
+        ),
+    ),
+    retry_count_header: str = typer.Option(
+        "x-rabbitkit-retry-count",
+        "--retry-count-header",
+        help="Header name --reset-retry-count strips. Match RetryConfig.retry_header if customized.",
+    ),
 ) -> None:
     """Replay messages from a dead-letter queue to a target exchange/queue.
 
-    Messages are consumed from the DLQ and published to the target.
-    On successful publish, the DLQ message is acked (removed).
+    Messages are consumed from the DLQ and published to the target with
+    publisher confirms and ``mandatory=True``. The DLQ message is acked
+    (removed) only after the broker confirms the republish; a failed or
+    unroutable publish is nack-requeued so the message stays on the DLQ.
 
     Example::
 
@@ -109,9 +126,13 @@ def dlq_replay(
 
         # Replay with a specific routing key
         rabbitkit dlq replay orders.created.dlq orders -k orders.created
+
+        # Give a previously max-retried message a fresh retry ladder
+        rabbitkit dlq replay orders.created.dlq orders --reset-retry-count
     """
     try:
         import pika
+        from pika import exceptions as pika_exceptions
     except ImportError:
         typer.echo("pika is required: pip install pika", err=True)
         raise typer.Exit(1) from None
@@ -119,29 +140,51 @@ def dlq_replay(
     params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
+    # Confirms make basic_publish raise on nack/unroutable instead of
+    # fire-and-forget — without this, ack-after-publish can lose the message.
+    channel.confirm_delivery()
 
     replayed = 0
+    failed = 0
     for _ in range(limit):
         method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
         if method is None:
             break
 
         rk = routing_key or method.routing_key
+        if reset_retry_count and properties.headers and retry_count_header in properties.headers:
+            properties.headers.pop(retry_count_header, None)
+
         if dry_run:
             typer.echo(f"[dry-run] Would publish to exchange={target!r} routing_key={rk!r}  body={body[:100]!r}")
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-        else:
+            continue
+
+        try:
             channel.basic_publish(
                 exchange=target,
                 routing_key=rk,
                 body=body,
                 properties=properties,
+                mandatory=True,
             )
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            typer.echo(f"Replayed: routing_key={rk!r}  message_id={properties.message_id}")
-            replayed += 1
+        except (pika_exceptions.UnroutableError, pika_exceptions.NackError) as exc:
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            typer.echo(
+                f"FAILED (stays on DLQ): routing_key={rk!r}  message_id={properties.message_id}  ({exc})",
+                err=True,
+            )
+            failed += 1
+            continue
+
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        typer.echo(f"Replayed: routing_key={rk!r}  message_id={properties.message_id}")
+        replayed += 1
 
     connection.close()
 
     if not dry_run:
         typer.echo(f"\nReplayed {replayed} message(s) from {queue!r} → {target!r}.")
+        if failed:
+            typer.echo(f"{failed} message(s) failed to publish and remain on {queue!r}.", err=True)
+            raise typer.Exit(1)

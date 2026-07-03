@@ -24,7 +24,7 @@ import enum
 import logging
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from rabbitkit.core.config import HealthCheckConfig
@@ -185,24 +185,17 @@ def _get_last_heartbeat(broker: Any) -> float | None:
     return float(hb)
 
 
-def broker_health_check(
+def _local_broker_health_check(
     broker: HealthProvider | Any,
     config: HealthCheckConfig | None = None,
 ) -> BrokerHealthResult:
-    """Check broker health status (sync).
+    """Process-local health check — see :func:`broker_health_check`.
 
-    Args:
-        broker: A broker implementing :class:`HealthProvider` (typed
-            properties) or a legacy broker exposing private attributes
-            (``_started``, ``_transport``, ``_worker_pool``).
-        config: Optional :class:`HealthCheckConfig` to tune thresholds.
-
-    Returns:
-        BrokerHealthResult with status:
-        - HEALTHY: started, connected, not blocked, all consumers active
-        - DEGRADED: started but connection blocked (L15), consumers missing,
-          or pool backlog high
-        - UNHEALTHY: not started or not connected
+    Only inspects *this process's* view of the broker (its own connection,
+    consumers, worker pool). Cannot detect a network partition where this
+    process still holds a live connection to one node while the rest of the
+    cluster is unreachable — that requires an independent signal, which
+    :func:`broker_health_check`'s optional ``management_client`` provides.
     """
     cfg = config or HealthCheckConfig()
 
@@ -266,16 +259,69 @@ def broker_health_check(
     )
 
 
+def _apply_management_check(result: BrokerHealthResult, ok: bool) -> BrokerHealthResult:
+    if ok or result.status == HealthStatus.UNHEALTHY:
+        return result
+    return replace(
+        result,
+        status=HealthStatus.DEGRADED,
+        details={
+            **result.details,
+            "management_check": "failed — this process has a live broker connection, but the "
+            "management API reports the node unhealthy (possible cluster partition)",
+        },
+    )
+
+
+def broker_health_check(
+    broker: HealthProvider | Any,
+    config: HealthCheckConfig | None = None,
+    management_client: Any = None,
+) -> BrokerHealthResult:
+    """Check broker health status (sync).
+
+    Args:
+        broker: A broker implementing :class:`HealthProvider` (typed
+            properties) or a legacy broker exposing private attributes
+            (``_started``, ``_transport``, ``_worker_pool``).
+        config: Optional :class:`HealthCheckConfig` to tune thresholds.
+        management_client: Optional :class:`~rabbitkit.management.RabbitManagementClient`
+            (sync ``.health_check()``). When given, its result is folded in
+            as an additional signal: this process may hold a perfectly live
+            connection to one node while the rest of a partitioned cluster is
+            unreachable, which the process-local checks alone cannot detect.
+            A failing management check downgrades an otherwise-HEALTHY result
+            to DEGRADED (never overrides an UNHEALTHY local result). Omit for
+            the original process-local-only behavior.
+
+    Returns:
+        BrokerHealthResult with status HEALTHY (started, connected, not
+        blocked, all consumers active), DEGRADED (started but connection
+        blocked (L15), consumers missing, pool backlog high, or — with
+        ``management_client`` — the management API reports the node
+        unhealthy), or UNHEALTHY (not started or not connected).
+    """
+    result = _local_broker_health_check(broker, config=config)
+    if management_client is not None and result.status != HealthStatus.UNHEALTHY:
+        result = _apply_management_check(result, management_client.health_check())
+    return result
+
+
 async def broker_health_check_async(
     broker: HealthProvider | Any,
     config: HealthCheckConfig | None = None,
+    management_client: Any = None,
 ) -> BrokerHealthResult:
     """Async variant of broker_health_check.
 
-    Same logic as sync -- transport.is_connected() is always sync.
-    Provided for consistency with async health check frameworks.
+    Same local logic as sync -- transport.is_connected() is always sync.
+    ``management_client`` (if given) must expose an async ``.health_check_async()``
+    — see :func:`broker_health_check` for the rationale and semantics.
     """
-    return broker_health_check(broker, config=config)
+    result = _local_broker_health_check(broker, config=config)
+    if management_client is not None and result.status != HealthStatus.UNHEALTHY:
+        result = _apply_management_check(result, await management_client.health_check_async())
+    return result
 
 
 # Transport contract (I-5): a transport MAY expose any of these optional
@@ -385,20 +431,27 @@ def broker_liveness(broker: HealthProvider | Any, wedged_timeout: float = 60.0) 
     return True
 
 
-def broker_readiness(broker: HealthProvider | Any, config: HealthCheckConfig | None = None) -> bool:
+def broker_readiness(
+    broker: HealthProvider | Any,
+    config: HealthCheckConfig | None = None,
+    management_client: Any = None,
+) -> bool:
     """Readiness probe — is the broker ready to serve traffic right now?
 
     Args:
         broker: A broker implementing :class:`HealthProvider` (typed
             properties) or a legacy broker exposing private attributes.
         config: Optional :class:`HealthCheckConfig` to tune thresholds.
+        management_client: Optional :class:`~rabbitkit.management.RabbitManagementClient`
+            — see :func:`broker_health_check`. A failing management check
+            fails readiness even if this process's own connection looks fine.
 
     Requires: health check not UNHEALTHY, transport connected, connection
     not blocked by broker flow control (L15), and every registered route
     has an active (live) consumer. Use this for load-balancer / ingress
     gating; use :func:`broker_liveness` for restart decisions.
     """
-    result = broker_health_check(broker, config=config)
+    result = broker_health_check(broker, config=config, management_client=management_client)
     if result.status == HealthStatus.UNHEALTHY:
         return False
     if not result.connected:
@@ -407,6 +460,11 @@ def broker_readiness(broker: HealthProvider | Any, config: HealthCheckConfig | N
     # though it's technically still "connected" and may still have live
     # consumers.
     if result.blocked:
+        return False
+    # A failing management check downgrades to DEGRADED rather than
+    # UNHEALTHY (this process's own connection may be fine), but a
+    # partitioned/unreachable node is still not ready for traffic.
+    if "management_check" in result.details:
         return False
     # M-SRE3: every route must have a live consumer. The health check already
     # verified transport connectivity above.
@@ -418,6 +476,25 @@ async def broker_liveness_async(broker: HealthProvider | Any, wedged_timeout: fl
     return broker_liveness(broker, wedged_timeout=wedged_timeout)
 
 
-async def broker_readiness_async(broker: HealthProvider | Any, config: HealthCheckConfig | None = None) -> bool:
-    """Async variant of :func:`broker_readiness`."""
-    return broker_readiness(broker, config=config)
+async def broker_readiness_async(
+    broker: HealthProvider | Any,
+    config: HealthCheckConfig | None = None,
+    management_client: Any = None,
+) -> bool:
+    """Async variant of :func:`broker_readiness`.
+
+    Uses :func:`broker_health_check_async` (``management_client.health_check_async()``)
+    rather than delegating to the sync ``broker_readiness`` — the sync
+    management check makes a blocking network call, which must not run on
+    the event loop.
+    """
+    result = await broker_health_check_async(broker, config=config, management_client=management_client)
+    if result.status == HealthStatus.UNHEALTHY:
+        return False
+    if not result.connected:
+        return False
+    if result.blocked:
+        return False
+    if "management_check" in result.details:
+        return False
+    return result.consumer_count == result.route_count

@@ -5,7 +5,10 @@ Provides inspection and recovery tools for messages stuck in DLQs.
 **Operational realism:**
 - ``peek()`` returns materialized snapshots, not live references
 - ``peek()`` may affect message ordering (basic.get + requeue changes position)
-- ``replay()`` preserves original headers
+- ``replay()`` preserves original headers (pass ``reset_retry_count=True`` to
+  grant the replayed message a fresh retry ladder)
+- ``replay()`` acks a DLQ original only after the republish outcome is OK;
+  failed republishes are nack-requeued so they stay on the DLQ
 - ``purge()`` is immediate and unfiltered — use ``replay()`` for selective recovery
 """
 
@@ -19,6 +22,33 @@ from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import MessageEnvelope
 
 logger = logging.getLogger(__name__)
+
+# Matches RetryConfig.retry_header's default. If you customized retry_header,
+# strip your header via a predicate/pre-processing step instead.
+_RETRY_COUNT_HEADER = "x-rabbitkit-retry-count"
+
+
+class ReplayResult(int):
+    """Replay report that IS the replayed count (int-compatible, so existing
+    ``count = inspector.replay(...)`` callers keep working), with extras:
+
+    - ``failed``: messages whose republish outcome was not OK — they were
+      nack-requeued and REMAIN ON THE DLQ.
+    - ``requeued``: non-matching messages returned to the DLQ (predicate
+      returned False).
+    """
+
+    failed: int
+    requeued: int
+
+    def __new__(cls, replayed: int, failed: int = 0, requeued: int = 0) -> ReplayResult:
+        obj = super().__new__(cls, replayed)
+        obj.failed = failed
+        obj.requeued = requeued
+        return obj
+
+    def __repr__(self) -> str:
+        return f"ReplayResult(replayed={int(self)}, failed={self.failed}, requeued={self.requeued})"
 
 
 class DLQInspector:
@@ -73,17 +103,60 @@ class DLQInspector:
 
         return messages
 
+    @staticmethod
+    def _build_replay_envelope(
+        msg: RabbitMessage,
+        target_queue: str | None,
+        target_exchange: str | None,
+        reset_retry_count: bool,
+    ) -> MessageEnvelope:
+        """Build the republish envelope for one DLQ message.
+
+        ``mandatory=True`` so an unroutable target comes back as a
+        ``RETURNED`` outcome instead of being broker-confirmed into the void.
+        """
+        rk = target_queue or msg.headers.get("x-rabbitkit-original-queue", msg.routing_key)
+        headers = dict(msg.headers)
+        if reset_retry_count:
+            headers.pop(_RETRY_COUNT_HEADER, None)
+        return MessageEnvelope(
+            routing_key=rk,
+            body=msg.body,
+            exchange=target_exchange if target_exchange is not None else "",
+            headers=headers,
+            message_id=msg.message_id or "",
+            correlation_id=msg.correlation_id,
+            content_type=msg.content_type or "application/octet-stream",
+            content_encoding=msg.content_encoding,
+            # Preserve the remaining original message properties -- these used
+            # to be silently dropped on replay, e.g. a priority-queue message
+            # lost its priority, and an RPC request's reply_to/type/app_id/
+            # user_id never survived the replay for the reply to route back.
+            reply_to=msg.reply_to,
+            priority=msg.priority,
+            expiration=msg.expiration,
+            type=msg.type,
+            app_id=msg.app_id,
+            user_id=msg.user_id,
+            mandatory=True,
+        )
+
     def replay(
         self,
         queue: str,
         predicate: Callable[[RabbitMessage], bool] | None = None,
         target_queue: str | None = None,
         target_exchange: str | None = None,
-    ) -> int:
+        *,
+        reset_retry_count: bool = False,
+    ) -> ReplayResult:
         """Replay messages from the DLQ.
 
         Fetches messages, applies optional predicate filter, publishes
-        matching messages to the target, and acks the originals.
+        matching messages to the target, and acks each original **only after
+        its republish outcome is OK**. A failed republish (NACKED / TIMEOUT /
+        RETURNED / ERROR) is nack-requeued, so the message stays on the DLQ
+        instead of being lost.
 
         Non-matching messages are nacked with ``requeue=True``.
 
@@ -94,25 +167,33 @@ class DLQInspector:
             target_queue: Target queue routing key. Defaults to the
                 original queue from message headers.
             target_exchange: Target exchange. Defaults to "".
+            reset_retry_count: Strip the ``x-rabbitkit-retry-count`` header
+                so the replayed message gets a fresh retry ladder. Default
+                False preserves headers verbatim — meaning a previously
+                max-retried message is terminal after ONE failed attempt and
+                returns to the DLQ.
 
         Returns:
-            Number of messages replayed.
+            :class:`ReplayResult` — int-compatible replayed count, with
+            ``.failed`` (left on the DLQ) and ``.requeued`` (non-matching).
 
-        Loop Engineering Review, Reliability: a non-matching message is
-        **not** nacked (requeued) until after this method's fetch loop has
-        fully exhausted the queue. ``basic_get`` has no natural "already
-        seen this delivery" tracking of its own -- if a non-matching
-        message were requeued immediately, and nothing else is consuming
-        from this queue, the very next ``basic_get`` call in this same loop
-        could immediately re-fetch that exact message, forever, for any
-        predicate that ever returns ``False``. Held-but-unsettled messages
-        are invisible to further ``basic_get`` calls (the broker still
-        considers them delivered-but-unacked), so deferring the nack until
-        after the loop truly exits guarantees termination regardless of how
-        many messages the predicate rejects.
+        Loop Engineering Review, Reliability: a non-matching or
+        failed-publish message is **not** nacked (requeued) until after this
+        method's fetch loop has fully exhausted the queue. ``basic_get`` has
+        no natural "already seen this delivery" tracking of its own -- if
+        such a message were requeued immediately, and nothing else is
+        consuming from this queue, the very next ``basic_get`` call in this
+        same loop could immediately re-fetch that exact message, forever.
+        Held-but-unsettled messages are invisible to further ``basic_get``
+        calls (the broker still considers them delivered-but-unacked), so
+        deferring the nack until after the loop truly exits guarantees
+        termination regardless of how many messages the predicate rejects or
+        the publisher fails.
         """
         replayed = 0
-        non_matching: list[RabbitMessage] = []
+        held_for_requeue: list[RabbitMessage] = []
+        failed = 0
+        requeued = 0
 
         while True:
             msg = self._transport.basic_get(queue)
@@ -121,39 +202,39 @@ class DLQInspector:
 
             # Apply predicate filter -- hold, don't nack yet (see docstring).
             if predicate is not None and not predicate(msg):
-                non_matching.append(msg)
+                held_for_requeue.append(msg)
+                requeued += 1
                 continue
 
-            # Determine target
-            rk = target_queue or msg.headers.get("x-rabbitkit-original-queue", msg.routing_key)
-            exchange = target_exchange if target_exchange is not None else ""
+            envelope = self._build_replay_envelope(msg, target_queue, target_exchange, reset_retry_count)
+            outcome = self._transport.publish(envelope)
+            if outcome is not None and not outcome.ok:
+                # Republish failed — DO NOT ack, or the message is lost
+                # forever. Hold for nack-requeue so it stays on the DLQ.
+                logger.error(
+                    "DLQ replay publish failed (status=%s); message stays on %r: routing_key=%s message_id=%s",
+                    getattr(outcome, "status", "unknown"),
+                    queue,
+                    envelope.routing_key,
+                    envelope.message_id,
+                )
+                held_for_requeue.append(msg)
+                failed += 1
+                continue
 
-            # Publish to target
-            envelope = MessageEnvelope(
-                routing_key=rk,
-                body=msg.body,
-                exchange=exchange,
-                headers=dict(msg.headers),
-                message_id=msg.message_id or "",
-                correlation_id=msg.correlation_id,
-                content_type=msg.content_type or "application/octet-stream",
-                content_encoding=msg.content_encoding,
-            )
-            self._transport.publish(envelope)
-
-            # Ack the original
+            # Ack the original — it is safely republished now
             if not msg.is_settled:
                 msg.ack()
 
             replayed += 1
 
         # The fetch loop is done (basic_get returned None) -- now it's safe
-        # to requeue non-matching messages; this loop can no longer re-fetch them.
-        for msg in non_matching:
+        # to requeue held messages; this loop can no longer re-fetch them.
+        for msg in held_for_requeue:
             if not msg.is_settled:
                 msg.nack(requeue=True)
 
-        return replayed
+        return ReplayResult(replayed, failed=failed, requeued=requeued)
 
     def purge(self, queue: str) -> int:
         """Purge all messages from the queue.
@@ -187,12 +268,17 @@ class DLQInspector:
         predicate: Callable[[RabbitMessage], bool] | None = None,
         target_queue: str | None = None,
         target_exchange: str | None = None,
-    ) -> int:
-        """Async variant of ``replay`` -- see its docstring for why
-        non-matching messages are held, not nacked, until the fetch loop
-        has fully exhausted the queue (termination guarantee)."""
+        *,
+        reset_retry_count: bool = False,
+    ) -> ReplayResult:
+        """Async variant of ``replay`` -- see its docstring for the
+        outcome-checked ack, ``reset_retry_count``, and why non-matching /
+        failed messages are held, not nacked, until the fetch loop has fully
+        exhausted the queue (termination guarantee)."""
         replayed = 0
-        non_matching: list[RabbitMessage] = []
+        held_for_requeue: list[RabbitMessage] = []
+        failed = 0
+        requeued = 0
 
         while True:
             msg = await self._transport.basic_get(queue)
@@ -200,34 +286,34 @@ class DLQInspector:
                 break
 
             if predicate is not None and not predicate(msg):
-                non_matching.append(msg)
+                held_for_requeue.append(msg)
+                requeued += 1
                 continue
 
-            rk = target_queue or msg.headers.get("x-rabbitkit-original-queue", msg.routing_key)
-            exchange = target_exchange if target_exchange is not None else ""
-
-            envelope = MessageEnvelope(
-                routing_key=rk,
-                body=msg.body,
-                exchange=exchange,
-                headers=dict(msg.headers),
-                message_id=msg.message_id or "",
-                correlation_id=msg.correlation_id,
-                content_type=msg.content_type or "application/octet-stream",
-                content_encoding=msg.content_encoding,
-            )
-            await self._transport.publish(envelope)
+            envelope = self._build_replay_envelope(msg, target_queue, target_exchange, reset_retry_count)
+            outcome = await self._transport.publish(envelope)
+            if outcome is not None and not outcome.ok:
+                logger.error(
+                    "DLQ replay publish failed (status=%s); message stays on %r: routing_key=%s message_id=%s",
+                    getattr(outcome, "status", "unknown"),
+                    queue,
+                    envelope.routing_key,
+                    envelope.message_id,
+                )
+                held_for_requeue.append(msg)
+                failed += 1
+                continue
 
             if not msg.is_settled:
                 await msg.ack_async()
 
             replayed += 1
 
-        for msg in non_matching:
+        for msg in held_for_requeue:
             if not msg.is_settled:
                 await msg.nack_async(requeue=True)
 
-        return replayed
+        return ReplayResult(replayed, failed=failed, requeued=requeued)
 
     async def purge_async(self, queue: str) -> int:
         """Async variant of ``purge``."""

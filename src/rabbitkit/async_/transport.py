@@ -14,6 +14,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -52,12 +53,15 @@ class AsyncTransportImpl:
         topology_mode: TopologyMode = TopologyMode.AUTO_DECLARE,
         confirm_delivery: bool = True,
         confirm_timeout: float = 5.0,
+        on_topology_conflict: str = "raise",
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._security_config = security_config or SecurityConfig()
         self._pool_config = pool_config or PoolConfig()
         self._topology_mode = topology_mode
         self._topo = TopologyDispatcher(topology_mode)
+        # M14: "raise" | "warn_continue" on a 406 topology-drift conflict.
+        self._on_topology_conflict = on_topology_conflict
         self._confirm_delivery = confirm_delivery
         # Per-publish timeout when publisher confirms are enabled. Without this a
         # broker that never confirms would block the publish coroutine forever;
@@ -108,11 +112,29 @@ class AsyncTransportImpl:
         self._blocked_callbacks: list[Callable[[], None]] = []
         self._unblocked_callbacks: list[Callable[[], None]] = []
 
+        # Connection-churn metric hook (see on_reconnect) -- adapted from
+        # aio-pika's RobustConnection.reconnect_callbacks.
+        self._reconnect_callbacks: list[Callable[[], None]] = []
+
         # L15: passive blocked-state tracking, independent of whether a
         # FlowController is registered above -- health.broker_health_check
         # reads this (via the is_blocked property) so a broker/disk/memory
         # alarm is visible even when the caller never opted into FlowController.
         self._blocked_state: bool = False
+
+    def on_reconnect(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired on every ``connect_robust`` re-connection
+        (connection-churn metric hook). Reconnects were logged but never
+        counted, so a flapping broker/network was invisible to metrics
+        alerting."""
+        self._reconnect_callbacks.append(callback)
+
+    def _aio_reconnected(self, *_args: Any) -> None:
+        for cb in list(self._reconnect_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover - never break the event loop
+                logger.exception("reconnect callback raised")
 
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
@@ -162,6 +184,18 @@ class AsyncTransportImpl:
             pub_conn.connection_unblocked.add_callback(self._aio_unblocked)
         except Exception:  # pragma: no cover - older aio-pika may differ
             logger.debug("Could not register blocked/unblocked callbacks")
+
+        # Connection-churn metric hook: connect_robust reconnects silently
+        # (well, logged) -- count them so a flapping broker/network is
+        # visible to metrics alerting. Both connections, since either can
+        # flap independently.
+        try:
+            pub_conn.reconnect_callbacks.add(self._aio_reconnected)
+            consumer_conn_for_cb = await self._conn_pool.get_consumer_connection()
+            if consumer_conn_for_cb is not pub_conn:
+                consumer_conn_for_cb.reconnect_callbacks.add(self._aio_reconnected)
+        except Exception:  # pragma: no cover - older aio-pika may differ
+            logger.debug("Could not register reconnect callbacks")
 
         # I-11: install a blocked-connection watchdog so a broker alarm that isn't
         # cleared within blocked_connection_timeout closes the connection (forcing
@@ -400,12 +434,17 @@ class AsyncTransportImpl:
                     mandatory=envelope.mandatory,
                 )
         except TimeoutError as e:
-            logger.warning("Batch publish confirm timed out after %.1fs", self._confirm_timeout)
-            try:
-                if not channel.is_closed:
-                    await channel.close()
-            except Exception:  # pragma: no cover — best effort
-                pass
+            # M17: do NOT close the channel here. This coroutine may be one of
+            # several concurrent calls sharing the SAME channel (BatchPublisher's
+            # _flush gathers N of these on one channel) — closing it the instant
+            # OUR OWN confirm-wait times out would kill every sibling publish
+            # still awaiting ITS OWN confirm on that channel, even ones that
+            # would have confirmed cleanly a moment later. Callers decide
+            # whether/when to close a channel that had a timeout, and do so
+            # only once they know no other publish is still using it (e.g.
+            # after their own single call, or after a whole gathered batch has
+            # fully resolved) — see callers of _publish_on_channel.
+            logger.warning("Publish confirm timed out after %.1fs", self._confirm_timeout)
             return PublishOutcome(
                 status=PublishStatus.TIMEOUT,
                 exchange=envelope.exchange,
@@ -475,7 +514,16 @@ class AsyncTransportImpl:
 
             if envelope.mandatory:
                 channel = await self._get_mandatory_channel()
-                return await self._publish_on_channel(channel, envelope)
+                outcome = await self._publish_on_channel(channel, envelope)
+                # M17: this channel is a single persistent channel reused across
+                # ALL mandatory publishes — close it AFTER our own call resolves
+                # (not from inside _publish_on_channel) so a timeout doesn't risk
+                # yanking a channel a concurrent mandatory publish is still using.
+                # _get_mandatory_channel() lazily reopens on the next call.
+                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
+                    with contextlib.suppress(Exception):
+                        await channel.close()
+                return outcome
 
             if not self._confirm_delivery:
                 # Fast path: persistent channel, no confirm wait, no pool overhead
@@ -502,7 +550,16 @@ class AsyncTransportImpl:
             # Confirmed path: pool channel per publish so each confirm is isolated
             channel = await self._conn_pool.acquire_publisher_channel()
             try:
-                return await self._publish_on_channel(channel, envelope)
+                outcome = await self._publish_on_channel(channel, envelope)
+                # M17: close a timed-out channel before returning it to the pool
+                # so the pool doesn't hand out a possibly-wedged channel next.
+                # This channel is exclusively ours for this single publish (not
+                # shared concurrently), so closing here — after our own call has
+                # fully resolved — is safe.
+                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
+                    with contextlib.suppress(Exception):
+                        await channel.close()
+                return outcome
             finally:
                 await self._conn_pool.release_publisher_channel(channel)
 
@@ -609,7 +666,7 @@ class AsyncTransportImpl:
                     arguments=kwargs.get("arguments"),
                 )
         except aio_pika.exceptions.ChannelPreconditionFailed as exc:
-            self._raise_precondition_failed("exchange", kwargs["exchange"], exc)
+            await self._handle_precondition_failed("exchange", kwargs["exchange"], exc)
 
     async def declare_queue(self, queue: RabbitQueue) -> None:
         """Declare a queue on the topology channel."""
@@ -636,9 +693,9 @@ class AsyncTransportImpl:
                     arguments=kwargs.get("arguments"),
                 )
         except aio_pika.exceptions.ChannelPreconditionFailed as exc:
-            self._raise_precondition_failed("queue", kwargs["queue"], exc)
+            await self._handle_precondition_failed("queue", kwargs["queue"], exc)
 
-    def _raise_precondition_failed(self, kind: str, name: str, exc: BaseException) -> None:
+    async def _handle_precondition_failed(self, kind: str, name: str, exc: BaseException) -> None:
         """M6: turn a 406 PRECONDITION_FAILED into a typed, actionable error.
 
         Declaring a queue/exchange with arguments that conflict with an
@@ -649,7 +706,25 @@ class AsyncTransportImpl:
         Previously this aborted startup with a low-level channel-closed
         traceback giving no hint which queue/exchange or argument actually
         conflicted.
+
+        M14: under ``SafetyConfig.on_topology_conflict="warn_continue"`` the
+        406 is logged and swallowed — a 406 (unlike a 404) proves the entity
+        exists, so rabbitkit continues with the EXISTING definition. The
+        conflict closed the topology channel, so we reopen it first.
         """
+        if self._on_topology_conflict == "warn_continue":
+            consumer_conn = await self._conn_pool.get_consumer_connection()
+            self._topology_channel = await consumer_conn.channel()
+            logger.warning(
+                "Topology drift on %s %r (broker: %s); on_topology_conflict='warn_continue' "
+                "— continuing with the EXISTING definition (rabbitkit's declaration was NOT "
+                "applied). Reconcile the %s or fix its rabbitkit config to silence this.",
+                kind,
+                name,
+                exc,
+                kind,
+            )
+            return
         raise ConfigurationError(
             f"Cannot declare {kind} {name!r}: it already exists with incompatible "
             f"arguments (broker said: {exc}). This usually means it was created "
@@ -660,8 +735,19 @@ class AsyncTransportImpl:
             f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
         ) from exc
 
-    async def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
-        """Bind a queue to an exchange on the topology channel."""
+    async def bind_queue(
+        self,
+        queue: str,
+        exchange: str,
+        routing_key: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind a queue to an exchange on the topology channel.
+
+        ``arguments`` carries header-match criteria for HEADERS exchanges
+        (``x-match`` etc.) — without them a headers binding matches every
+        message (C4).
+        """
         if self._topo.binding_action() is TopoAction.SKIP:
             return
 
@@ -670,7 +756,7 @@ class AsyncTransportImpl:
 
         q = await self._topology_channel.get_queue(queue, ensure=False)
         ex = await self._topology_channel.get_exchange(exchange, ensure=False)
-        await q.bind(ex, routing_key=routing_key)
+        await q.bind(ex, routing_key=routing_key, arguments=arguments)
 
     async def bind_exchange(
         self,
@@ -754,6 +840,15 @@ class AsyncTransportImpl:
         content_encoding=aio_message.content_encoding,
         type=aio_message.type,
         app_id=aio_message.app_id,
+        priority=aio_message.priority,
+        # aio-pika decodes the wire's ms-string expiration into seconds
+        # (float) on IncomingMessage; re-encode to the ms-string convention
+        # RabbitMessage/MessageEnvelope.expiration use everywhere else (matches
+        # the raw string pika.BasicProperties.expiration carries unmodified),
+        # so a retry/DLQ-replay envelope built from this message round-trips
+        # correctly regardless of which transport received it.
+        expiration=(str(int(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
+        user_id=aio_message.user_id,
         timestamp=aio_message.timestamp,  # was never surfaced on consume
         routing_key=aio_message.routing_key,
         exchange=aio_message.exchange or "",

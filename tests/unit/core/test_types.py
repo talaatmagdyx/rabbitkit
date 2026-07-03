@@ -9,6 +9,7 @@ import pytest
 from rabbitkit.core.types import (
     AckPolicy,
     ClassifiedError,
+    DeduplicationMarkPolicy,
     ErrorSeverity,
     ExchangeType,
     MessageEnvelope,
@@ -51,6 +52,30 @@ class TestAckPolicy:
 
     def test_all_values(self) -> None:
         assert len(AckPolicy) == 4
+
+
+class TestDeduplicationMarkPolicy:
+    def test_values(self) -> None:
+        assert DeduplicationMarkPolicy.ON_SUCCESS == "on_success"
+        assert DeduplicationMarkPolicy.ON_START == "on_start"
+        assert DeduplicationMarkPolicy.CLAIM == "claim"
+
+    def test_all_values(self) -> None:
+        assert len(DeduplicationMarkPolicy) == 3
+
+
+class TestRejectWithoutDLXPolicy:
+    def test_values(self) -> None:
+        from rabbitkit.core.types import RejectWithoutDLXPolicy
+
+        assert RejectWithoutDLXPolicy.AUTO_PROVISION == "auto_provision"
+        assert RejectWithoutDLXPolicy.ERROR == "error"
+        assert RejectWithoutDLXPolicy.DISCARD == "discard"
+
+    def test_all_values(self) -> None:
+        from rabbitkit.core.types import RejectWithoutDLXPolicy
+
+        assert len(RejectWithoutDLXPolicy) == 3
 
 
 class TestTopologyMode:
@@ -117,6 +142,20 @@ class TestPublishOutcome:
         outcome = PublishOutcome(status=PublishStatus.ERROR, error=err)
         assert outcome.ok is False
         assert outcome.error is err
+
+    def test_raise_for_status_returns_self_when_ok(self) -> None:
+        """M1: raise_for_status is a no-op that chains on success."""
+        outcome = PublishOutcome(status=PublishStatus.CONFIRMED)
+        assert outcome.raise_for_status() is outcome
+
+    def test_raise_for_status_raises_on_failure(self) -> None:
+        """M1: opt-in exception carrying the outcome for inspection."""
+        from rabbitkit.core.errors import PublishError
+
+        outcome = PublishOutcome(status=PublishStatus.NACKED, routing_key="orders")
+        with pytest.raises(PublishError) as exc_info:
+            outcome.raise_for_status()
+        assert exc_info.value.outcome is outcome
 
     def test_defaults(self) -> None:
         outcome = PublishOutcome(status=PublishStatus.CONFIRMED)
@@ -227,6 +266,20 @@ class TestMessageEnvelope:
         assert envelope.type == "OrderCreated"
         assert envelope.user_id == "guest"
         assert envelope.app_id == "rabbitkit"
+
+    def test_routing_key_over_255_bytes_raises(self) -> None:
+        """AMQP shortstr fields are wire-limited to 255 bytes -- catch this at
+        construction (every publish path funnels through here) instead of an
+        opaque broker error at publish time."""
+        with pytest.raises(ValueError, match="255"):
+            MessageEnvelope(routing_key="x" * 256, body=b"body")
+
+    def test_exchange_over_255_bytes_raises(self) -> None:
+        with pytest.raises(ValueError, match="255"):
+            MessageEnvelope(routing_key="rk", body=b"body", exchange="x" * 256)
+
+    def test_routing_key_at_255_bytes_ok(self) -> None:
+        MessageEnvelope(routing_key="x" * 255, body=b"body")  # should not raise
 
 
 # ── ClassifiedError ───────────────────────────────────────────────────────

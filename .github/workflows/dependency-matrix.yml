@@ -1,5 +1,5 @@
 # Loop Engineering Review, Testing: rabbitkit pins pika/aio-pika to ranges
-# (pika>=1.3.0,<2.0.0; aio-pika>=9.0.0,<10.0.0 -- see pyproject.toml) but the
+# (pika>=1.3.0,<2.0.0; aio-pika>=9.1.0,<10.0.0 -- see pyproject.toml) but the
 # regular CI jobs only ever install whatever pip currently resolves within
 # that range, which drifts toward "latest" over time and never actually
 # exercises the pinned MINIMUM. This job tests both ends of the range

@@ -908,8 +908,17 @@ bp.close()  # flush remaining + stop timer
 ```python
 from rabbitkit import BatchAcker, BatchAckConfig
 
+# ack_fn must NOT be a raw channel.basic_ack: the flush_interval_ms timer
+# fires from a background threading.Timer thread, not pika's I/O thread,
+# and pika channel methods are not thread-safe. Marshal onto the I/O
+# thread via connection.add_callback_threadsafe instead.
+def safe_ack(tag: int, multiple: bool = False) -> None:
+    connection.add_callback_threadsafe(
+        lambda: channel.basic_ack(delivery_tag=tag, multiple=multiple)
+    )
+
 acker = BatchAcker(
-    ack_fn=lambda tag, multiple=True: channel.basic_ack(tag, multiple=multiple),
+    ack_fn=safe_ack,
     config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
 )
 

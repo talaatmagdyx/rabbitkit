@@ -44,6 +44,16 @@ class TestRabbitExchange:
         ex = RabbitExchange(name="events")
         assert ex.to_bind_kwargs() is None
 
+    def test_name_over_255_bytes_raises(self) -> None:
+        """AMQP shortstr fields are wire-limited to 255 bytes -- catch this at
+        construction instead of an opaque broker error at declare time."""
+        with pytest.raises(ValueError, match="255"):
+            RabbitExchange(name="x" * 256, type=ExchangeType.FANOUT)
+
+    def test_routing_key_over_255_bytes_raises(self) -> None:
+        with pytest.raises(ValueError, match="255"):
+            RabbitExchange(name="events", bind_to="upstream", routing_key="x" * 256)
+
     def test_to_bind_kwargs_with_binding(self) -> None:
         ex = RabbitExchange(
             name="events",
@@ -74,6 +84,16 @@ class TestRabbitQueueBasic:
     def test_empty_name_raises(self) -> None:
         with pytest.raises(ValueError, match="Queue name"):
             RabbitQueue(name="")
+
+    def test_name_over_255_bytes_raises(self) -> None:
+        """AMQP shortstr fields are wire-limited to 255 bytes -- catch this at
+        construction instead of an opaque broker error at declare time."""
+        with pytest.raises(ValueError, match="255"):
+            RabbitQueue(name="q" * 256)
+
+    def test_routing_key_over_255_bytes_raises(self) -> None:
+        with pytest.raises(ValueError, match="255"):
+            RabbitQueue(name="orders", routing_key="x" * 256)
 
     def test_to_declare_kwargs_classic(self) -> None:
         q = RabbitQueue(name="orders", message_ttl=60000, max_length=1000)
@@ -191,9 +211,17 @@ class TestRabbitQueueClassic:
             RabbitQueue(name="q", queue_type=QueueType.CLASSIC, delivery_limit=5)
 
     def test_classic_with_lazy(self) -> None:
-        q = RabbitQueue(name="q", lazy=True)
+        with pytest.warns(UserWarning, match="deprecated x-queue-mode"):
+            q = RabbitQueue(name="q", lazy=True)
         kwargs = q.to_declare_kwargs()
         assert kwargs["arguments"]["x-queue-mode"] == "lazy"
+
+    def test_lazy_warns_deprecated_on_rabbitmq_312_plus(self) -> None:
+        """lazy=True still emits x-queue-mode=lazy (still meaningful pre-3.12
+        or on a v1 classic queue), but is a silent no-op on RabbitMQ >=3.12's
+        default CQv2 -- warn so operators don't rely on it unknowingly."""
+        with pytest.warns(UserWarning, match="CQv2"):
+            RabbitQueue(name="q", lazy=True)
 
     def test_classic_with_priority(self) -> None:
         q = RabbitQueue(name="q", max_priority=10)

@@ -146,6 +146,29 @@ class TestInit:
             mw = TracedConsumerMiddleware(service_name="payment-service")
         assert mw._service_name == "payment-service"
 
+    def test_warns_when_obskit_not_installed(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A caller who adds this middleware is opting into tracing --
+        silently no-oping forever with zero signal is the exact
+        "tracing goes dark silently" gap this warning closes."""
+        with patch("rabbitkit.middleware.tracing._get_obskit_tracing", return_value=None):
+            with caplog.at_level("WARNING", logger="rabbitkit.middleware.tracing"):
+                TracedConsumerMiddleware(service_name="order-service")
+        assert any("order-service" in r.message and "not installed" in r.message for r in caplog.records)
+
+    def test_warns_when_tracing_not_configured(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _FakeTracingModule(available=False)
+        with patch("rabbitkit.middleware.tracing._get_obskit_tracing", return_value=fake):
+            with caplog.at_level("WARNING", logger="rabbitkit.middleware.tracing"):
+                TracedConsumerMiddleware()
+        assert any("not configured" in r.message for r in caplog.records)
+
+    def test_no_warning_when_tracing_available(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _FakeTracingModule(available=True)
+        with patch("rabbitkit.middleware.tracing._get_obskit_tracing", return_value=fake):
+            with caplog.at_level("WARNING", logger="rabbitkit.middleware.tracing"):
+                TracedConsumerMiddleware()
+        assert caplog.records == []
+
 
 # ── consume_scope (sync) ─────────────────────────────────────────────────
 

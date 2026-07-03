@@ -73,6 +73,58 @@ class TestConnection:
 
                 mock_channel.confirm_delivery.assert_not_called()
 
+    def test_first_connect_does_not_fire_reconnect_callbacks(self) -> None:
+        """Connection-churn counter: the FIRST connect is not churn."""
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_reconnect(lambda: fired.append(1))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection"):
+                transport.connect()
+
+        assert fired == []
+
+    def test_reconnect_fires_reconnect_callbacks(self) -> None:
+        """Every connect AFTER the first fires the churn hook -- reconnects
+        were previously logged but never counted, so a flapping broker/
+        network was invisible to metrics-based alerting."""
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_reconnect(lambda: fired.append(1))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                transport.connect()
+                transport.disconnect()
+                transport.connect()  # re-connect -> churn
+                assert fired == [1]
+                transport.disconnect()
+                transport.connect()
+                assert fired == [1, 1]
+
+    def test_reconnect_callback_exception_does_not_break_connect(self) -> None:
+        transport = _make_transport()
+        transport.on_reconnect(lambda: (_ for _ in ()).throw(RuntimeError("cb boom")))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                transport.connect()
+                transport.disconnect()
+                transport.connect()  # must not raise despite the bad callback
+
+        assert transport.is_connected()
+
     def test_disconnect(self) -> None:
         transport = _make_transport()
 
@@ -191,6 +243,40 @@ class TestTopology:
         assert "PRECONDITION_FAILED" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, pika.exceptions.ChannelClosedByBroker)
 
+    def test_declare_queue_406_warn_continue(self) -> None:
+        """M14: with on_topology_conflict='warn_continue', a 406 is warned and
+        swallowed (existing definition kept), the channel is reopened, and
+        subsequent declares proceed."""
+        import pika
+
+        transport = _make_transport(on_topology_conflict="warn_continue")
+        channel = self._connect_transport(transport)
+        channel.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(
+            406, "PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'orders'"
+        )
+        # The reopened channel comes from connection.channel(); make it fresh.
+        reopened = MagicMock()
+        reopened.is_open = True
+        transport._connection.channel.return_value = reopened
+
+        transport.declare_queue(RabbitQueue(name="orders"))  # must NOT raise
+
+        assert transport._channel is reopened  # channel reopened for further declares
+
+    def test_declare_queue_406_raise_is_default(self) -> None:
+        """M14: default policy still raises (no silent drift)."""
+        import pika
+
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport()  # default on_topology_conflict="raise"
+        channel = self._connect_transport(transport)
+        channel.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(
+            406, "PRECONDITION_FAILED - inequivalent arg"
+        )
+        with pytest.raises(ConfigurationError):
+            transport.declare_queue(RabbitQueue(name="orders"))
+
     def test_declare_queue_other_channel_closed_reraises(self) -> None:
         """M6: a non-406 channel closure is not this middleware's concern --
         must propagate as-is, not be swallowed or misreported."""
@@ -228,7 +314,21 @@ class TestTopology:
 
         transport.bind_queue("orders", "events", "orders.created")
 
-        channel.queue_bind.assert_called_once_with(queue="orders", exchange="events", routing_key="orders.created")
+        channel.queue_bind.assert_called_once_with(
+            queue="orders", exchange="events", routing_key="orders.created", arguments=None
+        )
+
+    def test_bind_queue_passes_arguments(self) -> None:
+        """C4: headers-exchange match criteria must reach the broker."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+
+        args = {"x-match": "all", "type": "order"}
+        transport.bind_queue("orders.headers", "events.headers", "", arguments=args)
+
+        channel.queue_bind.assert_called_once_with(
+            queue="orders.headers", exchange="events.headers", routing_key="", arguments=args
+        )
 
     def test_bind_queue_manual_mode_skips(self) -> None:
         transport = _make_transport(topology_mode=TopologyMode.MANUAL)
@@ -747,6 +847,30 @@ class TestConsumeCallback:
 
         assert msg.timestamp == datetime.fromtimestamp(1704164645, tz=UTC)
 
+    def test_build_message_surfaces_priority_expiration_user_id(self) -> None:
+        """priority/expiration/user_id used to be dropped entirely on consume
+        (RabbitMessage had no slots for them), so a retry/DLQ-replay envelope
+        built from a consumed message could never carry them forward."""
+        transport = _make_transport()
+        method = MagicMock()
+        method.routing_key = "q"
+        method.exchange = ""
+        method.delivery_tag = 1
+        method.redelivered = False
+        method.consumer_tag = "t"
+        props = MagicMock()
+        props.headers = None
+        props.timestamp = None
+        props.priority = 5
+        props.expiration = "60000"
+        props.user_id = "guest"
+
+        msg = transport._build_message(MagicMock(), method, props, b"{}")
+
+        assert msg.priority == 5
+        assert msg.expiration == "60000"
+        assert msg.user_id == "guest"
+
     def test_build_message_no_ack_skips_settlement_wiring(self) -> None:
         """C2: a no-ack delivery (e.g. amq.rabbitmq.reply-to) gets no ack/nack/
         reject functions — the broker already auto-acked it, and calling
@@ -1028,7 +1152,10 @@ class TestPublishConfirmTimeout:
         outcome = transport.publish(env)
         elapsed = time.monotonic() - start
 
-        assert outcome.status == PublishStatus.ERROR
+        # A confirm that never arrives is exactly the documented TIMEOUT case
+        # (docs/message-safety.md), matching the async transport's equivalent
+        # asyncio.timeout(confirm_timeout) branch -- not a generic ERROR.
+        assert outcome.status == PublishStatus.TIMEOUT
         assert isinstance(outcome.error, TimeoutError)
         # Bounded by ~confirm_timeout (allow scheduling slack, but well under 30s).
         assert elapsed < 1.0
@@ -1040,6 +1167,123 @@ class TestPublishConfirmTimeout:
     def test_confirm_timeout_default(self) -> None:
         transport = _make_transport()
         assert transport._confirm_timeout == 5.0
+
+
+class TestPublishConfirmWaitBoundedInline:
+    """I-11: pika's BlockingChannel.basic_publish() has no timeout
+    parameter -- when _run_on_io_thread would otherwise run it fully
+    inline and unbounded (pure producer / nothing has ever consumed on
+    this connection), a wedged broker (confirms never arrive) used to hang
+    the calling thread forever, confirm_timeout notwithstanding. The
+    confirm wait is now bounded via a dedicated helper thread, and a
+    timeout poisons the connection so the next call reconnects instead of
+    reusing one a background thread might still be touching."""
+
+    def test_pure_producer_publish_times_out_instead_of_hanging(self) -> None:
+        import threading
+        import time
+
+        transport = _make_transport(confirm_timeout=0.1)
+        transport._connected = True
+        transport._ever_consumed = False  # pure producer: the unbounded case
+        transport._owner_ident = threading.get_ident()  # same thread as caller
+
+        channel = MagicMock()
+        channel.is_open = True
+        channel.basic_publish.side_effect = lambda **kw: time.sleep(100)
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        transport._connection = conn
+
+        env = MessageEnvelope(routing_key="rk", body=b"x")
+        start = time.monotonic()
+        outcome = transport.publish(env)
+        elapsed = time.monotonic() - start
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        assert isinstance(outcome.error, TimeoutError)
+        assert elapsed < 1.0
+
+    def test_timeout_poisons_connection_for_reconnect(self) -> None:
+        import threading
+        import time
+
+        transport = _make_transport(confirm_timeout=0.1)
+        transport._connected = True
+        transport._ever_consumed = False
+        transport._owner_ident = threading.get_ident()
+
+        channel = MagicMock()
+        channel.is_open = True
+        channel.basic_publish.side_effect = lambda **kw: time.sleep(100)
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        transport._connection = conn
+
+        env = MessageEnvelope(routing_key="rk", body=b"x")
+        transport.publish(env)
+
+        assert transport._connection is None
+        assert transport._channel is None
+        assert transport._connected is False
+        assert transport._owner_ident is None
+
+    def test_pure_producer_publish_succeeds_when_confirm_arrives_promptly(self) -> None:
+        """The common case -- a confirm that arrives quickly still works
+        correctly through the new bounded-helper-thread path."""
+        import threading
+
+        transport = _make_transport(confirm_timeout=5.0)
+        transport._connected = True
+        transport._ever_consumed = False
+        transport._owner_ident = threading.get_ident()
+
+        channel = MagicMock()
+        channel.is_open = True
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        transport._connection = conn
+
+        env = MessageEnvelope(routing_key="rk", body=b"x")
+        outcome = transport.publish(env)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        channel.basic_publish.assert_called_once()
+        # Not poisoned -- the connection is still usable.
+        assert transport._connection is conn
+
+    def test_actively_consuming_same_thread_runs_unbounded_inline(self) -> None:
+        """Documented residual limitation (see _publish_on_channel): cannot
+        safely bound this case, since this thread also drives
+        start_consuming()'s dispatch loop on the same connection. Verify
+        behavior is unchanged -- basic_publish is called directly, no
+        helper thread involved."""
+        import threading
+
+        transport = _make_transport(confirm_timeout=5.0)
+        transport._connected = True
+        transport._ever_consumed = True
+        transport._owner_ident = threading.get_ident()
+
+        channel = MagicMock()
+        channel.is_open = True
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        transport._connection = conn
+
+        env = MessageEnvelope(routing_key="rk", body=b"x")
+        outcome = transport.publish(env)
+
+        channel.basic_publish.assert_called_once()
+        assert outcome.status == PublishStatus.CONFIRMED
 
 
 # ── I-17: cross-thread stop_consuming marshalling ──────────────────────────

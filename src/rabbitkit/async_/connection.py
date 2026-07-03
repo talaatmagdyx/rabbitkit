@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import ssl
 from typing import Any
 from urllib.parse import quote
@@ -64,6 +65,19 @@ def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
     }
     cert_reqs = cert_reqs_map.get(ssl_config.cert_reqs, ssl.CERT_REQUIRED)
 
+    # M13: disabling certificate verification makes the connection MITM-able —
+    # warn loudly (see sync/connection.py for rationale).
+    if cert_reqs == ssl.CERT_NONE:
+        import warnings
+
+        warnings.warn(
+            "SSLConfig(cert_reqs='CERT_NONE') disables TLS certificate and hostname "
+            "verification — the connection is encrypted but MITM-able. Use "
+            "'CERT_REQUIRED' (the default) with a proper ca_certs bundle in production.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     # Defense in depth: never negotiate below TLS 1.2.
@@ -102,6 +116,9 @@ def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
 def make_aio_pika_connect_kwargs(
     connection: ConnectionConfig,
     security: SecurityConfig,
+    *,
+    host_override: str | None = None,
+    port_override: int | None = None,
 ) -> dict[str, Any]:
     """Build kwargs for aio_pika.connect_robust().
 
@@ -133,21 +150,37 @@ def make_aio_pika_connect_kwargs(
     # (e.g. ":", "@", "/", "+") don't corrupt the AMQP URL or leak as plaintext
     # delimiters. ConnectionConfig.url (core/config.py) is NOT in this module's
     # scope, so we rebuild a safe URL here.
-    user = quote(connection.username, safe="")
-    pwd = quote(connection.password, safe="")
+    # M13: resolve credentials via credentials_provider if set (rotation).
+    raw_user, raw_pwd = connection.resolve_credentials()
+    user = quote(raw_user, safe="")
+    pwd = quote(raw_pwd, safe="")
     vhost = connection.vhost
     if vhost == "/":
         vhost = "%2F"
-    base_url = f"amqp://{user}:{pwd}@{connection.host}:{connection.port}/{vhost}"
+    # M9: allow the caller (pool) to target a specific cluster node.
+    host = host_override if host_override is not None else connection.host
+    port = port_override if port_override is not None else connection.port
+    base_url = f"amqp://{user}:{pwd}@{host}:{port}/{vhost}"
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}heartbeat={connection.heartbeat}"
 
+    # H4: aio-pika's connect_robust uses a FIXED reconnect_interval — no
+    # exponential backoff. A fleet of consumers restarted together (e.g. a
+    # broker bounce under 200 pods) would otherwise retry in lockstep every
+    # `reconnect_backoff_base` seconds, hammering the recovering node in a
+    # thundering herd. We can't inject exponential backoff into connect_robust,
+    # but randomizing the interval PER PROCESS (full jitter over
+    # [base, min(base*2, backoff_max)]) de-synchronizes the herd so retries
+    # spread across the window instead of arriving as a spike. Each process
+    # picks its interval once at connect time; `random` needs no seeding for
+    # inter-process spread since PYTHONHASHSEED/os entropy differ per process.
+    base = connection.reconnect_backoff_base
+    jitter_span = max(0.0, min(base, connection.reconnect_backoff_max - base))
+    jittered_interval = base + random.uniform(0.0, jitter_span)  # noqa: S311 — jitter, not crypto
     kwargs: dict[str, Any] = {
         "url": url,
         "timeout": connection.socket_timeout,
-        # connect_robust uses a FIXED reconnect interval; map our backoff base to it.
-        # aio-pika has no exponential backoff, so reconnect_backoff_max is not applied here.
-        "reconnect_interval": connection.reconnect_backoff_base,
+        "reconnect_interval": jittered_interval,
     }
 
     # SSL

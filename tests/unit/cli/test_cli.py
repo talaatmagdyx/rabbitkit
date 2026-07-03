@@ -814,8 +814,11 @@ class TestDlqReplayCommand:
             routing_key="orders.created",
             body=body,
             properties=props,
+            mandatory=True,
         )
         channel.basic_ack.assert_called_once_with(delivery_tag=5)
+        # Publisher confirms must be on, or ack-after-publish can lose the message
+        channel.confirm_delivery.assert_called_once()
         assert "Replayed 1" in result.output
 
     def test_replay_routing_key_override(self) -> None:
@@ -861,6 +864,104 @@ class TestDlqReplayCommand:
             result = runner.invoke(app, ["dlq", "replay", "orders.dlq", "exchange"])
 
         assert result.exit_code == 1
+
+    def test_replay_failed_publish_nacks_and_exits_nonzero(self) -> None:
+        """C2 regression: an unroutable/nacked publish must NOT ack the DLQ
+        message — it is nack-requeued (stays on the DLQ) and the command
+        exits non-zero."""
+
+        class _FakeUnroutable(Exception):
+            pass
+
+        class _FakeNack(Exception):
+            pass
+
+        method = _make_pika_method(routing_key="rk", delivery_tag=7)
+        props = _make_pika_properties(message_id="doomed")
+        mock_pika = _make_mock_pika(messages=[(method, props, b"body")])
+        mock_pika.exceptions.UnroutableError = _FakeUnroutable
+        mock_pika.exceptions.NackError = _FakeNack
+
+        channel = mock_pika.BlockingConnection.return_value.channel.return_value
+        channel.basic_publish.side_effect = _FakeUnroutable("no binding")
+
+        with patch.dict("sys.modules", {"pika": mock_pika}):
+            result = runner.invoke(app, ["dlq", "replay", "orders.dlq", "orders-ex"])
+
+        assert result.exit_code == 1
+        channel.basic_ack.assert_not_called()
+        channel.basic_nack.assert_called_once_with(delivery_tag=7, requeue=True)
+
+    def test_replay_reset_retry_count_strips_header(self) -> None:
+        """--reset-retry-count strips the retry-count header before
+        publishing, so a previously max-retried message gets a fresh retry
+        ladder instead of being instantly terminal on the next failure.
+
+        The CLI replay path is hand-rolled raw pika (not DLQInspector), so
+        DLQInspector.replay(reset_retry_count=True) existing in the library
+        doesn't help a CLI user at all -- this flag is what actually closes
+        the gap for the `rabbitkit dlq replay` operator workflow."""
+        method = _make_pika_method(routing_key="rk", delivery_tag=3)
+        props = _make_pika_properties(headers={"x-rabbitkit-retry-count": 4, "x-tenant": "acme"})
+        body = b"body"
+
+        mock_pika = _make_mock_pika(messages=[(method, props, body)])
+
+        with patch.dict("sys.modules", {"pika": mock_pika}):
+            result = runner.invoke(
+                app, ["dlq", "replay", "orders.dlq", "orders-ex", "--reset-retry-count"]
+            )
+
+        assert result.exit_code == 0
+        channel = mock_pika.BlockingConnection.return_value.channel.return_value
+        published_props = channel.basic_publish.call_args.kwargs["properties"]
+        assert "x-rabbitkit-retry-count" not in published_props.headers
+        assert published_props.headers["x-tenant"] == "acme"  # other headers preserved
+
+    def test_replay_without_reset_retry_count_preserves_header(self) -> None:
+        """Default (no flag) preserves the retry-count header verbatim --
+        matches the documented loop-safe default."""
+        method = _make_pika_method(routing_key="rk", delivery_tag=3)
+        props = _make_pika_properties(headers={"x-rabbitkit-retry-count": 4})
+        body = b"body"
+
+        mock_pika = _make_mock_pika(messages=[(method, props, body)])
+
+        with patch.dict("sys.modules", {"pika": mock_pika}):
+            result = runner.invoke(app, ["dlq", "replay", "orders.dlq", "orders-ex"])
+
+        assert result.exit_code == 0
+        channel = mock_pika.BlockingConnection.return_value.channel.return_value
+        published_props = channel.basic_publish.call_args.kwargs["properties"]
+        assert published_props.headers["x-rabbitkit-retry-count"] == 4
+
+    def test_replay_reset_retry_count_custom_header_name(self) -> None:
+        """--retry-count-header lets an operator match a customized
+        RetryConfig.retry_header."""
+        method = _make_pika_method(routing_key="rk", delivery_tag=3)
+        props = _make_pika_properties(headers={"my-custom-retry-count": 2})
+        body = b"body"
+
+        mock_pika = _make_mock_pika(messages=[(method, props, body)])
+
+        with patch.dict("sys.modules", {"pika": mock_pika}):
+            result = runner.invoke(
+                app,
+                [
+                    "dlq",
+                    "replay",
+                    "orders.dlq",
+                    "orders-ex",
+                    "--reset-retry-count",
+                    "--retry-count-header",
+                    "my-custom-retry-count",
+                ],
+            )
+
+        assert result.exit_code == 0
+        channel = mock_pika.BlockingConnection.return_value.channel.return_value
+        published_props = channel.basic_publish.call_args.kwargs["properties"]
+        assert "my-custom-retry-count" not in published_props.headers
 
     def test_replay_multiple_messages(self) -> None:
         """dlq replay processes multiple messages in order."""
@@ -1766,3 +1867,21 @@ class TestLiveResources:
             result = _live_resources("http://guest:guest@localhost:15672", "/")
 
         assert result["exchanges"] == {}
+
+    def test_live_resources_rejects_non_http_scheme(self) -> None:
+        """--url is passed straight to urlopen -- without a scheme allowlist
+        it would happily fetch file:// (arbitrary local file read) or other
+        registered urllib handlers instead of just the management API."""
+        from rabbitkit.cli.commands.topology import _live_resources
+
+        with pytest.raises(ValueError, match="Unsupported management URL scheme"):
+            _live_resources("file:///etc/passwd", "/")
+
+    def test_live_resources_rejects_non_http_scheme_before_any_request(self) -> None:
+        """The scheme check must happen before urlopen is ever called."""
+        from rabbitkit.cli.commands.topology import _live_resources
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            with pytest.raises(ValueError, match="Unsupported management URL scheme"):
+                _live_resources("ftp://example.com", "/")
+        mock_urlopen.assert_not_called()

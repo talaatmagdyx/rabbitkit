@@ -207,6 +207,112 @@ class TestChannelPerWorker:
 # ── closed-channel recovery ──────────────────────────────────────────────────
 
 
+class TestConfirmTimeoutDoesNotCorruptSiblings:
+    """M17: a confirm timeout on one message in a batch must not fail the
+    OTHER concurrent messages sharing the same channel. The channel is closed
+    only after every concurrent publish in the batch has already resolved."""
+
+    async def test_sibling_outcomes_unaffected_by_one_timeout(self) -> None:
+        def _timeout_outcome() -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="slow")
+
+        async def publish_on_channel(ch: Any, env: MessageEnvelope) -> PublishOutcome:
+            if env.routing_key == "slow":
+                return _timeout_outcome()
+            return _ok()
+
+        transport = MagicMock()
+        transport._publish_on_channel = publish_on_channel
+
+        channel = MagicMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig())
+
+        envelopes = [
+            MessageEnvelope(routing_key="ok-1", body=b"1"),
+            MessageEnvelope(routing_key="slow", body=b"2"),
+            MessageEnvelope(routing_key="ok-2", body=b"3"),
+        ]
+        batch = [(env, asyncio.get_event_loop().create_future()) for env in envelopes]
+
+        await pub._flush(channel, batch)
+
+        results = {env.routing_key: fut.result() for env, fut in batch}
+        # The two healthy siblings confirmed cleanly -- NOT corrupted by the
+        # slow message's timeout (the pre-fix bug: closing the channel mid-
+        # gather would have failed these too).
+        assert results["ok-1"].status == PublishStatus.CONFIRMED
+        assert results["ok-2"].status == PublishStatus.CONFIRMED
+        assert results["slow"].status == PublishStatus.TIMEOUT
+
+    async def test_channel_closed_after_gather_when_any_outcome_timed_out(self) -> None:
+        async def publish_on_channel(ch: Any, env: MessageEnvelope) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
+
+        transport = MagicMock()
+        transport._publish_on_channel = publish_on_channel
+
+        channel = MagicMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig())
+        batch = [(_env(), asyncio.get_event_loop().create_future())]
+
+        await pub._flush(channel, batch)
+
+        channel.close.assert_called_once()
+
+    async def test_channel_not_closed_when_all_outcomes_ok(self) -> None:
+        """No unnecessary close when nothing timed out."""
+        transport = MagicMock()
+        transport._publish_on_channel = AsyncMock(return_value=_ok())
+
+        channel = MagicMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig())
+        batch = [(_env(), asyncio.get_event_loop().create_future()) for _ in range(3)]
+
+        await pub._flush(channel, batch)
+
+        channel.close.assert_not_called()
+
+    async def test_publish_on_channel_no_longer_closes_channel_itself(self) -> None:
+        """M17: the transport-level confirm-timeout handler must not close the
+        channel itself -- that decision now belongs to the caller (see the
+        _flush tests above), since _publish_on_channel doesn't know whether
+        it's the sole user of the channel."""
+        from rabbitkit.async_.transport import AsyncTransportImpl
+        from rabbitkit.core.config import ConnectionConfig, SecurityConfig
+
+        transport = AsyncTransportImpl(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+            confirm_timeout=0.01,
+        )
+
+        channel = MagicMock()
+        channel.is_closed = False
+        channel.close = AsyncMock()
+
+        async def slow_publish(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(1.0)
+
+        exchange = MagicMock()
+        exchange.publish = slow_publish
+        channel.get_exchange = AsyncMock(return_value=exchange)
+
+        envelope = MessageEnvelope(routing_key="q", body=b"x", exchange="ex")
+        outcome = await transport._publish_on_channel(channel, envelope)
+
+        assert outcome.status == PublishStatus.TIMEOUT
+        channel.close.assert_not_called()
+
+
 class TestClosedChannelRecovery:
     @pytest.mark.asyncio
     async def test_reacquires_when_channel_closed_after_flush(self) -> None:

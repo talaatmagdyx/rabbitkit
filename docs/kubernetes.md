@@ -133,3 +133,73 @@ When scaling horizontally, ensure that:
 - Each pod consumes from the same queue (RabbitMQ distributes messages across consumers).
 - `prefetch_count` is set appropriately for your workload — too high can cause uneven distribution during scale-down.
 - The DLQ capacity is monitored so that message loss is detected before scaling events hide it.
+
+**CPU-based HPA is the wrong signal for a queue consumer.** A consumer with
+a slow downstream call (a DB, an external API) can sit near-idle on CPU
+while its queue backlog grows unbounded — a plain `HorizontalPodAutoscaler`
+targeting CPU utilization never reacts to that. Scale on queue depth
+instead, via [KEDA](https://keda.sh)'s built-in `rabbitmq` scaler, which
+polls the management API directly (no extra exporter needed):
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scaler
+spec:
+  scaleTargetRef:
+    name: worker-deployment
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        queueName: orders
+        mode: QueueLength
+        value: "50" # target: ~50 ready messages per replica
+      authenticationRef:
+        name: rabbitmq-trigger-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: rabbitmq-trigger-auth
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: rabbitmq-secret
+      key: management-url # http://user:pass@rabbitmq:15672/vhost
+```
+
+If you're already polling queue depth in-process for metrics/dashboards
+(`rabbitkit.queue_metrics.QueueMetricsPoller`, wrapping
+`RabbitManagementClient`), the same management API credentials work for
+KEDA's `host` parameter — no separate scaling-specific integration needed.
+
+## Cluster Failover (`ConnectionConfig.nodes`)
+
+Against a multi-node RabbitMQ cluster, list the other nodes so a dead primary
+doesn't take the client down at startup:
+
+```python
+from rabbitkit import RabbitConfig, ConnectionConfig
+
+config = RabbitConfig(
+    connection=ConnectionConfig(
+        host="rabbit-0", port=5672,
+        nodes=("rabbit-1", "rabbit-2:5672"),  # "host" or "host:port"
+    )
+)
+```
+
+- **Sync (pika):** all nodes are tried natively via a `ConnectionParameters`
+  list — full failover, including on reconnect.
+- **Async (aio-pika):** endpoints are cycled on the *initial* connect; once
+  `connect_robust` succeeds it pins to that node for reconnects (aio-pika has
+  no multi-host reconnect). For per-reconnect failover on async, front the
+  cluster with a load balancer or DNS round-robin and point `host` at the VIP.
+
+For a queue-level HA guarantee independent of connection failover, use
+**quorum queues** (`RabbitQueue(queue_type=QueueType.QUORUM)`) so messages are
+replicated across nodes — see the retry docs for the `x-delivery-limit`
+crash-loop backstop.

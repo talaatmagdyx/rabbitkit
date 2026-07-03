@@ -34,9 +34,15 @@ from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
-from rabbitkit.core.route import RouteDefinition, warn_filter_without_dlx
+from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.core.types import (
+    AckPolicy,
+    MessageEnvelope,
+    PublishOutcome,
+    PublishStatus,
+    TopologyMode,
+)
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.retry import RetryRouter
 from rabbitkit.serialization.base import Serializer
@@ -94,6 +100,7 @@ class SyncBroker:
             serializer=serializer,
             di_resolver=di_resolver,
             context_repo=context_repo,
+            reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
         )
 
         self._transport: SyncTransport | None = None
@@ -183,6 +190,7 @@ class SyncBroker:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reject_without_dlx: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -198,6 +206,7 @@ class SyncBroker:
             name=name,
             prefetch_count=prefetch_count,
             filter_fn=filter_fn,
+            reject_without_dlx=reject_without_dlx,
         )
 
     def publisher(
@@ -250,6 +259,7 @@ class SyncBroker:
             topology_mode=self._config.topology_mode,
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,
+            on_topology_conflict=self._config.safety.on_topology_conflict,
         )
 
         self._transport.connect()
@@ -261,24 +271,13 @@ class SyncBroker:
             self._transport.on_blocked(self._flow_controller.on_blocked)
             self._transport.on_unblocked(self._flow_controller.on_unblocked)
 
-        # M-P5: a small publisher channel pool caps concurrent confirms. Warn
-        # when confirms are on and the pool is small relative to expected
-        # concurrency (kept as a non-fatal hint; default unchanged).
-        if self._config.publisher.confirm_delivery:
-            pool_size = self._config.pool.channel_pool_size
-            # Publisher concurrency ~ worker_count (handlers that publish) or 1.
-            expected = worker_config.worker_count if worker_config and worker_config.worker_count > 1 else 1
-            if pool_size < max(4, expected):
-                import warnings
-
-                warnings.warn(
-                    f"confirm_delivery=True with channel_pool_size={pool_size} "
-                    f"(expected publisher concurrency ~{expected}). Concurrent confirms "
-                    "are capped by the pool size; increase PoolConfig.channel_pool_size "
-                    "if publish throughput matters.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+        # M2: the old M-P5 "channel_pool_size caps concurrent confirms"
+        # warning was removed. The default SyncTransport publishes on a single
+        # dedicated channel (not SyncChannelPool — see sync/pool.py), so
+        # channel_pool_size does not gate publish concurrency or confirms;
+        # tuning it changed nothing on this path. The real sync
+        # confirmed-publish ceiling (RTT-bound, ~0.9k msg/s, H6) is documented
+        # on SyncBroker.publish and in the README.
 
         # Declare topology
         self._declare_topology()
@@ -287,22 +286,42 @@ class SyncBroker:
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
 
+        # Connection-churn counter: reconnects were logged but never counted.
+        self._wire_reconnect_metric()
+
+        # H2: single-worker sync consumers run the handler INLINE on the pika
+        # I/O thread, so nothing services heartbeat frames while a handler
+        # runs. A handler that runs longer than ~2x the heartbeat interval
+        # gets its connection killed broker-side mid-handler → the ack fails,
+        # the message is redelivered, and side effects can repeat (possibly in
+        # a loop). worker_count>1 is immune (handlers run on pool threads while
+        # the I/O thread keeps pumping). Warn so the failure mode is visible.
+        single_worker = worker_config is None or worker_config.worker_count <= 1
+        if single_worker and self._registry.routes and self._config.connection.heartbeat > 0:
+            import warnings
+
+            warnings.warn(
+                f"Starting a single-worker sync consumer (worker_count=1) with "
+                f"heartbeat={self._config.connection.heartbeat}s. Handlers run inline on "
+                "the I/O thread, so any handler taking longer than ~"
+                f"{self._config.connection.heartbeat * 2}s will starve heartbeats and the "
+                "broker will drop the connection mid-handler (→ redelivery + duplicate "
+                "side effects). For slow handlers, pass "
+                "start(worker_config=WorkerConfig(worker_count=N)) so handlers run off the "
+                "I/O thread, or raise ConnectionConfig.heartbeat well above your worst-case "
+                "handler duration.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         # Create worker pool if requested
         if worker_config is not None and worker_config.worker_count > 1:
-            # Warn if worker_count exceeds channel_pool_size — all workers
-            # publishing simultaneously will exhaust the channel pool and
-            # block until acquire_timeout, risking deadlock under load.
-            if worker_config.worker_count > self._config.pool.channel_pool_size:
-                import warnings
-
-                warnings.warn(
-                    f"worker_count={worker_config.worker_count} exceeds "
-                    f"channel_pool_size={self._config.pool.channel_pool_size}. "
-                    "Concurrent publishes may exhaust the channel pool and deadlock. "
-                    "Increase PoolConfig.channel_pool_size to at least worker_count.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            # M2: the old channel_pool_size deadlock warning was removed — the
+            # default SyncTransport publishes on a single dedicated publisher
+            # channel, NOT through SyncChannelPool (see sync/pool.py), so
+            # worker_count vs channel_pool_size cannot cause the described
+            # publish deadlock. Tuning channel_pool_size changed nothing on
+            # this path; the warning only misled operators.
             # Override prefetch_count if prefetch_per_worker is set
             if worker_config.prefetch_per_worker is not None:
                 self._consumer_config = replace(
@@ -557,6 +576,13 @@ class SyncBroker:
         signs the envelope) — see ``publish_middlewares``. Middleware wraps
         OUTSIDE the flow-control gate, so a middleware-transformed envelope is
         what gets rate-limited/blocked, and what the transport actually sends.
+
+        Throughput note (H6): with publisher confirms on (the default), this
+        waits for a broker confirm per message on a single channel, so it is
+        RTT-bound at ~0.9k msg/s and does NOT scale with worker_count — pika's
+        BlockingConnection serializes confirms, it cannot pipeline them. To
+        drain a large backlog fast, use AsyncBroker + AsyncBatchPublisher
+        (pipelined confirms, ~6.1k msg/s) or more processes.
         """
         if envelope is None:
             import json as _json
@@ -569,6 +595,8 @@ class SyncBroker:
                 raw_body = body.encode()
             else:
                 raw_body = _json.dumps(body).encode()
+            # M2: honor PublisherConfig defaults for the kwargs form (they were
+            # previously dead config). Envelope-form callers keep full control.
             envelope = MessageEnvelope(
                 routing_key=routing_key,
                 body=raw_body,
@@ -577,6 +605,20 @@ class SyncBroker:
                 content_type=content_type,
                 correlation_id=correlation_id,
                 reply_to=reply_to,
+                mandatory=self._config.publisher.mandatory,
+                delivery_mode=2 if self._config.publisher.persistent else 1,
+            )
+
+        # M10: reject oversized bodies at publish time (input validation at
+        # the trust boundary — a too-large message is a programming/policy
+        # error, caught before it hits the wire).
+        max_bytes = self._config.publisher.max_message_bytes
+        if max_bytes and len(envelope.body) > max_bytes:
+            raise ValueError(
+                f"Message body ({len(envelope.body)} bytes) exceeds "
+                f"PublisherConfig.max_message_bytes ({max_bytes}). Large messages are a "
+                "RabbitMQ anti-pattern — store the payload externally and publish a "
+                "reference, or raise the limit if this is intentional."
             )
 
         if self._transport is None:
@@ -605,6 +647,48 @@ class SyncBroker:
             outcome: PublishOutcome = chain(envelope, do_transport_publish)
             return outcome
         return do_transport_publish(envelope)
+
+    def _flow_controlled_internal_publish(self, env: MessageEnvelope) -> PublishOutcome:
+        """M18: apply the broker's ``FlowController`` (if configured) to an
+        INTERNAL republish — ``RetryMiddleware``'s delay-queue publish, or a
+        handler's result/RPC-reply publish — used as their ``publish_fn``
+        instead of the raw, unthrottled ``transport.publish``.
+
+        Deliberately diverges from ``do_transport_publish`` above: a
+        configured ``on_blocked="raise"`` must NEVER raise ``BackpressureError``
+        out of here. ``RetryMiddleware`` and the pipeline's result-publish path
+        only understand a returned ``PublishOutcome`` (checked via ``.ok``),
+        not exceptions — letting one escape would propagate as an unclassified
+        error, default to PERMANENT, and reject/destroy the message instead of
+        the existing safe nack+requeue-on-publish-failure behavior both paths
+        already implement. So regardless of the configured policy, a
+        blocked/dropped slot here always resolves as a failed
+        ``PublishOutcome`` (status=ERROR), never an exception — the same
+        outcome shape a real transport failure already produces.
+        """
+        if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
+            raise RuntimeError("Broker not started. Call start() first.")
+        transport = self._transport
+        fc = self._flow_controller
+        if fc is None:
+            return transport.publish(env)
+        try:
+            acquired = fc.acquire()
+        except BackpressureError as exc:
+            return PublishOutcome(
+                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
+            )
+        if not acquired:
+            return PublishOutcome(
+                status=PublishStatus.ERROR,
+                exchange=env.exchange,
+                routing_key=env.routing_key,
+                error=BackpressureError("publish dropped by backpressure policy"),
+            )
+        try:
+            return transport.publish(env)
+        finally:
+            fc.release()
 
     def request(
         self,
@@ -670,6 +754,7 @@ class SyncBroker:
             warn_retry_middleware_without_topology,
             warn_retry_without_confirms,
         )
+        from rabbitkit.middleware.signing import check_signing_retry_conflict
 
         wired = False
         for route in self._registry.routes:
@@ -682,6 +767,8 @@ class SyncBroker:
                     # queues and are silently dropped. Surface it loudly.
                     warn_retry_middleware_without_topology(route.name)
                 continue
+            # H1: signing + retry destroys every retried message — fail fast.
+            check_signing_retry_conflict(route.name, route.route_middlewares)
             if has_retry_mw:
                 continue
             if not self._config.publisher.confirm_delivery:
@@ -696,7 +783,7 @@ class SyncBroker:
                 index,
                 RetryMiddleware(
                     retry_config,
-                    publish_fn=self._transport.publish,
+                    publish_fn=self._flow_controlled_internal_publish,  # M18: honor FlowController
                     metrics_collector=metrics_mw.collector if metrics_mw else None,
                     metrics_config=metrics_mw.config if metrics_mw else None,
                 ),
@@ -711,6 +798,30 @@ class SyncBroker:
         if wired:
             # Drop any middleware chains cached before the retry mw was installed.
             self._pipeline.clear_caches()
+
+    def _wire_reconnect_metric(self) -> None:
+        """Count transport reconnects (connection churn) via the first route
+        ``MetricsMiddleware``'s collector, if any. Reconnects were logged but
+        never counted, so a flapping broker/network was invisible to
+        metrics-based alerting. No-op when no route carries metrics."""
+        if self._transport is None:
+            return
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        metrics_mw = next(
+            (
+                mw
+                for route in self._registry.routes
+                for mw in route.route_middlewares
+                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
+            ),
+            None,
+        )
+        if metrics_mw is None or metrics_mw.collector is None:
+            return
+        collector = metrics_mw.collector
+        metric_name = metrics_mw.config.reconnects_total
+        self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
 
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -734,19 +845,15 @@ class SyncBroker:
 
             # Determine retry config early so source queue can include DLQ routing
             retry_config = route.effective_retry_config(self._config.retry)
-            # H6: a filter_fn rejection nack(requeue=False)'s the message; without a
-            # DLX RabbitMQ just discards it. Retry-enabled routes already get one
-            # below; a manually-configured dead_letter_exchange is respected as-is.
-            # Otherwise auto-declare a "<queue>.dlq" DLQ so filter rejections are
-            # preserved even with no retry configured.
-            filter_dlq_name: str | None = None
-            if (
-                retry_config is None
-                and route.filter_fn is not None
-                and route.queue.dead_letter_exchange is None
-            ):
-                filter_dlq_name = f"{route.queue.name}.dlq"
-                warn_filter_without_dlx(route.name, route.queue.name, filter_dlq_name)
+            # C3: a route with no dead-letter path can reject(requeue=False)
+            # (permanent errors, filter_fn, RejectMessage) and RabbitMQ would
+            # DISCARD the message. Apply SafetyConfig.reject_without_dlx:
+            # auto-provision "<queue>.dlq" (default), fail startup, or warn
+            # and allow discard. Only under AUTO_DECLARE — in passive/manual
+            # modes rabbitkit does not own the queue's arguments.
+            safety_dlq_name: str | None = None
+            if self._config.topology_mode is TopologyMode.AUTO_DECLARE:
+                safety_dlq_name = route.resolve_safety_dlq(self._config.safety, self._config.retry)
 
             if retry_config is not None:
                 retry_router = RetryRouter(retry_config)
@@ -760,26 +867,32 @@ class SyncBroker:
                     dead_letter_exchange="",
                     dead_letter_routing_key=dlq_name,
                 )
-            elif filter_dlq_name is not None:
+            elif safety_dlq_name is not None:
                 import dataclasses
 
+                logger.info(
+                    "Auto-provisioned DLQ %r for queue %r (reject_without_dlx=auto_provision)",
+                    safety_dlq_name,
+                    route.queue.name,
+                )
                 source_queue = dataclasses.replace(
                     route.queue,
                     dead_letter_exchange="",
-                    dead_letter_routing_key=filter_dlq_name,
+                    dead_letter_routing_key=safety_dlq_name,
                 )
             else:
                 source_queue = route.queue
 
-            # Declare queue (with DLQ routing arguments if retry/filter-DLX applies)
+            # Declare queue (with DLQ routing arguments if retry/safety DLX applies)
             self._transport.declare_queue(source_queue)
 
-            # Bind queue to exchange
+            # Bind queue to exchange (C4: bind_arguments matter for headers exchanges)
             if route.exchange is not None:
                 self._transport.bind_queue(
                     queue=route.queue.name,
                     exchange=route.exchange.name,
                     routing_key=to_binding_key(route.queue.routing_key),
+                    arguments=route.queue.bind_arguments or None,
                 )
 
             # Declare retry/DLQ topology if retry is enabled
@@ -788,8 +901,8 @@ class SyncBroker:
                 delay_queues = retry_router.get_delay_queue_definitions(route.queue.name, exchange_name)
                 for delay_queue in delay_queues:
                     self._transport.declare_queue(delay_queue)
-            elif filter_dlq_name is not None:
-                self._transport.declare_queue(RabbitQueue(name=filter_dlq_name, durable=True))
+            elif safety_dlq_name is not None:
+                self._transport.declare_queue(RabbitQueue(name=safety_dlq_name, durable=True))
 
     def _mark_heartbeat(self) -> None:
         """Refresh the liveness heartbeat (I-4/L14).
@@ -807,7 +920,6 @@ class SyncBroker:
         if self._transport is None:
             return
 
-        transport = self._transport
         pool = self._worker_pool
 
         def on_message(message: RabbitMessage) -> None:
@@ -823,11 +935,30 @@ class SyncBroker:
                 # Populate named routing-key segments for Path() DI
                 message.path = extract_path(message.routing_key, route.queue.routing_key)
 
-                self._pipeline.process_sync(
-                    route,
-                    message,
-                    publish_fn=transport.publish,
-                )
+                try:
+                    self._pipeline.process_sync(
+                        route,
+                        message,
+                        publish_fn=self._flow_controlled_internal_publish,  # M18
+                    )
+                except Exception:
+                    # M12: AUTO/NACK_ON_ERROR settle inside the pipeline and
+                    # never reach here — but a MANUAL-policy handler that
+                    # raises without settling used to propagate out of the
+                    # delivery callback and STOP the entire run loop (one bad
+                    # handler took down the broker). Contain it: log and
+                    # nack-requeue if still unsettled, so the failure degrades
+                    # to a redelivery instead of a broker-wide halt. Matches
+                    # the pooled/async paths, which already isolate handler
+                    # exceptions.
+                    logger.error(
+                        "Handler raised through the pipeline; nacking for redelivery",
+                        queue=route.queue.name,
+                        message_id=message.message_id,
+                        exc_info=True,
+                    )
+                    if not message.is_settled:
+                        message.nack(requeue=True)
             finally:
                 self._in_flight_dec()
 

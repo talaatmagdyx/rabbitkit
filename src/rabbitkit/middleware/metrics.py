@@ -66,6 +66,10 @@ class MetricsCollector(Protocol):
         """Observe a value on a histogram metric."""
         ...
 
+    def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+        """Set a gauge metric to an absolute value (e.g. queue depth)."""
+        ...
+
 
 # ── Prometheus implementation (optional import) ──────────────────────────
 
@@ -94,6 +98,7 @@ class PrometheusCollector:
 
         self._counters: dict[str, Any] = {}
         self._histograms: dict[str, Any] = {}
+        self._gauges: dict[str, Any] = {}
         self._prometheus_client = prometheus_client
 
     def _get_counter(self, name: str, label_names: tuple[str, ...]) -> Any:
@@ -114,6 +119,15 @@ class PrometheusCollector:
             )
         return self._histograms[name]
 
+    def _get_gauge(self, name: str, label_names: tuple[str, ...]) -> Any:
+        if name not in self._gauges:
+            self._gauges[name] = self._prometheus_client.Gauge(
+                name,
+                f"rabbitkit {name}",
+                label_names,
+            )
+        return self._gauges[name]
+
     def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None:
         """Increment a Prometheus counter."""
         label_names = tuple(sorted(labels.keys()))
@@ -125,6 +139,12 @@ class PrometheusCollector:
         label_names = tuple(sorted(labels.keys()))
         histogram = self._get_histogram(name, label_names)
         histogram.labels(**labels).observe(value)
+
+    def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+        """Set a Prometheus gauge to an absolute value."""
+        label_names = tuple(sorted(labels.keys()))
+        gauge = self._get_gauge(name, label_names)
+        gauge.labels(**labels).set(value)
 
 
 # ── Middleware ────────────────────────────────────────────────────────────
@@ -208,6 +228,14 @@ class MetricsMiddleware(BaseMiddleware):
             return call_next(message)
 
         queue = _queue_label(message)
+        if message.redelivered:
+            # Broker-redelivery rate: a sustained rise means handlers are
+            # dying/timing out before acking, which the success/error
+            # consume counters alone can't distinguish from normal traffic.
+            self._collector.inc_counter(
+                self._cfg.messages_redelivered_total,
+                {"queue": queue},
+            )
         start = time.monotonic()
         try:
             result = call_next(message)
@@ -244,6 +272,12 @@ class MetricsMiddleware(BaseMiddleware):
             return await call_next(message)
 
         queue = _queue_label(message)
+        if message.redelivered:
+            # Broker-redelivery rate — see consume_scope.
+            self._collector.inc_counter(
+                self._cfg.messages_redelivered_total,
+                {"queue": queue},
+            )
         start = time.monotonic()
         try:
             result = await call_next(message)

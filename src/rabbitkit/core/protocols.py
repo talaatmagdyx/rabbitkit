@@ -69,8 +69,17 @@ class Transport(Protocol):
         """Declare a queue on the broker."""
         ...
 
-    def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
-        """Bind a queue to an exchange with a routing key."""
+    def bind_queue(
+        self,
+        queue: str,
+        exchange: str,
+        routing_key: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind a queue to an exchange with a routing key.
+
+        ``arguments`` carries header-match criteria for HEADERS exchanges.
+        """
         ...
 
     def bind_exchange(
@@ -138,8 +147,17 @@ class AsyncTransport(Protocol):
         """Declare a queue on the broker."""
         ...
 
-    async def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
-        """Bind a queue to an exchange with a routing key."""
+    async def bind_queue(
+        self,
+        queue: str,
+        exchange: str,
+        routing_key: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind a queue to an exchange with a routing key.
+
+        ``arguments`` carries header-match criteria for HEADERS exchanges.
+        """
         ...
 
     async def bind_exchange(

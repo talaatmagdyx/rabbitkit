@@ -351,6 +351,130 @@ class TestBrokerHealthCheck:
         assert "consumers active" in result.details["reason"]
 
 
+# ── management_client integration ────────────────────────────────────────
+#
+# broker_health_check's process-local checks can't detect a partitioned
+# cluster where this process still holds a live connection to one node --
+# an optional management_client (RabbitManagementClient) closes that gap.
+
+
+class TestBrokerHealthCheckManagementClient:
+    def test_no_management_client_unchanged(self) -> None:
+        """Omitting management_client preserves the original process-local-
+        only behavior exactly (no surprise new failure mode for existing
+        callers)."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        result = broker_health_check(broker)
+        assert result.status == HealthStatus.HEALTHY
+        assert "management_check" not in result.details
+
+    def test_management_check_passes_stays_healthy(self) -> None:
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = True
+
+        result = broker_health_check(broker, management_client=mgmt)
+
+        assert result.status == HealthStatus.HEALTHY
+        mgmt.health_check.assert_called_once()
+
+    def test_management_check_fails_downgrades_healthy_to_degraded(self) -> None:
+        """The core scenario this closes: this process's own connection is
+        perfectly fine (would read HEALTHY on its own), but the management
+        API reports the node unhealthy -- e.g. a partitioned cluster."""
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = False
+
+        result = broker_health_check(broker, management_client=mgmt)
+
+        assert result.status == HealthStatus.DEGRADED
+        assert "management_check" in result.details
+
+    def test_management_check_not_called_when_already_unhealthy(self) -> None:
+        """No point spending a network round-trip when the local check
+        already failed -- and an UNHEALTHY local result must not be
+        silently "improved" by a management check that never ran."""
+        broker = _make_broker(started=False)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = True
+
+        result = broker_health_check(broker, management_client=mgmt)
+
+        assert result.status == HealthStatus.UNHEALTHY
+        mgmt.health_check.assert_not_called()
+
+    def test_management_check_does_not_override_unhealthy(self) -> None:
+        broker = _make_broker(started=True, connected=False)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = False
+
+        result = broker_health_check(broker, management_client=mgmt)
+
+        assert result.status == HealthStatus.UNHEALTHY
+
+    async def test_async_management_check_uses_async_method(self) -> None:
+        """The async variant must await health_check_async(), not call the
+        sync health_check() (which would block the event loop)."""
+        from unittest.mock import AsyncMock
+
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check_async = AsyncMock(return_value=False)
+        mgmt.health_check = MagicMock(side_effect=AssertionError("must not call sync health_check"))
+
+        result = await broker_health_check_async(broker, management_client=mgmt)
+
+        assert result.status == HealthStatus.DEGRADED
+        mgmt.health_check_async.assert_awaited_once()
+
+
+class TestBrokerReadinessManagementClient:
+    def test_readiness_false_when_management_check_fails(self) -> None:
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = False
+
+        assert broker_readiness(broker, management_client=mgmt) is False
+
+    def test_readiness_true_when_management_check_passes(self) -> None:
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check.return_value = True
+
+        assert broker_readiness(broker, management_client=mgmt) is True
+
+    async def test_readiness_async_false_when_management_check_fails(self) -> None:
+        from unittest.mock import AsyncMock
+
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+        mgmt = MagicMock()
+        mgmt.health_check_async = AsyncMock(return_value=False)
+
+        assert await broker_readiness_async(broker, management_client=mgmt) is False
+
+    async def test_readiness_async_false_when_disconnected(self) -> None:
+        """broker_readiness_async no longer delegates to the sync variant
+        (that would run a blocking management call on the event loop), so
+        its own early-return branches need direct coverage."""
+        broker = _make_broker(started=True, connected=False)
+
+        assert await broker_readiness_async(broker) is False
+
+    async def test_readiness_async_false_when_blocked(self) -> None:
+        routes = [_make_route(consumer_tag="ctag-1")]
+        broker = _make_broker(started=True, connected=True, routes=routes, blocked=True)
+
+        assert await broker_readiness_async(broker) is False
+
+
 # ── broker_health_check_async ────────────────────────────────────────────
 
 
@@ -949,5 +1073,27 @@ class TestBrokerReadinessConnectedFalse:
         )
         with patch("rabbitkit.health.broker_health_check", return_value=mocked_result):
             result = broker_readiness(broker)
+
+        assert result is False
+
+    async def test_readiness_async_returns_false_when_not_connected_but_not_unhealthy(self) -> None:
+        """Async twin of the above -- broker_readiness_async has its own
+        copy of the guard (it can't delegate to sync without running a
+        blocking management call on the event loop)."""
+        from unittest.mock import AsyncMock, patch
+
+        broker = SimpleNamespace()
+        mocked_result = BrokerHealthResult(
+            status=HealthStatus.HEALTHY,
+            started=True,
+            connected=False,
+            consumer_count=0,
+            route_count=0,
+        )
+        with patch(
+            "rabbitkit.health.broker_health_check_async",
+            new=AsyncMock(return_value=mocked_result),
+        ):
+            result = await broker_readiness_async(broker)
 
         assert result is False

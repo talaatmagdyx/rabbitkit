@@ -406,7 +406,10 @@ async def scenario_sync_restart_during_publish() -> tuple[bool, str]:
                 if ok else f"FAIL: only {confirmed[0]}/{n} confirmed")
 
 
-async def main() -> None:
+async def main(only: list[str] | None = None) -> None:
+    """Run chaos scenarios. ``only`` filters to scenarios whose name contains
+    any of the given substrings (case-insensitive) — used by the gating CI
+    step (M15) to run just the critical restart-mid-consume scenarios."""
     start_broker()
     scenarios = [
         ("ASYNC restart mid-consume (no loss + idempotent dedup)", scenario_restart_during_consume),
@@ -416,6 +419,9 @@ async def main() -> None:
         ("SYNC transient failures → retry → DLQ", scenario_sync_retry_to_dlq),
         ("SYNC restart mid-publish (resend unconfirmed)", scenario_sync_restart_during_publish),
     ]
+    if only:
+        needles = [s.lower() for s in only]
+        scenarios = [(n, fn) for (n, fn) in scenarios if any(s in n.lower() for s in needles)]
     results = []
     try:
         for name, fn in scenarios:
@@ -438,4 +444,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+
+    asyncio.run(main(sys.argv[1:] or None))

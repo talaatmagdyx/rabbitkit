@@ -323,10 +323,12 @@ class AsyncConnectionPool:
                 "aio-pika is required for async transport. Install it with: pip install rabbitkit[async]"
             ) from None
 
-        kwargs = make_aio_pika_connect_kwargs(
-            self._connection_config,
-            self._security_config,
-        )
+        # M9: cycle through cluster endpoints on the initial connect so a dead
+        # configured primary doesn't take the client down at startup. Once
+        # connect_robust succeeds it pins to that node for reconnects (aio-pika
+        # has no multi-host reconnect) — put a load balancer / DNS in front for
+        # per-reconnect failover across nodes.
+        endpoints = self._connection_config.cluster_endpoints()
 
         # H-SRE3: connect_robust handles reconnects AFTER the first connection
         # with a FIXED interval, so a fleet of clients starting at once thunder
@@ -337,6 +339,13 @@ class AsyncConnectionPool:
         connection_errors = get_connection_errors()
         max_attempts = 30
         for attempt in range(1, max_attempts + 1):
+            host, port = endpoints[(attempt - 1) % len(endpoints)]
+            kwargs = make_aio_pika_connect_kwargs(
+                self._connection_config,
+                self._security_config,
+                host_override=host,
+                port_override=port,
+            )
             try:
                 return await aio_pika.connect_robust(**kwargs)
             except connection_errors as e:

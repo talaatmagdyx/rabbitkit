@@ -58,15 +58,18 @@ class RabbitMessage:
         "correlation_id",
         "delivery_tag",
         "exchange",
+        "expiration",
         "headers",
         "message_id",
         "path",
+        "priority",
         "raw_message",
         "redelivered",
         "reply_to",
         "routing_key",
         "timestamp",
         "type",
+        "user_id",
     )
 
     def __init__(
@@ -82,6 +85,9 @@ class RabbitMessage:
         timestamp: datetime | None = None,
         type: str | None = None,  # noqa: A002 — AMQP property name
         app_id: str | None = None,
+        priority: int | None = None,
+        expiration: str | None = None,
+        user_id: str | None = None,
         routing_key: str = "",
         exchange: str = "",
         delivery_tag: int | None = None,
@@ -100,6 +106,9 @@ class RabbitMessage:
         self.timestamp = timestamp
         self.type = type
         self.app_id = app_id
+        self.priority = priority
+        self.expiration = expiration
+        self.user_id = user_id
         self.routing_key = routing_key
         self.exchange = exchange
         self.delivery_tag = delivery_tag

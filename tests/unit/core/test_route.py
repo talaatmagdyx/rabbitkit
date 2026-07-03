@@ -327,6 +327,138 @@ class TestFullValidation:
         route.validate(broker_retry=RetryConfig())  # no exception
 
 
+class TestHeadersBindingValidation:
+    """C4: headers-exchange bindings require bind_arguments with a valid x-match."""
+
+    def _headers_exchange(self) -> RabbitExchange:
+        from rabbitkit.core.types import ExchangeType
+
+        return RabbitExchange(name="events.headers", type=ExchangeType.HEADERS)
+
+    def test_headers_exchange_without_bind_arguments_raises(self) -> None:
+        route = _make_route(exchange=self._headers_exchange())
+        with pytest.raises(ConfigurationError, match="bind_arguments"):
+            route.validate()
+
+    def test_headers_exchange_with_invalid_x_match_raises(self) -> None:
+        queue = RabbitQueue(name="q", bind_arguments={"x-match": "invalid", "type": "order"})
+        route = _make_route(queue=queue, exchange=self._headers_exchange())
+        with pytest.raises(ConfigurationError, match="x-match"):
+            route.validate()
+
+    @pytest.mark.parametrize("x_match", ["all", "any", "all-with-x", "any-with-x"])
+    def test_headers_exchange_with_valid_x_match_passes(self, x_match: str) -> None:
+        queue = RabbitQueue(name="q", bind_arguments={"x-match": x_match, "type": "order"})
+        route = _make_route(queue=queue, exchange=self._headers_exchange())
+        route.validate()  # no exception
+
+    def test_headers_exchange_x_match_defaults_to_all(self) -> None:
+        """RabbitMQ defaults a missing x-match to 'all' — accepted."""
+        queue = RabbitQueue(name="q", bind_arguments={"type": "order"})
+        route = _make_route(queue=queue, exchange=self._headers_exchange())
+        route.validate()  # no exception
+
+    def test_non_headers_exchange_needs_no_bind_arguments(self) -> None:
+        route = _make_route()  # default direct exchange
+        route.validate()  # no exception
+
+
+class TestRejectWithoutDLXResolution:
+    """C3: RouteDefinition.resolve_safety_dlq / can_reject_without_dlx."""
+
+    def _safety(self, **kw: object) -> object:
+        from rabbitkit.core.config import SafetyConfig
+
+        return SafetyConfig(**kw)  # type: ignore[arg-type]
+
+    def test_invalid_override_value_raises_at_validation(self) -> None:
+        route = _make_route(reject_without_dlx="always")
+        with pytest.raises(ConfigurationError, match="reject_without_dlx"):
+            route.validate()
+
+    def test_auto_provision_returns_dlq_name(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route(queue=RabbitQueue(name="orders"))
+        assert route.resolve_safety_dlq(SafetyConfig()) == "orders.dlq"
+
+    def test_retry_enabled_route_needs_nothing(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route(retry_override=RetryConfig())
+        assert route.resolve_safety_dlq(SafetyConfig()) is None
+
+    def test_manual_dlx_respected(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        queue = RabbitQueue(name="orders", dead_letter_exchange="my-dlx")
+        route = _make_route(queue=queue)
+        assert route.resolve_safety_dlq(SafetyConfig()) is None
+
+    def test_ack_first_without_filter_cannot_reject(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route(ack_policy=AckPolicy.ACK_FIRST)
+        assert route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="error")) is None
+
+    def test_ack_first_with_filter_can_reject(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route(ack_policy=AckPolicy.ACK_FIRST, filter_fn=lambda m: True)
+        assert route.resolve_safety_dlq(SafetyConfig()) == "test-queue.dlq"
+
+    def test_error_policy_raises_unsafe_topology(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.errors import UnsafeTopologyError
+
+        route = _make_route()
+        with pytest.raises(UnsafeTopologyError, match="dead-letter"):
+            route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="error"))
+
+    def test_unsafe_topology_error_is_configuration_error(self) -> None:
+        from rabbitkit.core.errors import UnsafeTopologyError
+
+        assert issubclass(UnsafeTopologyError, ConfigurationError)
+
+    def test_discard_policy_warns_and_returns_none(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route()
+        with pytest.warns(RuntimeWarning, match="permanently discarded"):
+            result = route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="discard"))
+        assert result is None
+
+    def test_discard_policy_silent_when_warn_disabled(self) -> None:
+        import warnings
+
+        from rabbitkit.core.config import SafetyConfig
+
+        route = _make_route()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = route.resolve_safety_dlq(
+                SafetyConfig(reject_without_dlx="discard", warn_on_discard=False)
+            )
+        assert result is None
+        assert caught == []
+
+    def test_per_route_override_beats_config(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.errors import UnsafeTopologyError
+
+        route = _make_route(reject_without_dlx="error")
+        with pytest.raises(UnsafeTopologyError):
+            route.resolve_safety_dlq(SafetyConfig())  # config default auto_provision
+
+    def test_enum_member_accepted_as_override(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.types import RejectWithoutDLXPolicy
+
+        route = _make_route(reject_without_dlx=RejectWithoutDLXPolicy.AUTO_PROVISION)
+        route.validate()
+        assert route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="discard")) == "test-queue.dlq"
+
+
 class TestRouteDynamic:
     def test_delete_consumer_tag_raises(self) -> None:
         """L10: consumer_tag has no deleter -- del route.consumer_tag raises.

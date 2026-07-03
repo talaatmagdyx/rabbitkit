@@ -4,6 +4,32 @@ RabbitKit provides a built-in retry system based on RabbitMQ dead-letter exchang
 
 ---
 
+## Every Route Gets a Dead-Letter Path by Default
+
+In RabbitMQ, a message rejected with `requeue=False` is **permanently discarded** unless the queue has a dead-letter exchange. A plain subscriber with no retry can still reject — a handler raising `ValueError` on a malformed payload is classified as a permanent error and rejected. To prevent silent loss, RabbitKit auto-provisions a `{queue}.dlq` for **every** route that can reject, controlled by `SafetyConfig.reject_without_dlx`:
+
+| Policy | Behavior | Use |
+|---|---|---|
+| `"auto_provision"` (default) | Declares `{queue}.dlq` and wires the source queue's DLX to it | Most consumers |
+| `"error"` | Startup fails with `UnsafeTopologyError` if a rejecting route has no DLX | Topology managed externally (Terraform/definitions) |
+| `"discard"` | Rejected messages may be discarded; warns once per route | Low-value/ephemeral data only — explicit opt-in to loss |
+
+```python
+from rabbitkit import RabbitConfig, SafetyConfig, RejectWithoutDLXPolicy
+
+config = RabbitConfig(safety=SafetyConfig(reject_without_dlx=RejectWithoutDLXPolicy.ERROR))
+
+# Or per route:
+@broker.subscriber(queue="low-value-telemetry", reject_without_dlx="discard")
+def handle(body: bytes) -> None: ...
+```
+
+Retry-enabled routes and queues with a manually configured `dead_letter_exchange` already have a dead-letter path and are left untouched. `ACK_FIRST` routes (which ack before the handler and can never reject) are skipped. The policy applies only under `TopologyMode.AUTO_DECLARE` — in `PASSIVE_ONLY`/`MANUAL` modes RabbitKit does not own queue arguments and cannot know whether an externally managed DLX exists.
+
+**Upgrading an existing deployment:** auto-provisioning adds `x-dead-letter-exchange`/`x-dead-letter-routing-key` to the source queue's declare arguments. RabbitMQ rejects re-declaring an existing queue with different arguments (406 `PRECONDITION_FAILED` → a clear `ConfigurationError` at startup). Either delete/re-create the queue, apply the matching arguments via a policy on the broker, switch that route to `reject_without_dlx="discard"`/`"error"`, run with `TopologyMode.PASSIVE_ONLY`, or set `SafetyConfig(on_topology_conflict="warn_continue")` — which warns and continues using the *existing* queue definition for just the conflicting queues while still declaring the rest (unlike `PASSIVE_ONLY`, which skips declaration entirely).
+
+---
+
 ## Full Topology Example
 
 For a queue named `orders.created`, RabbitKit declares the following topology automatically when `RetryConfig` is provided:
@@ -85,6 +111,33 @@ that never settles a message, independent of anything RetryMiddleware does),
 prefer **quorum queues** for the source queue and set `x-delivery-limit` — the
 broker itself dead-letters a message after that many redeliveries, with no
 dependency on any header at all.
+
+### Crash-loop backstop (M5)
+
+The header count only advances on the delay-queue round trip
+(`RetryMiddleware` acks the source and republishes). A handler that *crashes
+the process* mid-message (OOM, segfault, SIGKILL) never acks, so the broker
+redelivers the same message forever — the header never increments and the
+retry ladder is never engaged. The broker-side backstop for this is a quorum
+source queue with `x-delivery-limit`: it counts *redeliveries* and
+dead-letters once the limit is hit, regardless of the header. rabbitkit
+preserves both the quorum type and the delivery limit when retry re-declares
+the source queue with its DLX routing, so the two compose:
+
+```python
+from rabbitkit import RabbitQueue, QueueType, RetryConfig
+
+@broker.subscriber(
+    queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=20),
+    retry=RetryConfig(max_retries=4, delays=(5, 30, 120, 600)),
+)
+def handle(order: Order) -> None:
+    ...
+# Normal retries ack+republish (source redelivery count stays ~0 per cycle),
+# so delivery_limit only trips on a true crash-loop → message dead-lettered
+# to orders.dlq by the broker. Keep delivery_limit comfortably above the
+# redeliveries a normal restart might cause.
+```
 
 ---
 

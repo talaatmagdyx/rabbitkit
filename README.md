@@ -159,6 +159,17 @@ heartbeat fresh. `AsyncBroker` needs no equivalent — see
 [the sync-vs-async connection model note](docs/guide/full-guide.md#sync-vs-async-two-different-connection-models)
 for why.
 
+**Sync confirmed-publish throughput ceiling (~0.9k msg/s):** `SyncBroker.publish()`
+waits for a publisher confirm per message on a single channel, so throughput
+is bounded by broker round-trip latency (~900 msg/s in the benchmarks),
+*regardless of how many worker threads publish* — pika's `BlockingConnection`
+serializes confirms and does not pipeline them. This is fine for
+publish-alongside-consume workloads, but if you need to drain a large backlog
+(e.g. an outbox after an outage), use `AsyncBroker` with `AsyncBatchPublisher`
+(pipelined confirms, ~6.1k msg/s) or scale out across processes. `worker_count`
+does **not** raise sync publish throughput. `highload.BatchPublisher` improves
+ergonomics, not the confirm ceiling.
+
 ## What's next
 
 - **[Full Guide](docs/guide/full-guide.md)** — every feature, in depth: configuration, routing, ack policies, DI, middleware, retry, serialization, high-load infrastructure, RPC, backpressure, health checks, locking, deduplication, circuit breaking, signing, compression, result backends, stream queues, AsyncAPI, the management API, the dashboard, the CLI, testing, FastAPI, environment config, Kubernetes, app lifecycle, and architecture.

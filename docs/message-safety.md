@@ -70,6 +70,21 @@ reports this via `PublishOutcome.status`:
 the same way you would treat a failed publish (e.g. don't ack an upstream message on the
 strength of an outcome that isn't `.ok`).
 
+**Sync transport residual limitation:** pika's `BlockingChannel.basic_publish()` has no
+timeout parameter of its own. `confirm_timeout` bounds every publish path *except* one: a
+publish made from the connection's owner thread *while a consume loop it also drives is
+active* (the default `worker_count=1` consumer publishing a result/retry from inside a
+handler) cannot be safely bounded — interrupting it would leave a background thread possibly
+still touching the same connection at the exact moment `start_consuming()` resumes touching
+it too, which pika does not support from two threads at once. Every other sync publish path
+(a pure producer with no consumer, publishing before any consuming has started, and any
+publish from a non-owner worker thread) is fully bounded, including on a broker that accepts
+the TCP connection but never sends the confirm frame back (disk full, internally wedged) — the
+connection is discarded and transparently re-established on the next call rather than reused.
+**Mitigation for the one unbounded case:** pass `worker_config=WorkerConfig(worker_count=2+)` to
+`SyncBroker.start()` — a handler's publish then runs on a worker thread, which already marshals
+through the bounded cross-thread path.
+
 A `mandatory=True` publish always detects an unroutable message and reports `RETURNED`,
 regardless of the broker's `confirm_delivery` setting — `SyncBroker` upgrades the target
 channel to confirm mode on demand, and `AsyncBroker` routes the publish through a dedicated,

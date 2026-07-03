@@ -58,12 +58,15 @@ class SyncTransport:
         topology_mode: TopologyMode = TopologyMode.AUTO_DECLARE,
         confirm_delivery: bool = True,
         confirm_timeout: float = 5.0,
+        on_topology_conflict: str = "raise",
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._socket_config = socket_config or SocketConfig()
         self._security_config = security_config or SecurityConfig()
         self._topology_mode = topology_mode
         self._topo = TopologyDispatcher(topology_mode)
+        # M14: "raise" | "warn_continue" on a 406 topology-drift conflict.
+        self._on_topology_conflict = on_topology_conflict
         self._confirm_delivery = confirm_delivery
         # I-10: bound the publish+confirm wait so a missing confirm cannot stall
         # a worker forever. Brokers should pass ``config.publisher.confirm_timeout``
@@ -132,6 +135,24 @@ class SyncTransport:
         # the broker may override via attribute if desired.
         self.max_reconnect_attempts: int = 0  # 0 == use the time-bounded default below
         self._reconnect_total_timeout: float = 300.0
+
+        # Connection-churn signal: reconnects were logged but never counted,
+        # so a flapping broker/network was invisible to metrics alerting.
+        # Fired on every successful connect() AFTER the first (see connect()).
+        self._reconnect_callbacks: list[Callable[[], None]] = []
+        self._ever_connected = False
+
+    def on_reconnect(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired on every re-connection after the first
+        successful connect (connection-churn metric hook)."""
+        self._reconnect_callbacks.append(callback)
+
+    def _fire_reconnect(self) -> None:
+        for cb in list(self._reconnect_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never let a cb break connect
+                logger.exception("reconnect callback raised")
 
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
@@ -219,6 +240,9 @@ class SyncTransport:
 
         self._connected = True
         self._owner_ident = threading.get_ident()
+        if self._ever_connected:
+            self._fire_reconnect()  # connection-churn metric hook
+        self._ever_connected = True
         logger.info("Connected to RabbitMQ")
 
     def __enter__(self) -> SyncTransport:
@@ -428,6 +452,77 @@ class SyncTransport:
             raise error[0]
         return result[0]
 
+    def _publish_confirm_wait_bounded(self, fn: Callable[[], _T], timeout: float) -> _T:
+        """Bound a blocking publish call that would otherwise run fully
+        inline and unbounded (I-11).
+
+        pika's ``BlockingChannel.basic_publish()`` takes no timeout
+        parameter, and its confirm-wait loops via ``process_data_events``
+        with no aggregate time limit -- a broker that accepts the TCP
+        connection but never sends the confirm frame back (disk full,
+        internally wedged) hangs this call forever, `confirm_timeout`
+        notwithstanding, whenever ``_run_on_io_thread`` would otherwise run
+        it inline (single-worker/pure-producer case — see
+        ``_publish_on_channel``, the cross-thread marshal case is already
+        bounded by ``_run_on_io_thread`` itself).
+
+        Runs *fn* on a dedicated one-shot thread and bounds OUR wait for it
+        (same R-3 shape as ``_run_on_io_thread``). On timeout, that thread
+        may still be blocked inside pika, touching the connection -- never
+        safe to touch that connection from any other thread afterward
+        (pika's ``BlockingConnection`` supports exactly one thread at a
+        time), so it is poisoned (all references dropped, never closed —
+        closing would itself be a second thread touching it).
+        ``_ensure_connected()`` transparently creates a fresh connection on
+        the next call, the same recovery path as a genuine network failure.
+
+        Only called when no consume loop can be sharing this connection
+        (see the call site) -- if one were, resuming ``start_consuming()``
+        after giving up would immediately recreate the exact concurrent-
+        touch hazard this method exists to avoid.
+        """
+        result: list[_T] = []
+        error: list[BaseException] = []
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                result.append(fn())
+            except BaseException as exc:
+                error.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, name="rabbitkit-publish-confirm-wait", daemon=True).start()
+        if not done.wait(timeout=timeout):
+            self._poison_wedged_connection()
+            raise TimeoutError(
+                f"Timed out after {timeout}s waiting for a publish confirm; connection "
+                "presumed wedged and will be re-established on the next call"
+            )
+        if error:
+            raise error[0]
+        return result[0]
+
+    def _poison_wedged_connection(self) -> None:
+        """Drop all references to a connection a timed-out background
+        publish (I-11) may still be touching. Never call ``.close()`` or
+        otherwise touch the pika objects here -- that would itself be a
+        second thread concurrently touching a ``BlockingConnection``, which
+        pika does not support. The abandoned background thread's eventual
+        completion (or, rarely, permanent hang) only ever touches its own
+        locally-captured references and no longer affects anything here.
+        """
+        self._connection = None
+        self._channel = None
+        self._reply_to_channel = None
+        self._consumer_channels = {}
+        self._consumer_tags = {}
+        self._confirmed_channel_ids = set()
+        self._connected = False
+        self._owner_ident = None
+        self._ever_consumed = False
+
     def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.
 
@@ -494,21 +589,37 @@ class SyncTransport:
                 properties.timestamp = int(envelope.timestamp.timestamp())
 
             # I-10: bound the publish+confirm wait by confirm_timeout so a
-            # missing confirm cannot stall the worker forever. pika's
-            # BlockingChannel confirm is synchronous on the owner thread, so
-            # the bound here is the cross-thread marshal timeout; on the owner
-            # thread basic_publish runs inline (the I/O loop drives the confirm).
+            # missing confirm cannot stall the worker forever.
             publish_timeout = min(30.0, self._confirm_timeout)
-            self._run_on_io_thread(
-                lambda: channel.basic_publish(
+            def do_publish() -> None:
+                channel.basic_publish(
                     exchange=envelope.exchange,
                     routing_key=envelope.routing_key,
                     body=envelope.body,
                     properties=properties,
                     mandatory=envelope.mandatory,
-                ),
-                timeout=publish_timeout,
-            )
+                )
+            if threading.get_ident() == self._owner_ident and self._ever_consumed:
+                # I-11: this thread also owns dispatching further deliveries
+                # via start_consuming() -- cannot safely bound this wait on a
+                # separate thread (see _publish_confirm_wait_bounded's
+                # docstring: resuming start_consuming() the instant we gave
+                # up would immediately touch a connection our own abandoned
+                # helper thread might still be using). Documented residual
+                # limitation: pika's BlockingChannel has no native way to
+                # bound a confirm wait from the owner thread itself. Mitigate
+                # by using worker_count > 1, so a handler's publish marshals
+                # through the already-bounded cross-thread path instead.
+                do_publish()
+            elif self._owner_ident is None or not self._ever_consumed:
+                # No consume loop can be sharing this connection (pure
+                # producer, or nothing has ever consumed yet) -- safe to
+                # bound with a dedicated helper thread.
+                self._publish_confirm_wait_bounded(do_publish, timeout=publish_timeout)
+            else:
+                # Cross-thread: marshal onto the owner's I/O loop, which
+                # _run_on_io_thread already bounds by confirm_timeout.
+                self._run_on_io_thread(do_publish, timeout=publish_timeout)
 
             # M4: only report CONFIRMED when the channel is actually in
             # publisher-confirm mode -- confirm_delivery=False (unless this
@@ -544,6 +655,28 @@ class SyncTransport:
             )
             return PublishOutcome(
                 status=PublishStatus.NACKED,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=e,
+            )
+
+        except TimeoutError as e:
+            # I-10: basic_publish() blocks synchronously for the broker confirm
+            # (in confirm mode); _run_on_io_thread bounds that wait by
+            # confirm_timeout and raises TimeoutError on expiry -- exactly the
+            # "no confirm arrived in time" case docs/message-safety.md documents
+            # as PublishStatus.TIMEOUT (matching the async transport's
+            # equivalent asyncio.timeout(confirm_timeout) branch). This used to
+            # fall through to the generic ERROR branch below, so a caller
+            # correctly checking `status == PublishStatus.TIMEOUT` per the
+            # documented contract silently never saw it on the sync transport.
+            logger.warning(
+                "Publish confirm timed out: exchange=%s routing_key=%s",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return PublishOutcome(
+                status=PublishStatus.TIMEOUT,
                 exchange=envelope.exchange,
                 routing_key=envelope.routing_key,
                 error=e,
@@ -668,7 +801,28 @@ class SyncTransport:
         low-level pika traceback giving no hint which queue/exchange or
         argument actually conflicted. Any other reply code is re-raised
         as-is (not this middleware's concern).
+
+        M14: under ``SafetyConfig.on_topology_conflict="warn_continue"`` a 406
+        is logged and swallowed — the entity already exists (a 406, unlike a
+        404, proves existence), so rabbitkit continues with the EXISTING
+        definition instead of crash-looping. The 406 closed the channel, so
+        we reopen it first (connection stays open) for subsequent declares.
         """
+        if exc.reply_code == 406 and self._on_topology_conflict == "warn_continue":
+            # Reopen the broker-closed channel so the rest of topology
+            # declaration can proceed on the existing (drifted) entity.
+            self._channel = self._connection.channel()
+            self._confirmed_channel_ids.discard(id(self._channel))
+            logger.warning(
+                "Topology drift on %s %r (broker: %s); on_topology_conflict='warn_continue' "
+                "— continuing with the EXISTING definition (rabbitkit's declaration was NOT "
+                "applied). Reconcile the %s or fix its rabbitkit config to silence this.",
+                kind,
+                name,
+                exc.reply_text,
+                kind,
+            )
+            return
         if exc.reply_code == 406:
             raise ConfigurationError(
                 f"Cannot declare {kind} {name!r}: it already exists with incompatible "
@@ -681,8 +835,19 @@ class SyncTransport:
             ) from exc
         raise exc
 
-    def bind_queue(self, queue: str, exchange: str, routing_key: str) -> None:
-        """Bind a queue to an exchange."""
+    def bind_queue(
+        self,
+        queue: str,
+        exchange: str,
+        routing_key: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind a queue to an exchange.
+
+        ``arguments`` carries header-match criteria for HEADERS exchanges
+        (``x-match`` etc.) — without them a headers binding matches every
+        message (C4).
+        """
         if self._topo.binding_action() is TopoAction.SKIP:
             return
 
@@ -692,6 +857,7 @@ class SyncTransport:
             queue=queue,
             exchange=exchange,
             routing_key=routing_key,
+            arguments=arguments,
         )
 
     def bind_exchange(
@@ -882,6 +1048,9 @@ class SyncTransport:
             content_encoding=properties.content_encoding,
             type=properties.type,
             app_id=properties.app_id,
+            priority=properties.priority,
+            expiration=properties.expiration,
+            user_id=properties.user_id,
             timestamp=timestamp,
             routing_key=method.routing_key,
             exchange=method.exchange,

@@ -80,6 +80,7 @@ class RabbitRouter:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reject_without_dlx: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber on this router.
 
@@ -123,6 +124,7 @@ class RabbitRouter:
             name=name,
             prefetch_count=prefetch_count,
             filter_fn=filter_fn,
+            reject_without_dlx=reject_without_dlx,
         )
 
     def publisher(

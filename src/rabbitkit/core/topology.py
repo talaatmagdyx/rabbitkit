@@ -11,7 +11,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
-from rabbitkit.core.types import ExchangeType, QueueType
+from rabbitkit.core.types import ExchangeType, QueueType, validate_amqp_shortstr
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,8 @@ class RabbitExchange:
         if self.internal and self.auto_delete:
             msg = "Internal exchanges cannot be auto_delete (they are never published to directly)."
             raise ValueError(msg)
+        validate_amqp_shortstr("Exchange name", self.name)
+        validate_amqp_shortstr("Exchange routing_key", self.routing_key)
 
     def to_declare_kwargs(self) -> dict[str, Any]:
         """Build exchange_declare kwargs for pika/aio-pika."""
@@ -116,6 +118,8 @@ class RabbitQueue:
         if not self.name:
             msg = "Queue name is required"
             raise ValueError(msg)
+        validate_amqp_shortstr("Queue name", self.name)
+        validate_amqp_shortstr("Queue routing_key", self.routing_key)
 
         # Quorum constraints
         if self.queue_type == QueueType.QUORUM:
@@ -157,6 +161,18 @@ class RabbitQueue:
                 raise ValueError(msg)
 
         # Warnings for unusual combos
+        if self.lazy:
+            warnings.warn(
+                f"Queue '{self.name}': lazy=True sets the deprecated x-queue-mode=lazy "
+                "argument. RabbitMQ >=3.12 defaults classic queues to CQv2, which already "
+                "keeps message bodies out of memory in a lazy-like manner -- x-queue-mode "
+                "is a silent no-op there. On RabbitMQ <3.12 (or a classic queue explicitly "
+                "downgraded to v1) it still has effect. If you're targeting >=3.12, drop "
+                "lazy=True; the default queue behavior already covers this.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if self.auto_delete and self.durable:
             warnings.warn(
                 f"Queue '{self.name}': auto_delete=True with durable=True is unusual — "

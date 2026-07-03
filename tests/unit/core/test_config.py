@@ -11,6 +11,7 @@ from rabbitkit.core.config import (
     CompressionConfig,
     ConnectionConfig,
     ConsumerConfig,
+    DeduplicationConfig,
     MetricsConfig,
     PoolConfig,
     PublisherConfig,
@@ -22,7 +23,7 @@ from rabbitkit.core.config import (
     SSLConfig,
     WorkerConfig,
 )
-from rabbitkit.core.types import ErrorSeverity, TopologyMode
+from rabbitkit.core.types import DeduplicationMarkPolicy, ErrorSeverity, TopologyMode
 
 # ── ConnectionConfig ──────────────────────────────────────────────────────
 
@@ -156,6 +157,87 @@ class TestConnectionConfig:
         assert config.host == "host"
         # The url property re-encodes the reserved characters.
         assert config.url == "amqp://user%40:p%40ss@host:5672/%2F"
+
+    def test_from_url_amqps_warns_and_defaults_port_5671(self) -> None:
+        """M3: an amqps:// URL warns (TLS is separate config) and defaults to
+        the AMQPS port, so an un-TLS'd connection fails fast instead of
+        silently sending plaintext."""
+        with pytest.warns(RuntimeWarning, match="amqps"):
+            config = ConnectionConfig.from_url("amqps://guest:guest@host/")
+        assert config.port == 5671
+
+    def test_from_url_amqps_explicit_port_preserved(self) -> None:
+        with pytest.warns(RuntimeWarning, match="amqps"):
+            config = ConnectionConfig.from_url("amqps://guest:guest@host:5999/")
+        assert config.port == 5999
+
+    def test_from_url_amqp_does_not_warn(self) -> None:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            config = ConnectionConfig.from_url("amqp://guest:guest@host/")
+        assert config.port == 5672
+
+
+class TestConsumerConfigM6:
+    def test_reject_transient_on_redelivery_default_off(self) -> None:
+        assert ConsumerConfig().reject_transient_on_redelivery is False
+
+
+class TestCredentialsProvider:
+    """M13: credentials_provider enables secret rotation without a redeploy."""
+
+    def test_static_credentials_default(self) -> None:
+        cfg = ConnectionConfig(username="u", password="p")
+        assert cfg.resolve_credentials() == ("u", "p")
+
+    def test_provider_overrides_and_is_called_each_time(self) -> None:
+        calls = {"n": 0}
+
+        def provider() -> tuple[str, str]:
+            calls["n"] += 1
+            return (f"user-{calls['n']}", f"pass-{calls['n']}")
+
+        cfg = ConnectionConfig(username="static", password="static", credentials_provider=provider)
+        assert cfg.resolve_credentials() == ("user-1", "pass-1")
+        # Re-resolved on the next (re)connect → rotated secret picked up.
+        assert cfg.resolve_credentials() == ("user-2", "pass-2")
+
+
+class TestClusterEndpoints:
+    """M9: multi-host failover — nodes parsing and endpoint ordering."""
+
+    def test_no_nodes_single_endpoint(self) -> None:
+        cfg = ConnectionConfig(host="h1", port=5672)
+        assert cfg.cluster_endpoints() == [("h1", 5672)]
+
+    def test_nodes_host_only_inherit_port(self) -> None:
+        cfg = ConnectionConfig(host="h1", port=5673, nodes=("h2", "h3"))
+        assert cfg.cluster_endpoints() == [("h1", 5673), ("h2", 5673), ("h3", 5673)]
+
+    def test_nodes_host_port(self) -> None:
+        cfg = ConnectionConfig(host="h1", nodes=("h2:5673", "h3:5674"))
+        assert cfg.cluster_endpoints() == [("h1", 5672), ("h2", 5673), ("h3", 5674)]
+
+    def test_malformed_node_port_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-numeric port"):
+            ConnectionConfig(host="h1", nodes=("h2:notaport",))
+
+
+class TestSecurityConfigMechanism:
+    def test_plain_is_default(self) -> None:
+        from rabbitkit.core.config import SecurityConfig
+
+        assert SecurityConfig().mechanism == "PLAIN"
+
+    def test_non_plain_mechanism_rejected(self) -> None:
+        """M2: EXTERNAL/other SASL mechanisms are not implemented — fail fast
+        rather than silently ignoring the field."""
+        from rabbitkit.core.config import SecurityConfig
+
+        with pytest.raises(ValueError, match="not supported"):
+            SecurityConfig(mechanism="EXTERNAL")
 
     def test_from_url_defaults(self) -> None:
         config = ConnectionConfig.from_url("amqp://localhost")
@@ -302,6 +384,12 @@ class TestRetryConfig:
         assert config.max_retries == 0
         assert config.delays == ()
 
+    def test_shared_mode_rejected(self) -> None:
+        """H3: per_queue=False (shared delay queues) misroutes failed messages
+        across source queues — rejected at construction."""
+        with pytest.raises(ValueError, match="unsafe and unsupported"):
+            RetryConfig(per_queue=False)
+
 
 # ── CompressionConfig ────────────────────────────────────────────────────
 
@@ -354,6 +442,20 @@ class TestPlaceholderConfigs:
         config = WorkerConfig()
         assert config.worker_count == 1
         assert config.prefetch_per_worker is None
+        assert config.max_queue_size == 0  # M11: unbounded by default
+
+    def test_worker_count_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="worker_count"):
+            WorkerConfig(worker_count=0)
+
+    def test_max_queue_size_must_be_non_negative(self) -> None:
+        with pytest.raises(ValueError, match="max_queue_size"):
+            WorkerConfig(max_queue_size=-1)
+
+
+class TestPublisherConfigSizeGuard:
+    def test_max_message_bytes_default_disabled(self) -> None:
+        assert PublisherConfig().max_message_bytes == 0
 
 
 # ── RabbitConfig (composition) ────────────────────────────────────────────
@@ -502,3 +604,89 @@ class TestMetricsConfigProperties:
     def test_consumer_active(self) -> None:
         cfg = MetricsConfig()
         assert cfg.consumer_active == "rabbitkit_consumer_active"
+
+
+# ── DeduplicationConfig ───────────────────────────────────────────────────
+
+
+class TestDeduplicationConfig:
+    def test_defaults(self) -> None:
+        cfg = DeduplicationConfig()
+        assert cfg.mark_policy == "on_success"
+        assert cfg.processing_timeout == 300
+        assert cfg.on_in_flight == "nack_requeue"
+
+    def test_accepts_enum_member(self) -> None:
+        cfg = DeduplicationConfig(mark_policy=DeduplicationMarkPolicy.CLAIM)
+        assert cfg.mark_policy == "claim"
+
+    def test_accepts_all_string_policies(self) -> None:
+        for policy in ("on_success", "on_start", "claim"):
+            assert DeduplicationConfig(mark_policy=policy).mark_policy == policy
+
+    def test_invalid_mark_policy_raises(self) -> None:
+        with pytest.raises(ValueError, match="mark_policy"):
+            DeduplicationConfig(mark_policy="always")
+
+    def test_invalid_on_in_flight_raises(self) -> None:
+        with pytest.raises(ValueError, match="on_in_flight"):
+            DeduplicationConfig(on_in_flight="wait")
+
+    def test_non_positive_processing_timeout_raises(self) -> None:
+        with pytest.raises(ValueError, match="processing_timeout"):
+            DeduplicationConfig(processing_timeout=0)
+
+
+# ── SafetyConfig ──────────────────────────────────────────────────────────
+
+
+class TestSafetyConfig:
+    def test_defaults(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        cfg = SafetyConfig()
+        assert cfg.reject_without_dlx == "auto_provision"
+        assert cfg.dlq_suffix == ".dlq"
+        assert cfg.warn_on_discard is True
+
+    def test_accepts_enum_member(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.types import RejectWithoutDLXPolicy
+
+        cfg = SafetyConfig(reject_without_dlx=RejectWithoutDLXPolicy.ERROR)
+        assert cfg.reject_without_dlx == "error"
+
+    def test_invalid_policy_raises(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        with pytest.raises(ValueError, match="reject_without_dlx"):
+            SafetyConfig(reject_without_dlx="never")
+
+    def test_empty_dlq_suffix_raises(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        with pytest.raises(ValueError, match="dlq_suffix"):
+            SafetyConfig(dlq_suffix="")
+
+    def test_on_topology_conflict_default_raise(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        assert SafetyConfig().on_topology_conflict == "raise"
+
+    def test_on_topology_conflict_accepts_warn_continue(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        assert SafetyConfig(on_topology_conflict="warn_continue").on_topology_conflict == "warn_continue"
+
+    def test_on_topology_conflict_invalid_raises(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        with pytest.raises(ValueError, match="on_topology_conflict"):
+            SafetyConfig(on_topology_conflict="ignore")
+
+    def test_composed_into_rabbit_config(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        assert RabbitConfig().safety == SafetyConfig()
+        custom = RabbitConfig(safety=SafetyConfig(reject_without_dlx="error"))
+        assert custom.safety.reject_without_dlx == "error"

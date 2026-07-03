@@ -454,6 +454,99 @@ class TestResultPublishing:
         assert envelope.routing_key == "result"
         assert envelope.exchange == "out"
 
+    def test_transient_redelivery_rejects_when_enabled(self) -> None:
+        """M6: with reject_transient_on_redelivery, a transient error on an
+        already-redelivered message rejects to DLQ instead of requeuing."""
+        pipeline = HandlerPipeline(reject_transient_on_redelivery=True)
+        msg = _make_message(redelivered=True)
+        _ack, nack, reject = _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            raise ConnectionError("transient")  # classified TRANSIENT
+
+        pipeline.process_sync(_make_route(handler=handler), msg)
+        reject.assert_called_once_with(False)
+        nack.assert_not_called()
+
+    def test_transient_first_delivery_still_requeues_when_enabled(self) -> None:
+        """M6: the first delivery (redelivered=False) still nack-requeues — the
+        cap only trips on the redelivery."""
+        pipeline = HandlerPipeline(reject_transient_on_redelivery=True)
+        msg = _make_message(redelivered=False)
+        _ack, nack, reject = _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            raise ConnectionError("transient")
+
+        pipeline.process_sync(_make_route(handler=handler), msg)
+        nack.assert_called_once_with(True)
+        reject.assert_not_called()
+
+    def test_transient_redelivery_requeues_when_disabled(self) -> None:
+        """M6 default (off): transient errors requeue unbounded even on redelivery."""
+        pipeline = HandlerPipeline()  # flag defaults False
+        msg = _make_message(redelivered=True)
+        _ack, nack, reject = _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            raise ConnectionError("transient")
+
+        pipeline.process_sync(_make_route(handler=handler), msg)
+        nack.assert_called_once_with(True)
+        reject.assert_not_called()
+
+    async def test_transient_redelivery_rejects_when_enabled_async(self) -> None:
+        msg = _make_message(redelivered=True)
+        msg._ack_async_fn = AsyncMock()
+        msg._nack_async_fn = AsyncMock()
+        msg._reject_async_fn = AsyncMock()
+
+        async def handler(body: bytes) -> None:
+            raise ConnectionError("transient")
+
+        await HandlerPipeline(reject_transient_on_redelivery=True).process_async(
+            _make_route(handler=handler), msg
+        )
+        msg._reject_async_fn.assert_awaited_once_with(False)
+        msg._nack_async_fn.assert_not_awaited()
+
+    def test_requeued_for_retry_sentinel_not_published(self) -> None:
+        """M7: when an inner middleware returns REQUEUED_FOR_RETRY (message
+        already requeued+settled), the pipeline must NOT serialize the
+        sentinel as a bogus result/RPC reply."""
+        from rabbitkit.core.types import REQUEUED_FOR_RETRY
+
+        msg = _make_message()
+        _wire_sync(msg)
+        publish_fn = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        def handler(body: bytes) -> object:
+            return REQUEUED_FOR_RETRY
+
+        rp = ResultPublisher(exchange="out", routing_key="result")
+        route = _make_route(handler=handler, result_publisher=rp)
+        HandlerPipeline().process_sync(route, msg, publish_fn=publish_fn)
+
+        publish_fn.assert_not_called()  # sentinel is not a result
+
+    async def test_requeued_for_retry_sentinel_not_published_async(self) -> None:
+        from rabbitkit.core.types import REQUEUED_FOR_RETRY
+
+        msg = _make_message()
+        ack = AsyncMock()
+        msg._ack_async_fn = ack
+        msg._nack_async_fn = AsyncMock()
+        publish_fn = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+
+        async def handler(body: bytes) -> object:
+            return REQUEUED_FOR_RETRY
+
+        rp = ResultPublisher(exchange="out", routing_key="result")
+        route = _make_route(handler=handler, result_publisher=rp)
+        await HandlerPipeline().process_async(route, msg, publish_fn=publish_fn)
+
+        publish_fn.assert_not_called()
+
     def test_reply_to_takes_precedence(self) -> None:
         msg = _make_message(reply_to="amq.rabbitmq.reply-to", correlation_id="corr-123")
         _wire_sync(msg)
@@ -1245,6 +1338,71 @@ class TestDeserializeBody:
 
         mock_serializer.decode.assert_called_once()
         assert received[0] == {"id": 1}
+
+    async def test_async_large_body_decode_offloaded_to_thread(self) -> None:
+        """M10: a large body is decoded via asyncio.to_thread so it doesn't
+        block the event loop."""
+        import asyncio
+        from unittest.mock import patch
+
+        mock_serializer = MagicMock()
+        mock_serializer.decode.return_value = {"id": 1}
+        pipeline = HandlerPipeline(serializer=mock_serializer)
+
+        big = b"x" * (256 * 1024 + 1)  # just over the offload threshold
+        msg = _make_message(body=big)
+        msg._ack_async_fn = AsyncMock()
+        msg._nack_async_fn = AsyncMock()
+
+        def handler(body: dict) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        with patch("asyncio.to_thread", wraps=asyncio.to_thread) as spy:
+            await pipeline.process_async(route, msg)
+        spy.assert_called_once()  # decode ran off the loop
+        mock_serializer.decode.assert_called_once()
+
+    async def test_async_small_body_decode_inline(self) -> None:
+        """M10: a small body decodes inline (no thread-hop overhead)."""
+        import asyncio
+        from unittest.mock import patch
+
+        mock_serializer = MagicMock()
+        mock_serializer.decode.return_value = {"id": 1}
+        pipeline = HandlerPipeline(serializer=mock_serializer)
+
+        msg = _make_message(body=b'{"id": 1}')
+        msg._ack_async_fn = AsyncMock()
+        msg._nack_async_fn = AsyncMock()
+
+        def handler(body: dict) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        with patch("asyncio.to_thread", wraps=asyncio.to_thread) as spy:
+            await pipeline.process_async(route, msg)
+        spy.assert_not_called()  # inline decode
+        mock_serializer.decode.assert_called_once()
+
+    async def test_async_bytes_body_type_returns_raw(self) -> None:
+        """M10: async path with a serializer but a bytes body-type returns the
+        raw body (no decode, no offload)."""
+        mock_serializer = MagicMock()
+        pipeline = HandlerPipeline(serializer=mock_serializer)
+        msg = _make_message(body=b"raw-bytes")
+        msg._ack_async_fn = AsyncMock()
+        msg._nack_async_fn = AsyncMock()
+
+        received: list[object] = []
+
+        def handler(body: bytes) -> None:
+            received.append(body)
+
+        route = _make_route(handler=handler)
+        await pipeline.process_async(route, msg)
+        mock_serializer.decode.assert_not_called()
+        assert received[0] == b"raw-bytes"
 
     def test_deserializer_pydantic_model_validation(self) -> None:
         """Lines 244-249: auto-validates Pydantic models when decoded is dict.

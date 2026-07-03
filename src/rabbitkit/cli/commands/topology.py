@@ -71,14 +71,22 @@ def _declared_resources(broker: Any) -> dict[str, Any]:
 
 def _live_resources(management_url: str, vhost: str) -> dict[str, Any]:
     """Fetch live queues and exchanges from the management API."""
+    import urllib.parse
     import urllib.request
+
+    scheme = urllib.parse.urlparse(management_url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(
+            f"Unsupported management URL scheme {scheme!r}; only 'http' and 'https' are "
+            "allowed (--url is passed straight to urlopen, which will happily fetch "
+            "file:// or other schemes if not restricted)."
+        )
 
     def get(path: str) -> list[dict[str, Any]]:
         req = urllib.request.Request(f"{management_url.rstrip('/')}{path}")  # noqa: S310
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
             return cast("list[dict[str, Any]]", json.loads(resp.read()))
 
-    import urllib.parse
     encoded_vhost = urllib.parse.quote(vhost, safe="")
     try:
         queues_raw = get(f"/api/queues/{encoded_vhost}")

@@ -768,10 +768,13 @@ async def test_async_dedup_retry_composition_does_not_drop_retried_message(rabbi
 
     class _FakeAsyncRedis:
         """Duck-typed in-memory stand-in for a real async redis client —
-        DeduplicationMiddleware only needs .set(nx=True, ex=...)/.delete()."""
+        DeduplicationMiddleware only needs .exists()/.set(nx=True, ex=...)/.delete()."""
 
         def __init__(self) -> None:
             self._store: dict[str, str] = {}
+
+        async def exists(self, key: str) -> int:
+            return 1 if key in self._store else 0
 
         async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
             if nx and key in self._store:

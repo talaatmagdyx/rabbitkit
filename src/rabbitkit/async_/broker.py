@@ -37,9 +37,15 @@ from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
-from rabbitkit.core.route import RouteDefinition, warn_filter_without_dlx
+from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.core.types import (
+    AckPolicy,
+    MessageEnvelope,
+    PublishOutcome,
+    PublishStatus,
+    TopologyMode,
+)
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.retry import RetryRouter
 from rabbitkit.serialization.base import Serializer
@@ -91,6 +97,7 @@ class AsyncBroker:
             serializer=serializer,
             di_resolver=di_resolver,
             context_repo=context_repo,
+            reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
         )
 
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -127,6 +134,12 @@ class AsyncBroker:
         # health checks that read it directly keep working (backward compat).
         self._in_flight = 0
         self._in_flight_cond: asyncio.Condition | None = None  # lazily created in loop
+        # Task/message pairs for in-flight INLINE consumption (no worker pool
+        # configured -- the default). Mirrors AsyncWorkerPool._task_messages so
+        # a drain-deadline timeout can cancel + nack the still-running ones
+        # with delivery-tag logging, the same as the pooled path already does,
+        # instead of silently abandoning them unacked.
+        self._inflight_tasks: dict[asyncio.Task[None], RabbitMessage] = {}
 
         # Optional publish-side flow control (C-6).
         self._flow_controller: Any | None = None
@@ -250,6 +263,7 @@ class AsyncBroker:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reject_without_dlx: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -265,6 +279,7 @@ class AsyncBroker:
             name=name,
             prefetch_count=prefetch_count,
             filter_fn=filter_fn,
+            reject_without_dlx=reject_without_dlx,
         )
 
     def publisher(
@@ -326,6 +341,7 @@ class AsyncBroker:
             topology_mode=self._config.topology_mode,
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,
+            on_topology_conflict=self._config.safety.on_topology_conflict,
         )
 
         await self._transport.connect()
@@ -391,6 +407,9 @@ class AsyncBroker:
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
+
+        # Connection-churn counter: reconnects were logged but never counted.
+        self._wire_reconnect_metric()
 
         # Create worker pool if requested
         if worker_config is not None and worker_config.worker_count > 1:
@@ -568,12 +587,39 @@ class AsyncBroker:
                         await cond.wait()
                 except TimeoutError:
                     break
-            if self._in_flight > 0:
+        # Deadline elapsed with handlers still running: cancel + nack them
+        # explicitly (delivery-tag logged) instead of silently abandoning
+        # them unacked -- matches AsyncWorkerPool.stop()'s behavior for the
+        # pooled path. Outside the `async with cond:` block since we're no
+        # longer touching `_in_flight`/the condition itself here, and
+        # cancelling a task can re-enter this broker (e.g. its `finally`
+        # decrementing `_in_flight`), which would deadlock re-acquiring cond.
+        if self._in_flight > 0:
+            logger.warning(
+                "AsyncBroker.stop: %d in-flight handler(s) still running after "
+                "graceful drain deadline; disconnecting anyway",
+                self._in_flight,
+            )
+            tasks = dict(self._inflight_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            for message in tasks.values():
+                if message.is_settled:
+                    continue  # handler reached its own ack/nack before being cut off
                 logger.warning(
-                    "AsyncBroker.stop: %d in-flight handler(s) still running after "
-                    "graceful drain deadline; disconnecting anyway",
-                    self._in_flight,
+                    "AsyncBroker.stop: handler for delivery_tag=%s message_id=%s did not "
+                    "complete within graceful_timeout; abandoning (task cancelled) and "
+                    "nacking for redelivery — ensure handlers are idempotent under "
+                    "at-least-once delivery",
+                    message.delivery_tag,
+                    message.message_id,
                 )
+                try:
+                    await message.nack_async(requeue=True)
+                except Exception:
+                    logger.warning("nack on abandoned handler's message raised", exc_info=True)
 
     async def stop(self, timeout: float | None = None) -> None:
         """Stop the broker - cancel consumers, drain pool, drain in-flight, disconnect.
@@ -697,6 +743,8 @@ class AsyncBroker:
                 raw_body = body.encode()
             else:
                 raw_body = _json.dumps(body).encode()
+            # M2: honor PublisherConfig defaults for the kwargs form (they were
+            # previously dead config). Envelope-form callers keep full control.
             envelope = MessageEnvelope(
                 routing_key=routing_key,
                 body=raw_body,
@@ -705,6 +753,18 @@ class AsyncBroker:
                 content_type=content_type,
                 correlation_id=correlation_id,
                 reply_to=reply_to,
+                mandatory=self._config.publisher.mandatory,
+                delivery_mode=2 if self._config.publisher.persistent else 1,
+            )
+
+        # M10: reject oversized bodies at publish time (see sync broker).
+        max_bytes = self._config.publisher.max_message_bytes
+        if max_bytes and len(envelope.body) > max_bytes:
+            raise ValueError(
+                f"Message body ({len(envelope.body)} bytes) exceeds "
+                f"PublisherConfig.max_message_bytes ({max_bytes}). Large messages are a "
+                "RabbitMQ anti-pattern — store the payload externally and publish a "
+                "reference, or raise the limit if this is intentional."
             )
 
         if self._transport is None:
@@ -737,6 +797,40 @@ class AsyncBroker:
             outcome: PublishOutcome = await chain(envelope, do_publish)
             return outcome
         return await do_publish(envelope)
+
+    async def _flow_controlled_internal_publish(self, env: MessageEnvelope) -> PublishOutcome:
+        """M18: async mirror of ``SyncBroker._flow_controlled_internal_publish``
+        — see its docstring. Used as the ``publish_fn`` for ``RetryMiddleware``'s
+        delay-queue republish and the pipeline's result/RPC-reply publish so
+        the broker's ``FlowController`` (if configured) applies to these
+        internal publishes too. Never lets ``BackpressureError`` escape as an
+        exception — a blocked/dropped slot always resolves as a failed
+        ``PublishOutcome`` so existing nack+requeue handling applies
+        regardless of the configured ``on_blocked`` policy.
+        """
+        if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
+            raise RuntimeError("Broker not started. Call start() first.")
+        transport = self._transport
+        fc = self._flow_controller
+        if fc is None:
+            return await transport.publish(env)  # type: ignore[no-any-return]
+        try:
+            acquired = await fc.acquire_async()
+        except BackpressureError as exc:
+            return PublishOutcome(
+                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
+            )
+        if not acquired:
+            return PublishOutcome(
+                status=PublishStatus.ERROR,
+                exchange=env.exchange,
+                routing_key=env.routing_key,
+                error=BackpressureError("publish dropped by backpressure policy"),
+            )
+        try:
+            return await transport.publish(env)  # type: ignore[no-any-return]
+        finally:
+            await fc.release_async()
 
     async def request(
         self,
@@ -807,6 +901,7 @@ class AsyncBroker:
             warn_retry_middleware_without_topology,
             warn_retry_without_confirms,
         )
+        from rabbitkit.middleware.signing import check_signing_retry_conflict
 
         wired = False
         for route in self._registry.routes:
@@ -819,6 +914,8 @@ class AsyncBroker:
                     # queues and are silently dropped. Surface it loudly.
                     warn_retry_middleware_without_topology(route.name)
                 continue
+            # H1: signing + retry destroys every retried message — fail fast.
+            check_signing_retry_conflict(route.name, route.route_middlewares)
             if has_retry_mw:
                 continue
             if not self._config.publisher.confirm_delivery:
@@ -835,7 +932,7 @@ class AsyncBroker:
                 index,
                 RetryMiddleware(
                     retry_config,
-                    publish_async_fn=self._transport.publish,
+                    publish_async_fn=self._flow_controlled_internal_publish,  # M18
                     metrics_collector=metrics_mw.collector if metrics_mw else None,
                     metrics_config=metrics_mw.config if metrics_mw else None,
                 ),
@@ -850,6 +947,29 @@ class AsyncBroker:
         if wired:
             # Drop any middleware chains cached before the retry mw was installed.
             self._pipeline.clear_caches()
+
+    def _wire_reconnect_metric(self) -> None:
+        """Async mirror of ``SyncBroker._wire_reconnect_metric`` — count
+        transport reconnects (connection churn) via the first route
+        ``MetricsMiddleware``'s collector, if any. No-op without metrics."""
+        if self._transport is None:
+            return
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        metrics_mw = next(
+            (
+                mw
+                for route in self._registry.routes
+                for mw in route.route_middlewares
+                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
+            ),
+            None,
+        )
+        if metrics_mw is None or metrics_mw.collector is None:
+            return
+        collector = metrics_mw.collector
+        metric_name = metrics_mw.config.reconnects_total
+        self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
 
     async def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -873,19 +993,15 @@ class AsyncBroker:
 
             # Determine retry config early so source queue can include DLQ routing
             retry_config = route.effective_retry_config(self._config.retry)
-            # H6: a filter_fn rejection nack(requeue=False)'s the message; without a
-            # DLX RabbitMQ just discards it. Retry-enabled routes already get one
-            # below; a manually-configured dead_letter_exchange is respected as-is.
-            # Otherwise auto-declare a "<queue>.dlq" DLQ so filter rejections are
-            # preserved even with no retry configured.
-            filter_dlq_name: str | None = None
-            if (
-                retry_config is None
-                and route.filter_fn is not None
-                and route.queue.dead_letter_exchange is None
-            ):
-                filter_dlq_name = f"{route.queue.name}.dlq"
-                warn_filter_without_dlx(route.name, route.queue.name, filter_dlq_name)
+            # C3: a route with no dead-letter path can reject(requeue=False)
+            # (permanent errors, filter_fn, RejectMessage) and RabbitMQ would
+            # DISCARD the message. Apply SafetyConfig.reject_without_dlx:
+            # auto-provision "<queue>.dlq" (default), fail startup, or warn
+            # and allow discard. Only under AUTO_DECLARE — in passive/manual
+            # modes rabbitkit does not own the queue's arguments.
+            safety_dlq_name: str | None = None
+            if self._config.topology_mode is TopologyMode.AUTO_DECLARE:
+                safety_dlq_name = route.resolve_safety_dlq(self._config.safety, self._config.retry)
 
             if retry_config is not None:
                 retry_router = RetryRouter(retry_config)
@@ -899,26 +1015,32 @@ class AsyncBroker:
                     dead_letter_exchange="",
                     dead_letter_routing_key=dlq_name,
                 )
-            elif filter_dlq_name is not None:
+            elif safety_dlq_name is not None:
                 import dataclasses
 
+                logger.info(
+                    "Auto-provisioned DLQ %r for queue %r (reject_without_dlx=auto_provision)",
+                    safety_dlq_name,
+                    route.queue.name,
+                )
                 source_queue = dataclasses.replace(
                     route.queue,
                     dead_letter_exchange="",
-                    dead_letter_routing_key=filter_dlq_name,
+                    dead_letter_routing_key=safety_dlq_name,
                 )
             else:
                 source_queue = route.queue
 
-            # Declare queue (with DLQ routing arguments if retry/filter-DLX applies)
+            # Declare queue (with DLQ routing arguments if retry/safety DLX applies)
             await self._transport.declare_queue(source_queue)
 
-            # Bind queue to exchange
+            # Bind queue to exchange (C4: bind_arguments matter for headers exchanges)
             if route.exchange is not None:
                 await self._transport.bind_queue(
                     queue=route.queue.name,
                     exchange=route.exchange.name,
                     routing_key=to_binding_key(route.queue.routing_key),
+                    arguments=route.queue.bind_arguments or None,
                 )
 
             # Declare retry/DLQ topology if retry is enabled
@@ -927,21 +1049,27 @@ class AsyncBroker:
                 delay_queues = retry_router.get_delay_queue_definitions(route.queue.name, exchange_name)
                 for delay_queue in delay_queues:
                     await self._transport.declare_queue(delay_queue)
-            elif filter_dlq_name is not None:
-                await self._transport.declare_queue(RabbitQueue(name=filter_dlq_name, durable=True))
+            elif safety_dlq_name is not None:
+                await self._transport.declare_queue(RabbitQueue(name=safety_dlq_name, durable=True))
 
     async def _start_consumer(self, route: RouteDefinition) -> None:
         """Start consuming for a single route."""
         if self._transport is None:
             return
 
-        transport = self._transport
         pool = self._worker_pool
 
         async def on_message(message: RabbitMessage) -> None:
             """Process incoming message through the pipeline."""
             # Track inline in-flight so stop() can drain gracefully (C-2).
+            # Also register this task/message pair so a drain-deadline timeout
+            # can cancel + nack it explicitly (with delivery-tag logging),
+            # matching AsyncWorkerPool.stop()'s behavior for the pooled path,
+            # instead of silently abandoning it unacked.
             await self._in_flight_inc()
+            task = asyncio.current_task()
+            if task is not None:
+                self._inflight_tasks[task] = message
             self._mark_heartbeat()
             try:
                 # Set the original queue in headers for retry routing
@@ -954,9 +1082,11 @@ class AsyncBroker:
                 await self._pipeline.process_async(
                     route,
                     message,
-                    publish_fn=transport.publish,
+                    publish_fn=self._flow_controlled_internal_publish,  # M18
                 )
             finally:
+                if task is not None:
+                    self._inflight_tasks.pop(task, None)
                 await self._in_flight_dec()
 
         if pool is not None:

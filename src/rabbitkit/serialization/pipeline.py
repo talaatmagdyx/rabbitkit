@@ -177,10 +177,25 @@ class JsonParser:
 
 
 class PydanticDecoder:
-    """Decoder that uses Pydantic model_validate for decoding."""
+    """Decoder that uses Pydantic model_validate for decoding.
+
+    Companion to ``DataclassDecoder``'s H14 note: this is the decoder that
+    note recommends for untrusted input, on the premise that
+    ``model_validate`` rejects wrong-shaped data instead of silently
+    accepting it. That premise used to be undermined by an
+    ``isinstance(data, dict)`` guard here -- a non-dict top-level payload
+    (a producer sending a JSON array/string/number instead of an object,
+    whether by bug or by an attacker probing for a decoder that skips
+    validation on the untaken branch) bypassed ``model_validate`` entirely
+    and returned the raw, un-validated value straight to the handler.
+    Pydantic already raises a clean ``ValidationError`` for a non-dict
+    input (``model_type`` error), so there is no reason to special-case
+    it -- doing so only suppressed the exact validation this decoder
+    exists to provide.
+    """
 
     def decode(self, data: Any, target_type: type) -> Any:
-        if hasattr(target_type, "model_validate") and isinstance(data, dict):
+        if hasattr(target_type, "model_validate"):
             return target_type.model_validate(data)
         return data
 

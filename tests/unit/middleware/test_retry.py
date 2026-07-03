@@ -140,21 +140,11 @@ class TestRetryTransient:
 
         assert published[0].routing_key == "orders-queue.retry.1"
 
-    def test_retry_shared_naming(self) -> None:
-        """per_queue=False uses shared 'rabbitkit' prefix."""
-        published: list[MessageEnvelope] = []
-
-        config = RetryConfig(max_retries=2, delays=(5,), per_queue=False, strict_delays=False)
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
-
-        msg = _make_message()
-
-        def failing_handler(m: RabbitMessage) -> None:
-            raise ConnectionResetError("lost")
-
-        mw.consume_scope(failing_handler, msg)
-
-        assert published[0].routing_key == "rabbitkit.retry.1"
+    def test_shared_mode_rejected(self) -> None:
+        """H3: per_queue=False is unsafe (misroutes across queues) and now
+        raises at construction rather than silently misrouting."""
+        with pytest.raises(ValueError, match="per_queue=False"):
+            RetryConfig(max_retries=2, delays=(5,), per_queue=False, strict_delays=False)
 
     def test_second_retry_uses_correct_attempt(self) -> None:
         """Message on retry attempt 1 → routes to retry.2."""
@@ -639,17 +629,11 @@ class TestRetryRouter:
         # DLQ naming
         assert queues[3].name == "orders-queue.dlq"
 
-    def test_shared_delay_queues(self) -> None:
-        """Shared mode creates shared delay queues + DLQ."""
-        config = RetryConfig(max_retries=2, delays=(5, 30), per_queue=False)
-        router = RetryRouter(config)
-
-        queues = router.get_delay_queue_definitions("orders-queue", "orders-exchange")
-
-        assert len(queues) == 3
-        assert queues[0].name == "rabbitkit.retry.1"
-        assert queues[1].name == "rabbitkit.retry.2"
-        assert queues[2].name == "rabbitkit.dlq"
+    def test_shared_mode_rejected_at_config(self) -> None:
+        """H3: shared mode (per_queue=False) is unsafe and rejected before a
+        RetryRouter is ever built."""
+        with pytest.raises(ValueError, match="per_queue=False"):
+            RetryConfig(max_retries=2, delays=(5, 30), per_queue=False)
 
     def test_delay_queue_has_ttl(self) -> None:
         """Delay queues have x-message-ttl set in milliseconds."""
@@ -743,6 +727,44 @@ class TestRetryEnvelopeNoOriginalQueue:
         envelope = mw._build_retry_envelope(msg, retry_count=0)
 
         assert envelope.headers.get("x-rabbitkit-original-queue") == ""
+
+    def test_build_retry_envelope_is_mandatory(self) -> None:
+        """M4: retry publishes are mandatory so a deleted/missing delay queue
+        RETURNs (outcome not-ok → nack+requeue) instead of confirming into
+        the void and acking the source (silent loss)."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+        envelope = mw._build_retry_envelope(msg, retry_count=0)
+        assert envelope.mandatory is True
+
+    def test_build_retry_envelope_preserves_message_properties(self) -> None:
+        """A retry republish used to silently drop priority/expiration/type/
+        app_id/user_id/reply_to -- e.g. a priority-queue message lost its
+        priority on its first retry, and an RPC request's reply_to never
+        survived long enough for the eventual reply to route back."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        msg = _make_message(
+            headers={"x-rabbitkit-original-queue": "orders"},
+            routing_key="orders",
+            reply_to="amq.rabbitmq.reply-to",
+            priority=7,
+            expiration="60000",
+            type="order.created",
+            app_id="order-service",
+            user_id="guest",
+        )
+        envelope = mw._build_retry_envelope(msg, retry_count=0)
+
+        assert envelope.reply_to == "amq.rabbitmq.reply-to"
+        assert envelope.priority == 7
+        assert envelope.expiration == "60000"
+        assert envelope.type == "order.created"
+        assert envelope.app_id == "order-service"
+        assert envelope.user_id == "guest"
 
 
 class TestRetryPredicates:

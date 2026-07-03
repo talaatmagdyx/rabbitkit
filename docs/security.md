@@ -3,6 +3,22 @@
 Found a vulnerability in rabbitkit itself (not just a hardening question)?
 See [SECURITY.md](../SECURITY.md) for how to report it privately.
 
+## Safe defaults at a glance
+
+A scannable summary — each row links to the section with the full story.
+
+| Feature | Safe by default? | What you must configure for production |
+|---|---|---|
+| TLS (`SSLConfig`) | Yes, when enabled: `CERT_REQUIRED`, hostname verification, TLS ≥ 1.2 | You must still explicitly enable it (`SSLConfig(enabled=True)`) and point it at real certs — see [TLS for Broker Connections](#tls-for-broker-connections). |
+| Default credentials | No — rabbitkit warns if you use `guest`/`guest` against a non-local host, but does not block it | Use dedicated, least-privilege credentials per service; never ship the default in production — see [Credentials](#credentials). |
+| Config `repr()` / `.url` | Yes — passwords are masked in `repr()` and in `.safe_url` | Use `.safe_url` (not `.url`) anywhere you might log a config object; `.url` still contains the plaintext password by necessity (it's what actually connects). |
+| Message signing (`SigningMiddleware`) | Partially — HMAC comparison is constant-time and the signature covers routing metadata, not just the body | The default nonce cache is **per-process** — real replay protection across multiple workers/pods requires wiring `RedisNonceCache` yourself. You'll get a `RuntimeWarning` if you don't — don't ignore it. See [Shared nonce store](#shared-nonce-store-for-multiprocessmultipod-deployments). |
+| Deduplication (`DeduplicationMiddleware`) | Fails open by default (`fallback_on_redis_error=True`) — availability over strict dedup | For payments or anything non-idempotent at the business layer, set `fallback_on_redis_error=False` to fail closed. Either way, see [the idempotency contract](production/idempotency.md) — dedup is a mitigation, not a substitute for idempotent handlers. |
+| Management API client (`RabbitManagementClient`) | Yes — rejects non-`http(s)` schemes, doesn't follow redirects, caps response size | Never construct `ManagementConfig.url` from user-controllable input, even though the client defends against SSRF-class abuse itself. |
+| Distributed locking (`RedisLock`) | Release is atomic (compare-and-delete) | `ttl` has **no auto-renewal** — a slow handler can lose the lock mid-work. Size `ttl` well above worst-case handler time; use `fencing_token()` for downstream writes that must not double-apply. |
+| Monitoring dashboard (`create_dashboard_app`) | **No — unauthenticated by default** | Always pass `auth_token=`, bind to loopback only, and put it behind a reverse proxy for anything beyond local debugging. This is the single riskiest default in the toolkit if ignored — see [`docs/stability-policy.md`](stability-policy.md)'s Experimental section. |
+| Result backends (`ResultBackend`) | N/A — no auth built in, it's a Redis key-value store under the hood | Treat correlation IDs as sensitive if the stored result is; the TTL you set is the only cleanup mechanism. |
+
 ## Message Bodies
 
 Do not log message bodies by default. Bodies may contain PII, credentials, or sensitive business data. Enable body logging only in development environments with explicit opt-in.

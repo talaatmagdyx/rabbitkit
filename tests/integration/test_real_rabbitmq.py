@@ -632,6 +632,72 @@ async def test_async_retry_count_header_spoofing_clamped(rabbitmq_url: str) -> N
     await broker.stop()
 
 
+async def test_async_quorum_queue_delivery_limit_dead_letters_independent_of_app_retry(
+    rabbitmq_url: str,
+) -> None:
+    """Loop Engineering Review, Reliability: a quorum queue's broker-enforced
+    ``x-delivery-limit`` must dead-letter an endlessly-nacked message on its
+    own, with NO application-level retry configured at all -- proving the
+    broker-side backstop (recommended in docs/retry-and-dlq.md for
+    defense-in-depth against a compromised/buggy app-level retry-count
+    header) actually works against a real broker, not just that
+    ``RabbitQueue.to_declare_kwargs()`` maps the field correctly (already
+    covered at the unit level in tests/unit/core/test_topology.py).
+
+    No ``retry=`` is set on this route -- the handler always raises a
+    TRANSIENT-classified error under the default AckPolicy.AUTO, which nacks
+    with ``requeue=True`` directly (no RetryMiddleware, no
+    ``x-rabbitkit-retry-count`` header involved whatsoever). The ONLY thing
+    that can stop the redelivery loop is RabbitMQ's own quorum-queue
+    delivery limit.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope, QueueType
+
+    call_count = 0
+    dead_lettered = asyncio.Event()
+
+    dlq_name = "integ-quorum-delivery-limit-dlq"
+    src_queue = RabbitQueue(
+        name="integ-quorum-delivery-limit-src",
+        queue_type=QueueType.QUORUM,
+        durable=True,
+        delivery_limit=1,  # dead-letter after the original delivery + 1 redelivery
+        dead_letter_exchange="",
+        dead_letter_routing_key=dlq_name,
+    )
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue=src_queue)  # deliberately: no retry= at all
+    async def always_transient_failure(body: bytes) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise TimeoutError("app never gives up on its own -- only the broker limit can stop this")
+
+    @broker.subscriber(queue=dlq_name)
+    async def on_dlq(body: bytes) -> None:
+        dead_lettered.set()
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    await broker.publish(MessageEnvelope(routing_key="integ-quorum-delivery-limit-src", body=b"doomed"))
+
+    await asyncio.wait_for(dead_lettered.wait(), timeout=20.0)
+
+    # delivery_limit=1 means the broker dead-letters after exactly 2 total
+    # deliveries (original + 1 redelivery). If the app-level retry-count
+    # header (which doesn't even exist on this route) were somehow the thing
+    # stopping this, call_count would either never stabilize or dead_lettered
+    # would never fire -- this proves the broker's own limit did the work.
+    assert call_count == 2, f"expected exactly 2 attempts (delivery_limit=1), got {call_count}"
+
+    await broker.stop()
+
+
 async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbitmq_url: str) -> None:
     """H6: a filter_fn rejection on a route with no retry and no manually
     configured DLX must not silently discard the message.
@@ -1908,3 +1974,87 @@ async def test_dlq_inspector_async_real_transport(rabbitmq_url: str) -> None:
 
     assert len(msgs) == 3
     assert purged == 3
+
+
+def test_dlq_inspector_replay_sync_real_transport(rabbitmq_url: str) -> None:
+    """Loop Engineering Review, Testing: DLQInspector.replay() was only ever
+    unit-tested against a mock transport (tests/unit/test_dlq.py) -- this
+    proves it actually republishes to a real target queue and acks the
+    originals off the source queue against a REAL broker, not just that the
+    mock transport's `.publish`/`.ack` were called with the right arguments.
+    """
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.dlq import DLQInspector
+    from rabbitkit.sync.broker import SyncBroker
+
+    broker = SyncBroker(config=_make_sync_config(rabbitmq_url))
+    broker.start()
+    assert broker._transport is not None
+
+    dlq = "dlq-replay-sync-src"
+    target = "dlq-replay-sync-target"
+    broker._transport.declare_queue(RabbitQueue(name=dlq, durable=True))
+    broker._transport.declare_queue(RabbitQueue(name=target, durable=True))
+
+    for i in range(3):
+        broker.publish(MessageEnvelope(routing_key=dlq, body=f"m{i}".encode()))
+
+    inspector = DLQInspector(broker._transport)
+    replayed = inspector.replay(dlq, target_queue=target)
+
+    # The source DLQ must now be empty -- replayed messages were acked off
+    # it, not left behind or merely peeked.
+    remaining = inspector.peek(dlq, limit=10)
+
+    # The target queue must have actually received them.
+    landed = inspector.peek(target, limit=10)
+    inspector.purge(target)
+
+    broker.stop()
+
+    assert replayed == 3
+    assert remaining == []
+    assert len(landed) == 3
+    assert {m.body for m in landed} == {b"m0", b"m1", b"m2"}
+
+
+async def test_dlq_inspector_replay_async_real_transport(rabbitmq_url: str) -> None:
+    """Async variant of test_dlq_inspector_replay_sync_real_transport, plus
+    the predicate filter: only messages matching the predicate are
+    replayed, non-matching ones are left on the source (nacked with
+    requeue=True, not dropped)."""
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.dlq import DLQInspector
+
+    broker = AsyncBroker(_make_async_config(rabbitmq_url))
+    await broker.start()
+    assert broker._transport is not None
+
+    dlq = "dlq-replay-async-src"
+    target = "dlq-replay-async-target"
+    await broker._transport.declare_queue(RabbitQueue(name=dlq, durable=True))
+    await broker._transport.declare_queue(RabbitQueue(name=target, durable=True))
+
+    for i in range(4):
+        await broker.publish(MessageEnvelope(routing_key=dlq, body=f"m{i}".encode()))
+
+    inspector = DLQInspector(broker._transport)
+    # Only replay even-indexed bodies -- proves the predicate is honored
+    # against a real broker, not just that replay() moves everything.
+    replayed = await inspector.replay_async(
+        dlq,
+        predicate=lambda msg: msg.body in (b"m0", b"m2"),
+        target_queue=target,
+    )
+
+    landed = await inspector.peek_async(target, limit=10)
+    await inspector.purge_async(target)
+    await inspector.purge_async(dlq)  # clean up the requeued non-matching messages
+
+    await broker.stop()
+
+    assert replayed == 2
+    assert {m.body for m in landed} == {b"m0", b"m2"}

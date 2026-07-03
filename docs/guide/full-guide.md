@@ -2,7 +2,7 @@
 
 > **Production-grade RabbitMQ toolkit for Python** — sync (pika) and async (aio-pika),
 > decorator-based routing, middleware pipeline, retry, compression, DI, RPC, and more.
-> Version 1.1.0 · Python ≥ 3.11 · MIT License
+> Version 1.1.1 · Python ≥ 3.11 · MIT License
 
 ## Table of Contents
 
@@ -719,6 +719,36 @@ async def handle(body: bytes) -> None:
 4. The handler is called again (up to `max_retries`)
 5. After exhaustion, the message is rejected → DLQ
 
+Setting `retry=` (broker-wide or per-route) does two things at once: it
+declares the delay/DLQ topology **and** installs `RetryMiddleware` on the
+route automatically, as the outermost middleware. You don't construct
+`RetryMiddleware` yourself for the common case — only for advanced needs
+(custom error `predicates`), and even then the broker detects an
+already-present `RetryMiddleware` in `middlewares=[...]` and doesn't add a
+second one.
+
+With `per_queue=True` (default), each source queue gets isolated delay
+infrastructure:
+
+```
+orders-queue
+  -> orders-queue.retry.0   (TTL=5s,   DLX back to orders exchange)
+  -> orders-queue.retry.1   (TTL=30s,  DLX back to orders exchange)
+  -> orders-queue.retry.2   (TTL=120s, DLX back to orders exchange)
+  -> orders-queue.dlq       (terminal failures)
+```
+
+**The retry-count header is not trusted input.** `x-rabbitkit-retry-count` is
+read from the inbound message and clamped to `[0, max_retries]` regardless of
+what a producer sets it to — a spoofed negative value can't reset the
+counter (or produce a non-existent negative delay-queue routing key), and a
+spoofed huge value can't skip straight to the DLQ beyond the configured cap.
+For a broker-enforced backstop that's completely independent of this
+app-level header, use a **quorum queue** with `x-delivery-limit` (see
+`RabbitQueue(queue_type=QueueType.QUORUM, delivery_limit=...)` in the
+Topology section) — RabbitMQ itself dead-letters after the limit regardless
+of any application-level retry logic.
+
 ### Error classification
 
 ```python
@@ -995,6 +1025,10 @@ ready = broker_readiness(broker)
 result = broker_health_check(broker)
 # result.status: HEALTHY | DEGRADED | UNHEALTHY
 # result.connected: bool
+# result.blocked: bool           -- connection.blocked (broker memory/disk alarm);
+#                                    orthogonal to connected -- a blocked connection
+#                                    can't publish even though it's still "connected".
+#                                    Forces DEGRADED and makes broker_readiness() False.
 # result.consumer_count: int
 # result.route_count: int
 # result.worker_pool_pending: int
@@ -1043,6 +1077,21 @@ async def handle(body: bytes) -> None:
     ...
 ```
 
+> **`ttl` has no auto-renewal.** A handler that runs longer than `ttl` loses
+> the lock mid-work — a second consumer can then acquire the same key and
+> process concurrently, defeating the lock entirely. Release itself is
+> correctly atomic (a Lua compare-and-delete, so a stale holder can never
+> delete someone else's lock) — the gap is purely "did the handler outlive
+> the TTL." Set `ttl` comfortably above your worst-case handler time. For a
+> downstream write that must not be applied twice even if the lock is lost
+> mid-work, use `lock.fencing_token(key)` and have the downstream store
+> reject a token older than the one it already recorded — the lock alone is
+> not a sufficient correctness guarantee for that case.
+
+If the lock cannot be acquired (another instance holds it), `LockMiddleware`
+nacks the message with `requeue=True` so it's retried later rather than
+dropped.
+
 ---
 
 ## 15. Deduplication
@@ -1077,15 +1126,35 @@ async def handle(body: bytes) -> None:
 
 Prefer `"on_success"` for most workflows. Use `"on_start"` only when concurrent dual-delivery is a larger risk than missed retries.
 
+**Composing with `RetryMiddleware`:** `RetryMiddleware` swallows a transient
+handler failure (routes it to a delay queue, acks the source) rather than
+raising — so from an outer middleware's point of view, `call_next(message)`
+returns normally either way, indistinguishable from the handler succeeding.
+`DeduplicationMiddleware` checks for a sentinel `RetryMiddleware` returns
+instead of `None` in this case, and skips marking the message as processed
+(or, for `mark_policy="on_start"`, retroactively undoes the premature mark)
+— so the actual retry redelivery is processed instead of being silently
+dropped as a "duplicate," regardless of which of the two you list first.
+Any custom middleware with similar "mark as done" side effects wrapping a
+route that may contain a `RetryMiddleware` should check for the same
+sentinel.
+
 ---
 
 ## 16. Circuit Breaker
+
+> **Advanced Stable, not dependency-free.** `CircuitBreakerMiddleware` is a
+> no-op passthrough unless you give it a real circuit breaker implementation
+> — it does not ship its own breaker logic. In practice that means
+> `pip install rabbitkit[obskit]` (or any object satisfying
+> `CircuitBreakerProtocol`/`AsyncCircuitBreakerProtocol` yourself). Don't
+> add this middleware expecting circuit-breaking "for free."
 
 ```python
 from rabbitkit import CircuitBreakerMiddleware
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerProtocol
 
-# Using a provided circuit breaker implementation
+# Using a provided circuit breaker implementation (e.g. obskit.resilience.CircuitBreaker)
 breaker = MyCircuitBreaker(failure_threshold=5, recovery_timeout=30)
 @broker.subscriber(
     queue="external-api-calls",
@@ -1095,6 +1164,10 @@ async def handle(body: bytes) -> None:
     # When the circuit is open, messages are rejected immediately (fail-fast)
     ...
 ```
+
+An async handler requires `async_circuit_breaker=` — passing only a sync
+`circuit_breaker=` and using it with an async handler raises `TypeError` at
+call time rather than silently no-op-ing.
 
 ---
 
@@ -1106,11 +1179,11 @@ from rabbitkit.experimental import SigningMiddleware, SigningConfig
 @broker.subscriber(
     queue="secure-events",
     middlewares=[SigningMiddleware(SigningConfig(
-        key=b"my-secret-hmac-key",
-        algorithm="sha256",            # "sha256" or "sha512"
-        header_name="x-signature",
-        max_skew=300,                  # max timestamp skew (seconds)
-        require_freshness=True,         # reject unsigned messages
+        secret_key="my-secret-hmac-key",
+        algorithm="hmac-sha256",         # "hmac-sha256" or "hmac-sha512"
+        header_name="x-rabbitkit-signature",
+        max_skew=60,                     # max timestamp skew (seconds) -- also the nonce replay window
+        require_freshness=True,          # reject messages lacking timestamp/nonce headers
     ))],
 )
 async def handle(body: bytes) -> None:
@@ -1119,12 +1192,16 @@ async def handle(body: bytes) -> None:
     ...
 ```
 
-**Replay protection:** The middleware includes a bounded `TTLSetNonceCache` (100k entries,
-`OrderedDict`-based O(1) LRU eviction). A captured signed message cannot be replayed —
-the nonce is rejected as a duplicate. **This cache is per-process** — in any
-multi-process/multi-pod deployment, use `nonce_cache=RedisNonceCache(redis.Redis(...))`
-(`from rabbitkit.middleware.signing import RedisNonceCache`) so the seen-set is
-shared across every process; a `RuntimeWarning` is emitted if you don't.
+**Replay protection:** the default `TTLSetNonceCache` is a bounded, in-memory
+seen-set. At capacity, it reclaims genuinely-*expired* entries first; if it's
+still full after that (i.e. genuinely full of *live*, unexpired nonces), the
+**new** nonce is rejected rather than evicting a live one to make room —
+evicting a live nonce would let an attacker flood unique nonces to force out
+a target's still-valid one and then replay it. **This cache is per-process**
+— in any multi-process/multi-pod deployment, use
+`nonce_cache=RedisNonceCache(redis.Redis(...))`
+(`from rabbitkit.middleware.signing import RedisNonceCache`) so the seen-set
+is shared across every process; a `RuntimeWarning` is emitted if you don't.
 
 **What's covered:** the default signature covers `exchange`, `routing_key`,
 `content_encoding`, and `reply_to` in addition to `timestamp`/`nonce`/`body` —
@@ -1593,7 +1670,9 @@ IDLE → STARTING → RUNNING → STOPPING → STOPPED
 - `threading.local` for per-thread zstd contexts (zstandard contexts are not thread-safe)
 - `concurrent.futures.Future` for sync RPC pending calls
 - `asyncio.Future` for async RPC pending calls
-- `OrderedDict` LRU for the nonce cache (O(1) eviction)
+- `OrderedDict`-backed nonce cache — reclaims *expired* entries first; rejects
+  new nonces rather than evicting a still-live one when genuinely full (see
+  the Message Signing section for why evicting live entries would be exploitable)
 - `weakref`-aware pool tracking (`_in_use` set for leak detection)
 - `@asynccontextmanager` / `@contextmanager` for pool acquire (prevents leaks)
 - `__aenter__`/`__aexit__` on transports for idiomatic `async with transport:`
@@ -1620,11 +1699,48 @@ IDLE → STARTING → RUNNING → STOPPING → STOPPED
 - **Settlement happens AFTER the transport call** — `RabbitMessage.ack()` sets `_disposition`
   only after `_ack_fn()` returns successfully (a failed ack propagates, not silently swallowed).
 
+### Sync vs. async: two different connection models
+
+This is the one place the two brokers are genuinely asymmetric, not just
+syntactically different (`await` vs. not) — and it's caused real confusion,
+so it's documented explicitly here.
+
+- **`SyncTransport`** (pika, `BlockingConnection`) shares **one** connection
+  for both publishing and consuming. `SyncBroker.run()`'s consume loop calls
+  `process_data_events(time_limit=1.0)` in a tight loop, which — as a side
+  effect — is what keeps that single connection's heartbeats serviced,
+  whether or not any message is actually flowing. A **publish-only**
+  `SyncBroker` (no subscribers, `run()`/`start_consuming()` never called)
+  has nothing driving that pump: the connection is only touched when
+  `publish()` runs. A long idle gap can get it heartbeat-timed-out
+  broker-side; the *next* publish still transparently reconnects
+  (`ensure_connected()` runs before every publish), but only reactively.
+  Call `broker.pump_idle()` periodically, from the same thread that called
+  `start()`, to reconnect proactively and keep the connection (and the
+  liveness heartbeat) alive between publishes — see the Quick Start section
+  for the pattern.
+
+- **`AsyncTransportImpl`** (aio-pika) eagerly establishes **two** dedicated
+  connections via `aio_pika.connect_robust()` — one for publishing, one for
+  consuming — at `start()` time, regardless of whether you have any
+  subscribers. `connect_robust()` manages its own heartbeat-sending and
+  reconnection as independent asyncio tasks that keep running as long as the
+  event loop is alive, whether or not your code is actively publishing.
+  There is no async equivalent of `pump_idle()` because there's nothing to
+  pump — the mechanism that makes it necessary on the sync side (a single
+  connection that only gets touched by whatever the application code
+  happens to call) doesn't exist on the async side.
+
+The practical rule: if you're running a **publish-only `SyncBroker`**, call
+`pump_idle()` on a timer. Every other combination (any consumer, or any
+`AsyncBroker`) needs no equivalent wiring.
+
 ---
 
-> **rabbitkit 1.1.0** — Production/Stable · Python ≥ 3.11 · MIT License
+> **rabbitkit 1.1.0** — Python ≥ 3.11 · MIT License
 >
 > Built with Strategy patterns, Protocol-based typing, contextvars for async safety,
 > daemon-thread worker pools for k8s-safe shutdown, streaming zip-bomb guards,
-> HMAC replay protection with OrderedDict LRU nonce cache, and a real in-memory
-> TestBroker that exercises the production pipeline — not mock theater.
+> HMAC replay protection with a reject-when-full (never evict-live) nonce cache,
+> and a real in-memory TestBroker that exercises the production pipeline —
+> not mock theater.

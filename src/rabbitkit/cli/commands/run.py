@@ -119,7 +119,7 @@ def _run_with_reload(app_path: str, reload_ext: str) -> None:
         ".",
         target=_run_single,
         args=(app_path,),
-        watch_filter=watchfiles.PythonFilter(extra_extensions=extensions - {".py"}),
+        watch_filter=watchfiles.PythonFilter(extra_extensions=tuple(sorted(extensions - {".py"}))),
     )
 
 

@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
@@ -42,7 +43,7 @@ otel       = ["opentelemetry-api>=1.20,<2"]
 settings    = ["pydantic-settings>=2.0.0,<3.0.0"]
 cli         = ["typer>=0.12.0,<1.0.0"]
 dashboard   = ["starlette>=0.37.0,<2.0.0", "uvicorn>=0.29.0,<1.0.0"]
-reload      = ["watchfiles>=0.21.0,<1.0.0"]
+reload      = ["watchfiles>=0.21.0,<2.0.0"]
 all         = ["rabbitkit[all-brokers,otel,redis,pydantic,msgspec,fastapi,compression,settings,cli,dashboard,reload,management]"]
 dev         = [
     "rabbitkit[all]",

@@ -24,12 +24,22 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        experimental: [false]
+        include:
+          # 3.15 is pre-release until Oct 2026; C-extension deps
+          # (pydantic-core, msgspec, zstandard) don't ship cp315 wheels yet,
+          # so this leg may fail without blocking the pipeline. Promote it
+          # to the main list once it holds green.
+          - python-version: "3.15"
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       # NOTE(coverage): the project aims for ~100% coverage, but the floor is
       # intentionally kept at 85 here so CI stays green while unreachable

@@ -6,7 +6,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/rabbitkit)](https://pypi.org/project/rabbitkit/)
 [![CI](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml/badge.svg)](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Typed](https://img.shields.io/badge/types-mypy%20--strict-blue)](pyproject.toml)
 [![Style](https://img.shields.io/badge/style-ruff-261230)](pyproject.toml)
@@ -427,7 +427,7 @@ and settlement rules.
 
 ## Compatibility
 
-Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13) · RabbitMQ ≥ 3.12 recommended ·
+Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimental) · RabbitMQ ≥ 3.12 recommended ·
 `pika >= 1.3, < 2.0` · `aio-pika >= 9.1, < 10.0`
 
 ## Documentation

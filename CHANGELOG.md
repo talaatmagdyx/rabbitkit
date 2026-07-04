@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Python 3.14 support** — added to the CI test matrix and trove
+  classifiers (full suite green). Python 3.15 runs as an experimental,
+  allowed-to-fail pre-release leg until its C-extension dependencies
+  (pydantic-core, msgspec, zstandard) ship cp315 wheels. The `reload`
+  extra's watchfiles pin widened to `<2.0.0` (0.x has no 3.14 wheels).
+
 ### Security
 
 - **starlette ≥1.3.1 allowed** — the `dashboard` extra's `<1.0.0` cap forced

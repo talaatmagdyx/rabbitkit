@@ -732,8 +732,11 @@ async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbit
         dead_lettered_bodies.append(body)
         dead_lettered.set()
 
-    with pytest.warns(RuntimeWarning, match="auto-declared 'integ-h6-filter-q.dlq'"):
-        await broker.start()
+    # C3 folded the filter-route special case into the general
+    # reject_without_dlx mechanism; the old H6 RuntimeWarning became an INFO
+    # log (see CHANGELOG 1.2.0). The auto-provisioned DLQ itself — this
+    # test's real subject — is asserted below on the real broker.
+    await broker.start()
     await asyncio.sleep(0.3)
 
     await broker.publish(MessageEnvelope(routing_key="integ-h6-filter-q", body=b"filtered-payload"))

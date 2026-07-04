@@ -93,6 +93,7 @@ from rabbitkit.serialization.pipeline import (
     RawDecoder,
     SerializationPipeline,
 )
+from rabbitkit.sync.batch import SyncBatchPublisher
 from rabbitkit.sync.broker import SyncBroker
 
 __all__ = [
@@ -178,6 +179,7 @@ __all__ = [
     "SecurityConfig",
     "SerializationPipeline",
     "SocketConfig",
+    "SyncBatchPublisher",
     "SyncBroker",
     "SyncWorkerPool",
     "TopologyMode",

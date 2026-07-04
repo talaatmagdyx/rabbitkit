@@ -6,7 +6,12 @@ one entry per change, in the order they happened. See
 policy this follows. Experimental API changes are not tracked here — see
 `CHANGELOG.md` for those.
 
-## `rabbitkit.aio` → `rabbitkit.async_` (1.1.0)
+> **Version numbering note:** entries marked *(internal 1.x)* predate the
+> first published release. The project was renumbered to **0.9.0** for its
+> public beta; no 1.x version was ever distributed, so these entries only
+> matter if you tracked the repository before publication.
+
+## `rabbitkit.aio` → `rabbitkit.async_` (internal 1.1.0)
 
 **What changed:** `rabbitkit.async_` is now the canonical import path for
 the async broker and transport. `rabbitkit.aio` still works, but importing
@@ -60,7 +65,7 @@ user action, add an entry here following this shape:
 **How to check if you're affected:** <a grep/search command, if applicable>
 ```
 
-## 1.3.0 — `TracedConsumerMiddleware` removed
+## 0.9.0 — `TracedConsumerMiddleware` removed
 
 The obskit-based tracing middleware is removed; rabbitkit is now fully
 self-contained (zero org-internal packages for any feature). Migrate to

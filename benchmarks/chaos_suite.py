@@ -24,17 +24,16 @@ import time
 
 from rabbitkit import MessageEnvelope, RabbitConfig, RetryConfig
 from rabbitkit.async_.broker import AsyncBroker
-from rabbitkit.core.config import SafetyConfig
-
-# Chaos scenarios pre-declare plain queues and test reconnect/redelivery,
-# not DLQ semantics — opt out of C3 auto-DLX so declarations match.
-_CHAOS_SAFETY = SafetyConfig(reject_without_dlx="discard", warn_on_discard=False)
-from rabbitkit.core.config import ConnectionConfig, PoolConfig
+from rabbitkit.core.config import ConnectionConfig, PoolConfig, SafetyConfig
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import AckPolicy, ErrorSeverity, PublishStatus
 from rabbitkit.dlq import DLQInspector
 from rabbitkit.middleware.retry import RetryMiddleware
 from rabbitkit.sync.broker import SyncBroker
+
+# Chaos scenarios pre-declare plain queues and test reconnect/redelivery,
+# not DLQ semantics — opt out of C3 auto-DLX so declarations match.
+_CHAOS_SAFETY = SafetyConfig(reject_without_dlx="discard", warn_on_discard=False)
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)

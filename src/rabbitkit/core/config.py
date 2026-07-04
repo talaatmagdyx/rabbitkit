@@ -343,6 +343,15 @@ class RetryConfig:
     # stability; does not affect delay timing. Spread retries across a fleet
     # via the per-process reconnect jitter, not this.
     jitter_factor: float = 0.1
+    # F4: "off" (default — single delay queue per tier, exact legacy topology)
+    # or "sharded" — each tier becomes jitter_shards sub-queues with uniform
+    # TTLs staggered across ±jitter_factor; a message picks its shard by a
+    # STABLE hash of its message_id, decorrelating retry waves across the
+    # fleet WITHOUT per-message TTL (which would reintroduce classic-queue
+    # head-of-line blocking). Shard 0 keeps the legacy queue name/TTL, so
+    # enabling this on an existing topology is additive (no 406s).
+    jitter_mode: str = "off"
+    jitter_shards: int = 3
     dead_letter_exchange: str = ""
     per_queue: bool = True
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT
@@ -351,6 +360,21 @@ class RetryConfig:
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ValueError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
+        if self.jitter_mode not in ("off", "sharded"):
+            raise ValueError(
+                f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}"
+            )
+        if self.jitter_mode == "sharded":
+            if self.jitter_shards < 2:
+                raise ValueError(
+                    f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', "
+                    f"got {self.jitter_shards}"
+                )
+            if not (0 < self.jitter_factor < 1):
+                raise ValueError(
+                    "RetryConfig.jitter_factor must be in (0, 1) with jitter_mode='sharded' "
+                    f"(it sets the TTL spread), got {self.jitter_factor}"
+                )
         if not self.per_queue:
             # H3: shared delay queues (rabbitkit.retry.N) bake a single
             # x-dead-letter-routing-key into each queue at declare time. That

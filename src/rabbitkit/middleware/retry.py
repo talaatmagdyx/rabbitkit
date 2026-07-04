@@ -26,6 +26,38 @@ from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 logger = logging.getLogger(__name__)
 
 
+def _shard_index(message_id: str, shards: int) -> int:
+    """Stable shard pick (F4). Python's hash() is salted per process — a
+    message's retry shard must be identical across every consumer process,
+    or its cadence changes on each redelivery. md5 here is a stable bucket
+    hash, not crypto."""
+    if not message_id:
+        return 0
+    import hashlib
+
+    return int(hashlib.md5(message_id.encode(), usedforsecurity=False).hexdigest(), 16) % shards
+
+
+def _shard_queue_name(source_queue: str, attempt: int, shard: int) -> str:
+    """Shard 0 keeps the legacy `{q}.retry.{n}` name (backward compatible —
+    enabling sharded jitter on an existing topology is purely additive)."""
+    base = f"{source_queue}.retry.{attempt}"
+    return base if shard == 0 else f"{base}.s{shard}"
+
+
+def _shard_ttl_multipliers(shards: int, jitter_factor: float) -> list[float]:
+    """Shard 0 is exactly 1.0 (legacy TTL, no redeclare conflict); shards
+    1..N-1 spread evenly across [1-jf, 1+jf]. Every queue's TTL is still
+    UNIFORM for all messages in it — jitter comes from which shard a
+    message hashes to, never from per-message TTL (head-of-line safety)."""
+    if shards == 2:
+        return [1.0, 1.0 + jitter_factor]
+    rest = shards - 1
+    return [1.0] + [
+        1.0 + jitter_factor * (-1.0 + 2.0 * i / (rest - 1)) for i in range(rest)
+    ]
+
+
 def retry_middleware_insertion_index(middlewares: Sequence[Any]) -> int:
     """Index at which an auto-wired ``RetryMiddleware`` should be inserted.
 
@@ -262,7 +294,11 @@ class RetryMiddleware(BaseMiddleware):
         attempt = retry_count + 1
         # Always per-queue (shared mode is rejected by RetryConfig — H3).
         source_queue = message.headers.get("x-rabbitkit-original-queue", "unknown")
-        delay_queue_rk = f"{source_queue}.retry.{attempt}"
+        if self._config.jitter_mode == "sharded":
+            shard = _shard_index(message.message_id or "", self._config.jitter_shards)
+            delay_queue_rk = _shard_queue_name(str(source_queue), attempt, shard)
+        else:
+            delay_queue_rk = f"{source_queue}.retry.{attempt}"
 
         # Preserve original headers + add retry metadata
         headers = dict(message.headers)
@@ -461,23 +497,29 @@ class RetryRouter:
         """
         queues: list[RabbitQueue] = []
 
+        if self._config.jitter_mode == "sharded":
+            multipliers = _shard_ttl_multipliers(self._config.jitter_shards, self._config.jitter_factor)
+        else:
+            multipliers = [1.0]
+
         for attempt in range(1, self._config.max_retries + 1):
             delay_ms = self._get_delay_ms(attempt - 1)
 
             # Always per-queue (shared mode is rejected by RetryConfig — H3).
-            q_name = f"{source_queue_name}.retry.{attempt}"
-
-            queue = RabbitQueue(
-                name=q_name,
-                durable=True,
-                arguments={
-                    "x-message-ttl": delay_ms,
-                    "x-dead-letter-exchange": "",  # default exchange (M5)
-                    "x-dead-letter-routing-key": source_queue_name,
-                    "x-queue-type": "classic",  # classic for delay queues
-                },
-            )
-            queues.append(queue)
+            for shard, mult in enumerate(multipliers):
+                queue = RabbitQueue(
+                    name=_shard_queue_name(source_queue_name, attempt, shard),
+                    durable=True,
+                    arguments={
+                        # Uniform per-queue TTL (head-of-line safety); shards
+                        # stagger TTLs ACROSS queues, never within one (F4).
+                        "x-message-ttl": max(1, int(delay_ms * mult)),
+                        "x-dead-letter-exchange": "",  # default exchange (M5)
+                        "x-dead-letter-routing-key": source_queue_name,
+                        "x-queue-type": "classic",  # classic for delay queues
+                    },
+                )
+                queues.append(queue)
 
         # DLQ — declared as a plain durable queue.
         # The source queue's x-dead-letter-exchange (set via

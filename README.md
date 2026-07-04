@@ -48,7 +48,7 @@ not be rewritten in every service. **That is what rabbitkit is for.**
 - [DI](#dependency-injection) ·
 - [Middleware](#middleware-batteries-included) ·
 - [CLI](#operate-it-from-the-terminal) ·
-- [Compares](#how-it-compares) ·
+- [Where it fits](#where-rabbitkit-fits) ·
 - [Architecture](#architecture) ·
 - [Docs](#documentation)
 
@@ -115,6 +115,19 @@ pip install rabbitkit[all]          # everything optional
 
 Requires Python ≥ 3.11.
 
+## The 10-minute path
+
+A durable, retrying, DLQ-backed consumer — tested without a broker:
+
+1. `pip install rabbitkit[async]`
+2. Create an `AsyncBroker(RabbitConfig())`
+3. Register a handler with `@broker.subscriber(queue=...)`
+4. Add `retry=RetryConfig(max_retries=3, delays=(5, 30, 120))`
+5. Run it: `rabbitkit run myapp.main:broker`
+6. Test it in CI with `TestBroker` — no RabbitMQ required
+
+Each step is shown below.
+
 ## Quick start
 
 ### 1. Create a consumer
@@ -178,8 +191,9 @@ orders.created
 ```
 
 Transient failures retry with backoff. Permanent failures skip the ladder
-and go straight to the DLQ. Nothing disappears silently — every rejecting
-route gets a DLQ by default.
+and go straight to the DLQ. By default, rejected messages do not disappear
+silently — every rejecting route gets a DLQ unless you explicitly opt into
+discard behavior.
 
 ### 4. Test it without RabbitMQ
 
@@ -238,8 +252,10 @@ sync_broker = SyncBroker(RabbitConfig())
 def handle_order_sync(body: bytes) -> None:
     print(f"received order: {body!r}")
 
-def run() -> None:
-    sync_broker.start()
+def main() -> None:
+    # Blocks until SIGINT/SIGTERM or stop(); reconnects on connection drops
+    # and drains in-flight work on pod termination.
+    sync_broker.run()
 ```
 
 The sync broker fits simple workers, scripts, legacy services, and teams
@@ -394,16 +410,31 @@ the recovery tool cannot itself lose messages.
 
 <p align="center"><img src="assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
 
-## How it compares
+## Where rabbitkit fits
 
-- **Raw `pika` / `aio-pika`** — rabbitkit is a reliability layer *on top of*
-  them, not a replacement; drop to the underlying client any time.
-- **Celery / task queues** — rabbitkit is messaging, not a task framework:
-  no scheduler, no result-store-first model, RabbitMQ stays visible.
-- **FastStream** — a great multi-broker, async-first framework. Choose it
-  for broker portability and its ecosystem; choose rabbitkit for
-  RabbitMQ-only depth: broker-side retry state, auto-DLX defaults, checked
-  publish outcomes, DLQ replay tooling, and a sync transport.
+rabbitkit sits *above* `pika` and `aio-pika` — a reliability layer, not a
+replacement; drop to the underlying client any time. It is for teams that
+use RabbitMQ directly and want production-safe messaging without rebuilding
+retries, DLQs, publisher confirms, acknowledgements, lifecycle handling, and
+test infrastructure in every service.
+
+**A good fit when:**
+
+- RabbitMQ is your primary broker
+- message loss would be an incident
+- retry and DLQ behavior must be explicit
+- CI should test handlers without a real broker
+- Kubernetes shutdown and readiness matter
+- operators need visibility into message outcomes
+
+**Probably not the right fit when:**
+
+- you need a task queue or scheduler (use a task framework)
+- you need a broker-agnostic framework or want to hide RabbitMQ semantics
+- at-most-once behavior is acceptable and a raw client is enough
+
+A detailed framework-by-framework comparison lives in
+[docs/comparison.md](docs/comparison.md).
 
 ## Architecture
 

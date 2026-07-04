@@ -7,19 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [1.3.0] — 2026-07-04
 
-- **Hosted documentation** — mkdocs site now deploys to GitHub Pages
-  (https://talaatmagdyx.github.io/rabbitkit/) on every push to `main` via a
-  new `Docs` workflow (`mkdocs build --strict` gates the deploy). Docs
-  homepage now carries the project logo and CLI demo; stale
-  `talaatmagdy/rabbitkit` URLs in `mkdocs.yml`/`pyproject.toml` corrected to
-  `talaatmagdyx`, and the theme favicon now points at an asset that exists.
-- **Python 3.14 support** — added to the CI test matrix and trove
-  classifiers (full suite green). Python 3.15 runs as an experimental,
-  allowed-to-fail pre-release leg until its C-extension dependencies
-  (pydantic-core, msgspec, zstandard) ship cp315 wheels. The `reload`
-  extra's watchfiles pin widened to `<2.0.0` (0.x has no 3.14 wheels).
+Roadmap release: six features extending the 1.2.0 thesis (*no message is
+lost, and operators can see and fix everything*) to places it didn't reach —
+the open observability ecosystem, the migration path onto the mandated
+quorum topology, retry-wave decorrelation, duplicate-result replay, and the
+sync confirm ceiling. Two features shipped as their honest reframings: sync
+confirm pipelining runs on a dedicated `SelectConnection` I/O thread
+(impossible on `BlockingChannel`), and "exactly-once" ships as the
+idempotent-receiver *effect* (wire-level exactly-once does not exist on
+RabbitMQ and the docs never claim it).
 
 ### Security
 
@@ -34,18 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event-loop state left by earlier tests, or wall-clock speed in the
   token-bucket refill test).
 
-## [1.3.0] — 2026-07-04
-
-Roadmap release: six features extending the 1.2.0 thesis (*no message is
-lost, and operators can see and fix everything*) to places it didn't reach —
-the open observability ecosystem, the migration path onto the mandated
-quorum topology, retry-wave decorrelation, duplicate-result replay, and the
-sync confirm ceiling. Two features shipped as their honest reframings: sync
-confirm pipelining runs on a dedicated `SelectConnection` I/O thread
-(impossible on `BlockingChannel`), and "exactly-once" ships as the
-idempotent-receiver *effect* (wire-level exactly-once does not exist on
-RabbitMQ and the docs never claim it).
-
 ### Removed
 
 - **`TracedConsumerMiddleware`** (the obskit integration) — removed
@@ -59,6 +45,18 @@ RabbitMQ and the docs never claim it).
   implementation (e.g. pybreaker) works as before.
 
 ### Added
+
+- **Hosted documentation** — mkdocs site now deploys to GitHub Pages
+  (https://talaatmagdyx.github.io/rabbitkit/) on every push to `main` via a
+  new `Docs` workflow (`mkdocs build --strict` gates the deploy). Docs
+  homepage now carries the project logo and CLI demo; stale
+  `talaatmagdy/rabbitkit` URLs in `mkdocs.yml`/`pyproject.toml` corrected to
+  `talaatmagdyx`, and the theme favicon now points at an asset that exists.
+- **Python 3.14 support** — added to the CI test matrix and trove
+  classifiers (full suite green). Python 3.15 runs as an experimental,
+  allowed-to-fail pre-release leg until its C-extension dependencies
+  (pydantic-core, msgspec, zstandard) ship cp315 wheels. The `reload`
+  extra's watchfiles pin widened to `<2.0.0` (0.x has no 3.14 wheels).
 
 - **`OTelTracingMiddleware`** (`rabbitkit[otel]`) — native OpenTelemetry
   tracing via `opentelemetry-api`: CONSUMER spans with W3C `traceparent`

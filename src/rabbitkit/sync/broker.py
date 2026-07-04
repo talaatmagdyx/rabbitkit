@@ -854,6 +854,22 @@ class SyncBroker:
             safety_dlq_name: str | None = None
             if self._config.topology_mode is TopologyMode.AUTO_DECLARE:
                 safety_dlq_name = route.resolve_safety_dlq(self._config.safety, self._config.retry)
+            # A queue that IS another route's DLQ is terminal — consuming your
+            # own DLQ is a legitimate pattern (inspect/replay consumers), and
+            # auto-chaining more topology onto it (safety DLX injection, or
+            # BROKER-DEFAULT retry inherited by the DLQ-consumer route) would
+            # re-declare the DLQ with different arguments than the retry/
+            # safety topology already declared it with — a 406 inequivalent-
+            # arg startup failure, caught by the real-broker CI suite. An
+            # EXPLICIT per-route retry= on a DLQ consumer still wins.
+            is_anothers_dlq = any(
+                other is not route and route.queue.name == f"{other.queue.name}.dlq"
+                for other in self._registry.routes
+            )
+            if is_anothers_dlq:
+                safety_dlq_name = None
+                if route.retry_override is None:
+                    retry_config = None  # don't inherit broker-default retry
 
             if retry_config is not None:
                 retry_router = RetryRouter(retry_config)

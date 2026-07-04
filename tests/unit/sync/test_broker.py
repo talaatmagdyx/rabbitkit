@@ -2424,3 +2424,29 @@ class TestSingleWorkerHeartbeatWarning:
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             self._start_mocked(broker)
+
+
+class TestDlqConsumerRouteNotAutoChained:
+    """CI real-broker regression: a route consuming ANOTHER route's DLQ must
+    not get a safety DLX auto-provisioned onto it — that re-declares the DLQ
+    with different args than the retry topology declared it with (406)."""
+
+    def test_safety_dlx_skipped_for_dlq_consumer_route(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+
+        broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None: ...
+
+        @broker.subscriber(queue="orders.dlq", retry=None)
+        def handle_dead(body: bytes) -> None: ...
+
+        broker._transport = MagicMock()
+        broker._declare_topology()
+
+        declared = {c.args[0].name: c.args[0] for c in broker._transport.declare_queue.call_args_list}
+        dlq = declared["orders.dlq"]
+        # Terminal: no x-dead-letter args injected onto the DLQ itself.
+        assert "x-dead-letter-exchange" not in (dlq.arguments or {})
+        assert dlq.dead_letter_exchange is None

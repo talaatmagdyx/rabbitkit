@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.3.0] — 2026-07-04
+## [0.9.0] — 2026-07-04
 
-Roadmap release: six features extending the 1.2.0 thesis (*no message is
+**First published release** (public beta). Entries below this point
+(numbered 1.0.0–1.3.0) are pre-publication internal milestones — the
+project was renumbered to 0.9.0 for its first public release to signal
+beta maturity; no earlier version was ever distributed.
+
+Roadmap release: six features extending the internal-1.2.0 thesis (*no message is
 lost, and operators can see and fix everything*) to places it didn't reach —
 the open observability ecosystem, the migration path onto the mandated
 quorum topology, retry-wave decorrelation, duplicate-result replay, and the

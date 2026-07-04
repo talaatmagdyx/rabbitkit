@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **starlette ≥1.3.1 allowed** — the `dashboard` extra's `<1.0.0` cap forced
+  starlette 0.52.1, which carries six known advisories (PYSEC-2026-161/248/249,
+  CVE-2026-48817/48818, all fixed by 1.3.1). The pin is now `<2.0.0`.
+
+### Fixed
+
+- CI reliability: unit tests no longer depend on ambient environment state
+  (a locally running broker, transitive `prometheus-client`/`httpx`,
+  event-loop state left by earlier tests, or wall-clock speed in the
+  token-bucket refill test).
+
 ## [1.3.0] — 2026-07-04
 
 Roadmap release: six features extending the 1.2.0 thesis (*no message is

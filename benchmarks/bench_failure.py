@@ -25,7 +25,7 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from benchmarks._common import percentiles, preload_proc
+from benchmarks._common import _bench_safety, percentiles, preload_proc
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
@@ -60,7 +60,7 @@ async def _predeclare_topology(url: str, queue: str, **subscriber_kwargs: Any) -
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
 
     @broker.subscriber(queue=queue, prefetch_count=PREFETCH, **subscriber_kwargs)
     async def _noop(body: bytes) -> None:
@@ -78,7 +78,7 @@ async def _drain_with_kwargs(url: str, queue: str, n: int, prefetch: int, **subs
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, WorkerConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     span: dict[str, float] = {}
     done = asyncio.Event()
@@ -107,7 +107,8 @@ async def _drain_with_pydantic(url: str, queue: str, n: int, prefetch: int) -> f
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, WorkerConfig
     from rabbitkit.serialization.json import JSONSerializer
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)), serializer=JSONSerializer())
+    broker = AsyncBroker(RabbitConfig(
+        safety=_bench_safety(), connection=ConnectionConfig.from_url(url)), serializer=JSONSerializer())
     count = 0
     span: dict[str, float] = {}
     done = asyncio.Event()
@@ -143,7 +144,7 @@ async def _bench_retry_latency(url: str, n_msgs: int = 50) -> list[float]:
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, RetryConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     roundtrips: list[float] = []
     fail_times: dict[int, float] = {}
     done = asyncio.Event()
@@ -205,7 +206,7 @@ async def _drain_with_dedup_new(
         config=DeduplicationConfig(mark_policy=mark_policy),
     )
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     span: dict[str, float] = {}
     done = asyncio.Event()
@@ -264,7 +265,7 @@ async def _drain_with_dedup_dup(
         config=DeduplicationConfig(mark_policy="on_start"),
     )
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
 
     @broker.subscriber(queue=queue, prefetch_count=prefetch, middlewares=[mw])
     async def handle(body: bytes) -> None:
@@ -326,7 +327,7 @@ async def _drain_with_dedup_lru(
 
     mw.consume_scope_async = _counted_scope  # type: ignore[method-assign]
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
 
     @broker.subscriber(queue=queue, prefetch_count=prefetch, middlewares=[mw])
     async def handle(body_bytes: bytes) -> None:

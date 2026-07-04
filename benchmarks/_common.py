@@ -14,6 +14,16 @@ logging.getLogger("aiormq").setLevel(logging.CRITICAL)
 IMAGE = "rabbitmq:3.13-management-alpine"
 PRELOAD_CONCURRENCY = 64
 
+def _bench_safety():  # lazy: keep module importable without rabbitkit extras
+    from rabbitkit.core.config import SafetyConfig
+
+    # Benchmarks pre-load queues with plain durable declarations; the
+    # auto_provision safety default (C3) would re-declare them with an
+    # x-dead-letter-exchange argument and hit a 406 inequivalent-arg error.
+    # Message-safety topology is not what these benches measure.
+    return SafetyConfig(reject_without_dlx="discard", warn_on_discard=False)
+
+
 
 def make_url(container: Any) -> str:
     return (
@@ -37,7 +47,7 @@ def preload(url: str, queue: str, n: int, body: bytes = b'{"id":1}', passive: bo
         from rabbitkit.core.topology import RabbitQueue
 
         broker = AsyncBroker(
-            RabbitConfig(
+            RabbitConfig(safety=_bench_safety(),
                 connection=ConnectionConfig.from_url(url),
                 pool=PoolConfig(channel_pool_size=PRELOAD_CONCURRENCY),
             )

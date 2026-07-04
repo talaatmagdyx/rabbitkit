@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 
-from benchmarks._common import preload_proc
+from benchmarks._common import _bench_safety, preload_proc
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("pika").setLevel(logging.CRITICAL)
@@ -31,7 +31,7 @@ def _bench_sync_consume(url: str, queue: str, n: int, prefetch: int, **subscribe
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.sync.broker import SyncBroker
 
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = SyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     span: dict[str, float] = {}
     done = threading.Event()
@@ -71,7 +71,7 @@ def _bench_sync_consume_pydantic(url: str, queue: str, n: int, prefetch: int) ->
     class Payload(BaseModel):
         id: int
 
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = SyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     span: dict[str, float] = {}
     done = threading.Event()
@@ -102,7 +102,7 @@ def _bench_sync_publish(url: str, queue: str, n: int) -> float:
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.sync.broker import SyncBroker
 
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = SyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     broker.start()
 
     t0 = time.perf_counter()

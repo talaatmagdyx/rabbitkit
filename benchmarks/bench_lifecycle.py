@@ -21,6 +21,8 @@ import statistics
 import time
 from typing import Any
 
+from benchmarks._common import _bench_safety
+
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
 logging.getLogger("aiormq").setLevel(logging.CRITICAL)
@@ -33,7 +35,7 @@ async def _bench_startup_time(url: str, runs: int = 5) -> list[float]:
 
     times: list[float] = []
     for _ in range(runs):
-        broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+        broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
         evt: asyncio.Event = asyncio.Event()
 
         def _make_startup_handler(event: asyncio.Event) -> Any:
@@ -62,7 +64,7 @@ async def _bench_shutdown_drain(url: str, in_flight: int) -> float:
     from rabbitkit.core.config import ConnectionConfig, ConsumerConfig, RabbitConfig, WorkerConfig
 
     broker = AsyncBroker(
-        RabbitConfig(
+        RabbitConfig(safety=_bench_safety(),
             connection=ConnectionConfig.from_url(url),
             consumer=ConsumerConfig(prefetch_count=in_flight),
         )
@@ -102,7 +104,7 @@ async def _bench_reconnect_recovery(url: str, container: Any, runs: int = 3) -> 
     recovery_times: list[float] = []
 
     for _ in range(runs):
-        broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+        broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
         recovered: asyncio.Event = asyncio.Event()
         drop_time: list[float] = []
 

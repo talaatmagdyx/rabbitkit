@@ -18,6 +18,7 @@ from typing import Any
 
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
+from benchmarks._common import _bench_safety
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, RabbitConfig
 from rabbitkit.core.topology import RabbitQueue
@@ -28,7 +29,11 @@ logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 
 async def _publish_via_broker(url: str, queue: str, n: int, concurrency: int) -> float:
     broker = AsyncBroker(
-        RabbitConfig(connection=ConnectionConfig.from_url(url), pool=PoolConfig(channel_pool_size=max(64, concurrency)))
+        RabbitConfig(
+        safety=_bench_safety(),
+        connection=ConnectionConfig.from_url(url),
+        pool=PoolConfig(channel_pool_size=max(64, concurrency)),
+    )
     )
     await broker.start()
     await broker._transport.declare_queue(RabbitQueue(name=queue))

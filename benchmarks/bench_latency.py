@@ -23,7 +23,7 @@ import logging
 import time
 from typing import Any
 
-from benchmarks._common import percentiles
+from benchmarks._common import _bench_safety, percentiles
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
@@ -69,7 +69,7 @@ async def _measure_latency(
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     total = n + WARMUP_N
     all_latencies: list[float] = []
     done = asyncio.Event()
@@ -102,7 +102,8 @@ async def _measure_pydantic_latency(url: str, queue: str, n: int, prefetch: int)
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.serialization.json import JSONSerializer
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)), serializer=JSONSerializer())
+    broker = AsyncBroker(RabbitConfig(
+        safety=_bench_safety(), connection=ConnectionConfig.from_url(url)), serializer=JSONSerializer())
     total = n + WARMUP_N
     all_latencies: list[float] = []
     done = asyncio.Event()
@@ -134,7 +135,8 @@ async def _measure_msgspec_latency(url: str, queue: str, n: int, prefetch: int) 
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.serialization.msgspec import MsgspecSerializer
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)), serializer=MsgspecSerializer())
+    broker = AsyncBroker(RabbitConfig(
+        safety=_bench_safety(), connection=ConnectionConfig.from_url(url)), serializer=MsgspecSerializer())
     total = n + WARMUP_N
     all_latencies: list[float] = []
     done = asyncio.Event()

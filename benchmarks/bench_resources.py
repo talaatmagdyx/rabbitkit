@@ -22,7 +22,7 @@ import os
 import time
 from typing import Any
 
-from benchmarks._common import preload_proc
+from benchmarks._common import _bench_safety, preload_proc
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
@@ -44,7 +44,7 @@ async def _consume_raw(url: str, queue: str, n: int, prefetch: int) -> None:
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, WorkerConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     done = asyncio.Event()
 
@@ -64,7 +64,7 @@ async def _consume_json(url: str, queue: str, n: int, prefetch: int) -> None:
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, WorkerConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     done = asyncio.Event()
 
@@ -91,7 +91,7 @@ async def _consume_pydantic(url: str, queue: str, n: int, prefetch: int) -> None
         name: str
         amount: float
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     done = asyncio.Event()
 
@@ -111,7 +111,7 @@ async def _consume_retry(url: str, queue: str, n: int, prefetch: int) -> None:
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, RetryConfig, WorkerConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     count = 0
     done = asyncio.Event()
 

@@ -25,7 +25,7 @@ import logging
 import time
 from typing import Any
 
-from benchmarks._common import preload_proc
+from benchmarks._common import _bench_safety, preload_proc
 
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("aio_pika").setLevel(logging.CRITICAL)
@@ -63,7 +63,8 @@ async def _drain(url: str, queue: str, n: int, prefetch: int, handler_factory: A
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig, WorkerConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)), serializer=serializer)
+    broker = AsyncBroker(RabbitConfig(
+        safety=_bench_safety(), connection=ConnectionConfig.from_url(url)), serializer=serializer)
     count = 0
     span: dict[str, float] = {}
     done = asyncio.Event()
@@ -173,7 +174,7 @@ async def _predeclare_topology(url: str, factory: Any, queue: str, prefetch: int
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     factory(broker, queue, prefetch, lambda: None)  # register subscriber → topology declared on start
     await broker.start()
     await broker.stop()
@@ -191,7 +192,7 @@ async def _bench_publish(url: str, queue: str, n: int, concurrency: int, confirm
     from rabbitkit.core.topology import RabbitQueue
 
     broker = AsyncBroker(
-        RabbitConfig(
+        RabbitConfig(safety=_bench_safety(),
             connection=ConnectionConfig.from_url(url),
             pool=PoolConfig(channel_pool_size=concurrency),
             publisher=PublisherConfig(confirm_delivery=confirm_delivery),
@@ -230,7 +231,7 @@ async def _bench_publish_batch(
     from rabbitkit.core.topology import RabbitQueue
 
     broker = AsyncBroker(
-        RabbitConfig(
+        RabbitConfig(safety=_bench_safety(),
             connection=ConnectionConfig.from_url(url),
             pool=PoolConfig(channel_pool_size=PUBLISH_CONCURRENCY, prewarm_channels=prewarm),
         ),

@@ -20,6 +20,7 @@ import asyncio
 import time
 from collections.abc import Callable
 
+from benchmarks._common import _bench_safety
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.core.config import ConnectionConfig, ConsumerConfig, RabbitConfig, WorkerConfig
 from rabbitkit.core.types import MessageEnvelope
@@ -37,7 +38,7 @@ async def soak(
     Returns (published, consumed_unique, messages_per_second).
     Raises AssertionError if any message is lost or throughput stalls.
     """
-    config = RabbitConfig(
+    config = RabbitConfig(safety=_bench_safety(),
         connection=ConnectionConfig.from_url(url),
         consumer=ConsumerConfig(prefetch_count=50),
     )

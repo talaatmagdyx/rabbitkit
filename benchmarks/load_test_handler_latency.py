@@ -10,6 +10,7 @@ import time
 
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
+from benchmarks._common import _bench_safety
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, RabbitConfig, WorkerConfig
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import MessageEnvelope
@@ -22,7 +23,7 @@ def _preload(url: str, queue: str, n: int) -> None:
     from rabbitkit.async_.broker import AsyncBroker
 
     async def go() -> None:
-        b = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url),
+        b = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url),
                                      pool=PoolConfig(channel_pool_size=64)))
         await b.start()
         await b._transport.declare_queue(RabbitQueue(name=queue))
@@ -43,7 +44,7 @@ def _busy(us: float) -> None:
 
 async def _async_case(url: str, queue: str, n: int, prefetch: int, work: str) -> float:
     from rabbitkit.async_.broker import AsyncBroker
-    b = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    b = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     span: dict[str, float] = {}
     count = 0
 
@@ -70,7 +71,7 @@ async def _async_case(url: str, queue: str, n: int, prefetch: int, work: str) ->
 
 def _sync_case(url: str, queue: str, n: int, prefetch: int, work: str) -> float:
     from rabbitkit.sync.broker import SyncBroker
-    b = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    b = SyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     span: dict[str, float] = {}
     count = 0
     done = threading.Event()

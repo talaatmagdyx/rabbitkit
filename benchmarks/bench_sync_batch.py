@@ -19,6 +19,8 @@ import logging
 import threading
 import time
 
+from benchmarks._common import _bench_safety
+
 logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 logging.getLogger("pika").setLevel(logging.CRITICAL)
 
@@ -44,7 +46,7 @@ def _bench_baseline_blocking_publish(url: str, queue: str, n: int) -> float:
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.sync.broker import SyncBroker
 
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+    broker = SyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
     broker.start()
 
     t0 = time.perf_counter()

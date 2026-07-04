@@ -28,6 +28,7 @@ from typing import Any
 
 from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
 
+from benchmarks._common import _bench_safety
 from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, RabbitConfig
 from rabbitkit.core.topology import RabbitQueue
@@ -42,7 +43,11 @@ def _preload(url: str, queue: str, n: int) -> None:
 
     async def go() -> None:
         broker = AsyncBroker(
-            RabbitConfig(connection=ConnectionConfig.from_url(url), pool=PoolConfig(channel_pool_size=64))
+            RabbitConfig(
+                safety=_bench_safety(),
+                connection=ConnectionConfig.from_url(url),
+                pool=PoolConfig(channel_pool_size=64),
+            )
         )
         await broker.start()
         await broker._transport.declare_queue(RabbitQueue(name=queue))
@@ -62,7 +67,7 @@ def _consumer(url: str, queue: str, counter: Any, n: int, prefetch: int) -> None
     logging.getLogger("rabbitkit").setLevel(logging.ERROR)
 
     async def go() -> None:
-        broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(url)))
+        broker = AsyncBroker(RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url)))
 
         @broker.subscriber(queue=queue, prefetch_count=prefetch)
         async def handle(body: bytes) -> None:

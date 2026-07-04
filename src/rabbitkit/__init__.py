@@ -79,6 +79,7 @@ from rabbitkit.middleware.metrics import (
     start_metrics_server,
 )
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 from rabbitkit.queue_metrics import QueueMetricsPoller
 from rabbitkit.serialization.pipeline import (
@@ -175,6 +176,7 @@ __all__ = [
     "SyncBroker",
     "SyncWorkerPool",
     "TopologyMode",
+    "OTelTracingMiddleware",
     "TracedConsumerMiddleware",
     "UnsafeTopologyError",
     "WorkerConfig",

@@ -6,6 +6,7 @@ from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware, Pr
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.signing import InvalidSignatureError, SigningConfig, SigningMiddleware
 from rabbitkit.middleware.timeout import HandlerTimeoutError, TimeoutConfig, TimeoutMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "SigningMiddleware",
     "TimeoutConfig",
     "TimeoutMiddleware",
+    "OTelTracingMiddleware",
     "TracedConsumerMiddleware",
 ]

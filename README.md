@@ -36,20 +36,20 @@ acknowledgements, confirms, DLQs, shutdown behavior, and test harness should
 not be rewritten in every service. **That is what rabbitkit is for.**
 
 **Contents:** 
-- [Believes](#what-rabbitkit-believes) ·
-- [Why](#why-rabbitkit-exists) ·
-- [Install](#installation) ·
-- [Quick start](#quick-start) ·
-- [Safety model](#message-safety-model) ·
-- [Failure table](#what-happens-when-things-fail) ·
-- [Ack policies](#acknowledgement-policies) ·
-- [Production profile](#production-profile) ·
-- [Observability](#observability) ·
-- [DI](#dependency-injection) ·
-- [Middleware](#middleware-batteries-included) ·
-- [CLI](#operate-it-from-the-terminal) ·
-- [Where it fits](#where-rabbitkit-fits) ·
-- [Architecture](#architecture) ·
+- [Believes](#what-rabbitkit-believes)
+- [Why](#why-rabbitkit-exists)
+- [Install](#installation)
+- [Quick start](#quick-start)
+- [Safety model](#message-safety-model)
+- [Failure table](#what-happens-when-things-fail)
+- [Ack policies](#acknowledgement-policies)
+- [Production profile](#production-profile)
+- [Observability](#observability)
+- [DI](#dependency-injection)
+- [Middleware](#middleware-batteries-included)
+- [CLI](#operate-it-from-the-terminal)
+- [Where it fits](#where-rabbitkit-fits)
+- [Architecture](#architecture)
 - [Docs](#documentation)
 
 ---
@@ -93,14 +93,22 @@ something else — it is to make direct RabbitMQ usage feel like good
 application code: clear routing, safe defaults, explicit outcomes, real
 tests, production-ready lifecycle.
 
-**rabbitkit is:** a RabbitMQ-first toolkit · a clean consumer/publisher
-API · a reliability layer over `pika` and `aio-pika` · a testing layer for
-handlers · a production lifecycle layer · safety defaults for retry, DLQ,
-confirms, and acks.
+**rabbitkit is:**
 
-**rabbitkit is not:** a task queue · a scheduler · a generic event-streaming
-abstraction · a replacement for understanding RabbitMQ · an exactly-once
-delivery system.
+- a RabbitMQ-first toolkit
+- a clean consumer/publisher API
+- a reliability layer over `pika` and `aio-pika`
+- a testing layer for handlers
+- a production lifecycle layer
+- safety defaults for retry, DLQ, confirms, and acks
+
+**rabbitkit is not:**
+
+- a task queue
+- a scheduler
+- a generic event-streaming abstraction
+- a replacement for understanding RabbitMQ
+- an exactly-once delivery system
 
 ---
 
@@ -465,16 +473,16 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 
 **📚 Full rendered docs: [talaatmagdyx.github.io/rabbitkit](https://talaatmagdyx.github.io/rabbitkit/)**
 
-- [Getting Started](docs/guide/getting-started.md) ·
-- [Full Guide](docs/guide/full-guide.md) ·
-- [Message Safety](docs/message-safety.md) ·
-- [Retry & DLQ](docs/retry-and-dlq.md) ·
-- [Production Checklist](docs/production/checklist.md) ·
-- [Idempotency Contract](docs/production/idempotency.md) ·
-- [Kubernetes](docs/kubernetes.md) ·
-- [Quorum Migration](docs/quorum-migration.md) ·
-- [Security](docs/security.md) ·
-- [Stability Policy](docs/stability-policy.md) ·
+- [Getting Started](docs/guide/getting-started.md)
+- [Full Guide](docs/guide/full-guide.md)
+- [Message Safety](docs/message-safety.md)
+- [Retry & DLQ](docs/retry-and-dlq.md)
+- [Production Checklist](docs/production/checklist.md)
+- [Idempotency Contract](docs/production/idempotency.md)
+- [Kubernetes](docs/kubernetes.md)
+- [Quorum Migration](docs/quorum-migration.md)
+- [Security](docs/security.md)
+- [Stability Policy](docs/stability-policy.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## Contributing & security

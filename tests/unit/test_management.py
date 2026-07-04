@@ -896,3 +896,139 @@ class TestGetSessionImportError:
         with patch.dict("sys.modules", {"aiohttp": None}):
             with pytest.raises(ImportError, match="aiohttp"):
                 await client._get_session()
+
+
+# ── Migration helpers: parameters, shovels, bindings, queue declaration ──
+
+
+class TestParameterOperations:
+    def test_put_parameter(self) -> None:
+        """PUT /api/parameters/{component}/{vhost}/{name} with a JSON body."""
+        client = RabbitManagementClient()
+        value = {"value": {"src-queue": "a", "dest-queue": "b"}}
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            result = client.put_parameter("shovel", "/", "move-a-b", value)
+        assert result is None
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "PUT"
+        assert "/api/parameters/shovel/%2F/move-a-b" in req.full_url
+        assert json.loads(req.data.decode()) == value
+
+    def test_put_parameter_encodes_path_segments(self) -> None:
+        """Component, vhost, and name are URL-encoded like other methods."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            client.put_parameter("shovel", "my/vhost", "a b", {"value": {}})
+        req = mock_opener.open.call_args[0][0]
+        assert "/api/parameters/shovel/my%2Fvhost/a%20b" in req.full_url
+
+    def test_delete_parameter(self) -> None:
+        """DELETE /api/parameters/{component}/{vhost}/{name}."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=204)) as mock_opener:
+            result = client.delete_parameter("shovel", "/", "move-a-b")
+        assert result is None
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "DELETE"
+        assert "/api/parameters/shovel/%2F/move-a-b" in req.full_url
+
+
+class TestShovelStatuses:
+    def test_list_shovel_statuses(self) -> None:
+        """GET /api/shovels returns the raw status list."""
+        statuses = [{"name": "move-a-b", "state": "running"}]
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(statuses)) as mock_opener:
+            result = client.list_shovel_statuses()
+        assert result == statuses
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "GET"
+        assert req.full_url.endswith("/api/shovels")
+
+    def test_list_shovel_statuses_raises_when_plugin_missing(self) -> None:
+        """A 404 (shovel plugin disabled) propagates to the caller."""
+        client = RabbitManagementClient()
+        err = urllib.error.HTTPError(
+            "http://localhost:15672/api/shovels",
+            404,
+            "Not Found",
+            {},
+            __import__("io").BytesIO(b""),
+        )
+        with patch.object(client, "_opener") as mock_opener:
+            mock_opener.open.side_effect = err
+            with pytest.raises(urllib.error.HTTPError):
+                client.list_shovel_statuses()
+
+
+class TestQueueBindingOperations:
+    def test_get_queue_bindings(self) -> None:
+        """GET /api/queues/{vhost}/{queue}/bindings returns the binding list."""
+        bindings = [{"source": "ex", "destination": "orders.q", "routing_key": "rk"}]
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(bindings)) as mock_opener:
+            result = client.get_queue_bindings("orders.q")
+        assert result == bindings
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "GET"
+        assert "/api/queues/%2F/orders.q/bindings" in req.full_url
+
+    def test_get_queue_bindings_encodes_segments(self) -> None:
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen([])) as mock_opener:
+            client.get_queue_bindings("a/b", vhost="vh")
+        req = mock_opener.open.call_args[0][0]
+        assert "/api/queues/vh/a%2Fb/bindings" in req.full_url
+
+    def test_declare_queue(self) -> None:
+        """PUT /api/queues/{vhost}/{name} with durable/auto_delete/arguments body."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            result = client.declare_queue("new.q", arguments={"x-queue-type": "quorum"})
+        assert result is None
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "PUT"
+        assert "/api/queues/%2F/new.q" in req.full_url
+        assert json.loads(req.data.decode()) == {
+            "durable": True,
+            "auto_delete": False,
+            "arguments": {"x-queue-type": "quorum"},
+        }
+
+    def test_declare_queue_default_arguments(self) -> None:
+        """arguments=None serializes as an empty dict."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            client.declare_queue("plain.q", vhost="vh", durable=False)
+        req = mock_opener.open.call_args[0][0]
+        assert "/api/queues/vh/plain.q" in req.full_url
+        assert json.loads(req.data.decode()) == {"durable": False, "auto_delete": False, "arguments": {}}
+
+    def test_bind_queue(self) -> None:
+        """POST /api/bindings/{vhost}/e/{exchange}/q/{queue} with routing_key body."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            result = client.bind_queue("my.q", "my-ex", "orders.#", arguments={"x-match": "all"})
+        assert result is None
+        req = mock_opener.open.call_args[0][0]
+        assert req.method == "POST"
+        assert "/api/bindings/%2F/e/my-ex/q/my.q" in req.full_url
+        assert json.loads(req.data.decode()) == {"routing_key": "orders.#", "arguments": {"x-match": "all"}}
+
+    def test_bind_queue_default_arguments(self) -> None:
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=201)) as mock_opener:
+            client.bind_queue("q/1", "e/1", vhost="vh")
+        req = mock_opener.open.call_args[0][0]
+        assert "/api/bindings/vh/e/e%2F1/q/q%2F1" in req.full_url
+        assert json.loads(req.data.decode()) == {"routing_key": "", "arguments": {}}
+
+
+class TestEmptyBodyResponses:
+    def test_200_with_empty_body_returns_none(self) -> None:
+        """A 2xx response with an empty body (e.g. 201 Created) returns None
+        instead of crashing in json.loads."""
+        client = RabbitManagementClient()
+        with _patch_open(client, _mock_urlopen(status=200)):
+            result = client._request("PUT", "/queues/%2F/q")
+        assert result is None

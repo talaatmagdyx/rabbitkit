@@ -16,9 +16,10 @@ class TestAsyncBrokerRequest:
         broker = AsyncBroker(RabbitConfig())
         with pytest.raises(RuntimeError, match="Broker not started"):
             import asyncio
-            asyncio.get_event_loop().run_until_complete(
-                broker.request("test.queue", b"body")
-            )
+
+            # asyncio.run (not get_event_loop) — the module-level loop state
+            # depends on which pytest-asyncio tests ran before this one.
+            asyncio.run(broker.request("test.queue", b"body"))
 
     @pytest.mark.asyncio
     async def test_request_creates_rpc_client(self) -> None:

@@ -38,15 +38,19 @@ class TestTokenBucket:
 
     def test_tokens_refill_over_time(self) -> None:
         """Tokens refill based on elapsed time."""
+        import time
+
         bucket = _TokenBucket(rate=1000)
-        # Exhaust all tokens
+        # Exhaust all tokens, then pin the refill clock to "now" — at
+        # rate=1000 a single elapsed millisecond mints a token, so on a
+        # loaded runner the exhaustion loop itself would refill one.
         for _ in range(1000):
             bucket.acquire()
+        bucket._tokens = 0.0
+        bucket._last_refill = time.monotonic()
         assert bucket.acquire() is False
 
         # Simulate time passing by manipulating _last_refill
-        import time
-
         bucket._last_refill = time.monotonic() - 1.0  # 1 second ago
         assert bucket.acquire() is True  # refill happened
 

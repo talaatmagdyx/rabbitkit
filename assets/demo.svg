@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" viewBox="0 0 720 300" font-family="Menlo, SFMono-Regular, monospace" font-size="13">
+  <rect width="720" height="300" rx="10" fill="#1C2422"/>
+  <circle cx="22" cy="20" r="6" fill="#FF5F57"/><circle cx="42" cy="20" r="6" fill="#FEBC2E"/><circle cx="62" cy="20" r="6" fill="#28C840"/>
+  <text x="24" y="56" fill="#8FE0CF">$ rabbitkit dlq inspect orders.dlq</text>
+  <text x="24" y="78" fill="#EDF1EF">Messages in 'orders.dlq' (2 shown):</text>
+  <text x="24" y="98" fill="#B8C2BD">[1] routing_key=orders.created  message_id=ord-8841</text>
+  <text x="24" y="116" fill="#B8C2BD">     headers={'x-rabbitkit-retry-count': 3, 'x-error': 'timeout'}</text>
+  <text x="24" y="134" fill="#B8C2BD">[2] routing_key=orders.created  message_id=ord-8907</text>
+  <text x="24" y="166" fill="#8FE0CF">$ rabbitkit dlq replay orders.dlq orders --reset-retry-count</text>
+  <text x="24" y="188" fill="#EDF1EF">Replayed: routing_key='orders.created'  message_id=ord-8841</text>
+  <text x="24" y="206" fill="#EDF1EF">Replayed: routing_key='orders.created'  message_id=ord-8907</text>
+  <text x="24" y="234" fill="#28C840">Replayed 2 message(s) from 'orders.dlq' → 'orders'.</text>
+  <text x="24" y="264" fill="#6B756F"># acked only after each republish was broker-confirmed</text>
+</svg>

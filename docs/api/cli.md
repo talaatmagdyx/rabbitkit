@@ -138,3 +138,9 @@ rabbitkit shell myapp.main:broker
 ---
 
 ::: rabbitkit.cli
+
+## `rabbitkit topology migrate`
+
+Classic→quorum queue migration: plan (default, never mutates), `--execute
+--strategy drain-cutover|bridge`, `--dry-run`, `--resume`. See the
+[quorum migration guide](../quorum-migration.md).

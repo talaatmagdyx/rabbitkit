@@ -59,3 +59,14 @@ user action, add an entry here following this shape:
 **Timeline:** deprecated in `X.Y.Z`; removed no earlier than the following minor release.
 **How to check if you're affected:** <a grep/search command, if applicable>
 ```
+
+## 1.3.0 — `TracedConsumerMiddleware` removed
+
+The obskit-based tracing middleware is removed; rabbitkit is now fully
+self-contained (zero org-internal packages for any feature). Migrate to
+[`OTelTracingMiddleware`](api/middleware.md#oteltracingmiddleware)
+(`pip install rabbitkit[otel]`) — a drop-in replacement: same span names,
+semantic attributes, and W3C header propagation, on the standard
+OpenTelemetry API. The duck-typed `CircuitBreakerProtocol` compatibility
+with obskit's circuit breaker is unaffected (any compatible implementation,
+e.g. pybreaker, works and always did).

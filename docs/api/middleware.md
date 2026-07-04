@@ -70,6 +70,11 @@ anything non-idempotent.
 
 ::: rabbitkit.middleware.exception.ExceptionMiddleware
 
-## TracedConsumerMiddleware
 
-::: rabbitkit.middleware.tracing.TracedConsumerMiddleware
+## OTelTracingMiddleware
+
+Native OpenTelemetry tracing (`pip install rabbitkit[otel]`) — W3C
+`traceparent` propagation over AMQP headers, CONSUMER/PRODUCER spans, no
+org-internal packages required.
+
+::: rabbitkit.middleware.otel.OTelTracingMiddleware

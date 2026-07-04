@@ -1,7 +1,7 @@
 """Health check utilities for rabbitkit brokers.
 
-Provides callables suitable for use with obskit's health check system
-or any monitoring framework.
+Provides callables suitable for use with any monitoring or health-check
+framework.
 
 Usage::
 
@@ -11,11 +11,8 @@ Usage::
     status = broker_health_check(broker)
     print(status.status, status.details)
 
-    # With obskit health router
-    from obskit.health import build_health_router, HealthCheck
-    router = build_health_router(
-        checks=[HealthCheck(name="rabbitmq", check=broker_health_check(broker))]
-    )
+    # With any health-router framework
+    register_check(name="rabbitmq", check=lambda: broker_health_check(broker))
 """
 
 from __future__ import annotations

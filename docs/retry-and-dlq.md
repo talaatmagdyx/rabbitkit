@@ -275,3 +275,23 @@ rabbitkit dlq replay orders.created.dlq orders --limit 10
 ```
 
 Replay uses publisher confirms. If a message fails to publish, replay stops and reports the error rather than silently dropping messages.
+
+
+## Retry jitter: `jitter_mode="sharded"`
+
+By default every message that fails at the same moment retries at the same
+moment — the delay-queue TTLs are exact, so a burst of correlated failures
+re-hammers the recovering dependency as a phase-locked wave. Per-message
+TTL jitter is NOT an option here: mixed TTLs in one classic queue
+reintroduce head-of-line blocking (a long-TTL message parks everything
+behind it).
+
+`RetryConfig(jitter_mode="sharded", jitter_shards=3, jitter_factor=0.1)`
+decorrelates the wave while keeping every queue's TTL uniform: each tier
+becomes N sub-queues whose TTLs stagger across ±`jitter_factor`
+(`orders.retry.2` at 30s, `.s1` at 27s, `.s2` at 33s), and a message picks
+its shard by a **stable** hash of its `message_id` — the same message keeps
+the same cadence across redeliveries and processes. Shard 0 keeps the
+legacy queue name and exact TTL, so enabling this on an existing topology
+is purely additive: no 406s, no migration. The default `"off"` produces
+byte-identical topology to previous releases.

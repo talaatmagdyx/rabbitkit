@@ -19,3 +19,13 @@
 ## HealthProvider Protocol
 
 ::: rabbitkit.core.protocols.HealthProvider
+
+## HealthWatcher
+
+Opt-in push-style health notifications with debounced transitions. On
+Kubernetes keep probes primary; this is for bare metal/VMs and direct
+pager/webhook wiring.
+
+::: rabbitkit.health.HealthWatcher
+
+::: rabbitkit.health.AsyncHealthWatcher

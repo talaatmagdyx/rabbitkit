@@ -255,7 +255,7 @@ class SupportsRPC(Protocol):
 class CircuitBreakerProtocol(Protocol):
     """Generic circuit breaker protocol.
 
-    obskit's CircuitBreaker and pybreaker both satisfy this interface.
+    pybreaker (among others) satisfies this interface.
     Used optionally by transports — core works without any CB.
     """
 
@@ -278,9 +278,9 @@ class AsyncCircuitBreakerProtocol(Protocol):
 
 @runtime_checkable
 class MetricsCollector(Protocol):
-    """Optional metrics collector — obskit provides implementation.
+    """Optional metrics collector protocol.
 
-    Used for observability integration. No-op when obskit is not installed.
+    Used for observability integration; rabbitkit ships PrometheusCollector.
     """
 
     def increment(self, name: str, tags: dict[str, str] | None = None) -> None:

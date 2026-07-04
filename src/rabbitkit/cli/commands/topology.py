@@ -8,8 +8,11 @@ from typing import Any, cast
 import typer
 
 from rabbitkit.cli._utils import load_broker
+from rabbitkit.cli.commands.migrate import migrate_command
 
 topology_app = typer.Typer(help="Topology inspection and management commands.")
+
+topology_app.command("migrate")(migrate_command)
 
 
 @topology_app.command("list")

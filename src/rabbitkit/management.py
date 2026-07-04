@@ -54,6 +54,12 @@ Sync:
     client.get_queue(name, vhost="/")      -> QueueInfo
     client.purge_queue(name, vhost="/")    -> None
     client.delete_queue(name, vhost="/")   -> None
+    client.declare_queue(name, vhost="/", durable=True, arguments=None) -> None
+    client.get_queue_bindings(queue, vhost="/")   -> list[dict]
+    client.bind_queue(queue, exchange, routing_key="", vhost="/", arguments=None) -> None
+    client.put_parameter(component, vhost, name, value)    -> None
+    client.delete_parameter(component, vhost, name)        -> None
+    client.list_shovel_statuses()          -> list[dict]
     client.list_exchanges(vhost="/")       -> list[ExchangeInfo]
     client.get_exchange(name, vhost="/")   -> ExchangeInfo
     client.list_connections()              -> list[ConnectionInfo]
@@ -243,7 +249,11 @@ class RabbitManagementClient:
             if resp.status == 204:
                 # Drain + discard any (usually empty) body.
                 return None
-            return json.loads(self._read_capped(resp).decode())
+            data = self._read_capped(resp)
+            if not data:
+                # e.g. 201 Created from PUT /queues, /parameters, /bindings — empty body.
+                return None
+            return json.loads(data.decode())
 
     def _read_capped(self, resp: Any) -> bytes:
         """Read the response body in chunks, raising if it exceeds the cap."""
@@ -288,6 +298,73 @@ class RabbitManagementClient:
         vhost_encoded = urllib.parse.quote(vhost, safe="")
         name_encoded = urllib.parse.quote(name, safe="")
         return cast("ExchangeInfo", self._request("GET", f"/exchanges/{vhost_encoded}/{name_encoded}"))
+
+    # Queue declaration / bindings (used by `rabbitkit topology migrate`)
+    def declare_queue(
+        self,
+        name: str,
+        vhost: str = "/",
+        durable: bool = True,
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Declare a queue via ``PUT /api/queues/{vhost}/{name}``.
+
+        ``arguments`` are the queue's x-arguments (e.g. ``{"x-queue-type": "quorum"}``).
+        """
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        body = json.dumps({"durable": durable, "auto_delete": False, "arguments": arguments or {}}).encode()
+        self._request("PUT", f"/queues/{vhost_encoded}/{name_encoded}", body)
+
+    def get_queue_bindings(self, queue: str, vhost: str = "/") -> list[dict[str, Any]]:
+        """List all bindings of a queue via ``GET /api/queues/{vhost}/{queue}/bindings``."""
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        queue_encoded = urllib.parse.quote(queue, safe="")
+        return cast(
+            "list[dict[str, Any]]",
+            self._request("GET", f"/queues/{vhost_encoded}/{queue_encoded}/bindings"),
+        )
+
+    def bind_queue(
+        self,
+        queue: str,
+        exchange: str,
+        routing_key: str = "",
+        vhost: str = "/",
+        arguments: dict[str, Any] | None = None,
+    ) -> None:
+        """Bind a queue to an exchange via ``POST /api/bindings/{vhost}/e/{exchange}/q/{queue}``."""
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        exchange_encoded = urllib.parse.quote(exchange, safe="")
+        queue_encoded = urllib.parse.quote(queue, safe="")
+        body = json.dumps({"routing_key": routing_key, "arguments": arguments or {}}).encode()
+        self._request("POST", f"/bindings/{vhost_encoded}/e/{exchange_encoded}/q/{queue_encoded}", body)
+
+    # Runtime parameters (dynamic shovels, federation upstreams, ...)
+    def put_parameter(self, component: str, vhost: str, name: str, value: dict[str, Any]) -> None:
+        """Create/update a runtime parameter via ``PUT /api/parameters/{component}/{vhost}/{name}``.
+
+        For a dynamic shovel: ``put_parameter("shovel", "/", "my-shovel", {"value": {...}})``.
+        """
+        component_encoded = urllib.parse.quote(component, safe="")
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        body = json.dumps(value).encode()
+        self._request("PUT", f"/parameters/{component_encoded}/{vhost_encoded}/{name_encoded}", body)
+
+    def delete_parameter(self, component: str, vhost: str, name: str) -> None:
+        """Delete a runtime parameter via ``DELETE /api/parameters/{component}/{vhost}/{name}``."""
+        component_encoded = urllib.parse.quote(component, safe="")
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        self._request("DELETE", f"/parameters/{component_encoded}/{vhost_encoded}/{name_encoded}")
+
+    def list_shovel_statuses(self) -> list[dict[str, Any]]:
+        """List shovel statuses via ``GET /api/shovels``.
+
+        Raises (HTTP 404) when the ``rabbitmq_shovel`` plugin is not enabled.
+        """
+        return cast("list[dict[str, Any]]", self._request("GET", "/shovels"))
 
     # Connection/Channel
     def list_connections(self) -> list[ConnectionInfo]:

@@ -864,3 +864,88 @@ class TestRetryAsyncPublishFailure:
         await mw.consume_scope_async(handler, msg)
 
         assert msg._disposition == "nacked"
+
+
+class TestShardedJitter:
+    """F4: jitter_mode='sharded' — retry waves decorrelate via TTL-staggered
+    shard queues while every individual queue keeps a UNIFORM TTL (the
+    head-of-line-blocking safety invariant)."""
+
+    def _router(self, shards: int = 3, jf: float = 0.1) -> RetryRouter:
+        return RetryRouter(
+            RetryConfig(
+                max_retries=2, delays=(10, 60), jitter_mode="sharded",
+                jitter_shards=shards, jitter_factor=jf,
+            )
+        )
+
+    def test_off_mode_topology_byte_identical_to_legacy(self) -> None:
+        """Default topology must not change at all (regression guard)."""
+        router = RetryRouter(RetryConfig(max_retries=2, delays=(10, 60)))
+        queues = router.get_delay_queue_definitions("orders", "")
+        names = [q.name for q in queues]
+        assert names == ["orders.retry.1", "orders.retry.2", "orders.dlq"]
+        assert queues[0].arguments["x-message-ttl"] == 10_000
+
+    def test_sharded_topology_names_and_ttls(self) -> None:
+        queues = self._router(shards=3, jf=0.1).get_delay_queue_definitions("orders", "")
+        names = [q.name for q in queues]
+        # shard 0 keeps the legacy name (additive enablement, no 406s)
+        assert names == [
+            "orders.retry.1", "orders.retry.1.s1", "orders.retry.1.s2",
+            "orders.retry.2", "orders.retry.2.s1", "orders.retry.2.s2",
+            "orders.dlq",
+        ]
+        ttls_t1 = [q.arguments["x-message-ttl"] for q in queues[:3]]
+        assert ttls_t1 == [10_000, 9_000, 11_000]  # 1.0, 1-jf, 1+jf
+
+    def test_two_shards_spread_upward_only(self) -> None:
+        queues = self._router(shards=2, jf=0.2).get_delay_queue_definitions("q", "")
+        ttls = [q.arguments["x-message-ttl"] for q in queues[:2]]
+        assert ttls == [10_000, 12_000]
+
+    def test_each_shard_queue_ttl_is_uniform_within_queue(self) -> None:
+        """The invariant itself: TTL is a QUEUE argument, never per-message."""
+        for q in self._router().get_delay_queue_definitions("q", "")[:-1]:
+            assert "x-message-ttl" in q.arguments  # queue-level, uniform
+
+    def test_envelope_shard_pick_is_stable_and_deterministic(self) -> None:
+        from rabbitkit.middleware.retry import _shard_index
+
+        cfg = RetryConfig(
+            max_retries=2, delays=(10, 60), jitter_mode="sharded", jitter_shards=3
+        )
+        mw = RetryMiddleware(cfg)
+        msg = _make_message(message_id="stable-id-42")
+        rk1 = mw._build_retry_envelope(msg, retry_count=0).routing_key
+        rk2 = mw._build_retry_envelope(msg, retry_count=0).routing_key
+        assert rk1 == rk2  # deterministic
+        shard = _shard_index("stable-id-42", 3)
+        expected = "orders-queue.retry.1" if shard == 0 else f"orders-queue.retry.1.s{shard}"
+        assert rk1 == expected
+
+    def test_shard_index_stable_across_processes(self) -> None:
+        """md5-based, NOT Python hash() (which is salted per process)."""
+        from rabbitkit.middleware.retry import _shard_index
+
+        assert _shard_index("abc", 3) == _shard_index("abc", 3)
+        assert _shard_index("", 3) == 0  # no id -> legacy shard
+
+    def test_messages_spread_across_shards(self) -> None:
+        from rabbitkit.middleware.retry import _shard_index
+
+        shards = {_shard_index(f"id-{i}", 3) for i in range(60)}
+        assert shards == {0, 1, 2}
+
+    def test_off_mode_envelope_unchanged(self) -> None:
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        env = mw._build_retry_envelope(_make_message(message_id="x"), retry_count=0)
+        assert env.routing_key == "orders-queue.retry.1"
+
+    def test_config_validation(self) -> None:
+        with pytest.raises(ValueError, match="jitter_mode"):
+            RetryConfig(jitter_mode="bogus")
+        with pytest.raises(ValueError, match="jitter_shards"):
+            RetryConfig(jitter_mode="sharded", jitter_shards=1)
+        with pytest.raises(ValueError, match="jitter_factor"):
+            RetryConfig(jitter_mode="sharded", jitter_factor=0.0)

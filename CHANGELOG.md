@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-07-04
+
+First PyPI-visible patch: the 0.9.0 package description referenced images
+and doc links by repository-relative paths, which render broken on
+pypi.org (release descriptions are immutable, so 0.9.0's page stays
+as-is). The README now uses absolute URLs everywhere.
+
 ### Fixed
 
 - **Quiet settlement on a dead channel** — when a channel/connection dies

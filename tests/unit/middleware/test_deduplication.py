@@ -1818,3 +1818,135 @@ class TestClaimPolicy:
         mw_closed = DeduplicationMiddleware(redis_client=redis, config=_claim_config(fallback_on_redis_error=False))
         with pytest.raises(ConnectionError, match="Redis is down"):
             await mw_closed.consume_scope_async(handler, _make_message(message_id="async-claim-get-err"))
+
+
+class TestIdempotentReceiver:
+    """F5: store_results=True on the claim policy — a duplicate delivery of a
+    completed message REPLAYS the stored handler result (the pipeline then
+    re-publishes it byte-identically) instead of just skipping. This is the
+    idempotent-receiver EFFECT; it never claims wire-level exactly-once."""
+
+    def _mw(self, redis: Any, **cfg: Any) -> DeduplicationMiddleware:
+        defaults: dict[str, Any] = {"mark_policy": "claim", "store_results": True}
+        defaults.update(cfg)
+        return DeduplicationMiddleware(redis_client=redis, config=DeduplicationConfig(**defaults))
+
+    @staticmethod
+    def _msg(message_id: str, *, sync: bool = True) -> RabbitMessage:
+        m = _make_message(message_id=message_id)
+        if sync:
+            m._ack_fn = MagicMock()
+            m._nack_fn = MagicMock()
+        else:
+            m._ack_async_fn = _noop_async_ack
+            m._nack_async_fn = None
+        return m
+
+    def test_config_requires_claim_policy(self) -> None:
+        with pytest.raises(ValueError, match="mark_policy='claim'"):
+            DeduplicationConfig(store_results=True, mark_policy="on_success")
+        with pytest.raises(ValueError, match="max_result_bytes"):
+            DeduplicationConfig(store_results=True, mark_policy="claim", max_result_bytes=0)
+
+    def test_success_stores_result_envelope(self) -> None:
+        redis = _FakeRedis()
+        mw = self._mw(redis)
+        msg = self._msg("m1")
+
+        out = mw.consume_scope(lambda m: {"total": 42}, msg)
+
+        assert out == {"total": 42}
+        stored = redis._store["rabbitkit:dedup:m1"]
+        assert stored.startswith("{")
+        assert '"r":{"total":42}' in stored.replace(" ", "")
+
+    def test_duplicate_replays_stored_result(self) -> None:
+        """The core behavior: second delivery returns the FIRST run's result
+        without re-running the handler."""
+        redis = _FakeRedis()
+        mw = self._mw(redis)
+        calls: list[int] = []
+
+        def handler(m: RabbitMessage) -> dict[str, int]:
+            calls.append(1)
+            return {"total": 42}
+
+        first = mw.consume_scope(handler, self._msg("m1"))
+        dup_msg = self._msg("m1")
+        replayed = mw.consume_scope(handler, dup_msg)
+
+        assert replayed == first == {"total": 42}
+        assert calls == [1]  # handler ran exactly once
+        assert dup_msg.disposition == "acked"
+
+    def test_none_result_stores_plain_completed_and_skips(self) -> None:
+        redis = _FakeRedis()
+        mw = self._mw(redis)
+        mw.consume_scope(lambda m: None, self._msg("m1"))
+        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+        assert mw.consume_scope(lambda m: None, self._msg("m1")) is None
+
+    def test_unserializable_result_degrades_to_plain_completed(self) -> None:
+        """A non-JSON result must not fail the handler -- store the plain
+        mark; the duplicate skips without replay (documented degradation)."""
+        redis = _FakeRedis()
+        mw = self._mw(redis)
+        out = mw.consume_scope(lambda m: object(), self._msg("m1"))
+        assert out is not None
+        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+
+    def test_oversized_result_degrades_to_plain_completed(self) -> None:
+        redis = _FakeRedis()
+        mw = self._mw(redis, max_result_bytes=10)
+        mw.consume_scope(lambda m: {"k": "x" * 100}, self._msg("m1"))
+        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+
+    def test_legacy_value_reads_as_completed_without_replay(self) -> None:
+        """Keys written by pre-F5 deployments ('1' / 'completed') skip
+        exactly as before -- safe rolling upgrade."""
+        redis = _FakeRedis()
+        redis._store["rabbitkit:dedup:m1"] = "1"
+        mw = self._mw(redis)
+        assert mw.consume_scope(lambda m: {"new": 1}, self._msg("m1")) is None
+
+    def test_schema_version_mismatch_skips_without_replay(self) -> None:
+        redis = _FakeRedis()
+        redis._store["rabbitkit:dedup:m1"] = '{"s":"completed","v":999,"r":{"stale":1}}'
+        mw = self._mw(redis)
+        assert mw.consume_scope(lambda m: {"x": 1}, self._msg("m1")) is None
+
+    def test_malformed_envelope_skips_without_replay(self) -> None:
+        redis = _FakeRedis()
+        redis._store["rabbitkit:dedup:m1"] = "{not json"
+        mw = self._mw(redis)
+        assert mw.consume_scope(lambda m: 1, self._msg("m1")) is None
+
+    def test_store_results_off_keeps_plain_mark(self) -> None:
+        redis = _FakeRedis()
+        mw = self._mw(redis, store_results=False)
+        mw.consume_scope(lambda m: {"total": 42}, self._msg("m1"))
+        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+
+    async def test_async_round_trip_replay(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = self._mw(redis)
+        calls: list[int] = []
+
+        async def handler(m: RabbitMessage) -> list[int]:
+            calls.append(1)
+            return [1, 2, 3]
+
+        first = await mw.consume_scope_async(handler, self._msg("m1", sync=False))
+        replayed = await mw.consume_scope_async(handler, self._msg("m1", sync=False))
+        assert first == replayed == [1, 2, 3]
+        assert calls == [1]
+
+    def test_bytes_stored_value_decodes(self) -> None:
+        from rabbitkit.middleware.deduplication import _decode_stored_result
+
+        ok, res = _decode_stored_result(b'{"s":"completed","v":1,"r":7}')
+        assert (ok, res) == (True, 7)
+        assert _decode_stored_result(b"\xff\xfe") == (False, None)
+        assert _decode_stored_result(None) == (False, None)
+        assert _decode_stored_result('{"s":"in-flight","v":1}') == (False, None)
+        assert _decode_stored_result('["not","a","dict"]') == (False, None)

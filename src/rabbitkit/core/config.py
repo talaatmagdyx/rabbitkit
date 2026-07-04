@@ -631,9 +631,29 @@ class DeduplicationConfig:
     mark_policy: str = "on_success"
     local_cache_size: int = 0  # 0 = disabled; >0 = in-process LRU capacity (short-circuits Redis for known duplicates)
     processing_timeout: int = 300  # claim only: in-flight claim TTL (seconds)
+    # F5 (idempotent receiver): with mark_policy="claim", store the handler's
+    # JSON-serializable result alongside the completed mark; a duplicate
+    # delivery then REPLAYS the stored result (the pipeline re-publishes it to
+    # the route's result publisher / reply_to, byte-identical) instead of just
+    # skipping. Results that aren't JSON-serializable or exceed
+    # max_result_bytes degrade gracefully to plain skip-without-replay.
+    # This is the idempotent-receiver EFFECT — wire-level exactly-once does
+    # not exist on RabbitMQ and this does not claim otherwise.
+    store_results: bool = False
+    max_result_bytes: int = 65536
     on_in_flight: str = "nack_requeue"  # claim only: "nack_requeue" (retry-safe) | "ack_skip"
 
     def __post_init__(self) -> None:
+        if self.store_results and self.mark_policy != "claim":
+            raise ValueError(
+                "DeduplicationConfig.store_results=True requires mark_policy='claim' "
+                f"(got {self.mark_policy!r}) — result replay is only crash-safe on the "
+                "claim state machine."
+            )
+        if self.max_result_bytes < 1:
+            raise ValueError(
+                f"DeduplicationConfig.max_result_bytes must be >= 1, got {self.max_result_bytes}"
+            )
         if self.mark_policy not in ("on_success", "on_start", "claim"):
             raise ValueError(
                 f"DeduplicationConfig.mark_policy must be one of "

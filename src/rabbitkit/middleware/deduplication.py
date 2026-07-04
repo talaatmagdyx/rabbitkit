@@ -78,6 +78,55 @@ logger = logging.getLogger(__name__)
 _IN_FLIGHT = "in-flight"
 _COMPLETED = "completed"
 
+# F5: schema tag for stored-result envelopes. Bumped when the envelope shape
+# changes; a mismatched tag degrades to skip-without-replay (never replays a
+# result written by an incompatible version).
+_RESULT_SCHEMA_VERSION = 1
+
+
+def _encode_completed_with_result(result: object, max_bytes: int) -> str | None:
+    """JSON envelope for a completed key carrying the handler result, or
+    ``None`` when the result can't be stored (not JSON-serializable, or over
+    *max_bytes*) — callers then degrade to the plain completed mark."""
+    import json
+
+    try:
+        encoded = json.dumps(
+            {"s": _COMPLETED, "v": _RESULT_SCHEMA_VERSION, "r": result},
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode()) > max_bytes:
+        return None
+    return encoded
+
+
+def _decode_stored_result(raw: object) -> tuple[bool, object]:
+    """``(has_result, result)`` from a completed key's stored value.
+
+    Legacy values ("1", "completed", "in-flight" never reaches here) and
+    schema-mismatched or malformed envelopes decode as ``(False, None)`` —
+    the duplicate is skipped without replay, exactly the pre-F5 behavior."""
+    import json
+
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode()
+        except UnicodeDecodeError:
+            return False, None
+    if not isinstance(raw, str) or not raw.startswith("{"):
+        return False, None
+    try:
+        envelope = json.loads(raw)
+    except ValueError:
+        return False, None
+    if not isinstance(envelope, dict) or envelope.get("v") != _RESULT_SCHEMA_VERSION:
+        return False, None
+    if envelope.get("s") != _COMPLETED or "r" not in envelope:
+        return False, None
+    return True, envelope["r"]
+
 
 class DeduplicationMiddleware(BaseMiddleware):
     """Idempotent consumer middleware backed by Redis SETNX.
@@ -478,6 +527,18 @@ class DeduplicationMiddleware(BaseMiddleware):
             if self._is_in_flight(raw):
                 self._handle_in_flight_duplicate_sync(message, key)
                 return None
+            if self._config.store_results:
+                has_result, stored = _decode_stored_result(raw)
+                if has_result:
+                    # F5: replay — returning the stored result makes the
+                    # pipeline re-publish it to the route's result publisher /
+                    # reply_to, so a duplicate (e.g. redelivered RPC request)
+                    # gets a byte-identical answer without re-running the
+                    # handler's side effects.
+                    logger.debug("Duplicate (key=%s); replaying stored result", key)
+                    if not message.is_settled:
+                        message.ack()
+                    return stored
             logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
             if not message.is_settled:
                 message.ack()
@@ -497,8 +558,13 @@ class DeduplicationMiddleware(BaseMiddleware):
         # Handler succeeded — flip the claim to completed with the full TTL.
         # Never raise past this point (side effects are committed; raising
         # would nack → redeliver → a guaranteed duplicate execution).
+        value = _COMPLETED
+        if self._config.store_results and result is not None:
+            encoded = _encode_completed_with_result(result, self._config.max_result_bytes)
+            if encoded is not None:
+                value = encoded
         try:
-            self._redis.set(key, _COMPLETED, ex=self._config.ttl)
+            self._redis.set(key, value, ex=self._config.ttl)
         except Exception:
             self._record_fallback(message)
             return result
@@ -550,6 +616,14 @@ class DeduplicationMiddleware(BaseMiddleware):
             if self._is_in_flight(raw):
                 await self._handle_in_flight_duplicate_async(message, key)
                 return None
+            if self._config.store_results:
+                has_result, stored = _decode_stored_result(raw)
+                if has_result:
+                    # F5: replay the stored result -- see the sync counterpart.
+                    logger.debug("Duplicate (key=%s); replaying stored result", key)
+                    if not message.is_settled:
+                        await message.ack_async()
+                    return stored
             logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
             if not message.is_settled:
                 await message.ack_async()
@@ -563,8 +637,13 @@ class DeduplicationMiddleware(BaseMiddleware):
         if result is REQUEUED_FOR_RETRY:
             await self._cleanup_key_after_non_success_async(key)
             return result
+        value = _COMPLETED
+        if self._config.store_results and result is not None:
+            encoded = _encode_completed_with_result(result, self._config.max_result_bytes)
+            if encoded is not None:
+                value = encoded
         try:
-            await self._redis.set(key, _COMPLETED, ex=self._config.ttl)
+            await self._redis.set(key, value, ex=self._config.ttl)
         except Exception:
             self._record_fallback(message)
             return result

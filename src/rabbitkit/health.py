@@ -23,6 +23,7 @@ from __future__ import annotations
 import enum
 import logging
 import time
+import typing
 import warnings
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -498,3 +499,159 @@ async def broker_readiness_async(
     if "management_check" in result.details:
         return False
     return result.consumer_count == result.route_count
+
+
+# ── Health-transition watcher ────────────────────────────────────────────
+
+
+class HealthWatcher:
+    """Opt-in push-style health notifications (sync, daemon-thread poller).
+
+    Polls :func:`broker_health_check` every *interval* seconds and fires
+    ``on_change(old, new, result)`` when the status transitions -- but only
+    after *debounce* consecutive identical readings, so a single flapping
+    poll never pages anyone. Callback exceptions are logged, never raised,
+    and never stall the loop.
+
+    Positioning: for deployments that aren't (only) Kubernetes -- bare
+    metal, VMs, direct pager/webhook wiring. On k8s, keep
+    :func:`broker_liveness`/:func:`broker_readiness` probes as the primary
+    signal; this watcher complements, never replaces, them.
+
+    When *collector* is given (any ``MetricsCollector`` with ``set_gauge``),
+    every poll also emits a ``rabbitkit_health_state`` gauge
+    (0 healthy / 1 degraded / 2 unhealthy), so Prometheus users get a state
+    series without writing a callback.
+
+    *clock* and *sleeper* are injectable for tests (no wall-clock sleeps in
+    the test suite -- the 1.2.0 deflaking lesson).
+    """
+
+    _GAUGE_VALUES: typing.ClassVar[dict[HealthStatus, int]] = {
+        HealthStatus.HEALTHY: 0,
+        HealthStatus.DEGRADED: 1,
+        HealthStatus.UNHEALTHY: 2,
+    }
+
+    def __init__(
+        self,
+        broker: HealthProvider | Any,
+        *,
+        interval: float = 10.0,
+        on_change: Any = None,
+        management_client: Any = None,
+        config: HealthCheckConfig | None = None,
+        debounce: int = 2,
+        collector: Any = None,
+        gauge_name: str = "rabbitkit_health_state",
+    ) -> None:
+        if interval <= 0:
+            raise ValueError(f"HealthWatcher interval must be > 0, got {interval}")
+        if debounce < 1:
+            raise ValueError(f"HealthWatcher debounce must be >= 1, got {debounce}")
+        self._broker = broker
+        self._interval = interval
+        self._on_change = on_change
+        self._management_client = management_client
+        self._config = config
+        self._debounce = debounce
+        self._collector = collector
+        self._gauge_name = gauge_name
+
+        self._current: HealthStatus | None = None  # last CONFIRMED status
+        self._candidate: HealthStatus | None = None
+        self._candidate_count = 0
+        self._thread: Any = None
+        self._stop_event: Any = None
+
+    @property
+    def current_status(self) -> HealthStatus | None:
+        """Last debounce-confirmed status (None until the first confirmation)."""
+        return self._current
+
+    def _tick(self) -> None:
+        """One poll: read health, then run the shared debounced state machine."""
+        result = broker_health_check(
+            self._broker, config=self._config, management_client=self._management_client
+        )
+        self._apply(result)
+
+    def _apply(self, result: BrokerHealthResult) -> None:
+        """Debounced state machine on an already-obtained result (shared with
+        the async variant)."""
+        if self._collector is not None:
+            try:
+                self._collector.set_gauge(self._gauge_name, {}, self._GAUGE_VALUES[result.status])
+            except Exception:  # pragma: no cover — collector bugs never stall the loop
+                logger.exception("HealthWatcher gauge emission raised")
+
+        status = result.status
+        if status == self._current:
+            # Confirmed state re-observed; reset any half-built candidate.
+            self._candidate = None
+            self._candidate_count = 0
+            return
+        if status != self._candidate:
+            self._candidate = status
+            self._candidate_count = 0
+        self._candidate_count += 1
+        if self._candidate_count < self._debounce:
+            return
+        old, self._current = self._current, status
+        self._candidate = None
+        self._candidate_count = 0
+        if self._on_change is not None:
+            try:
+                self._on_change(old, status, result)
+            except Exception:
+                logger.exception("HealthWatcher on_change callback raised")
+
+    def start(self) -> None:
+        """Start the daemon poller thread. Idempotent."""
+        import threading
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event = threading.Event()
+        stop = self._stop_event
+
+        def _loop() -> None:
+            while not stop.wait(timeout=self._interval):
+                try:
+                    self._tick()
+                except Exception:  # pragma: no cover — defensive; _tick guards itself
+                    logger.exception("HealthWatcher tick raised")
+
+        self._thread = threading.Thread(target=_loop, name="rabbitkit-health-watcher", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the poller (bounded join). Idempotent."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+
+class AsyncHealthWatcher(HealthWatcher):
+    """Async variant of :class:`HealthWatcher` — an asyncio task instead of
+    a thread, and the management check (if any) awaited via
+    :func:`broker_health_check_async` so it never blocks the event loop."""
+
+    async def _tick_async(self) -> None:
+        result = await broker_health_check_async(
+            self._broker, config=self._config, management_client=self._management_client
+        )
+        self._apply(result)
+
+    async def run(self) -> None:
+        """Poll forever (cancel the task to stop)."""
+        import asyncio
+
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                await self._tick_async()
+            except Exception:  # pragma: no cover — defensive; _tick guards itself
+                logger.exception("HealthWatcher tick raised")

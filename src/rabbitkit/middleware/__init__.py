@@ -3,10 +3,10 @@
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 from rabbitkit.middleware.metrics import MetricsCollector, MetricsMiddleware, PrometheusCollector
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.signing import InvalidSignatureError, SigningConfig, SigningMiddleware
 from rabbitkit.middleware.timeout import HandlerTimeoutError, TimeoutConfig, TimeoutMiddleware
-from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "InvalidSignatureError",
     "MetricsCollector",
     "MetricsMiddleware",
+    "OTelTracingMiddleware",
     "PrometheusCollector",
     "RateLimitConfig",
     "RateLimitMiddleware",
@@ -24,6 +25,5 @@ __all__ = [
     "SigningMiddleware",
     "TimeoutConfig",
     "TimeoutMiddleware",
-    "OTelTracingMiddleware",
     "TracedConsumerMiddleware",
 ]

@@ -38,3 +38,17 @@ jobs:
         env:
           RK_CHAOS_PORT: "32778"
         run: .venv/bin/python -m benchmarks
+      # Advanced tier: interleaved raw-aio-pika A/B overhead, payload/queue-type
+      # sweeps, open-loop paced latency. Repeated measurements with CV — see
+      # docs/benchmarking.md for how to read them. Best-effort like the classic
+      # suite: perf numbers inform, they don't gate.
+      - name: Advanced benchmarks (best-effort)
+        continue-on-error: true
+        run: .venv/bin/python -m benchmarks.advanced
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: benchmarks/results/
+          if-no-files-found: ignore

@@ -148,7 +148,6 @@ class _AsyncTokenBucket:
 _REASON_BLOCKED = "blocked"  # connection.blocked notification
 _REASON_RATE = "rate"  # rate-limiter token unavailable
 _REASON_SLOT = "slot"  # in-flight limit reached
-_REASON_RATE_RETRY = "rate_retry"  # rate token gone after a slot wait (give up)
 
 
 class _BlockedPolicy(Protocol):
@@ -176,11 +175,11 @@ class _WaitPolicy:
         if reason == _REASON_RATE:
             rl = fc._rate_limiter
             return rl is not None and rl.wait(timeout=timeout)
-        if reason == _REASON_SLOT:
-            return fc._slot_event.wait(timeout=timeout)
-        # _REASON_RATE_RETRY — already waited for a slot; give up rather than
-        # burn another rate-token wait within the same deadline.
-        return False
+        # _REASON_SLOT — the only remaining reason (reasons are internal and
+        # exhaustive; a former _REASON_RATE_RETRY "give up" reason was removed
+        # because dropping a waiter with deadline remaining violated the
+        # on_blocked="wait" contract).
+        return fc._slot_event.wait(timeout=timeout)
 
     async def handle_async(self, fc: FlowController, reason: str, timeout: float | None) -> bool:
         if reason == _REASON_BLOCKED:
@@ -196,16 +195,14 @@ class _WaitPolicy:
             if rl is None:
                 return False
             return await rl.wait(timeout=timeout)
-        if reason == _REASON_SLOT:
-            assert fc._async_slot_event is not None
-            try:
-                async with asyncio.timeout(timeout):
-                    await fc._async_slot_event.wait()
-                return True
-            except TimeoutError:
-                return False
-        # _REASON_RATE_RETRY — give up (see sync counterpart).
-        return False
+        # _REASON_SLOT — see the sync counterpart above.
+        assert fc._async_slot_event is not None
+        try:
+            async with asyncio.timeout(timeout):
+                await fc._async_slot_event.wait()
+            return True
+        except TimeoutError:
+            return False
 
 
 class _RaisePolicy:
@@ -233,7 +230,7 @@ def _raise_message(reason: str, fc: FlowController) -> str:
         return "Connection is blocked by RabbitMQ"
     if reason == _REASON_SLOT:
         return f"In-flight limit reached ({fc._config.max_in_flight})"
-    # _REASON_RATE / _REASON_RATE_RETRY
+    # _REASON_RATE
     return "Rate limit exceeded"
 
 
@@ -474,8 +471,17 @@ class FlowController:
                             assert self._async_slot_event is not None
                             self._async_slot_event.clear()
                         return True
-                # Slot was taken while we waited for a token: wait for a slot,
-                # then retry with a NON-blocking rate acquire (don't burn another).
+                # The slot was taken while we waited for a token; wait for a slot
+                # then RE-LOOP and re-claim under the lock, exactly like the sync
+                # path (I-9/perf-M-1). The re-loop re-checks the rate bucket
+                # non-blockingly and, if it's empty again (another contender took
+                # the refill), re-enters the bounded _REASON_RATE wait — it must
+                # NOT drop. A previous version demanded a second token HERE, under
+                # the lock, and dropped (_REASON_RATE_RETRY) when the bucket was
+                # momentarily empty — silently failing a waiter with almost its
+                # whole deadline remaining, the exact single-race-loss drop this
+                # loop exists to prevent (caught by the contender stress test
+                # failing ~1% of runs under CPU load, in ~70ms of a 10s budget).
                 assert self._async_slot_event is not None
                 _rem = _remaining()
                 if _rem is not None and _rem <= 0:
@@ -485,22 +491,7 @@ class FlowController:
                         await self._async_slot_event.wait()
                 except TimeoutError:
                     return False
-                async with self._async_lock:
-                    # perf-M-1: re-loop instead of dropping (return False) so a
-                    # caller that already paid for a rate token re-waits for a
-                    # slot within the deadline (mirrors sync I-9 + at_limit path).
-                    if self._in_flight >= self._config.max_in_flight:
-                        continue
-                    if self._async_rate_limiter is not None and not await self._async_rate_limiter.acquire():
-                        # Rate token gone after the slot wait: drop (wait/drop) or
-                        # raise. No re-loop here — we already waited for a slot.
-                        if not await self._policy.handle_async(self, _REASON_RATE_RETRY, _remaining()):
-                            return False
-                    self._in_flight += 1
-                    if self._in_flight >= self._config.max_in_flight:
-                        assert self._async_slot_event is not None
-                        self._async_slot_event.clear()
-                    return True
+                continue
 
             if at_limit:
                 # Policy dispatch outside the lock (C-5): wait/raise/drop.

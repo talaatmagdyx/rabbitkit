@@ -168,6 +168,24 @@ validation, and signing+retry now failing fast at startup.
 
 ### Fixed
 
+- **`FlowController.acquire_async` no longer silently drops a waiter that
+  paid for a rate token, lost the slot race, and woke to a momentarily
+  empty bucket.** With `on_blocked="wait"` + `rate_limit` + a contended
+  `max_in_flight`, a contender that (1) waited for and consumed a rate
+  token, (2) found the slot taken meanwhile, and (3) woke from the slot
+  wait to find the token bucket empty again was dropped via a second-token
+  demand (`_REASON_RATE_RETRY` → `False`) — returning `False` in ~70ms of
+  a 10-second budget. Surfaced as a ~1% failure rate of the contender
+  stress test under CPU load (initially misdiagnosed as test flakiness;
+  the test was right). The async path now mirrors the sync path exactly:
+  after the slot wait it re-loops into the bounded `_REASON_RATE` wait
+  instead of dropping — no waiter fails before its deadline. This also
+  removes a lock-held policy wait (the old path dispatched the rate
+  re-check while holding the async lock, violating the C-5 lock
+  discipline) and deletes the now-unused `_REASON_RATE_RETRY` reason.
+  Verified: 500 stress rounds under 8-way CPU load — 6 drops before the
+  fix, 0 after — plus a deterministic choreographed regression test that
+  fails against the old code.
 - **Retry delay-queue publishes are now `mandatory`** (audit M4) — a
   runtime-deleted/missing `{queue}.retry.N` queue used to broker-confirm the
   retry publish into the void and ack the source (silent loss). With

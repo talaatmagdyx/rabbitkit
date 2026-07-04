@@ -49,6 +49,7 @@ dev         = [
     "rabbitkit[all]",
     "pytest>=8.0",
     "httpx>=0.27,<1.0",  # starlette TestClient (dashboard tests)
+    "httpx2>=0.1",  # starlette 1.x TestClient backend (silences its httpx deprecation)
     "prometheus-client>=0.20,<2.0",  # PrometheusCollector tests
     "psutil>=5.9",  # bench_resources (memory/FD tracking)
     "mkdocs>=1.6.0",
@@ -147,4 +148,19 @@ filterwarnings = [
     "ignore:SigningMiddleware is using the default in-memory:RuntimeWarning",
     # third-party: testcontainers' own deprecated decorator
     "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
+    # M13 security guardrail, asserted by test_cert_none_warns; SSL tests
+    # construct CERT_NONE configs deliberately
+    "ignore:SSLConfig.cert_reqs='CERT_NONE'. disables TLS:RuntimeWarning",
+    # unittest.mock artifact: sync code paths touching AsyncMock attributes
+    # create coroutines that are never awaited by design in those tests
+    "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
+    # CLI tests mock asyncio.run, so the command's inner coroutine is
+    # intentionally never driven
+    "ignore:coroutine 'topology_apply.<locals>._apply' was never awaited:RuntimeWarning",
+    "ignore:coroutine 'TestSyncHooks:RuntimeWarning",
+    # config-validation guardrails, each with a dedicated pytest.warns test;
+    # config tests construct these misconfigurations deliberately
+    "ignore:ConnectionConfig uses default 'guest' credentials:UserWarning",
+    "ignore:RetryConfig.delays has:UserWarning",
+    "ignore:Queue .*lazy=True sets the deprecated:UserWarning",
 ]

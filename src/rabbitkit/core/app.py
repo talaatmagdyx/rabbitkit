@@ -10,6 +10,7 @@ State tracking: IDLE → STARTING → RUNNING → STOPPING → STOPPED
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import signal
 import threading
@@ -302,7 +303,7 @@ class RabbitApp:
                 result = hook()
                 if asyncio.iscoroutine(result):
                     await result
-            elif asyncio.iscoroutinefunction(hook):
+            elif inspect.iscoroutinefunction(hook):
                 result = hook()  # builds the coroutine; body not yet executed
                 try:
                     async with asyncio.timeout(timeout):

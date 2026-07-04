@@ -789,8 +789,8 @@ class HandlerPipeline:
             # P5: cached async detection — avoids per-message hasattr(result, "__await__").
             is_async = self._is_async_handler_cache.get(route.handler)
             if is_async is None:
-                import asyncio as _aio
-                is_async = _aio.iscoroutinefunction(route.handler)
+                import inspect as _inspect
+                is_async = _inspect.iscoroutinefunction(route.handler)
                 self._is_async_handler_cache[route.handler] = is_async
             if is_async:
                 result = await result

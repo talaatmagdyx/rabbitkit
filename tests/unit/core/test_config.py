@@ -347,6 +347,18 @@ class TestPoolConfig:
 
 
 class TestRetryConfig:
+    def test_delays_shorter_than_max_retries_warns(self) -> None:
+        """Mismatched delays/max_retries emits the reuse-last-delay warning."""
+        import warnings
+
+        with pytest.warns(UserWarning, match="Retries beyond the last delay entry"):
+            RetryConfig(max_retries=5, delays=(1, 2), strict_delays=False)
+
+        # A matching ladder must NOT warn.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            RetryConfig(max_retries=2, delays=(1, 2))
+
     def test_defaults(self) -> None:
         config = RetryConfig()
         assert config.max_retries == 4

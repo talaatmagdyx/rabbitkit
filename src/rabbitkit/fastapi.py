@@ -22,6 +22,7 @@ Or as a decorator-style::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -63,7 +64,7 @@ async def rabbitkit_lifespan(
 
         # Start broker
         if broker is not None:
-            if asyncio.iscoroutinefunction(getattr(broker, "start", None)):
+            if inspect.iscoroutinefunction(getattr(broker, "start", None)):
                 await broker.start()
             elif hasattr(broker, "start"):
                 broker.start()
@@ -74,7 +75,7 @@ async def rabbitkit_lifespan(
     finally:
         # Stop broker first
         if broker is not None:
-            if asyncio.iscoroutinefunction(getattr(broker, "stop", None)):
+            if inspect.iscoroutinefunction(getattr(broker, "stop", None)):
                 await broker.stop()
             elif hasattr(broker, "stop"):
                 broker.stop()

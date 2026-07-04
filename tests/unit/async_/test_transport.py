@@ -1483,6 +1483,7 @@ class TestMandatoryChannelClosedOnTimeout:
     @pytest.mark.asyncio
     async def test_timeout_closes_mandatory_channel_for_next_publish(self) -> None:
         transport = _make_transport(confirm_timeout=0.01)
+        transport._connected = True  # keep publish() off the real connect() path
         mock_conn = _make_mock_connection()
         transport._conn_pool._publisher_connection = mock_conn
 
@@ -1515,6 +1516,7 @@ class TestMandatoryChannelClosedOnTimeout:
     @pytest.mark.asyncio
     async def test_confirmed_mandatory_publish_does_not_close_channel(self) -> None:
         transport = _make_transport(confirm_timeout=0.01)
+        transport._connected = True  # keep publish() off the real connect() path
         mock_conn = _make_mock_connection()
         transport._conn_pool._publisher_connection = mock_conn
         channel = AsyncMock()

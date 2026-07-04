@@ -37,7 +37,9 @@ jobs:
       - name: pip-audit
         run: |
           uv pip install pip-audit
-          .venv/bin/python -m pip_audit --strict
+          # --skip-editable: rabbitkit itself is installed with -e and (until
+          # first PyPI release) can't be audited against the advisory DBs.
+          .venv/bin/python -m pip_audit --strict --skip-editable
       - name: Generate SBOM (CycloneDX)
         run: .venv/bin/python -m pip_audit --format=cyclonedx-json --output=sbom.json
       - uses: actions/upload-artifact@v4

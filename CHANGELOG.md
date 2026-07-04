@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.0] — 2026-07-04
 
-**First published release** (public beta). Entries below this point
-(numbered 1.0.0–1.3.0) are pre-publication internal milestones — the
-project was renumbered to 0.9.0 for its first public release to signal
-beta maturity; no earlier version was ever distributed.
+**First published release** (public beta). No earlier version was ever
+distributed: the 0.8.x entries below are pre-publication internal
+milestones (originally numbered 1.0.0–1.2.0; this release itself was
+internally 1.3.0), renumbered so the published 0.9.0 sits at the top of
+the version history.
 
-Roadmap release: six features extending the internal-1.2.0 thesis (*no message is
+Roadmap release: six features extending the 0.8.3 thesis (*no message is
 lost, and operators can see and fix everything*) to places it didn't reach —
 the open observability ecosystem, the migration path onto the mandated
 quorum topology, retry-wave decorrelation, duplicate-result replay, and the
@@ -119,7 +120,7 @@ RabbitMQ and the docs never claim it).
   ~0.9k msg/s blocking ceiling for callers who adopt it.
 
 
-## [1.2.0] — 2026-07-04
+## [0.8.3] — 2026-07-04 <small>(internal milestone, formerly 1.2.0)</small>
 
 Production-hardening release implementing the full `PRODUCTION_AUDIT.md`
 remediation: all 4 critical, 6 high-risk, and 18 medium findings, the
@@ -651,7 +652,7 @@ validation, and signing+retry now failing fast at startup.
   on), the new `messages_redelivered_total`/`reconnects_total` alerts,
   and partition-aware readiness via `management_client`.
 
-## [1.1.1] — 2026-07-03
+## [0.8.2] — 2026-07-03 <small>(internal milestone, formerly 1.1.1)</small>
 
 ### Added
 
@@ -791,7 +792,7 @@ validation, and signing+retry now failing fast at startup.
   `9.1.0` (it would otherwise permanently red on a problem that has nothing
   to do with rabbitkit).
 
-## [1.1.0] — 2026-07-01
+## [0.8.1] — 2026-07-01 <small>(internal milestone, formerly 1.1.0)</small>
 
 ### Added
 
@@ -1827,7 +1828,7 @@ validation, and signing+retry now failing fast at startup.
 - **`asyncio.timeout` in straggler wait** — replaces `asyncio.wait_for`
   (avoids the wrapper-task overhead).
 
-## [1.0.0] — 2026-06-29
+## [0.8.0] — 2026-06-29 <small>(internal milestone, formerly 1.0.0)</small>
 
 Code-quality refactors — Strategy patterns, shared dispatchers, typed protocols,
 and performance wins. No public API breaks.

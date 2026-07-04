@@ -3,15 +3,15 @@
 ## Where rabbitkit actually is (as of 0.9.0)
 
 rabbitkit is at `0.9.0` — the **first published release** (public beta).
-Development happened privately under internal milestone numbers
-(`1.0.0`–`1.3.0` in `CHANGELOG.md`); none of those were ever distributed,
-and the project was renumbered to `0.9.0` at publication so the version
-signals beta maturity honestly.
+Development happened privately under internal milestone numbers — now the
+`0.8.x` entries in `CHANGELOG.md` (each marked with its former number);
+none were ever distributed, and the history was renumbered at publication
+so the version signals beta maturity honestly.
 
 What that number means in practice:
 
 - **Stable Core** (below) has been through multiple structured
-  production-readiness passes (see the internal `1.1.x`–`1.3.0` entries in
+  production-readiness passes (see the `0.8.x` entries in
   `CHANGELOG.md` for the fix record) and is treated as frozen: breaking it
   requires the deprecation cycle described in this document, even before
   `1.0.0`.
@@ -141,7 +141,7 @@ For Stable Core (and Advanced Stable) APIs:
 3. The symbol is removed in the following minor release at the earliest.
 
 **Worked example:** `rabbitkit.aio` was deprecated in favor of the canonical
-`rabbitkit.async_` import path pre-publication (internal `1.1.0`) — it
+`rabbitkit.async_` import path pre-publication (internal `0.8.1`) — it
 still works, but importing it
 emits a `DeprecationWarning` pointing at the replacement. It will be removed
 no earlier than the next minor release. This is the policy in practice, not

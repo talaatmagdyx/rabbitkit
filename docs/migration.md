@@ -6,12 +6,12 @@ one entry per change, in the order they happened. See
 policy this follows. Experimental API changes are not tracked here — see
 `CHANGELOG.md` for those.
 
-> **Version numbering note:** entries marked *(internal 1.x)* predate the
-> first published release. The project was renumbered to **0.9.0** for its
-> public beta; no 1.x version was ever distributed, so these entries only
-> matter if you tracked the repository before publication.
+> **Version numbering note:** entries marked *(internal 0.8.x)* predate
+> the first published release (**0.9.0**, the public beta). No earlier
+> version was ever distributed, so these entries only matter if you
+> tracked the repository before publication.
 
-## `rabbitkit.aio` → `rabbitkit.async_` (internal 1.1.0)
+## `rabbitkit.aio` → `rabbitkit.async_` (internal 0.8.1)
 
 **What changed:** `rabbitkit.async_` is now the canonical import path for
 the async broker and transport. `rabbitkit.aio` still works, but importing
@@ -36,7 +36,7 @@ from rabbitkit.async_ import AsyncBroker
 from rabbitkit import AsyncBroker
 ```
 
-**Timeline:** deprecated pre-publication (internal `1.1.0`). Per the deprecation policy, it will be
+**Timeline:** deprecated pre-publication (internal `0.8.1`). Per the deprecation policy, it will be
 removed no earlier than the following minor release. If you see the
 `DeprecationWarning`, update the import now — there's no behavior
 difference, `rabbitkit.aio` re-exports the exact same class.

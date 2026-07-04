@@ -930,7 +930,22 @@ class SyncTransport:
             while self._consuming:
                 # process_data_events drains ALL channels' consumers + queued
                 # add_callback_threadsafe callbacks (acks from worker threads).
-                self._connection.process_data_events(time_limit=1.0)
+                try:
+                    self._connection.process_data_events(time_limit=1.0)
+                except ValueError as exc:
+                    # pika's SelectConnection ioloop raises a bare
+                    # ValueError("Timeout closed before call") when the
+                    # connection died between poll ticks (e.g. broker restart).
+                    # Re-raise it as the connection error it really is so
+                    # SyncBroker.run()'s recovery loop reconnects instead of
+                    # the consumer thread dying on an unrecognized exception.
+                    if self._connection.is_closed or "Timeout closed before call" in str(exc):
+                        import pika.exceptions
+
+                        raise pika.exceptions.AMQPConnectionError(
+                            f"connection lost mid-poll: {exc}"
+                        ) from exc
+                    raise
                 # L14: process_data_events returning (rather than raising a
                 # connection error) is itself evidence the I/O loop is alive
                 # and pumping -- fire once per tick regardless of whether any

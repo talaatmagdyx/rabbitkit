@@ -2194,3 +2194,49 @@ class TestPublishCrossThreadConfirmPropagation:
         assert len(outcomes) == 1
         assert outcomes[0].status == PublishStatus.CONFIRMED
         assert outcomes[0].ok
+
+
+class TestStartConsumingIoLoopDeath:
+    """A dead connection between poll ticks surfaces pika's internal bare
+    ValueError('Timeout closed before call'); start_consuming must re-raise
+    it as AMQPConnectionError so run()'s recovery loop reconnects."""
+
+    def _wired_transport(self) -> SyncTransport:
+        pytest.importorskip("pika")
+        transport = _make_transport()
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        transport._consumer_channels["q"] = mock_channel
+        return transport
+
+    def test_timeout_closed_valueerror_becomes_connection_error(self) -> None:
+        import pika.exceptions
+
+        transport = self._wired_transport()
+        transport._connection.is_closed = False
+        transport._connection.process_data_events.side_effect = ValueError(
+            "Timeout closed before call"
+        )
+        with pytest.raises(pika.exceptions.AMQPConnectionError, match="connection lost mid-poll"):
+            transport.start_consuming()
+
+    def test_valueerror_on_closed_connection_becomes_connection_error(self) -> None:
+        import pika.exceptions
+
+        transport = self._wired_transport()
+        transport._connection.is_closed = True
+        transport._connection.process_data_events.side_effect = ValueError("anything")
+        with pytest.raises(pika.exceptions.AMQPConnectionError):
+            transport.start_consuming()
+
+    def test_unrelated_valueerror_on_live_connection_reraised(self) -> None:
+        transport = self._wired_transport()
+        transport._connection.is_closed = False
+        transport._connection.process_data_events.side_effect = ValueError("bad time_limit")
+        with pytest.raises(ValueError, match="bad time_limit"):
+            transport.start_consuming()

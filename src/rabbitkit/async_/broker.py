@@ -220,6 +220,17 @@ class AsyncBroker:
                 cond.notify_all()
 
     @property
+    def started(self) -> bool:
+        """True between a successful ``start()`` and ``stop()``.
+
+        Public counterpart of ``_started`` — health checks
+        (:func:`rabbitkit.health.broker_health_check`) read this instead of
+        falling back to the private attribute (which emits a
+        DeprecationWarning).
+        """
+        return self._started
+
+    @property
     def config(self) -> RabbitConfig:
         return self._config
 

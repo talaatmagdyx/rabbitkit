@@ -37,6 +37,37 @@ from rabbitkit.serialization.base import Serializer
 logger = structlog.stdlib.get_logger(__name__)
 _stdlib_logger = logging.getLogger(__name__)
 
+# Transport "channel/connection died" exception class names. Matched by NAME
+# (not isinstance) because core/ never imports pika or aio-pika. Covers pika
+# (ChannelWrongStateError, ChannelClosed*, ConnectionClosed*, StreamLostError)
+# and aio-pika/aiormq (ChannelInvalidStateError, AMQPConnectionError).
+_CHANNEL_GONE_NAMES = frozenset(
+    {
+        "ChannelWrongStateError",
+        "ChannelClosed",
+        "ChannelClosedByBroker",
+        "ChannelClosedByClient",
+        "ChannelInvalidStateError",
+        "ConnectionClosed",
+        "ConnectionClosedByBroker",
+        "ConnectionWrongStateError",
+        "AMQPConnectionError",
+        "StreamLostError",
+    }
+)
+
+
+def _is_channel_gone(exc: BaseException) -> bool:
+    """True if *exc* (or its cause chain) is a transport channel/connection-death error."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if type(current).__name__ in _CHANNEL_GONE_NAMES:
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
 # M10: on the async path, bodies at/above this size are decoded in a worker
 # thread (asyncio.to_thread) so a large JSON/msgspec/pydantic parse doesn't
 # block the event loop. Below it, inline decode is faster than the thread hop.
@@ -1220,6 +1251,28 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         """Handle exception in sync pipeline per AckPolicy (Contract 1)."""
+        try:
+            self._handle_sync_exception_inner(route, message, exc)
+        except Exception as settle_exc:
+            # The settlement attempt itself failed because the channel or
+            # connection died (SIGTERM drain, broker restart, network cut).
+            # Nothing further can be settled on a dead channel and the broker
+            # will redeliver the unacked message — warn instead of letting a
+            # secondary exception escape as a full ERROR traceback.
+            if not _is_channel_gone(settle_exc):
+                raise
+            logger.warning(
+                "Channel closed before settlement (%s); leaving message "
+                "unsettled — the broker will redeliver it (at-least-once)",
+                type(settle_exc).__name__,
+            )
+
+    def _handle_sync_exception_inner(
+        self,
+        route: RouteDefinition,
+        message: RabbitMessage,
+        exc: Exception,
+    ) -> None:
         if message.is_settled:
             # Already settled (e.g., MANUAL mode handler settled then raised)
             logger.warning("Exception after settlement: %s", exc)
@@ -1261,6 +1314,25 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         """Handle exception in async pipeline per AckPolicy (Contract 1)."""
+        try:
+            await self._handle_async_exception_inner(route, message, exc)
+        except Exception as settle_exc:
+            # See _handle_sync_exception: a dead channel means nothing can be
+            # settled and the broker redelivers — warn, don't raise.
+            if not _is_channel_gone(settle_exc):
+                raise
+            logger.warning(
+                "Channel closed before settlement (%s); leaving message "
+                "unsettled — the broker will redeliver it (at-least-once)",
+                type(settle_exc).__name__,
+            )
+
+    async def _handle_async_exception_inner(
+        self,
+        route: RouteDefinition,
+        message: RabbitMessage,
+        exc: Exception,
+    ) -> None:
         if message.is_settled:
             logger.warning("Exception after settlement: %s", exc)
             return

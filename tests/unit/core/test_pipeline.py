@@ -2240,3 +2240,106 @@ class TestPublishResultAsyncSuccess:
         result = await pipeline._publish_result_async(route, msg, b"some-result", publish_fn)
         # publish_fn is not None but envelope is None → return True (line 841).
         assert result is True
+
+
+class _FakeChannelWrongStateError(Exception):
+    """Name-matched stand-in for pika's exception (core never imports pika)."""
+
+
+_FakeChannelWrongStateError.__name__ = "ChannelWrongStateError"
+
+
+class TestChannelGoneSettlement:
+    """A settle attempt on a dead channel warns and leaves the message
+    unsettled (broker redelivers) instead of escaping as a secondary
+    ERROR traceback — the SIGTERM-drain noise seen in integration runs."""
+
+    def test_sync_reject_on_closed_channel_swallowed(self) -> None:
+        msg = _make_message()
+        _, _, reject_fn = _wire_sync(msg)
+        reject_fn.side_effect = _FakeChannelWrongStateError("Channel is closed.")
+
+        def handler(body: bytes) -> None:
+            raise ValueError("bad data")  # permanent → reject path
+
+        route = _make_route(handler=handler)
+        HandlerPipeline().process_sync(route, msg)  # must not raise
+
+        reject_fn.assert_called_once()
+        assert msg._disposition == "pending"  # unsettled → broker redelivers
+
+    def test_sync_ack_on_closed_channel_swallowed(self) -> None:
+        """Success-path ack fails on a dead channel; the follow-up settle
+        (classified permanent → reject) fails the same way — no raise."""
+        msg = _make_message()
+        ack_fn, _, reject_fn = _wire_sync(msg)
+        ack_fn.side_effect = _FakeChannelWrongStateError("Channel is closed.")
+        reject_fn.side_effect = _FakeChannelWrongStateError("Channel is closed.")
+
+        def handler(body: bytes) -> None:
+            return None
+
+        route = _make_route(handler=handler)
+        HandlerPipeline().process_sync(route, msg)
+        assert msg._disposition == "pending"
+
+    def test_sync_non_channel_settle_failure_still_raises(self) -> None:
+        msg = _make_message()
+        _, _, reject_fn = _wire_sync(msg)
+        reject_fn.side_effect = OSError("disk on fire")
+
+        def handler(body: bytes) -> None:
+            raise ValueError("bad data")
+
+        route = _make_route(handler=handler)
+        with pytest.raises(OSError, match="disk on fire"):
+            HandlerPipeline()._handle_sync_exception(route, msg, ValueError("bad data"))
+
+    @pytest.mark.asyncio
+    async def test_async_reject_on_closed_channel_swallowed(self) -> None:
+        msg = _make_message()
+        _, _, reject_fn = _wire_async(msg)
+        reject_fn.side_effect = _FakeChannelWrongStateError("Channel is closed.")
+
+        async def handler(body: bytes) -> None:
+            raise ValueError("bad data")
+
+        route = _make_route(handler=handler)
+        await HandlerPipeline().process_async(route, msg)
+        assert msg._disposition == "pending"
+
+    @pytest.mark.asyncio
+    async def test_async_non_channel_settle_failure_still_raises(self) -> None:
+        msg = _make_message()
+        _, _, reject_fn = _wire_async(msg)
+        reject_fn.side_effect = OSError("disk on fire")
+
+        route = _make_route(handler=lambda body: None)
+        with pytest.raises(OSError, match="disk on fire"):
+            await HandlerPipeline()._handle_async_exception(route, msg, ValueError("bad"))
+
+
+class TestIsChannelGone:
+    def test_direct_name_match(self) -> None:
+        from rabbitkit.core.pipeline import _is_channel_gone
+
+        assert _is_channel_gone(_FakeChannelWrongStateError("x")) is True
+
+    def test_cause_chain_match(self) -> None:
+        from rabbitkit.core.pipeline import _is_channel_gone
+
+        outer = RuntimeError("wrapped")
+        outer.__cause__ = _FakeChannelWrongStateError("Channel is closed.")
+        assert _is_channel_gone(outer) is True
+
+    def test_unrelated_error_is_false(self) -> None:
+        from rabbitkit.core.pipeline import _is_channel_gone
+
+        assert _is_channel_gone(ValueError("nope")) is False
+
+    def test_self_referential_context_terminates(self) -> None:
+        from rabbitkit.core.pipeline import _is_channel_gone
+
+        exc = ValueError("loop")
+        exc.__context__ = exc  # pathological cycle must not hang
+        assert _is_channel_gone(exc) is False

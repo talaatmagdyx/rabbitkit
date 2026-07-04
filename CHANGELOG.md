@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Quiet settlement on a dead channel** — when a channel/connection dies
+  before a message can be settled (SIGTERM drain, broker restart), the
+  pipeline now logs one WARNING ("broker will redeliver it") instead of
+  letting the transport error escape as a full ERROR traceback plus a
+  secondary failed-settle exception. Detection is name-based
+  (`ChannelWrongStateError`, `ChannelInvalidStateError`, …) so `core/`
+  stays transport-free.
+- **`broker.started` property** — both brokers now expose the typed
+  `started` property, so `rabbitkit.health` no longer emits its own
+  fall-back-to-private-attribute DeprecationWarning against rabbitkit's
+  own brokers.
+- **Benchmarks: safety auto-provision opt-out** — real-broker benchmark
+  scenarios no longer 406 on preloaded queues (same inequivalent-arg
+  collision the chaos suite had); the full nightly suite produces numbers
+  again. `psutil` added to dev extras so the resources benchmark stops
+  self-skipping.
+
 ## [0.9.0] — 2026-07-04
 
 **First published release** (public beta). No earlier version was ever

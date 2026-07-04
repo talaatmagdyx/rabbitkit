@@ -2328,3 +2328,21 @@ class TestSigningRetryConflictAsync:
         broker._transport = MagicMock()
         with pytest.raises(ConfigurationError, match="SigningMiddleware is incompatible with retry"):
             broker._wire_retry_middleware()
+
+
+class TestStartedProperty:
+    def test_started_reflects_lifecycle(self) -> None:
+        broker = AsyncBroker(RabbitConfig())
+        assert broker.started is False
+        broker._started = True
+        assert broker.started is True
+
+    def test_health_check_uses_property_without_deprecation(self) -> None:
+        import warnings
+
+        from rabbitkit.health import _get_started
+
+        broker = AsyncBroker(RabbitConfig())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            assert _get_started(broker) is False

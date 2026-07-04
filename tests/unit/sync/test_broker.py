@@ -2450,3 +2450,21 @@ class TestDlqConsumerRouteNotAutoChained:
         # Terminal: no x-dead-letter args injected onto the DLQ itself.
         assert "x-dead-letter-exchange" not in (dlq.arguments or {})
         assert dlq.dead_letter_exchange is None
+
+
+class TestStartedProperty:
+    def test_started_reflects_lifecycle(self) -> None:
+        broker = SyncBroker(RabbitConfig())
+        assert broker.started is False
+        broker._started = True
+        assert broker.started is True
+
+    def test_health_check_uses_property_without_deprecation(self) -> None:
+        import warnings
+
+        from rabbitkit.health import _get_started
+
+        broker = SyncBroker(RabbitConfig())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            assert _get_started(broker) is False

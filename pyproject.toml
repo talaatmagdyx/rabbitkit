@@ -139,3 +139,12 @@ warn_unused_configs = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["integration: integration tests (may need RabbitMQ)"]
+filterwarnings = [
+    # rabbitkit's own operator-guidance warnings, exercised deliberately by
+    # tests (dedicated pytest.warns tests still assert they fire — pytest.warns
+    # bypasses these filters). Real users still see them.
+    "ignore:Starting a single-worker sync consumer:RuntimeWarning",
+    "ignore:SigningMiddleware is using the default in-memory:RuntimeWarning",
+    # third-party: testcontainers' own deprecated decorator
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
+]

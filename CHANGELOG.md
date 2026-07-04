@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Advanced benchmark tier** (`python -m benchmarks.advanced`, nightly) —
+  interleaved A/B overhead vs raw aio-pika (median ± CV over 5 reps),
+  payload-size sweep, classic-vs-quorum consume A/B, and open-loop paced
+  latency measured from the intended send instant (no coordinated
+  omission). Results carry an environment fingerprint and upload as
+  workflow artifacts. Methodology: `docs/benchmarking.md`.
+
+### Changed
+
+- Dependency ranges widened after full-suite validation on the newest
+  releases: `redis >=5,<9` (validated on 8.0.1; rabbitkit touches only
+  `set/get/exists/delete/eval`) and `structlog >=23.1,<27` (validated on
+  26.1.0).
+
 ## [0.9.1] — 2026-07-04
 
 First PyPI-visible patch: the 0.9.0 package description referenced images

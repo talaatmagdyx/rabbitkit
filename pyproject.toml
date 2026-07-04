@@ -26,14 +26,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "structlog>=23.1.0,<26.0.0",
+    "structlog>=23.1.0,<27.0.0",
 ]
 
 [project.optional-dependencies]
 sync        = ["pika>=1.3.0,<2.0.0"]
 async       = ["aio-pika>=9.1.0,<10.0.0"]
 all-brokers = ["rabbitkit[sync,async]"]
-redis       = ["redis>=5.0.0,<6.0.0"]
+redis       = ["redis>=5.0.0,<9.0.0"]
 pydantic    = ["pydantic>=2.0.0,<3.0.0"]
 msgspec     = ["msgspec>=0.18.0,<1.0.0"]
 fastapi     = ["fastapi>=0.111.0,<1.0.0"]

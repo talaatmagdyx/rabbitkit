@@ -68,11 +68,11 @@ integration = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/talaatmagdy/rabbitkit"
-Documentation = "https://github.com/talaatmagdy/rabbitkit"
-Repository = "https://github.com/talaatmagdy/rabbitkit"
-Changelog = "https://github.com/talaatmagdy/rabbitkit/blob/main/CHANGELOG.md"
-Issues = "https://github.com/talaatmagdy/rabbitkit/issues"
+Homepage = "https://github.com/talaatmagdyx/rabbitkit"
+Documentation = "https://talaatmagdyx.github.io/rabbitkit/"
+Repository = "https://github.com/talaatmagdyx/rabbitkit"
+Changelog = "https://github.com/talaatmagdyx/rabbitkit/blob/main/CHANGELOG.md"
+Issues = "https://github.com/talaatmagdyx/rabbitkit/issues"
 
 [project.scripts]
 rabbitkit = "rabbitkit.cli:app"

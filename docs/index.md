@@ -1,8 +1,16 @@
 # rabbitkit
 
+<p align="center">
+  <img src="assets/logo.svg" alt="rabbitkit" width="420">
+</p>
+
 **RabbitMQ-first production toolkit for Python** — safe retries, dead-letter queues,
 explicit acknowledgement policies, topology validation, in-process testing, and
 Kubernetes-ready lifecycle management.
+
+<p align="center">
+  <img src="assets/demo.svg" alt="rabbitkit CLI — dlq inspect and replay" width="720">
+</p>
 
 ## Quick Start
 

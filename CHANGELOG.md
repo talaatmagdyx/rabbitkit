@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hosted documentation** — mkdocs site now deploys to GitHub Pages
+  (https://talaatmagdyx.github.io/rabbitkit/) on every push to `main` via a
+  new `Docs` workflow (`mkdocs build --strict` gates the deploy). Docs
+  homepage now carries the project logo and CLI demo; stale
+  `talaatmagdy/rabbitkit` URLs in `mkdocs.yml`/`pyproject.toml` corrected to
+  `talaatmagdyx`, and the theme favicon now points at an asset that exists.
 - **Python 3.14 support** — added to the CI test matrix and trove
   classifiers (full suite green). Python 3.15 runs as an experimental,
   allowed-to-fail pre-release leg until its C-extension dependencies

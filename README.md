@@ -432,6 +432,8 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 
 ## Documentation
 
+**📚 Full rendered docs: [talaatmagdyx.github.io/rabbitkit](https://talaatmagdyx.github.io/rabbitkit/)**
+
 - [Getting Started](docs/guide/getting-started.md) ·
 - [Full Guide](docs/guide/full-guide.md) ·
 - [Message Safety](docs/message-safety.md) ·

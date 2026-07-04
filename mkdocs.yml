@@ -7,9 +7,9 @@
 
 site_name: rabbitkit
 site_description: Production-grade RabbitMQ toolkit for Python — sync & async, decorator routing, middleware, retry, DI, RPC.
-site_url: https://github.com/talaatmagdy/rabbitkit
-repo_url: https://github.com/talaatmagdy/rabbitkit
-repo_name: talaatmagdy/rabbitkit
+site_url: https://talaatmagdyx.github.io/rabbitkit/
+repo_url: https://github.com/talaatmagdyx/rabbitkit
+repo_name: talaatmagdyx/rabbitkit
 edit_uri: edit/main/docs/
 
 theme:
@@ -43,7 +43,7 @@ theme:
     code: JetBrains Mono
   icon:
     logo: material/rabbit
-  favicon: assets/favicon.png
+  favicon: assets/logo.svg
 
 nav:
   - Home: index.md
@@ -138,7 +138,7 @@ markdown_extensions:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/talaatmagdy/rabbitkit
+      link: https://github.com/talaatmagdyx/rabbitkit
     - icon: fontawesome/brands/python
       link: https://pypi.org/project/rabbitkit/
 

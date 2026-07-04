@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.svg" alt="rabbitkit" width="420"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/talaatmagdyx/rabbitkit/main/assets/logo.svg" alt="rabbitkit" width="420"></p>
 
 # rabbitkit
 
@@ -6,10 +6,10 @@
 
 [![PyPI](https://img.shields.io/pypi/v/rabbitkit)](https://pypi.org/project/rabbitkit/)
 [![CI](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml/badge.svg)](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Typed](https://img.shields.io/badge/types-mypy%20--strict-blue)](pyproject.toml)
-[![Style](https://img.shields.io/badge/style-ruff-261230)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/talaatmagdyx/rabbitkit/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/talaatmagdyx/rabbitkit/blob/main/LICENSE)
+[![Typed](https://img.shields.io/badge/types-mypy%20--strict-blue)](https://github.com/talaatmagdyx/rabbitkit/blob/main/pyproject.toml)
+[![Style](https://img.shields.io/badge/style-ruff-261230)](https://github.com/talaatmagdyx/rabbitkit/blob/main/pyproject.toml)
 
 rabbitkit is a **RabbitMQ-first toolkit for Python services**. It gives you
 clean decorators, safe retries, dead-letter queues, publisher confirms,
@@ -113,6 +113,8 @@ tests, production-ready lifecycle.
 ---
 
 ## Installation
+
+Available on PyPI: **[pypi.org/project/rabbitkit](https://pypi.org/project/rabbitkit/)**
 
 ```bash
 pip install rabbitkit[async]        # AsyncBroker (aio-pika)
@@ -323,13 +325,13 @@ only when loss is acceptable.
 ## Production profile
 
 The recommended baseline (see the
-[production checklist](docs/production/checklist.md)): quorum queues (+
+[production checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)): quorum queues (+
 `delivery_limit`), per-queue retry/DLQ topology, publisher confirms on,
 mandatory publishing where routing matters, checked `PublishOutcome`s,
 explicit ack policies, structured logs, split readiness/liveness probes,
 management-API metrics for queue depth and consumer lag, idempotent
 handlers. Migrating existing classic queues to quorum? There's a tool:
-`rabbitkit topology migrate` ([guide](docs/quorum-migration.md)).
+`rabbitkit topology migrate` ([guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/quorum-migration.md)).
 
 ## Observability
 
@@ -352,7 +354,7 @@ middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
 pybreaker).
 
 **Experimental** (may change without a deprecation cycle — read the
-[stability policy](docs/stability-policy.md)): RPC over direct reply-to,
+[stability policy](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/stability-policy.md)): RPC over direct reply-to,
 distributed locking, message signing, result backends, stream queues, the
 monitoring dashboard. Notable caveats: the default signing nonce cache is
 per-process (use a shared cache for real replay protection), and never
@@ -416,7 +418,7 @@ rabbitkit health myapp.main:broker
 The DLQ replay acks a message only after its republish is broker-confirmed —
 the recovery tool cannot itself lose messages.
 
-<p align="center"><img src="assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/talaatmagdyx/rabbitkit/main/assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
 
 ## Where rabbitkit fits
 
@@ -442,7 +444,7 @@ test infrastructure in every service.
 - at-most-once behavior is acceptable and a raw client is enough
 
 A detailed framework-by-framework comparison lives in
-[docs/comparison.md](docs/comparison.md).
+[docs/comparison.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/comparison.md).
 
 ## Architecture
 
@@ -473,25 +475,25 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 
 **📚 Full rendered docs: [talaatmagdyx.github.io/rabbitkit](https://talaatmagdyx.github.io/rabbitkit/)**
 
-- [Getting Started](docs/guide/getting-started.md)
-- [Full Guide](docs/guide/full-guide.md)
-- [Message Safety](docs/message-safety.md)
-- [Retry & DLQ](docs/retry-and-dlq.md)
-- [Production Checklist](docs/production/checklist.md)
-- [Idempotency Contract](docs/production/idempotency.md)
-- [Kubernetes](docs/kubernetes.md)
-- [Quorum Migration](docs/quorum-migration.md)
-- [Security](docs/security.md)
-- [Stability Policy](docs/stability-policy.md)
-- [Troubleshooting](docs/troubleshooting.md)
+- [Getting Started](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/guide/getting-started.md)
+- [Full Guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/guide/full-guide.md)
+- [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
+- [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
+- [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)
+- [Idempotency Contract](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/idempotency.md)
+- [Kubernetes](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/kubernetes.md)
+- [Quorum Migration](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/quorum-migration.md)
+- [Security](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/security.md)
+- [Stability Policy](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/stability-policy.md)
+- [Troubleshooting](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/troubleshooting.md)
 
 ## Contributing & security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local development and quality
+See [CONTRIBUTING.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/CONTRIBUTING.md) for local development and quality
 gates (ruff, `mypy --strict`, near-total test coverage — the bar is real).
-Found a vulnerability? Follow [SECURITY.md](SECURITY.md) and report it
+Found a vulnerability? Follow [SECURITY.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/SECURITY.md) and report it
 privately.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/talaatmagdyx/rabbitkit/blob/main/LICENSE)

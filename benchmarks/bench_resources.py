@@ -131,12 +131,45 @@ async def _consume_retry(url: str, queue: str, n: int, prefetch: int) -> None:
     await broker.stop()
 
 
-def _measure(url: str, queue: str, body: bytes, coro_fn: Any) -> dict[str, float]:
+async def _predeclare_retry(url: str, queue: str) -> None:
+    """Declare the retry-enabled queue topology (incl. DLX) before preload.
+
+    Mirrors bench_failure._predeclare_topology: start a broker with the
+    retry route so the source queue is created with its dead-letter
+    argument, then stop; preload then runs with passive=True.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import ConnectionConfig, RabbitConfig, RetryConfig
+
+    broker = AsyncBroker(
+        RabbitConfig(safety=_bench_safety(), connection=ConnectionConfig.from_url(url))
+    )
+
+    @broker.subscriber(
+        queue=queue,
+        prefetch_count=PREFETCH,
+        retry=RetryConfig(max_retries=3, delays=(1, 5, 30)),
+    )
+    async def _noop(body: bytes) -> None:
+        pass
+
+    await broker.start()
+    await broker.stop()
+
+
+def _measure(
+    url: str, queue: str, body: bytes, coro_fn: Any, *, retry: bool = False
+) -> dict[str, float]:
     """Pre-load queue, then measure resource usage while consuming."""
     psutil = _require_psutil()
     proc = psutil.Process(os.getpid())
 
-    preload_proc(url, queue, ITERATIONS, body)
+    # A retry-enabled route declares the source queue WITH a dead-letter
+    # argument; declare that topology first, then preload passively —
+    # otherwise the preloader's plain declaration 406s the consumer.
+    if retry:
+        asyncio.run(_predeclare_retry(url, queue))
+    preload_proc(url, queue, ITERATIONS, body, passive=retry)
 
     gc.collect()
     gc.disable()
@@ -187,7 +220,7 @@ def run_all(url: str) -> None:
 
     for name, queue, body, coro_fn in scenarios:
         try:
-            m = _measure(url, queue, body, coro_fn)
+            m = _measure(url, queue, body, coro_fn, retry=coro_fn is _consume_retry)
             rss = m["rss_delta_kb"]
             rss_str = f"{rss:+.0f} KB" if abs(rss) < 1024 else f"{rss/1024:+.1f} MB"
             print(

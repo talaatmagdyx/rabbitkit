@@ -200,6 +200,7 @@ async def _drain_with_dedup_new(
 
     redis_mock = MagicMock()
     redis_mock.set = AsyncMock(return_value=True)  # always new
+    redis_mock.exists = AsyncMock(return_value=False)  # never seen before
 
     mw = DeduplicationMiddleware(
         redis_client=redis_mock,
@@ -244,6 +245,7 @@ async def _drain_with_dedup_dup(
     from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 
     redis_mock = MagicMock()
+    redis_mock.exists = AsyncMock(return_value=False)  # never seen before
     count = 0
     span: dict[str, float] = {}
     done = asyncio.Event()
@@ -297,6 +299,7 @@ async def _drain_with_dedup_lru(
 
     redis_mock = MagicMock()
     redis_mock.set = AsyncMock(return_value=True)  # should never be called
+    redis_mock.exists = AsyncMock(return_value=False)  # LRU hit → never called
 
     # All preloaded messages have body b'{"id":1}' → same body-hash key
     body_hash = hashlib.sha256(b'{"id":1}').hexdigest()

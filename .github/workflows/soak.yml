@@ -1,0 +1,45 @@
+# Weekly soak: 30 minutes of sustained load with a broker kill every 3
+# minutes (~10 recovery cycles), tracking RSS/FD/task growth throughout.
+# GATING within this workflow: a recovery failure, message loss, or a
+# sustained leak slope fails the run — this is the long-running-pod
+# evidence a per-push CI job cannot produce.
+name: Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "seconds under load"
+        default: "1800"
+      restart_every:
+        description: "seconds between broker kills"
+        default: "180"
+  schedule:
+    # Weekly, Sunday 04:15 UTC (after the nightly integration run).
+    - cron: "15 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[dev]"
+      - name: Soak (load + periodic broker kills + leak tracking)
+        run: |
+          .venv/bin/python -m benchmarks.soak \
+            --duration "${{ github.event.inputs.duration || 1800 }}" \
+            --restart-every "${{ github.event.inputs.restart_every || 180 }}"
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: soak-report
+          path: benchmarks/results/soak_*.json
+          if-no-files-found: ignore

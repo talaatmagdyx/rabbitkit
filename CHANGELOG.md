@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   omission). Results carry an environment fingerprint and upload as
   workflow artifacts. Methodology: `docs/benchmarking.md`.
 
+- **Soak harness** (`python -m benchmarks.soak`, weekly workflow) —
+  sustained load with a broker kill every N seconds; verdicts require
+  recovery after every bounce, zero loss of confirmed publishes, and
+  bounded RSS slope / FD / task counts across all reconnect cycles.
+  Produces the long-running-pod evidence (reconnect soak + leak
+  detection) that per-push CI cannot.
+
 ### Changed
 
 - Dependency ranges widened after full-suite validation on the newest

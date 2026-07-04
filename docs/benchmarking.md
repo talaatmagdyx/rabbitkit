@@ -52,6 +52,29 @@ the system under test. It also reports the publisher's own schedule lag
 (p99) — if the load generator couldn't hold the pace, the report says so
 instead of publishing flattering numbers.
 
+## Tier 3: the soak harness (`python -m benchmarks.soak`)
+
+Sustained-runtime evidence for the two questions point-in-time tests
+cannot answer — the top risks for a long-running Kubernetes consumer:
+
+- **Connection recovery under sustained abuse.** The broker container is
+  killed every `--restart-every` seconds for the entire run; the verdict
+  requires the consumer to make progress within 60 s of *every* bounce,
+  and every broker-confirmed publish to be consumed at least once by the
+  end (duplicates are counted and reported — that's the at-least-once
+  contract — but loss fails the run).
+- **Leak detection.** RSS, open file descriptors, and asyncio task count
+  are sampled every 15 s. The verdict fits a least-squares slope to the
+  post-warmup RSS series (fails above 256 KB/min sustained) and requires
+  FD/task counts to stay flat across all the reconnect cycles — leaked
+  channels, consumers, or timers show up here.
+
+Runs weekly (`.github/workflows/soak.yml`, 30 min with a kill every 3
+minutes ≈ 10 recovery cycles; dispatchable with custom duration) and
+locally: `python -m benchmarks.soak --duration 600 --restart-every 120`.
+The exit code is the verdict; the JSON report (with full sample series
+and environment fingerprint) uploads as a workflow artifact.
+
 ## Reading the numbers
 
 - Prefer **medians**; CI runners have heavy right tails.

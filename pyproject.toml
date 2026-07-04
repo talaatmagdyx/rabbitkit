@@ -47,6 +47,7 @@ all         = ["rabbitkit[all-brokers,otel,redis,pydantic,msgspec,fastapi,compre
 dev         = [
     "rabbitkit[all]",
     "pytest>=8.0",
+    "httpx>=0.27,<1.0",  # starlette TestClient (dashboard tests)
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
     "mkdocstrings[python]>=0.26.0",

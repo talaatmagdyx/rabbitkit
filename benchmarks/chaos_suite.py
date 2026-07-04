@@ -24,7 +24,7 @@ import time
 
 from rabbitkit import MessageEnvelope, RabbitConfig, RetryConfig
 from rabbitkit.async_.broker import AsyncBroker
-from rabbitkit.core.config import ConnectionConfig, PoolConfig
+from rabbitkit.core.config import ConnectionConfig, PoolConfig, SafetyConfig
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import AckPolicy, ErrorSeverity, PublishStatus
 from rabbitkit.dlq import DLQInspector
@@ -106,7 +106,7 @@ async def _delayed_restart(delay: float) -> None:
 
 async def _preload(queue: str, n: int, *, persistent: bool = True) -> None:
     """Declare a DURABLE queue and publish n PERSISTENT messages, then disconnect."""
-    b = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL),
+    b = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL),
                                  pool=PoolConfig(channel_pool_size=32)))
     await b.start()
     await b._transport.declare_queue(RabbitQueue(name=queue, durable=True))
@@ -130,7 +130,7 @@ async def scenario_restart_during_consume() -> tuple[bool, str]:
     processed: set[str] = set()
     redeliveries = 0
 
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL)))
 
     at_restart = -1
 
@@ -177,7 +177,7 @@ async def scenario_retry_to_dlq() -> tuple[bool, str]:
     queue = "chaos.retry"
     retry_cfg = RetryConfig(max_retries=2, delays=(1, 1), jitter_factor=0.0,
                             per_queue=True, unknown_policy=ErrorSeverity.PERMANENT)
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL),
+    broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL),
                                       retry=retry_cfg))
     retry_mw = RetryMiddleware(retry_cfg, publish_async_fn=broker.publish)
     attempts = 0
@@ -216,7 +216,7 @@ async def scenario_restart_during_publish() -> tuple[bool, str]:
     queue = "chaos.publish"
     await _preload(queue, 0)  # just declare the durable queue
     n = 600
-    broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL),
+    broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL),
                                       pool=PoolConfig(channel_pool_size=32)))
     await broker.start()
 
@@ -253,7 +253,7 @@ def _run_sync_consumer(queue: str, n: int, processed: set[str], dups: list[int],
     handler can call stop_consuming() directly (no cross-thread channel call) to
     unblock run() once the queue is drained.
     """
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL)))
 
     @broker.subscriber(queue=RabbitQueue(name=queue, durable=True),
                        ack_policy=AckPolicy.NACK_ON_ERROR, prefetch_count=20)
@@ -305,7 +305,7 @@ async def scenario_sync_restart_during_consume() -> tuple[bool, str]:
 # ── Scenario 5: SYNC transient failures → retry → DLQ ────────────────────────
 def _run_sync_retry_consumer(queue: str, retry_cfg: RetryConfig, attempts: list[int],
                              ready: threading.Event) -> None:
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL), retry=retry_cfg))
+    broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL), retry=retry_cfg))
     retry_mw = RetryMiddleware(retry_cfg, publish_fn=broker.publish)
 
     @broker.subscriber(queue=RabbitQueue(name=queue, durable=True),
@@ -338,7 +338,7 @@ async def scenario_sync_retry_to_dlq() -> tuple[bool, str]:
     thread.start()
     ready.wait(10)
 
-    inspect_broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    inspect_broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL)))
     await inspect_broker.start()
     inspector = DLQInspector(inspect_broker._transport)
     dlq = f"{queue}.dlq"
@@ -361,7 +361,7 @@ async def scenario_sync_retry_to_dlq() -> tuple[bool, str]:
 # ── Scenario 6: SYNC broker restart mid-publish, resend unconfirmed ──────────
 def _run_sync_publisher(queue: str, n: int, confirmed: list[int],
                         ready: threading.Event, done: threading.Event) -> None:
-    broker = SyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
+    broker = SyncBroker(RabbitConfig(safety=SafetyConfig(reject_without_dlx="discard", warn_on_discard=False), connection=ConnectionConfig.from_url(URL)))
     broker.start()
     broker._transport.declare_queue(RabbitQueue(name=queue, durable=True))
     ready.set()

@@ -2,7 +2,7 @@
 
 > **Production-grade RabbitMQ toolkit for Python** — sync (pika) and async (aio-pika),
 > decorator-based routing, middleware pipeline, retry, compression, DI, RPC, and more.
-> Version 1.1.1 · Python ≥ 3.11 · MIT License
+> Version 0.9.0 · Python ≥ 3.11 · MIT License
 
 ## Table of Contents
 
@@ -1746,7 +1746,7 @@ The practical rule: if you're running a **publish-only `SyncBroker`**, call
 
 ---
 
-> **rabbitkit 1.1.0** — Python ≥ 3.11 · MIT License
+> **rabbitkit 0.9.0** — Python ≥ 3.11 · MIT License
 >
 > Built with Strategy patterns, Protocol-based typing, contextvars for async safety,
 > daemon-thread worker pools for k8s-safe shutdown, streaming zip-bomb guards,

@@ -1,30 +1,29 @@
 # Stability Policy
 
-## Where rabbitkit actually is (as of 1.2.0)
+## Where rabbitkit actually is (as of 0.9.0)
 
-rabbitkit is currently at `1.2.0` (a production-hardening release; see
-`CHANGELOG.md`'s `[1.2.0]` entry and `PRODUCTION_AUDIT.md`). The `1.1.0`
-version number was a
-**version-integrity correction**, not a deliberate stability freeze — the
-tree had accumulated post-1.0.0 public API and behavior changes while still
-tagged `1.0.0`, and 1.1.0 fixed the mismatch (see `CHANGELOG.md`'s `[1.1.0]`
-entry). No one formally decided "the API is frozen now" at that point.
+rabbitkit is at `0.9.0` — the **first published release** (public beta).
+Development happened privately under internal milestone numbers
+(`1.0.0`–`1.3.0` in `CHANGELOG.md`); none of those were ever distributed,
+and the project was renumbered to `0.9.0` at publication so the version
+signals beta maturity honestly.
 
-This policy resolves that ambiguity going forward rather than leaving it
-implicit:
+What that number means in practice:
 
-- **Stable Core** (below) is being frozen **as of `1.1.0`**, retroactively
-  formalizing what has, in practice, already been stable and has been through
-  a structured production-readiness pass (see `CHANGELOG.md`'s `1.1.0` and
-  `1.1.1` entries for the fix record this rests on).
+- **Stable Core** (below) has been through multiple structured
+  production-readiness passes (see the internal `1.1.x`–`1.3.0` entries in
+  `CHANGELOG.md` for the fix record) and is treated as frozen: breaking it
+  requires the deprecation cycle described in this document, even before
+  `1.0.0`.
 - **Advanced Stable** and **Experimental** are explicitly *not* covered by
-  that freeze yet — see their sections below for what guarantee (if any) each
+  that freeze — see their sections below for what guarantee (if any) each
   gets.
-- A future major version (`2.0.0`) is reserved for the first release where
-  *all three* tiers are simultaneously under full SemVer guarantees, if and
-  when Advanced Stable and Experimental features individually earn it (see
-  "Promotion criteria" below). Until then, treat the tier a symbol is in as
-  the actual guarantee — not the version number alone.
+- **`1.0.0`** is reserved for the release where Stable Core's freeze
+  graduates from policy to full SemVer guarantee. A later major is reserved
+  for the point where *all three* tiers are simultaneously under full
+  SemVer, if and when Advanced Stable and Experimental features individually
+  earn it (see "Promotion criteria" below). Until then, treat the tier a
+  symbol is in as the actual guarantee — not the version number alone.
 
 ---
 
@@ -142,7 +141,8 @@ For Stable Core (and Advanced Stable) APIs:
 3. The symbol is removed in the following minor release at the earliest.
 
 **Worked example:** `rabbitkit.aio` was deprecated in favor of the canonical
-`rabbitkit.async_` import path in `1.1.0` — it still works, but importing it
+`rabbitkit.async_` import path pre-publication (internal `1.1.0`) — it
+still works, but importing it
 emits a `DeprecationWarning` pointing at the replacement. It will be removed
 no earlier than the next minor release. This is the policy in practice, not
 just in theory.

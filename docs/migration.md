@@ -36,7 +36,7 @@ from rabbitkit.async_ import AsyncBroker
 from rabbitkit import AsyncBroker
 ```
 
-**Timeline:** deprecated in `1.1.0`. Per the deprecation policy, it will be
+**Timeline:** deprecated pre-publication (internal `1.1.0`). Per the deprecation policy, it will be
 removed no earlier than the following minor release. If you see the
 `DeprecationWarning`, update the import now — there's no behavior
 difference, `rabbitkit.aio` re-exports the exact same class.

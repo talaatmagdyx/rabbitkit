@@ -521,7 +521,7 @@ class HealthWatcher:
     series without writing a callback.
 
     *clock* and *sleeper* are injectable for tests (no wall-clock sleeps in
-    the test suite -- the 1.2.0 deflaking lesson).
+    the test suite -- a hard-won deflaking lesson).
     """
 
     _GAUGE_VALUES: typing.ClassVar[dict[HealthStatus, int]] = {

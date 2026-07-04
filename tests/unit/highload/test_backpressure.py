@@ -11,7 +11,6 @@ from rabbitkit.core.errors import BackpressureError
 from rabbitkit.highload.backpressure import (
     _REASON_BLOCKED,
     _REASON_RATE,
-    _REASON_RATE_RETRY,
     _REASON_SLOT,
     FlowController,
     _AsyncTokenBucket,
@@ -124,11 +123,6 @@ class TestWaitPolicy:
         fc.acquire()  # fill to limit → slot_event cleared
         assert _WaitPolicy().handle(fc, _REASON_SLOT, 0.01) is False
 
-    def test_handle_rate_retry_always_false(self) -> None:
-        fc = FlowController(BackpressureConfig(on_blocked="wait"))
-        assert _WaitPolicy().handle(fc, _REASON_RATE_RETRY, None) is False
-        assert _WaitPolicy().handle(fc, _REASON_RATE_RETRY, 1.0) is False
-
     async def test_handle_async_blocked_times_out(self) -> None:
         fc = FlowController(BackpressureConfig(on_blocked="wait"))
         fc._ensure_async_primitives()
@@ -148,12 +142,6 @@ class TestWaitPolicy:
         await fc.acquire_async()  # fill to limit → slot_event cleared
         assert await _WaitPolicy().handle_async(fc, _REASON_SLOT, 0.01) is False
 
-    async def test_handle_async_rate_retry_always_false(self) -> None:
-        fc = FlowController(BackpressureConfig(on_blocked="wait"))
-        fc._ensure_async_primitives()
-        assert await _WaitPolicy().handle_async(fc, _REASON_RATE_RETRY, None) is False
-
-
 class TestRaisePolicy:
     """_RaisePolicy raises BackpressureError with a reason-specific message."""
 
@@ -172,11 +160,6 @@ class TestRaisePolicy:
         with pytest.raises(BackpressureError, match=r"In-flight limit reached \(42\)"):
             _RaisePolicy().handle(fc, _REASON_SLOT, None)
 
-    def test_handle_rate_retry_raises(self) -> None:
-        fc = FlowController(BackpressureConfig(on_blocked="raise"))
-        with pytest.raises(BackpressureError, match="Rate limit"):
-            _RaisePolicy().handle(fc, _REASON_RATE_RETRY, None)
-
     async def test_handle_async_blocked_raises(self) -> None:
         fc = FlowController(BackpressureConfig(on_blocked="raise"))
         with pytest.raises(BackpressureError, match="blocked"):
@@ -191,13 +174,13 @@ class TestRaisePolicy:
 class TestDropPolicy:
     """_DropPolicy returns False for every reason (sync + async)."""
 
-    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT, _REASON_RATE_RETRY])
+    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT])
     def test_handle_returns_false(self, reason: str) -> None:
         fc = FlowController(BackpressureConfig(on_blocked="drop"))
         assert _DropPolicy().handle(fc, reason, None) is False
         assert _DropPolicy().handle(fc, reason, 1.0) is False
 
-    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT, _REASON_RATE_RETRY])
+    @pytest.mark.parametrize("reason", [_REASON_BLOCKED, _REASON_RATE, _REASON_SLOT])
     async def test_handle_async_returns_false(self, reason: str) -> None:
         fc = FlowController(BackpressureConfig(on_blocked="drop"))
         fc._ensure_async_primitives()
@@ -1041,6 +1024,66 @@ class TestAsyncAcquireWaitRaceLoss:
         # No contender may have been silently dropped on a slot-race loss.
         assert len(results) == n, f"only {len(results)}/{n} contenders returned"
         assert all(r is True for r in results), f"some contenders dropped: {results}"
+        assert fc.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_token_paid_slot_lost_empty_bucket_re_waits_instead_of_dropping(self) -> None:
+        """Regression for the ~1%-under-CPU-load contender drop: a waiter that
+        (1) paid for a rate token, (2) lost the slot race, (3) woke from the
+        slot wait to find the bucket empty again, used to be DROPPED via a
+        second-token demand (_REASON_RATE_RETRY -> False) with almost its whole
+        deadline remaining. It must instead re-loop into the bounded
+        _REASON_RATE wait and acquire (mirroring the sync path). Choreographed
+        deterministically: on the fixed code every step ends in a successful
+        acquire regardless of scheduling, so the test cannot flake; on the old
+        code the drop reproduces whenever the choreography lands."""
+        import asyncio
+
+        fc = FlowController(
+            BackpressureConfig(
+                max_in_flight=1,
+                rate_limit=100,
+                on_blocked="wait",
+                blocked_timeout=10.0,
+            )
+        )
+        fc._ensure_async_primitives()
+        assert fc._async_rate_limiter is not None
+        assert fc._async_lock is not None
+        assert fc._async_slot_event is not None
+        fc._async_rate_limiter._tokens = 0.0  # (1) force the rate-wait path
+
+        async def contender() -> bool:
+            return await fc.acquire_async(timeout=10.0)
+
+        task = asyncio.create_task(contender())
+        await asyncio.sleep(0.002)  # let it enter the ~10ms token wait
+
+        # (2) steal the slot while the contender waits for its token.
+        async with fc._async_lock:
+            fc._in_flight = 1
+            fc._async_slot_event.clear()
+
+        # Let the contender finish paying for its token, see the slot taken,
+        # and start waiting on the slot event.
+        await asyncio.sleep(0.03)
+
+        # (3) empty the bucket again, then free the slot: the contender wakes
+        # to a free slot but no token -- the exact old-drop condition. Reset
+        # _last_refill too, or the bucket instantly "refills" from the stale
+        # timestamp and the empty-bucket condition never lands.
+        import time as _time
+
+        fc._async_rate_limiter._tokens = 0.0
+        fc._async_rate_limiter._last_refill = _time.monotonic()
+        async with fc._async_lock:
+            fc._in_flight = 0
+            fc._async_slot_event.set()
+
+        ok = await asyncio.wait_for(task, timeout=10.0)
+        assert ok is True, "contender was dropped after paying a token and losing the slot race"
+        assert fc.in_flight == 1
+        await fc.release_async()
         assert fc.in_flight == 0
 
     @pytest.mark.asyncio

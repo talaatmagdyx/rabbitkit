@@ -1,103 +1,176 @@
+<p align="center"><img src="assets/logo.svg" alt="rabbitkit" width="420"></p>
+
 # rabbitkit
 
-**The RabbitMQ client that treats message loss as a bug, not an edge case.**
+**RabbitMQ made enjoyable — less broker plumbing, more business logic.**
 
-rabbitkit is a RabbitMQ-first toolkit for Python services that can't afford
-to lose messages. It wraps `pika` and `aio-pika` with safe retry + dead-letter
-topology, explicit acknowledgement policies, publisher confirms, and an
-in-memory `TestBroker` so your CI never needs a real broker.
+[![PyPI](https://img.shields.io/pypi/v/rabbitkit)](https://pypi.org/project/rabbitkit/)
+[![CI](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml/badge.svg)](https://github.com/talaatmagdyx/rabbitkit/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Typed](https://img.shields.io/badge/types-mypy%20--strict-blue)](pyproject.toml)
+[![Style](https://img.shields.io/badge/style-ruff-261230)](pyproject.toml)
 
-No multi-broker abstraction, no task-queue semantics — just RabbitMQ, done
-carefully. A durable, retrying consumer in under 10 minutes.
+rabbitkit is a **RabbitMQ-first toolkit for Python services**. It gives you
+clean decorators, safe retries, dead-letter queues, publisher confirms,
+explicit acknowledgement policies, Kubernetes-ready lifecycle hooks,
+structured logging, OpenTelemetry tracing, and real in-memory testing — so
+your team can focus on what each message *means*, not how the broker behaves
+when things fail.
 
-**Docs:** [Full Guide](docs/guide/full-guide.md) · [Getting Started](docs/guide/getting-started.md) · [Retry & DLQ](docs/retry-and-dlq.md) · [Ack Policies](docs/ack-policy.md) · [Message Safety](docs/message-safety.md) · [Kubernetes](docs/kubernetes.md) · [Production Checklist](docs/production/checklist.md) · [Security](docs/security.md) · [Stability Policy](docs/stability-policy.md) · [Troubleshooting](docs/troubleshooting.md) · [Comparison](docs/comparison.md)
+RabbitMQ is powerful. Production RabbitMQ is full of sharp edges.
+rabbitkit smooths those edges **without hiding the broker from you**.
 
-## Stable core
+```python
+from rabbitkit import AsyncBroker, RabbitConfig
 
-- **Decorator-based routing** — `@broker.subscriber(queue=..., exchange=..., routing_key=...)`
-- **Sync + async** — `SyncBroker` (pika) and `AsyncBroker` (aio-pika) with identical public APIs
-- **Retry with delay queues** — TTL + DLX topology, configurable backoff, per-queue isolation, and a trusted retry-count header (a producer can't spoof it into skipping the DLQ or retrying forever)
-- **Dead-letter queues** — automatic DLQ routing after max retries
-- **Explicit ack policies** — `AUTO`, `MANUAL`, `NACK_ON_ERROR`, `ACK_FIRST` — you always know who owns settlement
-- **Publisher confirms** — real delivery confirmation via `PublishOutcome`, not a fire-and-forget guess
-- **Topology management** — `AUTO_DECLARE`, `PASSIVE_ONLY`, `MANUAL` modes
-- **Testing without RabbitMQ** — `TestBroker` exercises the *real* pipeline (real settlement, real ack/nack tracking) in memory
-- **Health checks for Kubernetes** — liveness, readiness, and full health status, correctly separated so a transient broker blip doesn't cause cascading pod restarts
-- **Structured logging** — structlog with per-message context and secret redaction
-- **Serialization** — JSON, msgspec, Pydantic auto-validation
-- **Dependency injection** — `Depends()`, `Header()`, `Path()`, `Context()` markers, zero setup required
-- **FastAPI integration** — `rabbitkit_lifespan()` async context manager
+broker = AsyncBroker(RabbitConfig())
 
-**Beyond the core:** publish-side backpressure, batch publishing, a DLQ
-inspector CLI, a management API client, and a circuit breaker are genuinely
-useful production features with real complexity — see the
-[Advanced features](#advanced-and-experimental-features) section.
-RPC, distributed locking, message signing, result backends, stream queues,
-and the monitoring dashboard are **experimental** — real, but with sharp
-edges you should understand before depending on them. See
-[`docs/stability-policy.md`](docs/stability-policy.md) for exactly what
-"stable" means here and what isn't covered yet.
+@broker.subscriber(queue="orders.created")
+async def handle_order(order: dict) -> None:
+    await fulfill_order(order)
+```
+
+That should feel like application code. The retry topology,
+acknowledgements, confirms, DLQs, shutdown behavior, and test harness should
+not be rewritten in every service. **That is what rabbitkit is for.**
+
+**Contents:** [Believes](#what-rabbitkit-believes) · [Why](#why-rabbitkit-exists) ·
+[Install](#installation) · [Quick start](#quick-start) ·
+[Safety model](#message-safety-model) · [Failure table](#what-happens-when-things-fail) ·
+[Ack policies](#acknowledgement-policies) · [Production profile](#production-profile) ·
+[Observability](#observability) · [DI](#dependency-injection) ·
+[Middleware](#middleware-batteries-included) · [CLI](#operate-it-from-the-terminal) ·
+[Compares](#how-it-compares) · [Architecture](#architecture) · [Docs](#documentation)
+
+---
+
+## What rabbitkit believes
+
+Most services need the same things:
+
+- a clean way to register consumers
+- safe retry behavior
+- a place for poison messages to go
+- publisher confirms that are **checked**
+- explicit acknowledgement ownership
+- graceful shutdown
+- useful logs and traces
+- health checks that behave correctly in Kubernetes
+- tests that do not require a live broker
+
+rabbitkit packages those concerns into one focused toolkit. The philosophy:
+
+> **Make RabbitMQ pleasant for developers and predictable for operators.**
+
+Developers get a clean programming model. Operators get visible message
+outcomes. Production gets fewer silent failure paths.
+
+## Why rabbitkit exists
+
+Starting with RabbitMQ is easy: `basic_publish(...)`, `basic_consume(...)`.
+Then production asks better questions:
+
+- What happens if a handler fails *forever*?
+- Where does a malformed payload go?
+- Can a rejected message disappear because the queue had no DLX?
+- Did the retry publish **confirm** before the original was acknowledged?
+- Can a DLQ replay remove a message before the republish is confirmed?
+- Can a pod shut down without interrupting in-flight work?
+- Can CI test real consumer behavior without starting RabbitMQ?
+
+rabbitkit exists for those questions. Its goal is not to turn RabbitMQ into
+something else — it is to make direct RabbitMQ usage feel like good
+application code: clear routing, safe defaults, explicit outcomes, real
+tests, production-ready lifecycle.
+
+**rabbitkit is:** a RabbitMQ-first toolkit · a clean consumer/publisher
+API · a reliability layer over `pika` and `aio-pika` · a testing layer for
+handlers · a production lifecycle layer · safety defaults for retry, DLQ,
+confirms, and acks.
+
+**rabbitkit is not:** a task queue · a scheduler · a generic event-streaming
+abstraction · a replacement for understanding RabbitMQ · an exactly-once
+delivery system.
+
+---
 
 ## Installation
 
 ```bash
-pip install rabbitkit[sync]         # SyncBroker (pika)
 pip install rabbitkit[async]        # AsyncBroker (aio-pika)
+pip install rabbitkit[sync]         # SyncBroker (pika)
 pip install rabbitkit[all-brokers]  # both transports
-pip install rabbitkit[all]          # everything, including advanced/experimental extras
+pip install rabbitkit[all]          # everything optional
 ```
 
-Requires **Python >= 3.11**. See [`docs/guide/full-guide.md`](docs/guide/full-guide.md#1-getting-started) for the full extras table (compression, redis, pydantic, msgspec, management, dashboard, cli, and more).
+Requires Python ≥ 3.11.
 
-## Quick Start
+## Quick start
 
-### 1. A consumer
+### 1. Create a consumer
 
 ```python
 from rabbitkit import RabbitConfig, AsyncBroker
 
 broker = AsyncBroker(RabbitConfig())
 
-@broker.subscriber(queue="orders")
+@broker.subscriber(queue="orders.created")
 async def handle_order(body: dict) -> None:
     print(f"order id={body['id']}")
 
-await broker.start()
+async def main() -> None:
+    await broker.start()
 ```
 
-### 2. Publish a message
+That is enough to consume messages. But production usually needs more than
+"enough".
+
+### 2. Publish — and check the outcome
 
 ```python
-await broker.publish(
-    exchange="orders",
-    routing_key="orders",
-    body={"id": 42, "item": "widget"},
-)
+async def publish_order() -> None:
+    outcome = await broker.publish(
+        exchange="orders",
+        routing_key="orders.created",
+        body={"id": 42, "item": "widget"},
+    )
+    outcome.raise_for_status()
 ```
 
-### 3. Add retry and a dead-letter queue
+A publish can be `CONFIRMED`, `SENT`, `RETURNED`, `NACKED`, `TIMEOUT`, or
+`ERROR`. Application code can treat those as different states instead of
+assuming "publish called" means "message safe".
+
+### 3. Add retry and DLQ handling
 
 ```python
 from rabbitkit import RetryConfig
 
 @broker.subscriber(
-    queue="orders",
+    queue="orders.created",
+    exchange="orders",
+    routing_key="orders.created",
     retry=RetryConfig(max_retries=3, delays=(5, 30, 120)),
 )
-async def handle_order(body: dict) -> None:
-    ...   # retried with backoff on transient errors; dead-lettered after 3 failures
+async def handle_order_with_retry(body: dict) -> None:
+    await fulfill_order(body)
 ```
 
-Setting `retry=` declares the delay-queue/DLX topology *and* installs the
-retry middleware together, from one switch — see
-[`docs/retry-and-dlq.md`](docs/retry-and-dlq.md) for the full topology,
-error classification, and DLQ recovery.
+This wires the reliability path — **broker-side**, carried in hardened
+headers, surviving crashes and reconnects:
 
-**Before you rely on this for anything with side effects (payments, emails,
-external API calls): read [the idempotency contract](docs/production/idempotency.md).**
-At-least-once delivery means a handler can run more than once for the same
-message — retry and DLQ correctness don't remove that requirement, they
-make it safe *if* your handler is idempotent.
+```
+orders.created
+  → orders.created.retry.1   (5s)
+  → orders.created.retry.2   (30s)
+  → orders.created.retry.3   (120s)
+  → orders.created.dlq
+```
+
+Transient failures retry with backoff. Permanent failures skip the ladder
+and go straight to the DLQ. Nothing disappears silently — every rejecting
+route gets a DLQ by default.
 
 ### 4. Test it without RabbitMQ
 
@@ -107,29 +180,38 @@ from rabbitkit.testing import TestBroker
 def test_order_handler():
     broker = TestBroker()
 
-    @broker.subscriber(queue="orders")
+    @broker.subscriber(queue="orders.created")
     def handle(body: dict) -> None:
         assert body["id"] == 42
 
     broker.start()
-    broker.publish("orders", b'{"id": 42}')
+    broker.publish("orders.created", b'{"id": 42}')
     broker.stop()
 ```
 
-`TestBroker` is not a mock — it runs the same pipeline, settlement, and
-ack/nack tracking your production broker does, just without a socket. See
-[`docs/guide/full-guide.md#25-testing`](docs/guide/full-guide.md).
+`TestBroker` is not a mock. It runs the real routing, middleware,
+serialization, dependency resolution, settlement, and ack/nack pipeline in
+memory. Your CI can test RabbitMQ behavior without running RabbitMQ.
 
-### 5. Run it in FastAPI
+### 5. Run with FastAPI
 
 ```python
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+
+from rabbitkit import RabbitConfig, AsyncBroker
 from rabbitkit.fastapi import rabbitkit_lifespan
+
+api_broker = AsyncBroker(RabbitConfig())
+
+@api_broker.subscriber(queue="orders.created")
+async def handle_order_event(body: dict) -> None:
+    ...
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with rabbitkit_lifespan(broker):
+    async with rabbitkit_lifespan(api_broker):
         yield
 
 app = FastAPI(lifespan=lifespan)
@@ -141,105 +223,225 @@ app = FastAPI(lifespan=lifespan)
 from rabbitkit import RabbitConfig
 from rabbitkit.sync import SyncBroker
 
-broker = SyncBroker(RabbitConfig())
+sync_broker = SyncBroker(RabbitConfig())
 
-@broker.subscriber(queue="orders")
-def handle_order(body: bytes) -> None:
-    print(f"Received order: {body}")
+@sync_broker.subscriber(queue="orders.created")
+def handle_order_sync(body: bytes) -> None:
+    print(f"received order: {body!r}")
 
-broker.start()
+def run() -> None:
+    sync_broker.start()
 ```
 
-**Publish-only `SyncBroker` (no subscribers, never calls `run()`):** nothing
-else drives the connection's I/O loop, so a long idle gap between
-`publish()` calls can get the connection heartbeat-timed-out broker-side.
-Call `broker.pump_idle()` periodically from your own idle loop (same thread
-that called `start()`) to reconnect proactively and keep the liveness
-heartbeat fresh. `AsyncBroker` needs no equivalent — see
-[the sync-vs-async connection model note](docs/guide/full-guide.md#sync-vs-async-two-different-connection-models)
-for why.
+The sync broker fits simple workers, scripts, legacy services, and teams
+that do not want an asyncio runtime. **Throughput note:** sync confirmed
+publishing waits one confirm per message (~0.9k msg/s measured);
+`worker_count` does not raise it. For high-throughput confirmed publishing
+use `AsyncBroker` + `AsyncBatchPublisher` (pipelined confirms, ~6.1k msg/s
+measured) or `SyncBatchPublisher` (pipelined confirms for sync code on a
+dedicated I/O thread), or scale out across processes.
 
-**Sync confirmed-publish throughput ceiling (~0.9k msg/s):** `SyncBroker.publish()`
-waits for a publisher confirm per message on a single channel, so throughput
-is bounded by broker round-trip latency (~900 msg/s in the benchmarks),
-*regardless of how many worker threads publish* — pika's `BlockingConnection`
-serializes confirms and does not pipeline them. This is fine for
-publish-alongside-consume workloads, but if you need to drain a large backlog
-(e.g. an outbox after an outage), use `AsyncBroker` with `AsyncBatchPublisher`
-(pipelined confirms, ~6.1k msg/s) or scale out across processes. `worker_count`
-does **not** raise sync publish throughput. `highload.BatchPublisher` improves
-ergonomics, not the confirm ceiling.
+---
 
-## What's next
+## Message safety model
 
-- **[Full Guide](docs/guide/full-guide.md)** — every feature, in depth: configuration, routing, ack policies, DI, middleware, retry, serialization, high-load infrastructure, RPC, backpressure, health checks, locking, deduplication, circuit breaking, signing, compression, result backends, stream queues, AsyncAPI, the management API, the dashboard, the CLI, testing, FastAPI, environment config, Kubernetes, app lifecycle, and architecture.
-- **[Production Checklist](docs/production/checklist.md)** — what to configure before you trust this with real traffic.
-- **[Idempotency Contract](docs/production/idempotency.md)** — the one thing "safe retries" doesn't do for you automatically.
-- **[Troubleshooting](docs/troubleshooting.md)** — symptom → cause → fix for the issues people actually hit.
-- **[Stability Policy](docs/stability-policy.md)** — what's frozen, what's advanced, what's experimental, and why.
-- **[Kubernetes Guide](docs/kubernetes.md)** — probes, graceful shutdown, and a full deployment manifest.
-- **[Security](docs/security.md)** — signing, replay protection, TLS, and safe defaults.
+rabbitkit is an **at-least-once** toolkit: a handler may run more than once
+(crash after work but before ack, connection death mid-handler, DLQ replay,
+producer retry after a confirm timeout…). rabbitkit removes dangerous
+ambiguity around those cases — it does not remove the need for idempotency.
 
-## Advanced and experimental features
+For payments, emails, tickets, webhooks, external API calls: design the
+handler so running it twice is safe (idempotency keys, unique constraints,
+processed-event tables, outbox patterns — or rabbitkit's deduplication
+middleware, whose `store_results` mode replays the original result to
+duplicates). The rule is simple:
 
-Real features, real complexity — deliberately not part of the 10-minute
-story above. See the [Full Guide](docs/guide/full-guide.md) for usage of
-each.
+> rabbitkit can help you retry safely. Your business logic must still be
+> safe to retry.
 
-**Advanced Stable** (production-grade, opt in deliberately):
-publish-side backpressure (`FlowController`), batch publishing/acking,
-the DLQ inspector + CLI, the RabbitMQ Management API client, the CLI, and
-`CircuitBreakerMiddleware` (note: it's a no-op without a real circuit
-breaker implementation such as `obskit` — see the guide before adopting it).
+## What happens when things fail?
 
-**Experimental** (`rabbitkit.experimental` — may change without a
-deprecation cycle, read the caveats before depending on them):
-RPC over direct reply-to, distributed locking (`RedisLock` has no TTL
-renewal), message signing (default nonce cache is per-process — wire a
-shared cache for real replay protection), result backends (task-queue-style
-semantics, deliberately out of scope for rabbitkit's core), RabbitMQ stream
-queues, and the monitoring dashboard (**unauthenticated by default** — never
-expose it without `auth_token=` and a reverse proxy).
+| Failure mode | rabbitkit behavior |
+|---|---|
+| Handler raises forever | Retry ladder, then DLQ |
+| Malformed payload | Classified permanent, preserved in DLQ |
+| Reject with no DLX | Safe default auto-provisions a DLQ — no silent discard |
+| Retry publish times out | Original is **not** acked as if the retry succeeded |
+| DLQ replay publish fails | DLQ message is **not** removed as if replay succeeded |
+| Message unroutable | Mandatory publishing returns a distinct `RETURNED` outcome |
+| Broker blips | Readiness changes; liveness does **not** kill the pod |
+| Pod gets SIGTERM | Consumers stop first, in-flight work drains |
+| CI has no RabbitMQ | `TestBroker` runs the real pipeline in memory |
+
+## Acknowledgement policies
+
+Settlement is a decision, not a side effect hidden in a callback.
+
+| Policy | Behavior | Use case |
+|---|---|---|
+| `AUTO` | Ack on success, retry/reject on failure | Most consumers |
+| `MANUAL` | Handler owns ack/nack/reject | Custom settlement flows |
+| `NACK_ON_ERROR` | Ack on success, nack on failure | Never silently accept failed work |
+| `ACK_FIRST` | Ack before the handler runs | At-most-once workloads |
+
+`ACK_FIRST` can lose messages if the handler fails after the ack — use it
+only when loss is acceptable.
+
+## Production profile
+
+The recommended baseline (see the
+[production checklist](docs/production/checklist.md)): quorum queues (+
+`delivery_limit`), per-queue retry/DLQ topology, publisher confirms on,
+mandatory publishing where routing matters, checked `PublishOutcome`s,
+explicit ack policies, structured logs, split readiness/liveness probes,
+management-API metrics for queue depth and consumer lag, idempotent
+handlers. Migrating existing classic queues to quorum? There's a tool:
+`rabbitkit topology migrate` ([guide](docs/quorum-migration.md)).
+
+## Observability
+
+Structured logs carry message context (`message_id`, `correlation_id`,
+routing, queue, handler, retry count, settlement, duration, error type) with
+secret redaction on by default. Metrics cover consumed/acked/nacked/
+retried/dead-lettered counts, publish outcomes, handler latency,
+redeliveries, reconnects, and — via the management API poller — queue depth
+and consumer lag. Tracing is standard OpenTelemetry
+(`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
+one continuous trace from publish to consume.
+
+## Advanced & experimental
+
+**Advanced stable** (enable deliberately): publish-side backpressure
+(`FlowController`), batch publishing/acking, pipelined sync confirms
+(`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
+topology validation/drift/migration CLI, health watcher, circuit-breaker
+middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
+pybreaker).
+
+**Experimental** (may change without a deprecation cycle — read the
+[stability policy](docs/stability-policy.md)): RPC over direct reply-to,
+distributed locking, message signing, result backends, stream queues, the
+monitoring dashboard. Notable caveats: the default signing nonce cache is
+per-process (use a shared cache for real replay protection), and never
+expose the dashboard publicly without authentication.
+
+## Dependency injection
+
+Handlers resolve request-like context declaratively — typed body, headers,
+routing-key segments, and shared dependencies:
+
+```python
+from rabbitkit import AsyncBroker, Context, Depends, Header, Path, RabbitConfig
+from rabbitkit.core.message import RabbitMessage
+
+di_broker = AsyncBroker(RabbitConfig())
+
+def get_db() -> str:
+    return "db-connection"
+
+@di_broker.subscriber(queue="tenants.{tenant_id}.orders")
+async def handle_tenant_order(
+    body: dict,
+    tenant_id: str = Path(),
+    trace_id: str = Header("x-trace-id", default=""),
+    db: str = Depends(get_db),
+    message: RabbitMessage = Context(),
+) -> None:
+    ...
+```
+
+Serialization is pluggable per route: raw bytes, JSON (default), Pydantic
+models, msgspec structs, or a custom parser/decoder pipeline — annotate the
+body parameter with the type you want and pick the serializer that
+validates it.
+
+## Middleware, batteries included
+
+| Middleware | Job |
+|---|---|
+| `RetryMiddleware` | Broker-side retry ladder (auto-wired with `retry=`) |
+| `DeduplicationMiddleware` | Redis-backed duplicate suppression; `claim` policy is crash-safe; `store_results` replays the original answer to duplicates |
+| `MetricsMiddleware` | Counters + latency histograms, cardinality-guarded labels |
+| `OTelTracingMiddleware` | Standard OpenTelemetry spans + W3C propagation |
+| `CompressionMiddleware` | gzip/zstd with streaming zip-bomb guards |
+| `RateLimitMiddleware` | Token-bucket consume throttling (nack/drop/wait) |
+| `TimeoutMiddleware` | Per-handler deadlines, retry-classified |
+| `CircuitBreakerMiddleware` | Wraps any `CircuitBreakerProtocol` implementation |
+| `SigningMiddleware` | HMAC signing + replay protection (experimental) |
+
+## Operate it from the terminal
+
+```bash
+rabbitkit run myapp.main:broker                   # run consumers
+rabbitkit dlq inspect orders.dlq                  # peek at poison messages
+rabbitkit dlq replay orders.dlq orders --reset-retry-count
+rabbitkit topology validate myapp.main:broker     # declared vs live drift
+rabbitkit topology migrate myapp.main:broker      # classic -> quorum, planned & resumable
+rabbitkit health myapp.main:broker
+```
+
+The DLQ replay acks a message only after its republish is broker-confirmed —
+the recovery tool cannot itself lose messages.
+
+<p align="center"><img src="assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
+
+## How it compares
+
+- **Raw `pika` / `aio-pika`** — rabbitkit is a reliability layer *on top of*
+  them, not a replacement; drop to the underlying client any time.
+- **Celery / task queues** — rabbitkit is messaging, not a task framework:
+  no scheduler, no result-store-first model, RabbitMQ stays visible.
+- **FastStream** — a great multi-broker, async-first framework. Choose it
+  for broker portability and its ecosystem; choose rabbitkit for
+  RabbitMQ-only depth: broker-side retry state, auto-DLX defaults, checked
+  publish outcomes, DLQ replay tooling, and a sync transport.
 
 ## Architecture
 
 ```
 rabbitkit/
-  core/                # Business logic -- ZERO transport imports
-  sync/                # pika adapter (AMQP 0-9-1)
-  async_/              # aio-pika adapter (AMQP 0-9-1)
-  middleware/           # retry, compression, dedup, rate limit, timeout, tracing, metrics
-                         #   (+ circuit breaker, signing -- see stability policy)
-  serialization/        # JSON, msgspec, pydantic, two-stage pipeline
-  di/                   # Depends, Header, Path, Context, resolver
-  testing/              # TestBroker, TestApp, fixtures
+  core/                 # route registry, topology, pipeline, settlement, config
+  sync/                 # pika adapter (+ SyncBatchPublisher)
+  async_/               # aio-pika adapter (+ AsyncBatchPublisher)
+  middleware/           # retry, dedup, metrics, otel, compression, rate limit…
+  serialization/        # JSON, msgspec, Pydantic, parser/decoder pipeline
+  di/                   # Depends, Header, Path, Context
+  testing/              # TestBroker and friends
   highload/             # FlowController, BatchPublisher, BatchAcker
-  experimental/         # RPC, locking, signing, results, streams, dashboard -- see stability policy
-  fastapi.py            # rabbitkit_lifespan
+  cli/                  # dlq, topology, migrate, health, run, shell
+  fastapi.py            # FastAPI lifespan integration
 ```
 
-The shared core has zero transport dependencies; sync and async adapters are
-thin I/O layers. See [`docs/guide/full-guide.md#30-architecture--design-patterns`](docs/guide/full-guide.md)
-for design patterns, invariants, and the sync-vs-async connection model.
+The shared core has **zero** imports from `pika` or `aio-pika` — both
+transports are adapters over the same registry, pipeline, topology model,
+and settlement rules.
 
 ## Compatibility
 
-- **Python**: >= 3.11 (3.11, 3.12, 3.13)
-- **RabbitMQ**: >= 3.12
-- **pika**: >= 1.3, < 2.0
-- **aio-pika**: >= 9.1, < 10.0 (`9.0.0` imports `pkg_resources`, which recent `setuptools` no longer ships -- see `docs/troubleshooting.md`)
+Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13) · RabbitMQ ≥ 3.12 recommended ·
+`pika >= 1.3, < 2.0` · `aio-pika >= 9.1, < 10.0`
 
-## Contributing
+## Documentation
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, quality gates, and PR
-guidelines. This project follows the
-[Contributor Covenant](CODE_OF_CONDUCT.md).
+[Getting Started](docs/guide/getting-started.md) ·
+[Full Guide](docs/guide/full-guide.md) ·
+[Message Safety](docs/message-safety.md) ·
+[Retry & DLQ](docs/retry-and-dlq.md) ·
+[Production Checklist](docs/production/checklist.md) ·
+[Idempotency Contract](docs/production/idempotency.md) ·
+[Kubernetes](docs/kubernetes.md) ·
+[Quorum Migration](docs/quorum-migration.md) ·
+[Security](docs/security.md) ·
+[Stability Policy](docs/stability-policy.md) ·
+[Troubleshooting](docs/troubleshooting.md)
 
-## Security
+## Contributing & security
 
-Found a vulnerability? See [SECURITY.md](SECURITY.md) for how to report it
-privately — please do not open a public issue.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development and quality
+gates (ruff, `mypy --strict`, near-total test coverage — the bar is real).
+Found a vulnerability? Follow [SECURITY.md](SECURITY.md) and report it
+privately.
 
 ## License
 
-MIT
+[MIT](LICENSE)

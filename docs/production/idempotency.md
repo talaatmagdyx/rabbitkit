@@ -127,3 +127,23 @@ Pick whichever of these fits the side effect:
 **If your handler's side effect can't be repeated safely, at-least-once
 delivery — which is what "safe retries" is built on — will eventually
 repeat it. Design for that, don't fight it.**
+
+
+## Result replay: the idempotent-receiver effect
+
+`DeduplicationConfig(mark_policy="claim", store_results=True)` upgrades
+dedup from "skip the duplicate" to "answer the duplicate": on handler
+success the completed key stores the handler's JSON-serializable result,
+and a later duplicate delivery **replays** it — the pipeline re-publishes
+the stored result byte-identically to the route's result publisher /
+`reply_to`, so a redelivered RPC request gets the same answer without the
+handler's side effects running twice.
+
+This is the strongest duplicate posture rabbitkit offers, and it is still
+**not exactly-once delivery** — that does not exist on RabbitMQ. It is the
+idempotent-receiver *effect*: at-least-once transport, at-most-once
+handler execution per key, deterministic responses. Degradations are
+graceful and never fail the handler: results that aren't JSON-serializable
+or exceed `max_result_bytes` store the plain completed mark (the duplicate
+skips without replay), and keys written by older deployments read as
+completed-without-replay — rolling upgrades are safe.

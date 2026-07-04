@@ -1,4 +1,4 @@
-"""OTelTracingMiddleware — native OpenTelemetry tracing (no obskit needed).
+"""OTelTracingMiddleware — native OpenTelemetry tracing.
 
 Speaks ``opentelemetry-api`` directly so publish→consume trace propagation
 works for anyone, using W3C ``traceparent``/``tracestate`` headers over AMQP.
@@ -10,10 +10,6 @@ Lazy/no-op: if ``opentelemetry`` is not importable, every span is a
 passthrough — and the middleware warns ONCE at construction (a caller who
 adds it is opting into tracing; silently no-oping forever reads as
 "nothing to trace yet" instead of "tracing was never active").
-
-Relationship to :class:`~rabbitkit.middleware.tracing.TracedConsumerMiddleware`
-(the Lucidya-internal ``obskit`` integration): pick ONE. Stacking both on a
-route double-instruments every message.
 """
 
 from __future__ import annotations

@@ -72,7 +72,7 @@ pip install rabbitkit[all]
 | `dashboard` | starlette, uvicorn | Monitoring dashboard |
 | `settings` | pydantic-settings | Env-based configuration |
 | `management` | aiohttp | RabbitMQ management API client |
-| `obskit` | obskit | OpenTelemetry tracing integration |
+| `otel` | opentelemetry-api | OpenTelemetry tracing (`OTelTracingMiddleware`) |
 | `reload` | watchfiles | Hot reload during development |
 
 ### Your First Consumer (Sync)
@@ -601,7 +601,7 @@ list is outermost). The chain is **cached per route** for performance.
 | `RetryMiddleware` | Transient error → delay queue + redelivery |
 | `CompressionMiddleware` | Compress/decompress bodies (gzip/zstd) |
 | `MetricsMiddleware` | Prometheus counters/histograms |
-| `TracedConsumerMiddleware` | OpenTelemetry tracing (obskit) |
+| `OTelTracingMiddleware` | OpenTelemetry tracing (`rabbitkit[otel]`) |
 | `DeduplicationMiddleware` | Redis-based idempotent processing |
 | `CircuitBreakerMiddleware` | Fail-fast on cascading failures |
 | `RateLimitMiddleware` | Token-bucket rate limiting |
@@ -1155,7 +1155,7 @@ sentinel.
 > **Advanced Stable, not dependency-free.** `CircuitBreakerMiddleware` is a
 > no-op passthrough unless you give it a real circuit breaker implementation
 > — it does not ship its own breaker logic. In practice that means
-> `pip install rabbitkit[obskit]` (or any object satisfying
+> any object satisfying
 > `CircuitBreakerProtocol`/`AsyncCircuitBreakerProtocol` yourself). Don't
 > add this middleware expecting circuit-breaking "for free."
 
@@ -1163,7 +1163,7 @@ sentinel.
 from rabbitkit import CircuitBreakerMiddleware
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerProtocol
 
-# Using a provided circuit breaker implementation (e.g. obskit.resilience.CircuitBreaker)
+# Using any CircuitBreakerProtocol-compatible implementation (e.g. pybreaker)
 breaker = MyCircuitBreaker(failure_threshold=5, recovery_timeout=30)
 @broker.subscriber(
     queue="external-api-calls",

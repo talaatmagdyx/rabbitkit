@@ -52,6 +52,7 @@ nav:
       - Getting Started: guide/getting-started.md
       - Full Guide: guide/full-guide.md
       - Retry Architecture: rabbitmq-retry-architecture.md
+      - Quorum Migration: quorum-migration.md
   - API Reference:
       - Brokers: api/brokers.md
       - Configuration: api/config.md

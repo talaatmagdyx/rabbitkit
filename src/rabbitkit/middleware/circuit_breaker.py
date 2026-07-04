@@ -1,6 +1,6 @@
 """Circuit breaker middleware — wraps handler execution and publish operations.
 
-Uses obskit's CircuitBreaker or any compatible implementation that satisfies
+Uses any circuit-breaker implementation that satisfies
 CircuitBreakerProtocol / AsyncCircuitBreakerProtocol.
 
 When the circuit is open, operations fail fast with CircuitBreakerOpenError
@@ -34,9 +34,8 @@ class CircuitBreakerMiddleware(BaseMiddleware):
 
     Usage::
 
-        from obskit.resilience import CircuitBreaker
-
-        cb = CircuitBreaker(name="rabbitmq", fail_max=5, reset_timeout=60)
+        # any CircuitBreakerProtocol-compatible implementation, e.g. pybreaker
+        cb = MyCircuitBreaker(name="rabbitmq", fail_max=5, reset_timeout=60)
         middleware = CircuitBreakerMiddleware(circuit_breaker=cb)
 
         # Or with separate publish CB:

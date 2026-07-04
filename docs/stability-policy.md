@@ -79,7 +79,7 @@ it is not part of the "understand rabbitkit in 10 minutes" story.
 | DLQ inspection (`DLQInspector`) + the CLI's `dlq` commands | `rabbitkit` | |
 | RabbitMQ Management API client (`RabbitManagementClient`) | `rabbitkit` | Async methods require `rabbitkit[management]` (aiohttp). |
 | CLI (`rabbitkit run`/`health`/`topology`/`routes`/`shell`) | `rabbitkit[cli]` | |
-| `CircuitBreakerMiddleware` | `rabbitkit` | **Requires a `CircuitBreakerProtocol`-compatible implementation (e.g. `obskit`) to do anything** — it's a no-op passthrough without one. Exported at the top level for convenience, but treat the dependency as a real one before adopting it. |
+| `CircuitBreakerMiddleware` | `rabbitkit` | **Requires a `CircuitBreakerProtocol`-compatible implementation (e.g. pybreaker) to do anything** — it's a no-op passthrough without one. Exported at the top level for convenience, but treat the dependency as a real one before adopting it. |
 
 ---
 

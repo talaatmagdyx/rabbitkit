@@ -329,7 +329,7 @@ from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware
 from rabbitkit.middleware.timeout import TimeoutMiddleware, TimeoutConfig
 from rabbitkit.middleware.exception import ExceptionMiddleware
-from rabbitkit.middleware.tracing import TracedConsumerMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.core.config import DeduplicationConfig
 
 from .config import build_config
@@ -348,9 +348,9 @@ broker = AsyncBroker(
 redis = aioredis.from_url("redis://redis.internal:6379/0")
 
 # ── Middlewares (instances are shared across messages; construct once) ──
-trace_mw  = TracedConsumerMiddleware(service_name="order-service")
+trace_mw  = OTelTracingMiddleware(service_name="order-service")
 exc_mw    = ExceptionMiddleware(swallow_permanent=False)  # let terminal errors surface → DLQ
-cb_mw     = CircuitBreakerMiddleware(async_circuit_breaker=...)  # obskit CircuitBreaker (§12)
+cb_mw     = CircuitBreakerMiddleware(async_circuit_breaker=...)  # any CircuitBreakerProtocol impl (§12)
 dedupe_mw = DeduplicationMiddleware(
     redis, DeduplicationConfig(key_prefix="orders:dedup", ttl=86400, key_source="message_id"),
     key_fn=lambda m: m.headers.get("x-idempotency-key") or m.message_id,  # business key first
@@ -1071,7 +1071,7 @@ Fields: `message_id`, `correlation_id`, `trace_id`, `queue`, `routing_key`, `ten
 
 Scrape `queue_depth`, `messages_ready`, `messages_unacknowledged`, `messages_dlq` from `RabbitManagementClient` (§30) — these come from the broker, not the app, and survive app outages.
 
-**Tracing (OpenTelemetry via `TracedConsumerMiddleware`):** consume span + publish span, trace context propagated through headers (`traceparent`), child spans for DB and external HTTP. A single trace shows: receive → dedupe → handler → DB tx → outbox publish, *including* retries (because tracing is outermost). This is what lets you answer "why is this order stuck?" in one click.
+**Tracing (OpenTelemetry via `OTelTracingMiddleware`):** consume span + publish span, trace context propagated through headers (`traceparent`), child spans for DB and external HTTP. A single trace shows: receive → dedupe → handler → DB tx → outbox publish, *including* retries (because tracing is outermost). This is what lets you answer "why is this order stuck?" in one click.
 
 **Dashboards:** service overview (throughput/latency/error), queue health (depth/age/consumers), retry health (retry rate, attempt distribution), **DLQ triage** (depth, growth rate, top `error_type`), downstream dependency health (breaker state, downstream latency), saturation (prefetch utilization, worker pool pending, connection blocked), SLO dashboard (§23).
 

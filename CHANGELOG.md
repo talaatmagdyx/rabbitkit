@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-04
+
+Roadmap release: six features extending the 1.2.0 thesis (*no message is
+lost, and operators can see and fix everything*) to places it didn't reach —
+the open observability ecosystem, the migration path onto the mandated
+quorum topology, retry-wave decorrelation, duplicate-result replay, and the
+sync confirm ceiling. Two features shipped as their honest reframings: sync
+confirm pipelining runs on a dedicated `SelectConnection` I/O thread
+(impossible on `BlockingChannel`), and "exactly-once" ships as the
+idempotent-receiver *effect* (wire-level exactly-once does not exist on
+RabbitMQ and the docs never claim it).
+
+### Removed
+
+- **`TracedConsumerMiddleware`** (the obskit integration) — removed
+  entirely; rabbitkit is now fully self-contained, with zero org-internal
+  packages needed for any feature. obskit was never a required dependency
+  (every reference was lazy or duck-typed), and its one functional
+  integration is redundant with `OTelTracingMiddleware`, a drop-in
+  replacement (same spans, attributes, and propagation). Migration: swap
+  the class name and `pip install rabbitkit[otel]`. Duck-typed
+  `CircuitBreakerProtocol` compatibility is unaffected — any conforming
+  implementation (e.g. pybreaker) works as before.
+
+### Added
+
+- **`OTelTracingMiddleware`** (`rabbitkit[otel]`) — native OpenTelemetry
+  tracing via `opentelemetry-api`: CONSUMER spans with W3C `traceparent`
+  extraction from AMQP headers, PRODUCER spans injecting context into a copy
+  of the (frozen) envelope, exception recording with ERROR status, OTel
+  messaging semantic attributes. No-op with one loud construction warning
+  when opentelemetry isn't installed. Removes the org-internal `obskit`
+  coupling as the only tracing path — pick one middleware, not both.
+- **`HealthWatcher` / `AsyncHealthWatcher`** — opt-in push-style health
+  notifications: polls `broker_health_check` and fires
+  `on_change(old, new, result)` only after N consecutive identical readings
+  (debounce, default 2 — one flapping poll never pages). Callback errors are
+  logged, never raised. Optional collector emits a `rabbitkit_health_state`
+  gauge (0/1/2). For non-k8s deployments; probes stay primary on k8s.
+- **`rabbitkit topology migrate`** — the supported classic→quorum path the
+  production profile mandates but 1.2.0 had no route to. Plan mode (default,
+  never mutates) emits an ordered runbook + a bindings/arguments rollback
+  snapshot; `--execute --strategy drain-cutover` performs the
+  shovel-based create-tmp → drain → delete → redeclare-as-quorum → drain-back
+  sequence with rails (refuses live consumers without `--force`, verifies
+  message counts before every destructive step, checkpoints each of 11 steps
+  to a state file for `--resume`); `--strategy bridge` creates `{q}.q2` +
+  duplicate bindings and deletes nothing; `--dry-run` prints every management
+  call it would make. Detects a missing shovel plugin with a clear error.
+  `RabbitManagementClient` gained `put_parameter`/`delete_parameter`/
+  `list_shovel_statuses`/`get_queue_bindings`/`declare_queue`/`bind_queue`.
+- **`RetryConfig(jitter_mode="sharded")`** — decorrelates retry waves (the
+  audit's retry-storm amplifier) without per-message TTL: each tier becomes
+  `jitter_shards` sub-queues whose uniform TTLs stagger across
+  ±`jitter_factor`; a message picks its shard by a stable md5 hash of its
+  message_id (Python's `hash()` is process-salted and would change a
+  message's cadence per redelivery). Shard 0 keeps the legacy `{q}.retry.N`
+  name and exact TTL — enabling on an existing topology is additive, no
+  406s; the default `"off"` topology is byte-identical (regression-tested).
+  The roadmap's secondary delayed-exchange backend is deferred: it requires
+  custom exchange-type support in the core enums and both transports.
+- **`DeduplicationConfig(store_results=True)`** — the idempotent-receiver
+  effect on the crash-safe `claim` policy: handler results are stored in a
+  versioned envelope alongside the completed mark, and a duplicate delivery
+  REPLAYS the stored result (the pipeline re-publishes it byte-identically
+  to the result publisher / `reply_to`) instead of just skipping — a
+  redelivered RPC request gets the same answer without the handler's side
+  effects running twice. Graceful degradations, never errors: non-JSON or
+  oversized (`max_result_bytes`) results store the plain mark; legacy values
+  and schema-tag mismatches skip without replay (safe rolling upgrade).
+- **`SyncBatchPublisher`** — pipelined publisher confirms for sync code,
+  built on a private `pika.SelectConnection` owned entirely by one dedicated
+  daemon I/O thread (the one-thread-one-connection invariant holds; callers
+  enqueue thread-safely and block on their own outcome). Every slot settles
+  on every path — ack/nack (incl. `multiple=True` ranges),
+  Return-before-Ack with first-settlement-wins, caller timeout → TIMEOUT
+  with late-confirm no-op, connection death → ERROR for in-flight and
+  queued, bounded-jitter reconnect, drain-then-fail on close. Standalone by
+  design (not wired into `SyncBroker.publish`); raises the documented
+  ~0.9k msg/s blocking ceiling for callers who adopt it.
+
+
 ## [1.2.0] — 2026-07-04
 
 Production-hardening release implementing the full `PRODUCTION_AUDIT.md`

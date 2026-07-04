@@ -35,13 +35,22 @@ That should feel like application code. The retry topology,
 acknowledgements, confirms, DLQs, shutdown behavior, and test harness should
 not be rewritten in every service. **That is what rabbitkit is for.**
 
-**Contents:** [Believes](#what-rabbitkit-believes) · [Why](#why-rabbitkit-exists) ·
-[Install](#installation) · [Quick start](#quick-start) ·
-[Safety model](#message-safety-model) · [Failure table](#what-happens-when-things-fail) ·
-[Ack policies](#acknowledgement-policies) · [Production profile](#production-profile) ·
-[Observability](#observability) · [DI](#dependency-injection) ·
-[Middleware](#middleware-batteries-included) · [CLI](#operate-it-from-the-terminal) ·
-[Compares](#how-it-compares) · [Architecture](#architecture) · [Docs](#documentation)
+**Contents:** 
+- [Believes](#what-rabbitkit-believes) ·
+- [Why](#why-rabbitkit-exists) ·
+- [Install](#installation) ·
+- [Quick start](#quick-start) ·
+- [Safety model](#message-safety-model) ·
+- [Failure table](#what-happens-when-things-fail) ·
+- [Ack policies](#acknowledgement-policies) ·
+- [Production profile](#production-profile) ·
+- [Observability](#observability) ·
+- [DI](#dependency-injection) ·
+- [Middleware](#middleware-batteries-included) ·
+- [CLI](#operate-it-from-the-terminal) ·
+- [Compares](#how-it-compares) ·
+- [Architecture](#architecture) ·
+- [Docs](#documentation)
 
 ---
 
@@ -423,17 +432,17 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13) · RabbitMQ ≥ 3.12 recommended ·
 
 ## Documentation
 
-[Getting Started](docs/guide/getting-started.md) ·
-[Full Guide](docs/guide/full-guide.md) ·
-[Message Safety](docs/message-safety.md) ·
-[Retry & DLQ](docs/retry-and-dlq.md) ·
-[Production Checklist](docs/production/checklist.md) ·
-[Idempotency Contract](docs/production/idempotency.md) ·
-[Kubernetes](docs/kubernetes.md) ·
-[Quorum Migration](docs/quorum-migration.md) ·
-[Security](docs/security.md) ·
-[Stability Policy](docs/stability-policy.md) ·
-[Troubleshooting](docs/troubleshooting.md)
+- [Getting Started](docs/guide/getting-started.md) ·
+- [Full Guide](docs/guide/full-guide.md) ·
+- [Message Safety](docs/message-safety.md) ·
+- [Retry & DLQ](docs/retry-and-dlq.md) ·
+- [Production Checklist](docs/production/checklist.md) ·
+- [Idempotency Contract](docs/production/idempotency.md) ·
+- [Kubernetes](docs/kubernetes.md) ·
+- [Quorum Migration](docs/quorum-migration.md) ·
+- [Security](docs/security.md) ·
+- [Stability Policy](docs/stability-policy.md) ·
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## Contributing & security
 

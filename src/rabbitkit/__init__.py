@@ -57,8 +57,10 @@ from rabbitkit.di.resolver import DependencyScope
 from rabbitkit.dlq import DLQInspector, ReplayResult
 from rabbitkit.fastapi import rabbitkit_lifespan
 from rabbitkit.health import (
+    AsyncHealthWatcher,
     BrokerHealthResult,
     HealthStatus,
+    HealthWatcher,
     broker_health_check,
     broker_health_check_async,
     broker_liveness,
@@ -78,8 +80,8 @@ from rabbitkit.middleware.metrics import (
     metrics_app,
     start_metrics_server,
 )
-from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.otel import OTelTracingMiddleware
+from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 from rabbitkit.queue_metrics import QueueMetricsPoller
 from rabbitkit.serialization.pipeline import (
@@ -102,6 +104,7 @@ __all__ = [
     "AsyncAPIGeneratorConfig",
     "AsyncBatchPublisher",
     "AsyncBroker",
+    "AsyncHealthWatcher",
     "AsyncWorkerPool",
     "BackpressureConfig",
     "BackpressureError",
@@ -133,6 +136,7 @@ __all__ = [
     "Header",
     "HealthCheckConfig",
     "HealthStatus",
+    "HealthWatcher",
     "JsonParser",
     "LoggingConfig",
     "ManagementConfig",
@@ -144,6 +148,7 @@ __all__ = [
     "MetricsMiddleware",
     "MissingDependencyError",
     "NackMessage",
+    "OTelTracingMiddleware",
     "Path",
     "PoolConfig",
     "PrometheusCollector",
@@ -176,7 +181,6 @@ __all__ = [
     "SyncBroker",
     "SyncWorkerPool",
     "TopologyMode",
-    "OTelTracingMiddleware",
     "TracedConsumerMiddleware",
     "UnsafeTopologyError",
     "WorkerConfig",

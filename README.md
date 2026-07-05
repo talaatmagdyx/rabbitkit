@@ -51,6 +51,7 @@ not be rewritten in every service. **That is what rabbitkit is for.**
 - [Where it fits](#where-rabbitkit-fits)
 - [Performance](#performance)
 - [Migrating](#migrating-from-aio-pika-pika-or-celery)
+- [Examples](#examples)
 - [Architecture](#architecture)
 - [Docs](#documentation)
 
@@ -494,6 +495,35 @@ has before/after code for all three paths; the short version:
 - **From Celery**: `@app.task` → `@broker.subscriber(queue=...)`,
   `task.delay()` → `broker.publish()` — but read the guide's honest
   table first: if you depend on beat or canvases, stay on Celery.
+
+## Examples
+
+**[examples/](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples)** —
+25 self-contained, runnable projects covering every feature, each with its
+own README. They run against a real broker in CI on every nightly build, so
+they can't silently drift from the API.
+
+Start here:
+
+| Want to… | Example |
+|---|---|
+| See the smallest working consumer | [`quickstart/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/quickstart) |
+| Wire retry ladders + DLQ | [`retry_dlx/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/retry_dlx) · [`poison_message_handling/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/poison_message_handling) |
+| Serve alongside FastAPI | [`fastapi_lifespan/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/fastapi_lifespan) |
+| Run in Kubernetes with probes | [`kubernetes_worker/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/kubernetes_worker) |
+| Test handlers without a broker | [`testbroker_pytest/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/testbroker_pytest) |
+| Do RPC over RabbitMQ | [`rpc/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/rpc) |
+| Push throughput (batching, pools, backpressure) | [`highload/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/highload) |
+| See a full production service | [`order_service/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/order_service) |
+
+```bash
+# every example expects RabbitMQ on localhost:5672 (some also Redis on 6379)
+docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+python examples/quickstart/02_async_broker.py
+```
+
+The full index (all 25, grouped by topic) is in
+[examples/README.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/examples/README.md).
 
 ## Architecture
 

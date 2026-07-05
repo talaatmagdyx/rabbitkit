@@ -1,0 +1,16 @@
+---
+description: rabbitkit repo guide for AI agents
+alwaysApply: true
+---
+
+Read **@AGENTS.md** at the repo root before working — it is the single source
+of truth for this project (hard invariants, gates, layout, and the non-obvious
+gotchas that make you fast).
+
+Load-bearing rules (full detail in AGENTS.md):
+
+- `src/rabbitkit/core/` must NOT import `pika` or `aio_pika`.
+- One handler per queue (`DuplicateRouteError` otherwise).
+- Before committing: `ruff check src/ tests/ benchmarks/`,
+  `mypy src/rabbitkit/ --strict --ignore-missing-imports`, `pytest tests/unit/`.
+- No `Co-Authored-By` trailers. Don't bump version unless asked.

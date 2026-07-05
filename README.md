@@ -49,6 +49,8 @@ not be rewritten in every service. **That is what rabbitkit is for.**
 - [Middleware](#middleware-batteries-included)
 - [CLI](#operate-it-from-the-terminal)
 - [Where it fits](#where-rabbitkit-fits)
+- [Performance](#performance)
+- [Migrating](#migrating-from-aio-pika-pika-or-celery)
 - [Architecture](#architecture)
 - [Docs](#documentation)
 
@@ -437,14 +439,61 @@ test infrastructure in every service.
 - Kubernetes shutdown and readiness matter
 - operators need visibility into message outcomes
 
-**Probably not the right fit when:**
+**Do NOT use rabbitkit when:**
 
-- you need a task queue or scheduler (use a task framework)
-- you need a broker-agnostic framework or want to hide RabbitMQ semantics
-- at-most-once behavior is acceptable and a raw client is enough
+- **You need scheduled or delayed jobs as a first-class feature.** There
+  is no `beat`, no cron, no `eta=`. Use Celery/arq/APScheduler, or keep
+  a scheduler alongside rabbitkit.
+- **You need task canvases** (chains, chords, groups, result-first
+  workflows). That's a task framework's job; rabbitkit will not grow one.
+- **You might switch brokers.** rabbitkit is RabbitMQ-only on purpose —
+  Kafka/SQS/Redis Streams are not coming. Broker portability → FastStream.
+- **Your team must not see AMQP concepts.** rabbitkit deliberately keeps
+  exchanges, bindings, acks, and confirms visible; it smooths them, it
+  does not hide them.
+- **At-most-once is fine and volume is trivial.** A 30-line raw
+  `aio-pika` consumer with `message.process()` may be all you need —
+  rabbitkit earns its keep when loss, retries, and operations matter.
+- **You need exactly-once delivery.** Nothing on RabbitMQ gives you
+  that, including rabbitkit; the dedup middleware gives idempotent
+  *processing*, which is a different (weaker, honest) guarantee.
 
 A detailed framework-by-framework comparison lives in
 [docs/comparison.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/comparison.md).
+
+## Performance
+
+Measured against **bare aio-pika doing identical work** — interleaved
+A/B, 5 repetitions, median ± CV, GitHub-hosted runner (methodology:
+[docs/benchmarking.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/benchmarking.md)):
+
+| Metric | raw aio-pika | rabbitkit | delta |
+|---|---|---|---|
+| Consume (drain, prefetch 200) | 6,899 ± 4.8% msg/s | 6,273 ± 0.9% msg/s | **+9.1% overhead** |
+| Confirmed publish (sequential) | 2,544 ± 2.4% msg/s | 2,558 ± 3.5% msg/s | ≈ 0% |
+| End-to-end latency @400 msg/s (open-loop) | — | p50 1.3 ms · p99 1.8 ms · p99.9 44 ms | — |
+| Quorum vs classic queue (consume) | — | 4,659 vs 5,546 msg/s | quorum ≈ −16% |
+
+That +9.1% buys the full pipeline: middleware chain, DI resolution,
+serialization dispatch, ack orchestration, retry/DLQ safety, and
+metrics. Absolute numbers vary by machine — the ratios are the stable
+part. In-memory pipeline overhead alone (no broker) runs 32–38k msg/s.
+
+## Migrating from aio-pika, pika, or Celery
+
+rabbitkit consumers and your existing consumers can share the same
+broker and even the same queues, so migration is one consumer at a
+time — no big-bang cutover. The
+[migration guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/migrating-to-rabbitkit.md)
+has before/after code for all three paths; the short version:
+
+- **From aio-pika/pika**: your `on_message` callback body becomes the
+  handler; connection lifecycle, QoS, declaration, ack/reject logic, and
+  all retry topology disappear. Sync consumers additionally gain
+  reconnect-on-failure, which `BlockingConnection` never had.
+- **From Celery**: `@app.task` → `@broker.subscriber(queue=...)`,
+  `task.delay()` → `broker.publish()` — but read the guide's honest
+  table first: if you depend on beat or canvases, stay on Celery.
 
 ## Architecture
 

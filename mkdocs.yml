@@ -53,6 +53,7 @@ nav:
       - Full Guide: guide/full-guide.md
       - Retry Architecture: rabbitmq-retry-architecture.md
       - Quorum Migration: quorum-migration.md
+      - Migrating to rabbitkit: migrating-to-rabbitkit.md
       - Benchmarking: benchmarking.md
   - API Reference:
       - Brokers: api/brokers.md

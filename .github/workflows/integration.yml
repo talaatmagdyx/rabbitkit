@@ -52,3 +52,34 @@ jobs:
           name: benchmark-results
           path: benchmarks/results/
           if-no-files-found: ignore
+
+  # Runs every example/ script against a real broker so the examples can't
+  # silently drift when the package API changes (they aren't in the wheel,
+  # so PR-time checks never touch them). Uses `services:` on the default
+  # ports the examples connect to (5672 / 6379). GATING: a broken example is
+  # a real doc regression — the runner's exit code is the FAIL count.
+  examples:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 10s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[all]"
+      - name: Run example smoke test
+        run: .venv/bin/python -m examples.smoke_test --timeout 20

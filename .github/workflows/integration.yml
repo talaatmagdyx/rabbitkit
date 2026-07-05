@@ -65,6 +65,7 @@ jobs:
         image: rabbitmq:3.13-management-alpine
         ports:
           - 5672:5672
+          - 15672:15672  # management HTTP API (advanced/06_management_api.py)
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 5s --health-timeout 10s --health-retries 20
@@ -80,6 +81,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install uv && uv venv && uv pip install -e ".[all]"
+      # .[dev] (not .[all]): the pytest-based examples need pytest present.
+      - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: Run example smoke test
         run: .venv/bin/python -m examples.smoke_test --timeout 20

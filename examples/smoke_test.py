@@ -76,6 +76,14 @@ def _discover() -> list[pathlib.Path]:
     )
 
 
+def _is_pytest_file(path: pathlib.Path) -> bool:
+    """A pytest example (defines ``def test_*`` functions) must be run via
+    pytest, not executed as a script — as a script it just defines functions
+    and exits 0 (a hollow pass) or ImportErrors if pytest is absent."""
+    text = path.read_text(errors="replace")
+    return bool(re.search(r"^def test_\w+\(", text, re.MULTILINE))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=float, default=15.0, help="seconds per script")
@@ -97,10 +105,14 @@ def main() -> None:
     passes = running = 0
     for path in _discover():
         rel = str(path.relative_to(ROOT))
+        # pytest examples run under pytest; plain scripts run directly.
+        cmd = (
+            [sys.executable, "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"]
+            if _is_pytest_file(path)
+            else [sys.executable, rel]
+        )
         try:
-            cp = subprocess.run(
-                [sys.executable, rel], cwd=ROOT, capture_output=True, text=True, timeout=args.timeout
-            )
+            cp = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=args.timeout)
             out = cp.stdout + cp.stderr
             if cp.returncode == 0:
                 verdict, ok = "PASS", True

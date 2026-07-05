@@ -15,7 +15,7 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope, RetryConfig
+from rabbitkit import MessageEnvelope, RabbitConfig, RetryConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.dlq import DLQInspector
 
@@ -42,7 +42,7 @@ async def main() -> None:
             body=json.dumps({"id": i, "item": f"product-{i}", "qty": i + 1}).encode(),
         ))
 
-    # Wait for retries to exhaust (1 retry × 1s delay = ~2s)
+    # Wait for retries to exhaust (1 retry x 1s delay = ~2s)
     print("Waiting for retry exhaustion (2s)...")
     await asyncio.sleep(4)
     await broker.stop()
@@ -64,7 +64,8 @@ async def main() -> None:
     for msg in messages:
         data = json.loads(msg.body)
         retry_count = msg.headers.get("x-death", [{}])[0].get("count", "?") if msg.headers.get("x-death") else "?"
-        print(f"   - order #{data['id']}: {data['item']} (retried: {retry_count}x)")
+        # .get(): a real DLQ may hold messages from other producers too
+        print(f"   - order #{data.get('id', '?')}: {data.get('item', '?')} (retried: {retry_count}x)")
 
     # Filter DLQ messages
     print("\n2. Filtered peek (only order id=1):")

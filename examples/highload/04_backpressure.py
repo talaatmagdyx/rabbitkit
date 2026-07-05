@@ -16,9 +16,9 @@ Requirements:
 import asyncio
 import time
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.highload.backpressure import FlowController, BackpressureConfig
+from rabbitkit.highload.backpressure import BackpressureConfig, FlowController
 
 broker = AsyncBroker(RabbitConfig())
 

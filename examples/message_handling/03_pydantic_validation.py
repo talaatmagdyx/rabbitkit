@@ -19,11 +19,11 @@ from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.serialization.json import JsonSerializer
+from rabbitkit.serialization.json import JSONSerializer
 
-broker = AsyncBroker(RabbitConfig(), serializer=JsonSerializer())
+broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 
 # ── Simple model ──────────────────────────────────────────────────────────────

@@ -18,14 +18,13 @@ from pydantic import BaseModel
 
 from rabbitkit import RabbitConfig, RabbitRouter
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import ExchangeType
 from rabbitkit.asyncapi.generator import (
+    AsyncAPIGeneratorConfig,
     generate_asyncapi_doc,
     generate_asyncapi_json,
-    AsyncAPIGeneratorConfig,
 )
-
+from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+from rabbitkit.core.types import ExchangeType
 
 # ── Define Pydantic models (will become JSON Schema in AsyncAPI) ──────────────
 

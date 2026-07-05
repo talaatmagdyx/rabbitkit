@@ -14,7 +14,7 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 try:
@@ -25,7 +25,7 @@ try:
     # ── JSON mode (default) ───────────────────────────────────────────────────
     json_broker = AsyncBroker(
         RabbitConfig(),
-        serializer=MsgspecSerializer(format="json"),
+        serializer=MsgspecSerializer(),
     )
 
     # ── Define msgspec Struct models ──────────────────────────────────────────
@@ -46,7 +46,7 @@ try:
     async def handle_order(order: Order) -> None:
         """Decoded from JSON bytes into a validated Order struct."""
         total = order.qty * order.price
-        print(f"[msgspec] Order #{order.id}: {order.qty}× {order.item!r} = ${total:.2f}")
+        print(f"[msgspec] Order #{order.id}: {order.qty}x {order.item!r} = ${total:.2f}")
 
 
     @json_broker.subscriber(queue="msgspec-events")

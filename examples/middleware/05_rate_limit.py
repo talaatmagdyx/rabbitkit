@@ -14,9 +14,9 @@ Requirements:
 import asyncio
 import time
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.middleware.rate_limit import RateLimitMiddleware, RateLimitConfig
+from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
 
 broker = AsyncBroker(RabbitConfig())
 

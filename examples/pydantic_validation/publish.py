@@ -20,7 +20,7 @@ async def main() -> None:
     ]
 
     for msg in messages:
-        await broker.publish(routing_key="orders", body=msg)
+        await broker.publish(routing_key="pydantic.orders", body=msg)
         print(f"sent: {msg}")
 
     await broker.stop()

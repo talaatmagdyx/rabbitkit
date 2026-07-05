@@ -14,7 +14,7 @@ Requirements:
 import asyncio
 import time
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.config import WorkerConfig
 
@@ -39,7 +39,7 @@ async def main_async_pool() -> None:
     """Async broker with AsyncWorkerPool for concurrent coroutines."""
     worker_config = WorkerConfig(
         worker_count=4,          # max 4 concurrent handlers
-        prefetch_per_worker=2,   # prefetch = 4×2 = 8 messages ahead
+        prefetch_per_worker=2,   # prefetch = 4x2 = 8 messages ahead
     )
     await broker.start(worker_config=worker_config)
     print(f"AsyncBroker started with {worker_config.worker_count} concurrent workers")
@@ -58,7 +58,7 @@ async def main_async_pool() -> None:
 
     await asyncio.sleep(2.5)   # wait for all tasks to finish
     elapsed = time.monotonic() - start
-    print(f"\nCompleted 8×0.5s tasks in {elapsed:.1f}s with {worker_config.worker_count} workers")
+    print(f"\nCompleted 8x0.5s tasks in {elapsed:.1f}s with {worker_config.worker_count} workers")
     print(f"(Sequential would take {8 * 0.5:.1f}s)")
 
     await broker.stop()
@@ -74,7 +74,8 @@ def demo_sync_pool() -> None:
 
     @sync_broker.subscriber(queue="sync-parallel-tasks")
     def handle_sync_task(body: bytes) -> None:
-        import json, threading
+        import json
+        import threading
         data = json.loads(body)
         print(f"[sync-worker] thread={threading.current_thread().name} task-{data['id']}")
         time.sleep(data.get("duration", 0.2))

@@ -16,9 +16,9 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.locking import RedisLock, LockMiddleware
+from rabbitkit.locking import LockMiddleware, RedisLock
 
 try:
     import redis.asyncio as aioredis

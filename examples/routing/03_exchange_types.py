@@ -12,7 +12,7 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import ExchangeType
@@ -69,7 +69,10 @@ async def handle_any_sales(body: bytes) -> None:
 headers_exchange = RabbitExchange(name="headers-demo", type=ExchangeType.HEADERS)
 
 @broker.subscriber(
-    queue="headers-pdf",
+    queue=RabbitQueue(
+        name="headers-pdf",
+        bind_arguments={"x-match": "all", "format": "pdf"},  # required for headers exchanges
+    ),
     exchange=headers_exchange,
     routing_key="",  # ignored for headers exchange
 )

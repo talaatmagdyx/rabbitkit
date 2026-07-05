@@ -43,7 +43,7 @@ def make_config() -> RabbitConfig:
         connection=ConnectionConfig(
             host=os.environ.get("RABBITMQ_HOST", "localhost"),
             port=int(os.environ.get("RABBITMQ_PORT", "5672")),
-            user=os.environ.get("RABBITMQ_USER", "guest"),
+            username=os.environ.get("RABBITMQ_USER", "guest"),
             password=os.environ.get("RABBITMQ_PASSWORD", "guest"),
             vhost=os.environ.get("RABBITMQ_VHOST", "/"),
         ),
@@ -53,8 +53,7 @@ def make_config() -> RabbitConfig:
             graceful_timeout=30.0,  # drain up to 30s on SIGTERM
         ),
         logging=LoggingConfig(
-            level="INFO",
-            fmt="json",  # structured JSON for Loki / Elasticsearch
+            render_json=True,  # structured JSON for Loki / Elasticsearch
         ),
     )
 
@@ -63,7 +62,7 @@ config = make_config()
 broker = AsyncBroker(config)
 
 
-@broker.subscriber(queue=os.environ.get("QUEUE_NAME", "orders"))
+@broker.subscriber(queue=os.environ.get("QUEUE_NAME", "k8s-orders"))
 async def handle_order(body: dict) -> None:
     order_id = body.get("id")
     print(f"processing order {order_id}")

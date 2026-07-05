@@ -15,11 +15,12 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 try:
     import uvicorn
+
     from rabbitkit.dashboard import create_dashboard_app
     DASHBOARD_AVAILABLE = True
 except ImportError:

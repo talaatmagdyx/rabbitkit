@@ -17,16 +17,15 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.serialization.pipeline import (
-    SerializationPipeline,
+    DataclassDecoder,
     JsonParser,
     PydanticDecoder,
-    DataclassDecoder,
     RawDecoder,
+    SerializationPipeline,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline 1: JSON bytes → Pydantic model

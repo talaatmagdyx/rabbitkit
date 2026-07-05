@@ -14,10 +14,9 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.logging import LoggingConfig, configure_structlog
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mode 1: Development — coloured console output

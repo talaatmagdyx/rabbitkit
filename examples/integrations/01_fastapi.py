@@ -5,7 +5,7 @@ context manager. Both sync and async brokers are supported.
 
 Run:
     pip install "rabbitkit[async,fastapi]"
-    uvicorn examples.integrations.01_fastapi:app --reload
+    python examples/integrations/01_fastapi.py
 
 Then test:
     curl http://localhost:8000/health
@@ -20,12 +20,13 @@ import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 try:
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse
+
     from rabbitkit.fastapi import rabbitkit_lifespan
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -53,7 +54,7 @@ async def handle_order(body: bytes) -> None:
 app = FastAPI(
     title="Order Service",
     description="Example FastAPI app with rabbitkit integration",
-    lifespan=rabbitkit_lifespan(broker=broker),
+    lifespan=lambda app: rabbitkit_lifespan(app, broker=broker),
 )
 
 
@@ -128,4 +129,4 @@ async def list_routes() -> dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("examples.integrations.01_fastapi:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -148,7 +148,7 @@ print(f"Retry:   dev={dev_config.retry is None}, staging={stg_config.retry is no
 # WorkerConfig is NOT part of RabbitConfig — passed to broker.start()
 worker_config = WorkerConfig(
     worker_count=4,
-    prefetch_per_worker=5,  # total prefetch = 4×5 = 20
+    prefetch_per_worker=5,  # total prefetch = 4x5 = 20
 )
 
 broker = AsyncBroker(production_config)

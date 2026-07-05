@@ -42,10 +42,10 @@ from rabbitkit.di.resolver import DIResolver
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 from rabbitkit.middleware.exception import ExceptionMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.rate_limit import RateLimitMiddleware
 from rabbitkit.middleware.retry import RetryMiddleware
 from rabbitkit.middleware.timeout import TimeoutConfig, TimeoutMiddleware
-from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 from rabbitkit.serialization.pipeline import JsonParser, PydanticDecoder, SerializationPipeline
 
 # ── 1. FULL CONFIG — every sub-config, every field ───────────────────────────
@@ -122,7 +122,7 @@ redis = aioredis.from_url("redis://localhost:6379/0")  # constructed lazily; con
 
 # ── 4. Full consume-side middleware stack (OUTER → INNER) ────────────────────
 MIDDLEWARES = [
-    TracedConsumerMiddleware(service_name="full-config-async"),  # outermost: span covers retries
+    OTelTracingMiddleware(service_name="full-config-async"),  # outermost: span covers retries
     ExceptionMiddleware(swallow_permanent=False),  # let terminal errors reach the DLQ
     CircuitBreakerMiddleware(async_circuit_breaker=None),  # pass an obskit CircuitBreaker here
     DeduplicationMiddleware(
@@ -139,8 +139,8 @@ MIDDLEWARES = [
 
 # ── 5. Consumer ──────────────────────────────────────────────────────────────
 @broker.subscriber(
-    queue="orders.queue",
-    exchange="orders.exchange",
+    queue="fullcfg-async.orders",
+    exchange="fullcfg-async.exchange",
     routing_key="orders.created",
     ack_policy=AckPolicy.NACK_ON_ERROR,  # terminal → nack(requeue=False) → DLQ (NOT AUTO's requeue=True)
     retry=CONFIG.retry,  # declares the delay-queue + DLQ topology
@@ -155,7 +155,7 @@ async def main() -> None:
     await broker.start(worker_config=WorkerConfig(worker_count=1))  # async: prefetch drives concurrency
     outcome = await broker.publish(
         MessageEnvelope(
-            exchange="orders.exchange",
+            exchange="fullcfg-async.exchange",
             routing_key="orders.created",
             body=b'{"order_id":"o1","amount_cents":100,"created_at":"2026-01-01T00:00:00Z"}',
         )

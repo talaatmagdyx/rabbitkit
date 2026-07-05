@@ -14,7 +14,7 @@ Requirements:
 import asyncio
 from typing import Annotated
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.di.depends import Depends
 

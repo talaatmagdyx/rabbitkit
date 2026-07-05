@@ -18,7 +18,7 @@ Note:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware
 

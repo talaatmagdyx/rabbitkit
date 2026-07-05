@@ -15,9 +15,9 @@ import asyncio
 import json
 import time
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.highload.batch import BatchPublisher, BatchPublishConfig
+from rabbitkit.highload.batch import BatchPublishConfig, BatchPublisher
 
 broker = AsyncBroker(RabbitConfig())
 

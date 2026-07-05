@@ -1,6 +1,6 @@
 """Serialization: Built-in JSON serializer.
 
-JsonSerializer handles encode/decode for dict, list, str, int, float,
+JSONSerializer handles encode/decode for dict, list, str, int, float,
 and any JSON-serializable type. Uses stdlib json.
 
 Run:
@@ -14,12 +14,12 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.serialization.json import JsonSerializer
+from rabbitkit.serialization.json import JSONSerializer
 
 # Attach serializer at broker level — all routes share it
-broker = AsyncBroker(RabbitConfig(), serializer=JsonSerializer())
+broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 
 @broker.subscriber(queue="json-events")
@@ -35,7 +35,7 @@ async def handle_list(body: list) -> None:  # type: ignore[type-arg]
 
 
 # Per-route serializer override
-custom_serializer = JsonSerializer()
+custom_serializer = JSONSerializer()
 
 @broker.subscriber(queue="json-raw", serializer=None)  # override: no serializer
 async def handle_raw_bytes(body: bytes) -> None:
@@ -47,7 +47,7 @@ async def handle_raw_bytes(body: bytes) -> None:
 async def main() -> None:
     await broker.start()
 
-    # The JsonSerializer encodes on publish too (via MessageEnvelope.body)
+    # The JSONSerializer encodes on publish too (via MessageEnvelope.body)
     # For broker.publish we pass bytes directly — the handler decodes it
 
     await broker.publish(MessageEnvelope(

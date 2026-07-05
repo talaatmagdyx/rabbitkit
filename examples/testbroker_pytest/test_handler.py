@@ -13,7 +13,6 @@ import pytest
 
 from rabbitkit.testing import TestBroker
 
-
 # ── Application code under test ───────────────────────────────────────────────
 
 def make_broker() -> tuple["TestBroker", object]:

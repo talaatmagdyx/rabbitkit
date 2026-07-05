@@ -21,9 +21,9 @@ from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.core.config import RabbitConfig
 from rabbitkit.di.resolver import DIResolver
 from rabbitkit.middleware.exception import ExceptionMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.retry import RetryMiddleware
 from rabbitkit.middleware.timeout import TimeoutConfig, TimeoutMiddleware
-from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 from rabbitkit.serialization.pipeline import JsonParser, PydanticDecoder, SerializationPipeline
 
 from .config import ORDERS_RETRY
@@ -41,7 +41,7 @@ def build_broker(config: RabbitConfig) -> AsyncBroker:
     # Middleware order is OUTER → INNER (docs §15). Tracing outermost so the span
     # covers retries; timeout innermost so a timeout counts as one retryable attempt.
     middlewares: list[Any] = [
-        TracedConsumerMiddleware(service_name="order-service"),
+        OTelTracingMiddleware(service_name="order-service"),
         ExceptionMiddleware(swallow_permanent=False),  # let terminal errors reach the pipeline → DLQ
         RetryMiddleware(ORDERS_RETRY, publish_async_fn=broker.publish),  # ← must be wired
         TimeoutMiddleware(TimeoutConfig(timeout_seconds=15.0)),

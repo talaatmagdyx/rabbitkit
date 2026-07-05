@@ -246,7 +246,7 @@ async def handle_order_event(body: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with rabbitkit_lifespan(api_broker):
+    async with rabbitkit_lifespan(broker=api_broker):
         yield
 
 app = FastAPI(lifespan=lifespan)

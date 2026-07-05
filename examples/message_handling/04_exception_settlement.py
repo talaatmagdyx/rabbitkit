@@ -14,7 +14,7 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.message import AckMessage, NackMessage, RejectMessage
 

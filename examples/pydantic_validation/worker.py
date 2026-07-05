@@ -48,7 +48,7 @@ config = RabbitConfig(
 broker = AsyncBroker(config)
 
 
-@broker.subscriber(queue="orders")
+@broker.subscriber(queue="pydantic.orders")
 async def handle_order(body: Order) -> None:
     """Handler receives a fully-validated Order model."""
     print(f"order id={body.id} item={body.item!r} qty={body.qty} tenant={body.tenant!r}")

@@ -13,8 +13,7 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig
-from rabbitkit import MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 # ── 1. Create broker with default config (localhost:5672, guest/guest) ────────

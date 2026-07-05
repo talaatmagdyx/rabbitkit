@@ -5,7 +5,7 @@ Uses rabbitkit_lifespan() to wire broker start/stop into FastAPI's lifespan.
 Run:
     pip install "rabbitkit[async,fastapi]" uvicorn
     docker run -d --rm -p 5672:5672 rabbitmq:4-management
-    uvicorn examples.fastapi_lifespan.app:app --reload
+    python examples/fastapi_lifespan/app.py
 
 Test:
     curl http://localhost:8000/health
@@ -35,7 +35,7 @@ broker = AsyncBroker(RabbitConfig(connection=ConnectionConfig(host="localhost"))
 
 app = FastAPI(
     title="Order Service",
-    lifespan=rabbitkit_lifespan(broker=broker),
+    lifespan=lambda app: rabbitkit_lifespan(app, broker=broker),
 )
 
 
@@ -70,4 +70,4 @@ async def create_order(order: dict[str, Any]) -> dict[str, str]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("examples.fastapi_lifespan.app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

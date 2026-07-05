@@ -18,7 +18,7 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import QueueType
@@ -46,7 +46,9 @@ events_stream = RabbitQueue(
 
 
 # ── Consumer: reads from offset "first" (beginning of stream) ─────────────────
-@broker.subscriber(queue=events_stream)
+# Streams do not dead-letter — opt out of the safety DLX auto-provision
+# (its x-dead-letter argument is not a valid stream-queue argument).
+@broker.subscriber(queue=events_stream, reject_without_dlx="discard")
 async def handle_stream_event(body: bytes) -> None:
     """Processes each event in the stream."""
     data = json.loads(body)

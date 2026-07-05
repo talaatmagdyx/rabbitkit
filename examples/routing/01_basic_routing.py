@@ -13,7 +13,7 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import ExchangeType
@@ -22,7 +22,7 @@ broker = AsyncBroker(RabbitConfig())
 
 # ── Declare a topic exchange and queue explicitly ─────────────────────────────
 events_exchange = RabbitExchange(
-    name="events",
+    name="routing.events",
     type=ExchangeType.TOPIC,
     durable=True,
 )
@@ -66,7 +66,7 @@ async def main() -> None:
     ]:
         await broker.publish(
             MessageEnvelope(
-                exchange="events",
+                exchange="routing.events",
                 routing_key=routing_key,
                 body=body,
             )

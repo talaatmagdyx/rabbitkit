@@ -1,4 +1,4 @@
-"""Middleware: OpenTelemetry tracing via TracedConsumerMiddleware.
+"""Middleware: OpenTelemetry tracing via OTelTracingMiddleware.
 
 Wraps consume and publish operations in OTel trace spans with RabbitMQ
 semantic attributes (messaging.system, messaging.operation, etc.)
@@ -11,20 +11,20 @@ Requirements:
     RabbitMQ running on localhost:5672
 
 Note:
-    Without obskit, TracedConsumerMiddleware is a no-op passthrough.
-    No error is raised — tracing silently does nothing.
+    Without obskit, OTelTracingMiddleware is a no-op passthrough.
+    A loud construction-time warning tells you tracing is a no-op.
 """
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.middleware.tracing import TracedConsumerMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 
 broker = AsyncBroker(RabbitConfig())
 
 # ── Basic tracing setup ───────────────────────────────────────────────────────
-# TracedConsumerMiddleware is a no-op if obskit is not installed.
+# OTelTracingMiddleware is a no-op if obskit is not installed.
 # When obskit IS installed, it creates spans with:
 #   messaging.system          = "rabbitmq"
 #   messaging.operation       = "receive" | "publish"
@@ -32,7 +32,7 @@ broker = AsyncBroker(RabbitConfig())
 #   messaging.rabbitmq.routing_key = routing key
 #   messaging.message_id      = message_id header
 
-tracing_mw = TracedConsumerMiddleware(service_name="order-service")
+tracing_mw = OTelTracingMiddleware(service_name="order-service")
 
 
 @broker.subscriber(queue="traced-orders", middlewares=[tracing_mw])
@@ -50,7 +50,7 @@ async def handle_order(body: bytes) -> None:
 # from rabbitkit.middleware.retry import RetryMiddleware
 #
 # retry_mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
-# tracing_mw = TracedConsumerMiddleware(service_name="order-service")
+# tracing_mw = OTelTracingMiddleware(service_name="order-service")
 #
 # @broker.subscriber(
 #     queue="orders",
@@ -73,7 +73,7 @@ async def handle_order(body: bytes) -> None:
 # )
 # trace.set_tracer_provider(provider)
 #
-# Then use TracedConsumerMiddleware as above — it will use the configured provider.
+# Then use OTelTracingMiddleware as above — it will use the configured provider.
 
 
 async def main() -> None:

@@ -14,14 +14,13 @@ Requirements:
 
 import asyncio
 import json
-import pytest
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from rabbitkit import RabbitConfig, MessageEnvelope
-from rabbitkit.testing import TestBroker, TestApp
-from rabbitkit import RabbitApp
+import pytest
 
+from rabbitkit import MessageEnvelope, RabbitApp, RabbitConfig
+from rabbitkit.testing import TestApp, TestBroker
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Production code being tested

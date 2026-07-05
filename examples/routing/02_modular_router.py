@@ -14,7 +14,7 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope, RabbitRouter
+from rabbitkit import MessageEnvelope, RabbitConfig, RabbitRouter
 from rabbitkit.async_ import AsyncBroker
 
 # ── In a real app, these routers would live in separate modules ───────────────

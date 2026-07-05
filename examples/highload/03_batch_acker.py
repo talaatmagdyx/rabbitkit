@@ -18,11 +18,11 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import AckPolicy
-from rabbitkit.highload.batch import BatchAcker, BatchAckConfig
+from rabbitkit.highload.batch import BatchAckConfig, BatchAcker
 
 broker = AsyncBroker(RabbitConfig())
 

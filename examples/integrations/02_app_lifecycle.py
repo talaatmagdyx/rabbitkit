@@ -16,11 +16,11 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope, RabbitApp, AppState
+from rabbitkit import AppState, MessageEnvelope, RabbitApp, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 # ── App and broker ────────────────────────────────────────────────────────────
-app = RabbitApp(title="order-service", version="2.1.0")
+app = RabbitApp(title="order-service")
 broker = AsyncBroker(RabbitConfig())
 
 
@@ -105,8 +105,14 @@ async def main() -> None:
     # Run state monitor and lifecycle together
     asyncio.create_task(check_state_during_lifecycle())
 
-    # run_async() starts app + broker, waits for stop signal
-    await app.run_async(broker=broker)
+    # start the app's hook lifecycle, then the broker, and wait for the
+    # state monitor above to request shutdown
+    await app.start_async()
+    await broker.start()
+    while app.state.name not in ("STOPPING", "STOPPED"):
+        await asyncio.sleep(0.1)
+    await broker.stop()
+    await app.stop_async()
 
     print(f"\nFinal state: {app.state.name}")  # STOPPED
 

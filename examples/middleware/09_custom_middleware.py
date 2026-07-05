@@ -23,7 +23,7 @@ import asyncio
 import time
 from typing import Any
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import MessageEnvelope as Envelope

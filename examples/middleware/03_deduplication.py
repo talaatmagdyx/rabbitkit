@@ -15,9 +15,9 @@ Requirements:
 import asyncio
 import uuid
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.middleware.deduplication import DeduplicationMiddleware, DeduplicationConfig
+from rabbitkit.middleware.deduplication import DeduplicationConfig, DeduplicationMiddleware
 
 try:
     import redis.asyncio as aioredis  # type: ignore[import-untyped]
@@ -62,6 +62,7 @@ async def handle_unique_content(body: bytes) -> None:
 
 # ── Custom key function ───────────────────────────────────────────────────────
 import json
+
 
 def extract_order_id(msg: "object") -> str:
     """Extract order_id from body as the dedup key."""

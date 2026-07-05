@@ -14,7 +14,7 @@ Requirements:
 import json
 import threading
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.rpc import RPCClient, RPCTimeoutError
 from rabbitkit.sync import SyncBroker
 
@@ -55,8 +55,13 @@ def run_client() -> None:
     client_broker = SyncBroker(RabbitConfig())
     client_broker.start()
 
-    # Create RPC client
-    rpc = RPCClient(client_broker._transport, max_pending=10)
+    # Create RPC client. Sync RPC needs a dedicated reply connection so the
+    # reply I/O loop can be pumped while call() blocks waiting.
+    rpc = RPCClient(
+        client_broker._transport,
+        reply_connection=client_broker._transport._connection,
+        max_pending=10,
+    )
 
     try:
         # Addition
@@ -75,7 +80,7 @@ def run_client() -> None:
             timeout=5.0,
         )
         result = json.loads(response.body)
-        print(f"[rpc-client] 6 × 7 = {result['result']}")
+        print(f"[rpc-client] 6 x 7 = {result['result']}")
 
         # Timeout example
         try:

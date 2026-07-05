@@ -14,9 +14,9 @@ Requirements:
 import asyncio
 from typing import Annotated
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.di.context import Header, Path, Context
+from rabbitkit.di.context import Context, Header, Path
 
 broker = AsyncBroker(RabbitConfig())
 

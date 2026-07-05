@@ -12,13 +12,13 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.core.topology import RabbitExchange
 from rabbitkit.core.types import ExchangeType
 
 broker = AsyncBroker(RabbitConfig())
-exchange = RabbitExchange(name="audit", type=ExchangeType.TOPIC, durable=True)
+exchange = RabbitExchange(name="routing.audit", type=ExchangeType.TOPIC, durable=True)
 
 # ── Pattern: <tenant>.<service>.<action> ─────────────────────────────────────
 
@@ -59,7 +59,7 @@ async def main() -> None:
     for rk in messages:
         print(f"  routing_key={rk!r}")
         await broker.publish(
-            MessageEnvelope(exchange="audit", routing_key=rk, body=rk.encode())
+            MessageEnvelope(exchange="routing.audit", routing_key=rk, body=rk.encode())
         )
         await asyncio.sleep(0.1)
         print()

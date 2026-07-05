@@ -112,7 +112,6 @@ async def run() -> int:
         # declare the DURABLE queue up front
         seeder = AsyncBroker(RabbitConfig(connection=ConnectionConfig.from_url(URL)))
         await seeder.start()
-        await seeder._transport.declare_queue(RabbitQueue(name=QUEUE, durable=True))
         await seeder.stop()
 
         consumed: set[str] = set()

@@ -13,12 +13,12 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.middleware.signing import (
-    SigningMiddleware,
-    SigningConfig,
     InvalidSignatureError,
+    SigningConfig,
+    SigningMiddleware,
 )
 
 broker = AsyncBroker(RabbitConfig())

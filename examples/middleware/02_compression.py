@@ -15,7 +15,7 @@ Requirements:
 import asyncio
 import json
 
-from rabbitkit import RabbitConfig, MessageEnvelope, CompressionConfig
+from rabbitkit import CompressionConfig, MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.middleware.compression import CompressionMiddleware
 

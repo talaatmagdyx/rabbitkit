@@ -19,11 +19,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from rabbitkit import RabbitConfig, MessageEnvelope
+from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.serialization.json import JsonSerializer
+from rabbitkit.serialization.json import JSONSerializer
 
-broker = AsyncBroker(RabbitConfig(), serializer=JsonSerializer())
+broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ async def handle_order(order: Order) -> None:
     """Nested model validation — all OrderItem.Product fields validated."""
     print(f"[order] {order.order_id}: {len(order.items)} items, total=${order.total:.2f}")
     for item in order.items:
-        print(f"  - {item.product.sku} × {item.quantity} @ ${item.product.price}")
+        print(f"  - {item.product.sku} x {item.quantity} @ ${item.product.price}")
 
 
 # ── Publisher helper ──────────────────────────────────────────────────────────

@@ -41,10 +41,10 @@ from rabbitkit.di.resolver import DIResolver
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
 from rabbitkit.middleware.exception import ExceptionMiddleware
+from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.rate_limit import RateLimitMiddleware
 from rabbitkit.middleware.retry import RetryMiddleware
 from rabbitkit.middleware.timeout import TimeoutConfig, TimeoutMiddleware
-from rabbitkit.middleware.tracing import TracedConsumerMiddleware
 from rabbitkit.serialization.pipeline import JsonParser, PydanticDecoder, SerializationPipeline
 from rabbitkit.sync.broker import SyncBroker
 
@@ -117,7 +117,7 @@ redis_client = redis.from_url("redis://localhost:6379/0")  # lazy; connects on f
 
 # ── 4. Full consume-side middleware stack (sync variants) ────────────────────
 MIDDLEWARES = [
-    TracedConsumerMiddleware(service_name="full-config-sync"),
+    OTelTracingMiddleware(service_name="full-config-sync"),
     ExceptionMiddleware(swallow_permanent=False),
     CircuitBreakerMiddleware(circuit_breaker=None),  # pass an obskit CircuitBreaker here
     DeduplicationMiddleware(
@@ -133,8 +133,8 @@ MIDDLEWARES = [
 
 # ── 5. Consumer ──────────────────────────────────────────────────────────────
 @broker.subscriber(
-    queue="orders.queue",
-    exchange="orders.exchange",
+    queue="fullcfg-sync.orders",
+    exchange="fullcfg-sync.exchange",
     routing_key="orders.created",
     ack_policy=AckPolicy.NACK_ON_ERROR,
     retry=CONFIG.retry,
@@ -149,7 +149,7 @@ def main() -> None:
     broker.start(worker_config=WorkerConfig(worker_count=1))  # wc=1: handler inline, fastest for light work
     outcome = broker.publish(
         MessageEnvelope(
-            exchange="orders.exchange",
+            exchange="fullcfg-sync.exchange",
             routing_key="orders.created",
             body=b'{"order_id":"o1","amount_cents":100,"created_at":"2026-01-01T00:00:00Z"}',
         )

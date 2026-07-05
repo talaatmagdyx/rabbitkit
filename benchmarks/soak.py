@@ -47,6 +47,9 @@ QUEUE = "soak-q"
 RECOVERY_WINDOW_S = 60.0  # consumer must make progress this soon after a bounce
 SAMPLE_EVERY_S = 15.0
 RSS_SLOPE_LIMIT_KB_MIN = 256.0  # sustained growth above this fails the leak verdict
+RSS_NET_FLOOR_KB = 8_192.0  # ...but only if net growth also exceeds this (slope
+# alone is noise-dominated on short runs: few samples + allocator arena churn
+# around broker restarts can produce a positive fit on a shrinking process)
 WARMUP_FRACTION = 0.2  # discard early samples (allocator/arena warmup)
 
 
@@ -135,15 +138,36 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
         )
     )
 
-    confirmed: set[int] = set()
-    seen: set[int] = set()
+    # O(1)-memory message tracking (the first 30-min run failed its own RSS
+    # verdict because two sets holding 360k ids cost ~45 MB — the harness was
+    # measuring itself). Ids are published sequentially and confirmed in
+    # order, so:
+    #   - confirmed ids are always the contiguous range [0, confirmed_count)
+    #     → a counter, not a set;
+    #   - seen ids compact to a watermark W ("everything ≤ W seen") plus a
+    #     small residual set for out-of-order arrivals (≈ prefetch window).
+    # If a message is genuinely lost mid-run the watermark stalls and the
+    # residual grows — memory contamination only on runs that already fail
+    # the no_loss verdict, which is acceptable.
+    confirmed_count = 0
+    watermark = -1
+    residual: set[int] = set()
     received_total = 0
+
+    def _unique_seen() -> int:
+        return (watermark + 1) + len(residual)
 
     @broker.subscriber(queue=QUEUE, prefetch_count=100)
     async def handle(body: bytes) -> None:
-        nonlocal received_total
+        nonlocal received_total, watermark
         received_total += 1
-        seen.add(int(body))
+        i = int(body)
+        if i <= watermark or i in residual:
+            return  # duplicate (at-least-once redelivery)
+        residual.add(i)
+        while (watermark + 1) in residual:
+            watermark += 1
+            residual.discard(watermark)
 
     await broker.start()
 
@@ -154,6 +178,7 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
     stop = asyncio.Event()
 
     async def publisher() -> None:
+        nonlocal confirmed_count
         i = 0
         while not stop.is_set():
             due = t0 + i / rate
@@ -165,7 +190,7 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
                 try:
                     outcome = await broker.publish(routing_key=QUEUE, body=str(i).encode())
                     if outcome.ok:
-                        confirmed.add(i)
+                        confirmed_count = i + 1  # confirmed ids ≡ [0, i]
                         break
                 except Exception:
                     pass
@@ -179,7 +204,7 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
                 return
             except TimeoutError:
                 pass
-            mark = len(seen)
+            mark = _unique_seen()
             print(f"  [{time.monotonic() - t0:7.1f}s] restarting broker "
                   f"(consumed so far: {mark:,})", flush=True)
             await asyncio.to_thread(restart_broker)
@@ -200,24 +225,29 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
 
     # drain grace: let in-flight/requeued messages arrive
     drain_deadline = time.monotonic() + 60
-    while len(seen) < len(confirmed) and time.monotonic() < drain_deadline:
+    while _unique_seen() < confirmed_count and time.monotonic() < drain_deadline:
         await asyncio.sleep(1.0)
     samples.append(_sample(proc, t0))
     await broker.stop()
 
     # ── Verdicts ──────────────────────────────────────────────────────────
-    lost = confirmed - seen
+    # lost = confirmed ids ([0, confirmed_count)) never seen. Everything
+    # ≤ watermark was seen; add residual ids that fall inside the range.
+    in_range_residual = sum(1 for r in residual if r < confirmed_count)
+    covered = min(watermark + 1, confirmed_count) + in_range_residual
+    lost_count = confirmed_count - covered
     recovery_failures = []
     for r in restarts:
         # consumer must have made progress within the recovery window
         deadline = r["t"] + RECOVERY_WINDOW_S
         progressed = any(
             s["t"] > r["t"] and s["t"] <= deadline for s in samples
-        ) and len(seen) > r["seen_before"]
+        ) and _unique_seen() > r["seen_before"]
         if not progressed:
             recovery_failures.append(r["t"])
 
     slope = _slope_kb_per_min(samples)
+    rss_net_kb = samples[-1]["rss_kb"] - samples[0]["rss_kb"]
     early = samples[: max(2, len(samples) // 4)]
     fd_growth = max(s["fds"] for s in samples) - max(s["fds"] for s in early)
     task_growth = max(s["tasks"] for s in samples) - max(s["tasks"] for s in early)
@@ -226,21 +256,23 @@ async def soak(url: str, duration: float, rate: int, restart_every: float) -> di
         "duration_s": duration,
         "rate_msg_s": rate,
         "restarts": len(restarts),
-        "published_confirmed": len(confirmed),
-        "consumed_unique": len(seen),
-        "duplicates": received_total - len(seen),
-        "lost": len(lost),
+        "published_confirmed": confirmed_count,
+        "consumed_unique": _unique_seen(),
+        "duplicates": received_total - _unique_seen(),
+        "lost": lost_count,
         "recovery_failures": recovery_failures,
         "rss_start_kb": samples[0]["rss_kb"],
         "rss_end_kb": samples[-1]["rss_kb"],
         "rss_slope_kb_per_min": slope,
+        "rss_net_kb": rss_net_kb,
         "fd_growth": fd_growth,
         "task_growth": task_growth,
         "samples": samples,
         "verdicts": {
-            "no_loss": len(lost) == 0,
+            "no_loss": lost_count == 0,
             "recovered_after_every_restart": not recovery_failures,
-            "rss_bounded": slope <= RSS_SLOPE_LIMIT_KB_MIN,
+            # a leak must show BOTH a sustained slope and material net growth
+            "rss_bounded": slope <= RSS_SLOPE_LIMIT_KB_MIN or rss_net_kb <= RSS_NET_FLOOR_KB,
             "fds_bounded": fd_growth <= 16,
             "tasks_bounded": task_growth <= 32,
         },

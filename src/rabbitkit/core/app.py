@@ -273,6 +273,13 @@ class RabbitApp:
                         "Use start_async() or make the hook synchronous."
                     )
             else:
+                # A FRESH executor per hook is deliberate, not waste: Python
+                # cannot kill a thread, so a hook that hangs past its timeout
+                # occupies its worker forever. With a shared pool that stuck
+                # worker would make every SUBSEQUENT hook (including shutdown
+                # hooks during a SIGTERM drain) time out spuriously without
+                # ever running. Isolation costs one thread spawn (~50µs), paid
+                # only at startup/shutdown.
                 ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
                     fut = ex.submit(hook)

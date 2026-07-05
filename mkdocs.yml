@@ -54,6 +54,7 @@ nav:
       - Retry Architecture: rabbitmq-retry-architecture.md
       - Quorum Migration: quorum-migration.md
       - Migrating to rabbitkit: migrating-to-rabbitkit.md
+      - Concurrency Model: concurrency-model.md
       - Benchmarking: benchmarking.md
   - API Reference:
       - Brokers: api/brokers.md

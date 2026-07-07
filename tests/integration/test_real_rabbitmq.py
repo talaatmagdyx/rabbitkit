@@ -765,6 +765,43 @@ async def test_async_quorum_queue_delivery_limit_dead_letters_independent_of_app
     await broker.stop()
 
 
+async def test_async_queue_consumer_timeout_declares_and_consumes(rabbitmq_url: str) -> None:
+    """RabbitQueue(consumer_timeout=...) must produce a declaration a real
+    broker actually accepts (a wrong x-argument name or type is rejected
+    with a 406 PRECONDITION_FAILED at declare time) and the queue must
+    consume normally. Enforcement itself (channel force-close after the
+    timeout) is not end-to-end tested here: the server evaluates consumer
+    timeouts on a coarse periodic tick, which would make the test slow and
+    timing-flaky -- declaration acceptance is the contract rabbitkit owns.
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.topology import RabbitQueue
+    from rabbitkit.core.types import MessageEnvelope
+
+    received = asyncio.Event()
+
+    queue = RabbitQueue(
+        name="integ-consumer-timeout-q",
+        durable=True,
+        consumer_timeout=3_600_000,  # 1 hour, for handlers that outlive the 30-min server default
+    )
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    @broker.subscriber(queue=queue)
+    async def handle(body: bytes) -> None:
+        received.set()
+
+    await broker.start()  # raises ConfigurationError here if the broker rejects the x-argument
+    await asyncio.sleep(0.3)
+
+    await broker.publish(MessageEnvelope(routing_key="integ-consumer-timeout-q", body=b"slow-job"))
+    await asyncio.wait_for(received.wait(), timeout=15.0)
+
+    await broker.stop()
+
+
 async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbitmq_url: str) -> None:
     """H6: a filter_fn rejection on a route with no retry and no manually
     configured DLX must not silently discard the message.

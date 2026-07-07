@@ -83,6 +83,28 @@ generously relative to your actual traffic pattern.
 **A publish-only broker's connection drops after being idle.**
 Expected without `pump_idle()` — see the connection issues section above.
 
+**The consumer channel closes mid-handler with "delivery acknowledgement
+… timed out" (PRECONDITION_FAILED).**
+RabbitMQ force-closes a channel if a delivered message stays unacked past
+the server's `consumer_timeout` (default **30 minutes**) — the classic
+silent killer for long-running handlers with `AckPolicy.MANUAL` or a
+generous/disabled `TimeoutMiddleware`. The server does **not** advertise
+this limit to clients, so rabbitkit can't warn you up front. If a handler
+can legitimately hold a message longer, raise the limit per queue at
+declaration time — `RabbitQueue(name=..., consumer_timeout=3_600_000)`
+(ms; RabbitMQ ≥ 3.12) — or ack earlier and track completion elsewhere.
+
+**Publish fails with `ValueError: Message body … exceeds
+PublisherConfig.max_message_bytes`.**
+Working as intended: the client-side guard defaults to **16 MiB**,
+mirroring RabbitMQ's own `max_message_size` default. Without the guard the
+server rejects the message anyway — but with a channel exception that kills
+the (pooled) publisher channel and corrupts sibling in-flight publishes.
+If you deliberately raised `max_message_size` in `rabbitmq.conf`, set
+`PublisherConfig(max_message_bytes=...)` to match (the server doesn't
+advertise its limit, so rabbitkit can't discover it); `0` disables the
+guard. Better: store large payloads externally and publish a reference.
+
 ## Installation
 
 **`ModuleNotFoundError: No module named 'pkg_resources'` when importing

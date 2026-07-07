@@ -466,8 +466,18 @@ class TestPlaceholderConfigs:
 
 
 class TestPublisherConfigSizeGuard:
-    def test_max_message_bytes_default_disabled(self) -> None:
-        assert PublisherConfig().max_message_bytes == 0
+    def test_max_message_bytes_defaults_to_server_default(self) -> None:
+        """The default mirrors RabbitMQ's own max_message_size default
+        (16 MiB): the server would reject anything larger anyway, but with
+        a channel-killing exception instead of a clean client-side error.
+        The server does not advertise its actual limit (neither in AMQP
+        connection negotiation nor via the management API), so mirroring
+        the default is the closest possible thing to discovering it.
+        """
+        assert PublisherConfig().max_message_bytes == 16 * 1024 * 1024
+
+    def test_max_message_bytes_zero_disables(self) -> None:
+        assert PublisherConfig(max_message_bytes=0).max_message_bytes == 0
 
 
 # ── RabbitConfig (composition) ────────────────────────────────────────────

@@ -19,10 +19,12 @@ rabbitkit's own production-readiness reviews.
 - [ ] Treat any `PublishOutcome` that isn't a real, confirmed delivery as a failure — `outcome.raise_for_status()` is the one-liner. If durability before settling something else matters, check `status == PublishStatus.CONFIRMED` specifically: with confirms off, `.ok` is also `True` for `SENT` (written to the socket, never broker-acknowledged).
 - [ ] If you use `mandatory=True`, check for `PublishStatus.RETURNED` — an unroutable message is reported distinctly, not silently swallowed.
 - [ ] **High-volume publishers use `AsyncBroker`.** Sync confirmed publish ceilings at ~0.9k msg/s (pika serializes confirms on one channel; `worker_count` does not raise it). `AsyncBroker` + `AsyncBatchPublisher` pipelines confirms (~6.1k msg/s measured); scale further with more processes. See the throughput note in the README.
+- [ ] If you changed the server's `max_message_size` in `rabbitmq.conf`, set `PublisherConfig(max_message_bytes=...)` to match — the default (16 MiB) mirrors RabbitMQ's default, and the server does not advertise its actual limit to clients. The client-side guard turns a channel-killing server rejection into a clean `ValueError` before the bytes hit the wire.
 
 ## Concurrency & shutdown
 
 - [ ] `ConsumerConfig(graceful_timeout=...)` must exceed your worst-case handler time. A handler that outlives it is **abandoned, not killed** — Python can't forcibly stop an arbitrary thread or a cancelled-but-still-running coroutine's cleanup, so size this generously rather than tightly.
+- [ ] Any handler that can hold a delivery unacked longer than **30 minutes** (the server's `consumer_timeout` default, which is never advertised to clients) needs `RabbitQueue(consumer_timeout=...)` (ms; RabbitMQ ≥ 3.12) on its queue — otherwise RabbitMQ force-closes the channel mid-handler. See [Troubleshooting](../troubleshooting.md).
 - [ ] Kubernetes `terminationGracePeriodSeconds` must exceed `graceful_timeout` plus your `preStop` sleep, or the pod gets `SIGKILL`ed mid-message. See [the idempotency contract](idempotency.md) for why this is recoverable but noisy, not silently unsafe.
 - [ ] Prefer `RabbitApp.run_async()` (or `asyncio.run(broker.run())`) over bare `await broker.start()` for async consumers — the latter's signal-handler-triggered drain is fire-and-forget and isn't guaranteed to finish before the process exits.
 - [ ] `SyncBroker.stop()` must be called from the same thread that ran `start_consuming()` — exactly what `broker.run()` does. Don't wire your own cross-thread shutdown call.

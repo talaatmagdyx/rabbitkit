@@ -201,6 +201,44 @@ class TestRabbitQueueStream:
         with pytest.raises(ValueError, match="TTL"):
             RabbitQueue(name="q", queue_type=QueueType.STREAM, message_ttl=60000)
 
+    def test_stream_consumer_timeout_raises(self) -> None:
+        with pytest.raises(ValueError, match="consumer_timeout"):
+            RabbitQueue(name="q", queue_type=QueueType.STREAM, consumer_timeout=3_600_000)
+
+
+# ── RabbitQueue — consumer_timeout (x-consumer-timeout) ─────────────────
+
+
+class TestRabbitQueueConsumerTimeout:
+    """Per-queue override of the server's consumer ack timeout (default 30
+    min server-side, NOT advertised to clients) — the client-side way to
+    keep RabbitMQ from force-closing the channel under a long-running
+    handler.
+    """
+
+    def test_consumer_timeout_maps_to_x_argument(self) -> None:
+        q = RabbitQueue(name="q", consumer_timeout=3_600_000)
+        kwargs = q.to_declare_kwargs()
+        assert kwargs["arguments"]["x-consumer-timeout"] == 3_600_000
+
+    def test_consumer_timeout_on_quorum_queue(self) -> None:
+        q = RabbitQueue(name="q", queue_type=QueueType.QUORUM, consumer_timeout=3_600_000)
+        assert q.to_declare_kwargs()["arguments"]["x-consumer-timeout"] == 3_600_000
+
+    def test_default_omits_x_argument(self) -> None:
+        q = RabbitQueue(name="q")
+        assert "x-consumer-timeout" not in q.to_declare_kwargs()["arguments"]
+
+    def test_non_positive_raises(self) -> None:
+        with pytest.raises(ValueError, match="consumer_timeout must be a positive"):
+            RabbitQueue(name="q", consumer_timeout=0)
+        with pytest.raises(ValueError, match="consumer_timeout must be a positive"):
+            RabbitQueue(name="q", consumer_timeout=-1)
+
+    def test_passive_with_consumer_timeout_warns(self) -> None:
+        with pytest.warns(UserWarning, match="passive.*creation-only"):
+            RabbitQueue(name="q", passive=True, consumer_timeout=3_600_000)
+
 
 # ── RabbitQueue — classic validation ─────────────────────────────────────
 

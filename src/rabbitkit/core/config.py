@@ -273,12 +273,19 @@ class PublisherConfig:
     confirm_timeout: float = 5.0
     mandatory: bool = False
     persistent: bool = True
-    # M10: reject oversized message bodies at publish time (bytes). 0 =
-    # disabled (default, unchanged). Large messages are a RabbitMQ anti-pattern
-    # (memory pressure, head-of-line blocking, slow recovery) — set a cap
-    # (e.g. 1_048_576 for 1 MiB) to fail fast on a programming error instead
-    # of shipping a 50 MB message. Enforced by broker.publish() → ValueError.
-    max_message_bytes: int = 0
+    # M10: reject oversized message bodies at publish time (bytes),
+    # enforced by broker.publish() → ValueError. Default mirrors RabbitMQ's
+    # own server-side `max_message_size` default (16 MiB): the server would
+    # reject a larger message anyway — but with a channel exception that
+    # kills the (possibly pooled) publisher channel, corrupting sibling
+    # in-flight publishes. Neither AMQP connection negotiation nor the
+    # management API exposes the server's actual limit, so it cannot be
+    # discovered at connect time — if you raised `max_message_size` in
+    # rabbitmq.conf, raise this to match; 0 disables the client-side guard
+    # entirely. Large messages are a RabbitMQ anti-pattern (memory pressure,
+    # head-of-line blocking, slow recovery) — consider a tighter cap
+    # (e.g. 1_048_576 for 1 MiB) and storing payloads externally.
+    max_message_bytes: int = 16_777_216
 
 
 # ── Consumer ───────────────────────────────────────────────────────────────

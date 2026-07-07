@@ -282,7 +282,13 @@ from rabbitkit import RabbitConfig, ConnectionConfig, ConsumerConfig, PublisherC
 
 config = RabbitConfig(
     connection=ConnectionConfig(host="localhost", port=5672),
-    publisher=PublisherConfig(confirm_delivery=True, confirm_timeout=5.0),
+    publisher=PublisherConfig(
+        confirm_delivery=True,
+        confirm_timeout=5.0,
+        max_message_bytes=16_777_216,  # default mirrors the server's 16 MiB
+                                       #   max_message_size; raise to match a
+                                       #   changed rabbitmq.conf, 0 disables
+    ),
     consumer=ConsumerConfig(prefetch_count=50, graceful_timeout=30.0),
     pool=PoolConfig(channel_pool_size=20, channel_acquire_timeout=10.0),
     topology_mode=TopologyMode.AUTO_DECLARE,  # or PASSIVE_ONLY, MANUAL
@@ -433,6 +439,9 @@ from rabbitkit import RabbitExchange, RabbitQueue, ExchangeType, QueueType
         max_length=10000,
         max_priority=10,                   # classic only
         delivery_limit=3,                  # quorum only
+        consumer_timeout=3_600_000,        # ms — raise the server's 30-min ack
+                                           #   timeout for long-running handlers
+                                           #   (RabbitMQ >= 3.12, classic/quorum)
     ),
     exchange=RabbitExchange(
         name="events",

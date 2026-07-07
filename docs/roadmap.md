@@ -78,6 +78,16 @@ API freeze, full documentation, full type coverage, and migration support.
 - Full type coverage — `mypy --strict` clean across the entire public API surface
 - Migration guide — documented upgrade path from 0.x to 1.0 for any breaking changes introduced during the 0.x stabilization period
 
+### Under consideration (unscheduled)
+
+- **SASL `EXTERNAL` authentication (x509 certificate auth)** — for deployments
+  that authenticate clients by their TLS client certificate instead of
+  username/password. `SecurityConfig(mechanism=...)` currently fails fast for
+  anything other than `PLAIN` (deliberately — a silent fallback would be
+  worse). Both pika (`pika.credentials.ExternalCredentials`) and aio-pika
+  support it, so this is plumbing plus tests, prioritized on demand — open an
+  issue if your deployment needs it.
+
 ---
 
 ## Not on the Roadmap

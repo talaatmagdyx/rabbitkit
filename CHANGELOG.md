@@ -34,7 +34,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3,000 concurrently-published messages and reports per-queue counts and
   end-to-end throughput.
 
+- **`RabbitQueue(consumer_timeout=...)`** — per-queue override of the
+  server's consumer ack timeout (`x-consumer-timeout`, ms; RabbitMQ
+  >= 3.12, classic/quorum only). RabbitMQ force-closes a consumer's
+  channel if a delivery stays unacked past its `consumer_timeout`
+  (server default: 30 minutes), and the server never advertises that
+  limit to clients — neither in AMQP connection negotiation nor via the
+  management API (verified empirically against a live broker) — so a
+  long-running handler's only defense is declaring the override at init
+  time. Validated (positive; rejected on streams, where per-message ack
+  timeouts don't apply), warned about under `passive=True` like the
+  other creation-only options, covered by unit tests and a real-broker
+  integration test proving the declaration is accepted. Documented in
+  `docs/troubleshooting.md` and the production checklist.
+
 ### Changed
+
+- **`PublisherConfig.max_message_bytes` now defaults to 16 MiB**
+  (previously `0` = guard disabled), mirroring RabbitMQ's own
+  server-side `max_message_size` default. Rationale: the server rejects
+  an oversized publish anyway, but with a channel exception that kills
+  the (pooled) publisher channel and corrupts sibling in-flight
+  publishes — the client-side guard converts that into a clean
+  `ValueError` before the bytes hit the wire. The server's actual limit
+  cannot be discovered at connect time (not in the AMQP tune frame, not
+  in the management API), so mirroring the default is the closest
+  possible thing: if you raised `max_message_size` in `rabbitmq.conf`,
+  set `max_message_bytes` to match; `0` still disables the guard.
+  Behavior change is only visible to publishers of >16 MiB messages,
+  which the server was already rejecting destructively.
 
 - Dependency ranges widened after full-suite validation on the newest
   releases: `redis >=5,<9` (validated on 8.0.1; rabbitkit touches only

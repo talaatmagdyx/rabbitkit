@@ -88,6 +88,13 @@ class RabbitQueue:
     message_ttl: int | None = None  # ms
     max_length: int | None = None
     max_length_bytes: int | None = None
+    # x-consumer-timeout (ms) — per-queue override of the server's
+    # consumer ack timeout (server default: 30 minutes). If a delivered
+    # message stays unacked past it, RabbitMQ force-closes the consumer's
+    # channel. The server does not advertise its limit to clients, so if a
+    # handler can legitimately hold a message longer than 30 minutes, raise
+    # it HERE at declaration time (RabbitMQ >= 3.12; classic/quorum only).
+    consumer_timeout: int | None = None
 
     # Classic-only
     lazy: bool = False  # x-queue-mode: lazy (classic only)
@@ -153,6 +160,13 @@ class RabbitQueue:
             if self.message_ttl is not None:
                 msg = "Stream queues do not support message TTL"
                 raise ValueError(msg)
+            if self.consumer_timeout is not None:
+                msg = "Stream queues do not support consumer_timeout (per-message ack timeouts do not apply to streams)"
+                raise ValueError(msg)
+
+        if self.consumer_timeout is not None and self.consumer_timeout <= 0:
+            msg = f"Queue '{self.name}': consumer_timeout must be a positive number of milliseconds"
+            raise ValueError(msg)
 
         # Classic constraints
         if self.queue_type == QueueType.CLASSIC:
@@ -189,6 +203,7 @@ class RabbitQueue:
                 self.delivery_limit is not None,
                 self.message_ttl is not None,
                 self.max_length is not None,
+                self.consumer_timeout is not None,
             ]
         ):
             warnings.warn(
@@ -218,6 +233,8 @@ class RabbitQueue:
             args["x-max-length"] = self.max_length
         if self.max_length_bytes is not None:
             args["x-max-length-bytes"] = self.max_length_bytes
+        if self.consumer_timeout is not None:
+            args["x-consumer-timeout"] = self.consumer_timeout
 
         # Classic-only
         if self.lazy:

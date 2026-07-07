@@ -196,3 +196,89 @@ class TestTupleContents:
         assert KeyError in PERMANENT_ERRORS
         assert ValueError in PERMANENT_ERRORS
         assert TypeError in PERMANENT_ERRORS
+
+
+# ── custom validation / runtime error taxonomy ───────────────────────────
+
+
+class TestCustomErrorTaxonomy:
+    """Each custom error must (a) be raised at its site and (b) keep the
+    builtin base class it replaced, so pre-existing ``except ValueError`` /
+    ``except RuntimeError`` handlers (and tests) keep working unchanged.
+    """
+
+    def test_inheritance_contract(self) -> None:
+        from rabbitkit.core.errors import (
+            BrokerNotStartedError,
+            ConfigurationError,
+            ConfigValidationError,
+            MessageTooLargeError,
+            SettlementError,
+            TopologyValidationError,
+        )
+
+        assert issubclass(ConfigValidationError, ValueError)
+        assert issubclass(ConfigValidationError, ConfigurationError)
+        assert issubclass(TopologyValidationError, ValueError)
+        assert issubclass(TopologyValidationError, ConfigurationError)
+        assert issubclass(MessageTooLargeError, ValueError)
+        assert issubclass(BrokerNotStartedError, RuntimeError)
+        assert issubclass(SettlementError, RuntimeError)
+
+    def test_all_exported_at_top_level(self) -> None:
+        import rabbitkit
+
+        for name in (
+            "ConfigValidationError",
+            "TopologyValidationError",
+            "MessageTooLargeError",
+            "BrokerNotStartedError",
+            "SettlementError",
+        ):
+            assert hasattr(rabbitkit, name), name
+            assert name in rabbitkit.__all__, name
+
+    def test_config_validation_error_raised(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError):
+            RetryConfig(max_retries=-1)
+
+    def test_shortstr_validation_raises_config_validation_error(self) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+        from rabbitkit.core.types import validate_amqp_shortstr
+
+        with pytest.raises(ConfigValidationError, match="shortstr"):
+            validate_amqp_shortstr("Queue name", "q" * 256)
+
+    def test_topology_validation_error_raised(self) -> None:
+        from rabbitkit.core.errors import TopologyValidationError
+        from rabbitkit.core.topology import RabbitQueue
+        from rabbitkit.core.types import QueueType
+
+        with pytest.raises(TopologyValidationError):
+            RabbitQueue(name="q", queue_type=QueueType.QUORUM, durable=False)
+        with pytest.raises(TopologyValidationError):
+            RabbitQueue(name="q", consumer_timeout=0)
+
+    def test_settlement_error_raised_on_sync_ack_of_async_message(self) -> None:
+        from rabbitkit.core.errors import SettlementError
+        from rabbitkit.core.message import RabbitMessage
+
+        msg = RabbitMessage(body=b"x", routing_key="rk")  # no settlement fns wired
+        with pytest.raises(SettlementError):
+            msg.ack()
+
+    def test_old_catches_still_work(self) -> None:
+        """The exact backward-compat promise: bare builtin catches see them."""
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.message import RabbitMessage
+        from rabbitkit.core.topology import RabbitQueue
+
+        with pytest.raises(ValueError):
+            RetryConfig(max_retries=-1)
+        with pytest.raises(ValueError):
+            RabbitQueue(name="q", consumer_timeout=-5)
+        with pytest.raises(RuntimeError):
+            RabbitMessage(body=b"x", routing_key="rk").ack()

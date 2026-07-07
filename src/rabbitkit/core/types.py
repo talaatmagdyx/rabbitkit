@@ -36,7 +36,8 @@ AMQP_SHORTSTR_MAX_BYTES = 255
 
 
 def validate_amqp_shortstr(field_name: str, value: str) -> None:
-    """Raise ``ValueError`` if ``value`` exceeds the AMQP shortstr limit.
+    """Raise ``ConfigValidationError`` (a ``ValueError`` subclass) if
+    ``value`` exceeds the AMQP shortstr limit.
 
     Length is measured in encoded UTF-8 bytes (the wire unit), not
     characters -- a 255-character string using multi-byte code points can
@@ -44,11 +45,15 @@ def validate_amqp_shortstr(field_name: str, value: str) -> None:
     """
     encoded_len = len(value.encode("utf-8"))
     if encoded_len > AMQP_SHORTSTR_MAX_BYTES:
+        # Function-level import: errors.py imports from this module, so the
+        # exception type can't be imported at module scope without a cycle.
+        from rabbitkit.core.errors import ConfigValidationError
+
         msg = (
             f"{field_name} is {encoded_len} bytes, exceeding the AMQP shortstr "
             f"limit of {AMQP_SHORTSTR_MAX_BYTES} bytes: {value[:40]!r}..."
         )
-        raise ValueError(msg)
+        raise ConfigValidationError(msg)
 
 
 class _RequeuedForRetrySentinel:

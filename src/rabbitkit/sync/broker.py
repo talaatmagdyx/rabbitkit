@@ -29,7 +29,7 @@ from rabbitkit.core.config import (
     RetryDisabled,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError
+from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
@@ -625,7 +625,7 @@ class SyncBroker:
         # error, caught before it hits the wire).
         max_bytes = self._config.publisher.max_message_bytes
         if max_bytes and len(envelope.body) > max_bytes:
-            raise ValueError(
+            raise MessageTooLargeError(
                 f"Message body ({len(envelope.body)} bytes) exceeds "
                 f"PublisherConfig.max_message_bytes ({max_bytes}). Large messages are a "
                 "RabbitMQ anti-pattern — store the payload externally and publish a "
@@ -633,7 +633,7 @@ class SyncBroker:
             )
 
         if self._transport is None:
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
         transport = self._transport  # narrowed local capture for the closure below
 
         def do_transport_publish(env: MessageEnvelope) -> PublishOutcome:
@@ -678,7 +678,7 @@ class SyncBroker:
         outcome shape a real transport failure already produces.
         """
         if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
         transport = self._transport
         fc = self._flow_controller
         if fc is None:
@@ -716,7 +716,7 @@ class SyncBroker:
         The client is shared across calls and closed in stop().
         """
         if self._transport is None:
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
         if self._rpc_client is None:
             from rabbitkit.rpc import RPCClient
 

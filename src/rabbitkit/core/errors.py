@@ -16,6 +16,9 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 
+# Re-export: defined in message.py to avoid an import cycle (errors -> types -> message).
+# The `as` form marks it an explicit re-export for mypy --strict.
+from rabbitkit.core.message import SettlementError as SettlementError
 from rabbitkit.core.types import ClassifiedError, ErrorSeverity
 
 # ── Missing DI dependency (H10) ──────────────────────────────────────────
@@ -169,6 +172,59 @@ class UnsafeTopologyError(ConfigurationError):
     Subclasses :class:`ConfigurationError` so existing catch-alls for
     registration/startup misconfiguration keep working.
     """
+
+
+# ── Construction-time validation errors ──────────────────────────────────
+# Both dual-inherit ValueError: every one of these sites historically raised
+# a bare ValueError, so ``except ValueError`` (and every existing
+# ``pytest.raises(ValueError)``) keeps working — the custom types only ADD a
+# way to catch rabbitkit-specific validation precisely.
+
+
+class ConfigValidationError(ConfigurationError, ValueError):
+    """An invalid value was passed to a rabbitkit config object or
+    constructor — ``RabbitConfig`` sub-configs (``RetryConfig(max_retries=-1)``,
+    ``WorkerConfig(max_queue_size=-1)``, …) and AMQP short-string fields
+    (queue/exchange/routing-key names that are too long or contain control
+    characters, including on ``MessageEnvelope``).
+
+    Raised at construction time (``__post_init__``), so a bad value fails
+    where it's written, not at first use.
+    """
+
+
+class TopologyValidationError(ConfigurationError, ValueError):
+    """An invalid ``RabbitQueue`` / ``RabbitExchange`` declaration — a
+    combination RabbitMQ itself would reject or silently misbehave on
+    (non-durable quorum queue, priorities on a stream, ``delivery_limit`` on
+    a classic queue, non-positive ``consumer_timeout``, …).
+
+    Raised at model construction time, before anything touches the broker.
+    """
+
+
+class MessageTooLargeError(ValueError):
+    """A publish was rejected client-side because the body exceeds
+    ``PublisherConfig.max_message_bytes`` (default 16 MiB, mirroring the
+    server's ``max_message_size`` default).
+
+    Raised *before* the bytes hit the wire: the server would reject the
+    message anyway, but with a channel exception that kills the (pooled)
+    publisher channel and corrupts sibling in-flight publishes. Subclasses
+    ``ValueError`` for backward compatibility with earlier releases that
+    raised it directly.
+    """
+
+
+# ── Runtime API-misuse errors ────────────────────────────────────────────
+# Both dual-inherit RuntimeError for the same backward-compat reason.
+
+
+class BrokerNotStartedError(RuntimeError):
+    """A broker method that needs a live transport (``publish()``, RPC,
+    topology helpers) was called before ``start()`` (or after ``stop()``).
+    """
+
 
 
 # ── Publish error (opt-in) ───────────────────────────────────────────────

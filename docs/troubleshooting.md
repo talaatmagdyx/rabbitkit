@@ -94,8 +94,8 @@ can legitimately hold a message longer, raise the limit per queue at
 declaration time — `RabbitQueue(name=..., consumer_timeout=3_600_000)`
 (ms; RabbitMQ ≥ 3.12) — or ack earlier and track completion elsewhere.
 
-**Publish fails with `ValueError: Message body … exceeds
-PublisherConfig.max_message_bytes`.**
+**Publish fails with `MessageTooLargeError` (a `ValueError` subclass):
+`Message body … exceeds PublisherConfig.max_message_bytes`.**
 Working as intended: the client-side guard defaults to **16 MiB**,
 mirroring RabbitMQ's own `max_message_size` default. Without the guard the
 server rejects the message anyway — but with a channel exception that kills

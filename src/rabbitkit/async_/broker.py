@@ -33,7 +33,7 @@ from rabbitkit.core.config import (
     SocketConfig,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError
+from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
@@ -792,7 +792,7 @@ class AsyncBroker:
         # M10: reject oversized bodies at publish time (see sync broker).
         max_bytes = self._config.publisher.max_message_bytes
         if max_bytes and len(envelope.body) > max_bytes:
-            raise ValueError(
+            raise MessageTooLargeError(
                 f"Message body ({len(envelope.body)} bytes) exceeds "
                 f"PublisherConfig.max_message_bytes ({max_bytes}). Large messages are a "
                 "RabbitMQ anti-pattern — store the payload externally and publish a "
@@ -800,7 +800,7 @@ class AsyncBroker:
             )
 
         if self._transport is None:
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
 
         publish_fn = (
             self._batch_publisher.publish
@@ -841,7 +841,7 @@ class AsyncBroker:
         regardless of the configured ``on_blocked`` policy.
         """
         if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
         transport = self._transport
         fc = self._flow_controller
         if fc is None:
@@ -893,7 +893,7 @@ class AsyncBroker:
             RPCTimeoutError: If no response within timeout.
         """
         if self._transport is None:
-            raise RuntimeError("Broker not started. Call start() first.")
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
         if self._rpc_client is None:
             from rabbitkit.rpc import AsyncRPCClient
 

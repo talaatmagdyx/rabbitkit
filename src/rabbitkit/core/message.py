@@ -15,6 +15,20 @@ from datetime import datetime
 from typing import Any
 
 
+class SettlementError(RuntimeError):
+    """Invalid message-settlement call: calling the sync settlement methods
+    (``ack()`` ...) on a message from an async-only transport, or the async
+    variants (``ack_async()`` ...) on a message with no settlement function
+    wired at all.
+
+    Defined here rather than in ``core/errors.py`` because ``errors.py``
+    (indirectly, via ``types.py``) imports this module -- it is re-exported
+    from ``rabbitkit.core.errors`` and the package root, which are the
+    import paths to use. Subclasses ``RuntimeError`` so pre-existing
+    ``except RuntimeError`` handlers keep working.
+    """
+
+
 def is_rabbit_message_annotation(ann: Any) -> bool:
     """True if ``ann`` is/mentions :class:`RabbitMessage`.
 
@@ -139,7 +153,7 @@ class RabbitMessage:
     # ── Sync settlement ───────────────────────────────────────────────────
 
     def ack(self) -> None:
-        """Synchronous ack. Raises RuntimeError on async-only transport.
+        """Synchronous ack. Raises SettlementError on async-only transport.
 
         Sets disposition only after the transport call succeeds, so a failed
         ack (channel closed, frame error) leaves the message unsettled and the
@@ -149,27 +163,27 @@ class RabbitMessage:
             return  # idempotent guard
         if self._ack_fn is None:
             msg = "Cannot sync-ack an async transport message. Use await msg.ack_async()."
-            raise RuntimeError(msg)
+            raise SettlementError(msg)
         self._ack_fn()  # may raise — disposition stays "pending" on failure
         self._disposition = "acked"
 
     def nack(self, requeue: bool = True) -> None:
-        """Synchronous nack. Raises RuntimeError on async-only transport."""
+        """Synchronous nack. Raises SettlementError on async-only transport."""
         if self._disposition != "pending":
             return
         if self._nack_fn is None:
             msg = "Cannot sync-nack an async transport message. Use await msg.nack_async()."
-            raise RuntimeError(msg)
+            raise SettlementError(msg)
         self._nack_fn(requeue)
         self._disposition = "nacked"
 
     def reject(self, requeue: bool = False) -> None:
-        """Synchronous reject. Raises RuntimeError on async-only transport."""
+        """Synchronous reject. Raises SettlementError on async-only transport."""
         if self._disposition != "pending":
             return
         if self._reject_fn is None:
             msg = "Cannot sync-reject an async transport message. Use await msg.reject_async()."
-            raise RuntimeError(msg)
+            raise SettlementError(msg)
         self._reject_fn(requeue)
         self._disposition = "rejected"
 
@@ -184,7 +198,7 @@ class RabbitMessage:
         elif self._ack_fn:
             self._ack_fn()
         else:
-            raise RuntimeError("Cannot async-ack: no settlement fn set. Use msg.ack() on a sync transport.")
+            raise SettlementError("Cannot async-ack: no settlement fn set. Use msg.ack() on a sync transport.")
         self._disposition = "acked"
 
     async def nack_async(self, requeue: bool = True) -> None:
@@ -196,7 +210,7 @@ class RabbitMessage:
         elif self._nack_fn:
             self._nack_fn(requeue)
         else:
-            raise RuntimeError("Cannot async-nack: no settlement fn set. Use msg.nack() on a sync transport.")
+            raise SettlementError("Cannot async-nack: no settlement fn set. Use msg.nack() on a sync transport.")
         self._disposition = "nacked"
 
     async def reject_async(self, requeue: bool = False) -> None:
@@ -208,7 +222,7 @@ class RabbitMessage:
         elif self._reject_fn:
             self._reject_fn(requeue)
         else:
-            raise RuntimeError("Cannot async-reject: no settlement fn set. Use msg.reject() on a sync transport.")
+            raise SettlementError("Cannot async-reject: no settlement fn set. Use msg.reject() on a sync transport.")
         self._disposition = "rejected"
 
 

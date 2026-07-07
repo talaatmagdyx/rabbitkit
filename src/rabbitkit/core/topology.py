@@ -11,6 +11,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
+from rabbitkit.core.errors import TopologyValidationError
 from rabbitkit.core.types import ExchangeType, QueueType, validate_amqp_shortstr
 
 
@@ -36,10 +37,10 @@ class RabbitExchange:
         """Validate exchange configuration."""
         if not self.name and self.type != ExchangeType.DIRECT:
             msg = "Non-default exchanges must have a name"
-            raise ValueError(msg)
+            raise TopologyValidationError(msg)
         if self.internal and self.auto_delete:
             msg = "Internal exchanges cannot be auto_delete (they are never published to directly)."
-            raise ValueError(msg)
+            raise TopologyValidationError(msg)
         validate_amqp_shortstr("Exchange name", self.name)
         validate_amqp_shortstr("Exchange routing_key", self.routing_key)
 
@@ -119,12 +120,13 @@ class RabbitQueue:
     def validate(self) -> None:
         """Enforce queue-type-specific constraints.
 
-        Raises ValueError for invalid combinations.
+        Raises TopologyValidationError (a ValueError subclass) for
+        invalid combinations.
         Uses warnings.warn() for unusual but legal combinations.
         """
         if not self.name:
             msg = "Queue name is required"
-            raise ValueError(msg)
+            raise TopologyValidationError(msg)
         validate_amqp_shortstr("Queue name", self.name)
         validate_amqp_shortstr("Queue routing_key", self.routing_key)
 
@@ -132,47 +134,47 @@ class RabbitQueue:
         if self.queue_type == QueueType.QUORUM:
             if not self.durable:
                 msg = "Quorum queues must be durable"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.exclusive:
                 msg = "Quorum queues cannot be exclusive"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.lazy:
                 msg = "Quorum queues do not support lazy mode (x-queue-mode)"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.max_priority is not None:
                 msg = "Quorum queues do not support priorities"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
 
         # Stream constraints
         if self.queue_type == QueueType.STREAM:
             if not self.durable:
                 msg = "Stream queues must be durable"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.exclusive:
                 msg = "Stream queues cannot be exclusive"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.lazy:
                 msg = "Stream queues do not support lazy mode"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.max_priority is not None:
                 msg = "Stream queues do not support priorities"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.message_ttl is not None:
                 msg = "Stream queues do not support message TTL"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
             if self.consumer_timeout is not None:
                 msg = "Stream queues do not support consumer_timeout (per-message ack timeouts do not apply to streams)"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
 
         if self.consumer_timeout is not None and self.consumer_timeout <= 0:
             msg = f"Queue '{self.name}': consumer_timeout must be a positive number of milliseconds"
-            raise ValueError(msg)
+            raise TopologyValidationError(msg)
 
         # Classic constraints
         if self.queue_type == QueueType.CLASSIC:
             if self.delivery_limit is not None:
                 msg = "Classic queues do not support delivery_limit (quorum only)"
-                raise ValueError(msg)
+                raise TopologyValidationError(msg)
 
         # Warnings for unusual combos
         if self.lazy:

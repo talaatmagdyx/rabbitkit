@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from rabbitkit.core.errors import ConfigValidationError
 from rabbitkit.core.logging import LoggingConfig
 from rabbitkit.core.types import ErrorSeverity, TopologyMode
 
@@ -133,7 +134,7 @@ class ConnectionConfig:
         for node in self.nodes:
             _, sep, port = node.partition(":")
             if sep and not port.isdigit():
-                raise ValueError(
+                raise ConfigValidationError(
                     f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; "
                     "use 'host' or 'host:port'."
                 )
@@ -253,7 +254,7 @@ class SecurityConfig:
 
     def __post_init__(self) -> None:
         if self.mechanism != "PLAIN":
-            raise ValueError(
+            raise ConfigValidationError(
                 f"SecurityConfig.mechanism={self.mechanism!r} is not supported — only "
                 "'PLAIN' (username/password) is implemented. SASL EXTERNAL/x509-auth is "
                 "not wired into the transports. For TLS client certs (encryption, not "
@@ -274,7 +275,8 @@ class PublisherConfig:
     mandatory: bool = False
     persistent: bool = True
     # M10: reject oversized message bodies at publish time (bytes),
-    # enforced by broker.publish() → ValueError. Default mirrors RabbitMQ's
+    # enforced by broker.publish() → MessageTooLargeError (a ValueError
+    # subclass). Default mirrors RabbitMQ's
     # own server-side `max_message_size` default (16 MiB): the server would
     # reject a larger message anyway — but with a channel exception that
     # kills the (possibly pooled) publisher channel, corrupting sibling
@@ -373,19 +375,19 @@ class RetryConfig:
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
-            raise ValueError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
+            raise ConfigValidationError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
         if self.jitter_mode not in ("off", "sharded"):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}"
             )
         if self.jitter_mode == "sharded":
             if self.jitter_shards < 2:
-                raise ValueError(
+                raise ConfigValidationError(
                     f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', "
                     f"got {self.jitter_shards}"
                 )
             if not (0 < self.jitter_factor < 1):
-                raise ValueError(
+                raise ConfigValidationError(
                     "RetryConfig.jitter_factor must be in (0, 1) with jitter_mode='sharded' "
                     f"(it sets the TTL spread), got {self.jitter_factor}"
                 )
@@ -399,7 +401,7 @@ class RetryConfig:
             # reappearing on payments). A shared delay queue physically
             # cannot route each message back to its own varying source with
             # static broker config, so there is no safe shared topology.
-            raise ValueError(
+            raise ConfigValidationError(
                 "RetryConfig(per_queue=False) is unsafe and unsupported: shared "
                 "delay queues misroute failed messages across source queues (or "
                 "406 at startup). Use per_queue=True (the default), which gives "
@@ -413,7 +415,7 @@ class RetryConfig:
                 "delay values, or set strict_delays=False to allow the flat-tail behavior."
             )
             if self.strict_delays:
-                raise ValueError(msg)
+                raise ConfigValidationError(msg)
             import warnings
 
             warnings.warn(msg, UserWarning, stacklevel=2)
@@ -659,27 +661,27 @@ class DeduplicationConfig:
 
     def __post_init__(self) -> None:
         if self.store_results and self.mark_policy != "claim":
-            raise ValueError(
+            raise ConfigValidationError(
                 "DeduplicationConfig.store_results=True requires mark_policy='claim' "
                 f"(got {self.mark_policy!r}) — result replay is only crash-safe on the "
                 "claim state machine."
             )
         if self.max_result_bytes < 1:
-            raise ValueError(
+            raise ConfigValidationError(
                 f"DeduplicationConfig.max_result_bytes must be >= 1, got {self.max_result_bytes}"
             )
         if self.mark_policy not in ("on_success", "on_start", "claim"):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"DeduplicationConfig.mark_policy must be one of "
                 f"'on_success', 'on_start', 'claim'; got {self.mark_policy!r}"
             )
         if self.on_in_flight not in ("nack_requeue", "ack_skip"):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"DeduplicationConfig.on_in_flight must be 'nack_requeue' or "
                 f"'ack_skip'; got {self.on_in_flight!r}"
             )
         if self.processing_timeout <= 0:
-            raise ValueError(
+            raise ConfigValidationError(
                 f"DeduplicationConfig.processing_timeout must be > 0, got {self.processing_timeout}"
             )
 
@@ -725,14 +727,14 @@ class SafetyConfig:
 
     def __post_init__(self) -> None:
         if self.reject_without_dlx not in ("auto_provision", "error", "discard"):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"SafetyConfig.reject_without_dlx must be one of "
                 f"'auto_provision', 'error', 'discard'; got {self.reject_without_dlx!r}"
             )
         if not self.dlq_suffix:
-            raise ValueError("SafetyConfig.dlq_suffix must be non-empty")
+            raise ConfigValidationError("SafetyConfig.dlq_suffix must be non-empty")
         if self.on_topology_conflict not in ("raise", "warn_continue"):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"SafetyConfig.on_topology_conflict must be 'raise' or 'warn_continue'; "
                 f"got {self.on_topology_conflict!r}"
             )
@@ -766,17 +768,17 @@ class BatchPublishConfig:
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
-            raise ValueError(f"BatchPublishConfig.batch_size must be > 0, got {self.batch_size}")
+            raise ConfigValidationError(f"BatchPublishConfig.batch_size must be > 0, got {self.batch_size}")
         if self.flush_interval_ms < 0:
-            raise ValueError(
+            raise ConfigValidationError(
                 f"BatchPublishConfig.flush_interval_ms must be >= 0, got {self.flush_interval_ms}"
             )
         if self.max_in_flight <= 0:
-            raise ValueError(
+            raise ConfigValidationError(
                 f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}"
             )
         if self.flush_workers < 0:
-            raise ValueError(
+            raise ConfigValidationError(
                 f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}"
             )
 
@@ -830,9 +832,9 @@ class WorkerConfig:
 
     def __post_init__(self) -> None:
         if self.worker_count < 1:
-            raise ValueError(f"WorkerConfig.worker_count must be >= 1, got {self.worker_count}")
+            raise ConfigValidationError(f"WorkerConfig.worker_count must be >= 1, got {self.worker_count}")
         if self.max_queue_size < 0:
-            raise ValueError(f"WorkerConfig.max_queue_size must be >= 0, got {self.max_queue_size}")
+            raise ConfigValidationError(f"WorkerConfig.max_queue_size must be >= 0, got {self.max_queue_size}")
 
 
 # ── Top-Level Config ─────────────────────────────────────────────────────

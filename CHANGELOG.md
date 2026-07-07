@@ -48,6 +48,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration test proving the declaration is accepted. Documented in
   `docs/troubleshooting.md` and the production checklist.
 
+- **Typed error taxonomy for validation and API-misuse failures** — five
+  new exception classes replace bare builtins at ~50 raise sites, every
+  one **dual-inheriting the builtin it replaces** so existing
+  `except ValueError` / `except RuntimeError` handlers (and every
+  pre-existing test) keep working unchanged; the new types only ADD a
+  precise catch point. All exported from `rabbitkit` and
+  `rabbitkit.core.errors`:
+  - `ConfigValidationError(ConfigurationError, ValueError)` — invalid
+    values in config dataclasses (`RetryConfig(max_retries=-1)`, …) and
+    AMQP short-string violations (including on `MessageEnvelope`).
+  - `TopologyValidationError(ConfigurationError, ValueError)` — invalid
+    `RabbitQueue`/`RabbitExchange` declarations (non-durable quorum,
+    priorities on a stream, non-positive `consumer_timeout`, …).
+  - `MessageTooLargeError(ValueError)` — the publish-time
+    `max_message_bytes` guard.
+  - `BrokerNotStartedError(RuntimeError)` — broker methods needing a live
+    transport called before `start()`.
+  - `SettlementError(RuntimeError)` — sync settlement on an async-only
+    message or vice versa (defined in `core/message.py` to avoid an
+    import cycle; re-exported from `core/errors.py`).
+  Deliberately NOT converted: the registry's `TypeError` (genuine
+  programming error) and serialization/signing data errors (domain-
+  idiomatic; signing already has `InvalidSignatureError`). Locked in by a
+  new `TestCustomErrorTaxonomy` suite asserting each raise site, the
+  inheritance contract, top-level exports, and that bare-builtin catches
+  still work.
+
 ### Changed
 
 - **`PublisherConfig.max_message_bytes` now defaults to 16 MiB**

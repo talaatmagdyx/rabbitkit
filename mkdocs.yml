@@ -78,6 +78,11 @@ nav:
       - FastAPI: api/fastapi.md
       - Core Internals: api/core.md
 
+# Local-only planning notes may exist in docs/ (git-ignored, never tracked);
+# keep them out of the rendered site even when building from a dev machine.
+exclude_docs: |
+  IMPROVEMENT_PLAN.md
+
 plugins:
   - search
   - mkdocstrings:

@@ -111,6 +111,50 @@ class TestLifecycle:
         assert transport_cls.call_args.kwargs["pool_config"] is pool
 
     @pytest.mark.asyncio
+    async def test_start_warns_on_non_default_socket_config(self) -> None:
+        """SocketConfig is sync-only (aio-pika exposes no TCP-tuning knobs);
+        a non-default value must warn loudly instead of being silently
+        ignored — same "config that lies" class as the pool_config drop.
+        """
+        from rabbitkit.core.config import RabbitConfig, SocketConfig
+
+        broker = AsyncBroker(config=RabbitConfig(socket=SocketConfig(tcp_nodelay=False)))
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with pytest.warns(RuntimeWarning, match="SocketConfig.*not applied by AsyncBroker"):
+                await broker.start()
+
+    @pytest.mark.asyncio
+    async def test_start_default_socket_config_does_not_warn(self) -> None:
+        """The default SocketConfig() must NOT trigger the sync-only warning."""
+        import warnings
+
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                await broker.start()
+
+    @pytest.mark.asyncio
     async def test_start_idempotent(self) -> None:
         broker = AsyncBroker()
 

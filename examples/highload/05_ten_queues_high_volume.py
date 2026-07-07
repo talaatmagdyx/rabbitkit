@@ -27,6 +27,7 @@ Requirements:
 """
 
 import asyncio
+import os
 import time
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -35,7 +36,10 @@ from rabbitkit import ConsumerConfig, MessageEnvelope, PoolConfig, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 NUM_QUEUES = 10
-MSGS_PER_QUEUE = 300  # 10 x 300 = 3,000 messages total
+# Overridable so CI can size the run to finish inside its smoke-test
+# timeout — otherwise a slow broker turns the final assertions into
+# dead code (the runner kills the script before they execute).
+MSGS_PER_QUEUE = int(os.environ.get("RABBITKIT_EXAMPLE_MSGS_PER_QUEUE", "300"))
 TOTAL = NUM_QUEUES * MSGS_PER_QUEUE
 PUBLISH_CHUNK = 32  # concurrent publishes per gather() wave — match the channel pool
 

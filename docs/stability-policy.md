@@ -1,8 +1,9 @@
 # Stability Policy
 
-## Where rabbitkit actually is (as of 0.9.0)
+## Where rabbitkit actually is (as of 0.9.1)
 
-rabbitkit is at `0.9.0` — the **first published release** (public beta).
+rabbitkit is at `0.9.1`; `0.9.0` was the **first published release**
+(public beta).
 Development happened privately under internal milestone numbers — now the
 `0.8.x` entries in `CHANGELOG.md` (each marked with its former number);
 none were ever distributed, and the history was renumbered at publication

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable, Coroutine
 from typing import Any
 
 import pytest
@@ -187,7 +188,7 @@ async def test_async_ten_queues_one_broker_isolated_and_concurrent(rabbitmq_url:
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config)
 
-    def _make_handler(idx: int) -> Any:
+    def _make_handler(idx: int) -> Callable[[bytes], Coroutine[Any, Any, None]]:
         async def handle(body: bytes) -> None:
             nonlocal in_flight, max_in_flight, processed
             in_flight += 1
@@ -1515,7 +1516,7 @@ def test_sync_ten_queues_shared_ten_worker_pool(rabbitmq_url: str) -> None:
     config = _make_sync_config(rabbitmq_url)
     broker = SyncBroker(config=config)
 
-    def _make_handler(idx: int) -> Any:
+    def _make_handler(idx: int) -> Callable[[bytes], None]:
         def handle(body: bytes) -> None:
             time.sleep(0.01)  # overlap pool threads across queues
             with lock:

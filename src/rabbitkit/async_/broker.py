@@ -30,6 +30,7 @@ from rabbitkit.core.config import (
     RabbitConfig,
     RetryConfig,
     RetryDisabled,
+    SocketConfig,
     WorkerConfig,
 )
 from rabbitkit.core.errors import BackpressureError
@@ -344,6 +345,25 @@ class AsyncBroker:
             from rabbitkit.core.logging import configure_structlog
 
             configure_structlog(self._config.logging)
+
+        # SocketConfig is sync-only: pika accepts tcp_options, but
+        # aio-pika/aiormq exposes no socket-tuning knobs, and applying
+        # setsockopt to the live socket wouldn't survive connect_robust's
+        # automatic reconnects (each reconnect is a fresh, untuned socket).
+        # Warn instead of silently ignoring a config the user set.
+        if self._config.socket != SocketConfig():
+            import warnings
+
+            warnings.warn(
+                "RabbitConfig.socket (SocketConfig) is not applied by AsyncBroker: "
+                "aio-pika manages its own sockets and provides no TCP-tuning "
+                "options, and per-socket tuning would be silently lost on every "
+                "automatic reconnect. SocketConfig only affects SyncBroker; tune "
+                "the async side via ConnectionConfig (heartbeat, timeouts) or at "
+                "the OS level.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # Create transport
         self._transport = AsyncTransportImpl(

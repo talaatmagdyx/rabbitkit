@@ -58,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserting the transport receives the exact configured `PoolConfig`.
   With the fix the example's concurrent publish throughput rose ~50%.
 
+- **`RabbitConfig.socket` (SocketConfig) no longer silently ignored by
+  `AsyncBroker`** — the same "config that lies" class as the `pool` drop
+  above, surfaced by the production-readiness review that followed it:
+  nothing under `async_/` ever referenced `SocketConfig`, so TCP tuning
+  set on an async broker was a complete no-op. Unlike `pool`, this one
+  cannot be plumbed through: aio-pika/aiormq exposes no socket-tuning
+  hooks, and applying `setsockopt` to the live socket would be silently
+  lost on every `connect_robust` automatic reconnect. `AsyncBroker.start()`
+  now emits a `RuntimeWarning` when a non-default `SocketConfig` is set
+  (covered by two unit tests: warns on non-default, silent on default),
+  and `SocketConfig` is documented as **sync-only** in its docstring
+  (which feeds the API docs) and in the retry-architecture guide's
+  production config example.
+
 ## [0.9.1] — 2026-07-04
 
 First PyPI-visible patch: the 0.9.0 package description referenced images

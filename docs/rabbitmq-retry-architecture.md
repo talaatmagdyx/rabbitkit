@@ -215,9 +215,9 @@ def build_config(env: str) -> RabbitConfig:
             reconnect_backoff_max=30.0,   # cap exponential backoff at 30s
             connection_name=f"order-service@{env}",  # shows in mgmt UI — priceless during incidents
         ),
-        socket=SocketConfig(
-            tcp_nodelay=True,         # latency over throughput for small business messages
-            tcp_keepidle=10, tcp_keepintvl=5, tcp_keepcnt=3,  # detect dead TCP in ~25s
+        socket=SocketConfig(          # SYNC-ONLY: applied by SyncBroker (pika tcp_options);
+            tcp_nodelay=True,         #   AsyncBroker warns and ignores it (aio-pika manages
+            tcp_keepidle=10, tcp_keepintvl=5, tcp_keepcnt=3,  # its own sockets across reconnects)
         ),
         security=SecurityConfig(
             mechanism="PLAIN",

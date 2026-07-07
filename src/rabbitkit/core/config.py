@@ -202,6 +202,13 @@ class SocketConfig:
 
     Applied best-effort — not all options are universally guaranteed
     depending on OS and backend internals.
+
+    **Sync-only.** ``SyncBroker`` applies these via pika's ``tcp_options``;
+    ``AsyncBroker`` emits a ``RuntimeWarning`` and ignores a non-default
+    value — aio-pika/aiormq exposes no socket-tuning hooks, and per-socket
+    tuning would be silently lost on every automatic reconnect. Tune the
+    async side via ``ConnectionConfig`` (heartbeat, timeouts) or at the
+    OS level.
     """
 
     tcp_nodelay: bool = True

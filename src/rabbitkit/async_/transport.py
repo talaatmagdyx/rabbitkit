@@ -611,15 +611,17 @@ class AsyncTransportImpl:
                     self._mandatory_in_flight -= 1
                 if outcome.status == PublishStatus.TIMEOUT:
                     self._mandatory_channel_recycle = True
+                current = self._mandatory_publish_channel
                 if (
                     self._mandatory_channel_recycle
                     and self._mandatory_in_flight == 0
-                    and channel is self._mandatory_publish_channel
-                    and not channel.is_closed
+                    and current is not None
+                    and channel is current
+                    and not current.is_closed
                 ):
                     self._mandatory_channel_recycle = False
                     with contextlib.suppress(Exception):
-                        await channel.close()
+                        await current.close()
                 return outcome
 
             if not self._confirm_delivery:

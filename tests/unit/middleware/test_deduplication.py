@@ -1243,12 +1243,19 @@ class TestRetryRequeueComposition:
     def _retry_mw_that_requeues(self) -> RetryMiddleware:
         """A RetryMiddleware whose consume_scope always "succeeds" at
         requeuing — configured with plenty of retries left so a transient
-        failure never becomes terminal, and a working publish_fn."""
+        failure never becomes terminal, and working publish fns for BOTH
+        runtimes (the async tests exercise the async routing path, which
+        now correctly nacks instead of ack-dropping when its publish fn is
+        missing — the old cross-wiring silently "passed")."""
         from rabbitkit.core.config import RetryConfig
+
+        async def publish_async(env: object) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
 
         return RetryMiddleware(
             RetryConfig(max_retries=3, delays=(5, 30, 120)),
             publish_fn=lambda env: PublishOutcome(status=PublishStatus.CONFIRMED),
+            publish_async_fn=publish_async,
         )
 
     def test_on_success_does_not_mark_key_when_retry_requeues(self) -> None:

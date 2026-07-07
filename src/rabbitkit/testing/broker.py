@@ -395,8 +395,10 @@ class TestBroker:
         self._wire_settlement(message)
 
         # Mirror the real broker: stamp the source queue for retry routing.
-        if "x-rabbitkit-original-queue" not in message.headers:
-            message.headers["x-rabbitkit-original-queue"] = route.queue.name
+        # H2: ALWAYS overwrite (never trust a producer-set value) — see the
+        # real brokers for the spoofing rationale; TestBroker mirrors it so
+        # tests exercise the same semantics.
+        message.headers["x-rabbitkit-original-queue"] = route.queue.name
 
         message.path = extract_path(message.routing_key, route.queue.routing_key)
         self._consumed.append(message)
@@ -448,8 +450,10 @@ class TestBroker:
         self._wire_settlement(message)
 
         # Mirror the real broker: stamp the source queue for retry routing.
-        if "x-rabbitkit-original-queue" not in message.headers:
-            message.headers["x-rabbitkit-original-queue"] = route.queue.name
+        # H2: ALWAYS overwrite (never trust a producer-set value) — see the
+        # real brokers for the spoofing rationale; TestBroker mirrors it so
+        # tests exercise the same semantics.
+        message.headers["x-rabbitkit-original-queue"] = route.queue.name
 
         message.path = extract_path(message.routing_key, route.queue.routing_key)
         self._consumed.append(message)

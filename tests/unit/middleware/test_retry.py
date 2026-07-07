@@ -19,6 +19,17 @@ from rabbitkit.middleware.retry import RetryMiddleware, RetryRouter
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
+def _capture_ok(published: list[MessageEnvelope]):
+    """Publish fn that records the envelope and returns a CONFIRMED outcome
+    (L3: a None-returning publish fn is now treated as failure)."""
+
+    def publish(env: MessageEnvelope) -> PublishOutcome:
+        published.append(env)
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+    return publish
+
+
 def _make_message(**kwargs: object) -> RabbitMessage:
     defaults: dict[str, object] = {
         "body": b'{"id": 1}',
@@ -43,8 +54,9 @@ class TestRetryTransient:
         """Transient errors with retries left → publish to delay queue + ack source."""
         published: list[MessageEnvelope] = []
 
-        def capture_publish(env: MessageEnvelope) -> None:
+        def capture_publish(env: MessageEnvelope) -> PublishOutcome:
             published.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
 
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
         mw = RetryMiddleware(config, publish_fn=capture_publish)
@@ -95,7 +107,7 @@ class TestRetryTransient:
         published: list[MessageEnvelope] = []
 
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message()
 
@@ -111,7 +123,7 @@ class TestRetryTransient:
         published: list[MessageEnvelope] = []
 
         config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message(exchange="my-exchange", routing_key="my.rk")
 
@@ -129,7 +141,7 @@ class TestRetryTransient:
         published: list[MessageEnvelope] = []
 
         config = RetryConfig(max_retries=2, delays=(5, 30), per_queue=True)
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message(headers={"x-rabbitkit-original-queue": "orders-queue"})
 
@@ -151,7 +163,7 @@ class TestRetryTransient:
         published: list[MessageEnvelope] = []
 
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message(
             headers={
@@ -252,7 +264,7 @@ class TestRetryMetrics:
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
         mw = RetryMiddleware(
             config,
-            publish_fn=lambda env: None,
+            publish_fn=lambda env: PublishOutcome(status=PublishStatus.CONFIRMED),
             metrics_collector=collector,
             metrics_config=MetricsConfig(),
         )
@@ -274,8 +286,8 @@ class TestRetryMetrics:
         collector = MagicMock()
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
 
-        async def publish_async(env: MessageEnvelope) -> None:
-            return None
+        async def publish_async(env: MessageEnvelope) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
 
         mw = RetryMiddleware(
             config,
@@ -336,7 +348,7 @@ class TestRetryMetrics:
         """Without metrics_collector/metrics_config wired, no metric call is
         attempted -- must not raise."""
         config = RetryConfig(max_retries=1, delays=(5,))
-        mw = RetryMiddleware(config, publish_fn=lambda env: None)
+        mw = RetryMiddleware(config, publish_fn=lambda env: PublishOutcome(status=PublishStatus.CONFIRMED))
         msg = _make_message()
 
         def failing_handler(m: RabbitMessage) -> None:
@@ -350,7 +362,7 @@ class TestRetryMetrics:
         from rabbitkit.core.config import MetricsConfig
 
         config = RetryConfig(max_retries=1, delays=(5,))
-        mw = RetryMiddleware(config, publish_fn=lambda env: None, metrics_config=MetricsConfig())
+        mw = RetryMiddleware(config, publish_fn=_capture_ok([]), metrics_config=MetricsConfig())
         msg = _make_message()
 
         def failing_handler(m: RabbitMessage) -> None:
@@ -373,7 +385,7 @@ class TestRetryCountSpoofing:
         delay queue like a fresh message — not reset to unbounded retries."""
         published: list[MessageEnvelope] = []
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message(headers={"x-rabbitkit-retry-count": -5, "x-rabbitkit-original-queue": "orders-queue"})
 
@@ -446,7 +458,7 @@ class TestRetryCountSpoofing:
         middleware itself while handling the original exception."""
         published: list[MessageEnvelope] = []
         config = RetryConfig(max_retries=3, delays=(5, 30, 120))
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
         msg = _make_message(
             headers={"x-rabbitkit-retry-count": "garbage", "x-rabbitkit-original-queue": "orders-queue"}
         )
@@ -484,7 +496,7 @@ class TestRetryClassification:
         published: list[MessageEnvelope] = []
 
         config = RetryConfig(max_retries=3, delays=(5,), unknown_policy=ErrorSeverity.TRANSIENT, strict_delays=False)
-        mw = RetryMiddleware(config, publish_fn=lambda env: published.append(env))
+        mw = RetryMiddleware(config, publish_fn=_capture_ok(published))
 
         msg = _make_message()
 
@@ -505,8 +517,9 @@ class TestRetryAsync:
         """Async: transient error → delay queue + ack source."""
         published: list[MessageEnvelope] = []
 
-        async def capture_publish(env: MessageEnvelope) -> None:
+        async def capture_publish(env: MessageEnvelope) -> PublishOutcome:
             published.append(env)
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
 
         config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
         mw = RetryMiddleware(config, publish_async_fn=capture_publish)
@@ -577,34 +590,25 @@ class TestRetryConfig:
 
 
 class TestRetryDelay:
-    def test_delay_uses_correct_index(self) -> None:
-        """Delay index maps correctly to delays tuple."""
-        config = RetryConfig(max_retries=4, delays=(5, 30, 120, 600), jitter_factor=0.0)
+    """Retry timing authority is the delay QUEUE's uniform x-message-ttl
+    (RetryRouter._get_delay_ms) — never a per-message value. The old
+    per-message _compute_delay helper was dead code contradicting that
+    design and has been removed.
+    """
+
+    def test_no_per_message_delay_helper(self) -> None:
+        config = RetryConfig(max_retries=4, delays=(5, 30, 120, 600))
         mw = RetryMiddleware(config)
+        assert not hasattr(mw, "_compute_delay")
 
-        # With zero jitter, delay should be exact
-        assert mw._compute_delay(0) == 5
-        assert mw._compute_delay(1) == 30
-        assert mw._compute_delay(2) == 120
-        assert mw._compute_delay(3) == 600
+    def test_router_ttl_uses_correct_index_and_clamps(self) -> None:
+        from rabbitkit.middleware.retry import RetryRouter
 
-    def test_delay_clamps_to_last(self) -> None:
-        """Retry count beyond delays length clamps to last delay."""
-        config = RetryConfig(max_retries=10, delays=(5, 30), jitter_factor=0.0, strict_delays=False)
-        mw = RetryMiddleware(config)
-
-        assert mw._compute_delay(5) == 30  # clamped to index 1
-
-    def test_delay_with_jitter(self) -> None:
-        """Jitter creates variation around base delay."""
-        config = RetryConfig(max_retries=3, delays=(100,), jitter_factor=0.5, strict_delays=False)
-        mw = RetryMiddleware(config)
-
-        # With 50% jitter on delay=100, values should be in [50, 150]
-        delays = {mw._compute_delay(0) for _ in range(100)}
-        assert min(delays) >= 50
-        assert max(delays) <= 150
-        assert len(delays) > 1  # some variation expected
+        config = RetryConfig(max_retries=10, delays=(5, 30), strict_delays=False)
+        router = RetryRouter(config)
+        assert router._get_delay_ms(0) == 5000
+        assert router._get_delay_ms(1) == 30000
+        assert router._get_delay_ms(5) == 30000  # clamped to last
 
 
 # ── RetryRouter — topology ───────────────────────────────────────────────
@@ -740,10 +744,17 @@ class TestRetryEnvelopeNoOriginalQueue:
         assert envelope.mandatory is True
 
     def test_build_retry_envelope_preserves_message_properties(self) -> None:
-        """A retry republish used to silently drop priority/expiration/type/
-        app_id/user_id/reply_to -- e.g. a priority-queue message lost its
-        priority on its first retry, and an RPC request's reply_to never
-        survived long enough for the eventual reply to route back."""
+        """A retry republish used to silently drop priority/type/app_id/
+        user_id/reply_to -- e.g. a priority-queue message lost its priority
+        on its first retry, and an RPC request's reply_to never survived
+        long enough for the eventual reply to route back.
+
+        ``expiration`` is the deliberate EXCEPTION: preserving a producer
+        TTL shorter than the delay tier's x-message-ttl would expire the
+        message inside the delay queue and dead-letter it back to the
+        source early, collapsing the whole backoff ladder into a fast
+        retry storm. The delay queue's own TTL is the timing authority.
+        """
         from rabbitkit.middleware.retry import RetryMiddleware
 
         mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
@@ -761,7 +772,7 @@ class TestRetryEnvelopeNoOriginalQueue:
 
         assert envelope.reply_to == "amq.rabbitmq.reply-to"
         assert envelope.priority == 7
-        assert envelope.expiration == "60000"
+        assert envelope.expiration is None  # stripped — see docstring
         assert envelope.type == "order.created"
         assert envelope.app_id == "order-service"
         assert envelope.user_id == "guest"
@@ -949,3 +960,103 @@ class TestShardedJitter:
             RetryConfig(jitter_mode="sharded", jitter_shards=1)
         with pytest.raises(ValueError, match="jitter_factor"):
             RetryConfig(jitter_mode="sharded", jitter_factor=0.0)
+
+
+# ── No-publish-fn loss path (RabbitMQ-architect review H1) ───────────────
+
+
+class TestRetryWithoutPublishFn:
+    """A RetryMiddleware with no (matching) publish fn used to ACK a
+    transient failure without ever publishing to the delay queue — silent
+    message loss. It must now nack (requeue) and warn loudly.
+    """
+
+    def test_sync_no_publish_fn_nacks_and_warns_never_acks(self) -> None:
+        mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
+        msg = _make_message()
+
+        with pytest.warns(RuntimeWarning, match="no publish_fn"):
+            mw._route_to_delay_queue_sync(msg, retry_count=0)
+
+        msg._ack_fn.assert_not_called()
+        msg._nack_fn.assert_called_once_with(True)
+
+    def test_sync_broker_route_with_async_only_fn_nacks(self) -> None:
+        """Cross-wiring (publish_async_fn on a sync route) is the same loss
+        path — the sync routing method only reads _publish_fn."""
+
+        async def async_publish(env: MessageEnvelope) -> PublishOutcome:
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)), publish_async_fn=async_publish)
+        msg = _make_message()
+
+        with pytest.warns(RuntimeWarning, match="no publish_fn"):
+            mw._route_to_delay_queue_sync(msg, retry_count=0)
+
+        msg._ack_fn.assert_not_called()
+        msg._nack_fn.assert_called_once_with(True)
+
+    @pytest.mark.asyncio
+    async def test_async_no_publish_fn_nacks_and_warns_never_acks(self) -> None:
+        mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
+        msg = _make_message()
+        nacked: list[bool] = []
+
+        async def nack_async(requeue: bool = True) -> None:
+            nacked.append(requeue)
+
+        msg._nack_async_fn = nack_async
+        msg._nack_fn = None
+
+        with pytest.warns(RuntimeWarning, match="no publish_async_fn"):
+            await mw._route_to_delay_queue_async(msg, retry_count=0)
+
+        msg._ack_fn.assert_not_called()
+        assert nacked == [True]
+
+    def test_none_outcome_is_failure_not_success(self) -> None:
+        """L3: a publish fn returning None is UNVERIFIED — nack, never ack."""
+        mw = RetryMiddleware(
+            RetryConfig(max_retries=1, delays=(5,)),
+            publish_fn=lambda env: None,
+        )
+        msg = _make_message()
+        mw._route_to_delay_queue_sync(msg, retry_count=0)
+        msg._ack_fn.assert_not_called()
+        msg._nack_fn.assert_called_once_with(True)
+
+    def test_ensure_publish_fns_fills_only_unset(self) -> None:
+        sentinel_sync = MagicMock()
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)), publish_fn=sentinel_sync)
+        replacement = MagicMock()
+        mw.ensure_publish_fns(publish_fn=replacement, publish_async_fn=replacement)
+        assert mw._publish_fn is sentinel_sync  # explicit fn never overwritten
+        assert mw._publish_async_fn is replacement  # unset one filled in
+
+
+# ── DLQ queue-type inheritance (RabbitMQ-architect review M3) ─────────────
+
+
+class TestDlqQueueTypeInheritance:
+    def test_quorum_source_gets_quorum_dlq_classic_delay_queues(self) -> None:
+        from rabbitkit.core.types import QueueType
+        from rabbitkit.middleware.retry import RetryRouter
+
+        router = RetryRouter(RetryConfig(max_retries=2, delays=(5, 30)))
+        queues = router.get_delay_queue_definitions(
+            "orders", "", source_queue_type=QueueType.QUORUM
+        )
+        dlq = queues[-1]
+        assert dlq.name.endswith(".dlq")
+        assert dlq.queue_type == QueueType.QUORUM
+        for q in queues[:-1]:  # delay queues stay classic deliberately
+            assert q.arguments["x-queue-type"] == "classic"
+
+    def test_classic_source_keeps_classic_dlq(self) -> None:
+        from rabbitkit.core.types import QueueType
+        from rabbitkit.middleware.retry import RetryRouter
+
+        router = RetryRouter(RetryConfig(max_retries=1, delays=(5,)))
+        queues = router.get_delay_queue_definitions("orders", "")
+        assert queues[-1].queue_type == QueueType.CLASSIC

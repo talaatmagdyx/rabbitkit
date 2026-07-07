@@ -44,8 +44,11 @@ class _FakeTransport:
             return self._queue.pop(0)
         return None
 
-    def publish(self, envelope: MessageEnvelope) -> None:
+    def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        # L3: a None-returning publish is now treated as UNVERIFIED (failure)
+        # — the fake must return a real OK outcome like both transports do.
         self.published.append(envelope)
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
 
     def purge_queue(self, queue: str) -> int:
         count = self.purge_count
@@ -65,8 +68,10 @@ class _FakeAsyncTransport:
             return self._queue.pop(0)
         return None
 
-    async def publish(self, envelope: MessageEnvelope) -> None:
+    async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        # L3: see the sync fake — None outcome = unverified = failure.
         self.published.append(envelope)
+        return PublishOutcome(status=PublishStatus.CONFIRMED)
 
     async def purge_queue(self, queue: str) -> int:
         return self.purge_count
@@ -494,3 +499,29 @@ class TestReplayPublishOutcome:
 
         assert result == 1
         assert "x-rabbitkit-retry-count" not in transport.published[0].headers
+
+
+class TestReplayLimit:
+    """L2: `limit=` bounds the fetch loop — the defense against a live
+    consumer dead-lettering replayed messages back into the same DLQ faster
+    than the drain completes (the held-until-drained guarantee covers
+    self-refetch, not genuine re-arrival)."""
+
+    def test_limit_bounds_fetches(self) -> None:
+        transport = _FakeTransport(messages=[_make_message(f"m{i}".encode()) for i in range(5)])
+        inspector = DLQInspector(transport)
+        result = inspector.replay("dlq", limit=2)
+        assert int(result) == 2
+        assert len(transport.published) == 2
+
+    async def test_limit_bounds_fetches_async(self) -> None:
+        transport = _FakeAsyncTransport(messages=[_make_message(f"m{i}".encode()) for i in range(5)])
+        inspector = DLQInspector(transport)
+        result = await inspector.replay_async("dlq", limit=3)
+        assert int(result) == 3
+        assert len(transport.published) == 3
+
+    def test_none_limit_drains_all(self) -> None:
+        transport = _FakeTransport(messages=[_make_message(b"a"), _make_message(b"b")])
+        inspector = DLQInspector(transport)
+        assert int(inspector.replay("dlq")) == 2

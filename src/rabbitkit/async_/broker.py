@@ -45,6 +45,7 @@ from rabbitkit.core.types import (
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
+    QueueType,
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
@@ -949,9 +950,16 @@ class AsyncBroker:
             # H1: signing + retry destroys every retried message — fail fast.
             check_signing_retry_conflict(route.name, route.route_middlewares)
             if has_retry_mw:
+                # User-constructed RetryMiddleware: inject the broker's
+                # confirmed publish fn if none was passed (see sync broker).
+                for mw in route.route_middlewares:
+                    if isinstance(mw, RetryMiddleware):
+                        mw.ensure_publish_fns(publish_async_fn=self._flow_controlled_internal_publish)
                 continue
-            if not self._config.publisher.confirm_delivery:
-                warn_retry_without_confirms(route.name)  # M4
+            # (No confirms warning for the RETRY context: retry envelopes are
+            # published mandatory=True, which forces per-publish confirm mode
+            # on both transports even when confirm_delivery=False — the
+            # ack-after-confirmed-outcome invariant holds regardless.)
             index = retry_middleware_insertion_index(route.route_middlewares)
             # M2: if a MetricsMiddleware is already on this route, wire it into
             # RetryMiddleware too so messages_retried_total/dead_lettered_total
@@ -1094,11 +1102,25 @@ class AsyncBroker:
             # Declare retry/DLQ topology if retry is enabled
             if retry_config is not None:
                 exchange_name = route.exchange.name if route.exchange else ""
-                delay_queues = retry_router.get_delay_queue_definitions(route.queue.name, exchange_name)
+                delay_queues = retry_router.get_delay_queue_definitions(
+                    route.queue.name, exchange_name, source_queue_type=route.queue.queue_type
+                )
                 for delay_queue in delay_queues:
                     await self._transport.declare_queue(delay_queue)
             elif safety_dlq_name is not None:
-                await self._transport.declare_queue(RabbitQueue(name=safety_dlq_name, durable=True))
+                await self._transport.declare_queue(
+                    RabbitQueue(
+                        name=safety_dlq_name,
+                        durable=True,
+                        # Inherit quorum from a quorum source (see RetryRouter
+                        # DLQ note): the DLQ stores failures indefinitely.
+                        queue_type=(
+                            QueueType.QUORUM
+                            if route.queue.queue_type == QueueType.QUORUM
+                            else QueueType.CLASSIC
+                        ),
+                    )
+                )
 
     async def _start_consumer(self, route: RouteDefinition) -> None:
         """Start consuming for a single route."""
@@ -1120,9 +1142,14 @@ class AsyncBroker:
                 self._inflight_tasks[task] = message
             self._mark_heartbeat()
             try:
-                # Set the original queue in headers for retry routing
-                if "x-rabbitkit-original-queue" not in message.headers:
-                    message.headers["x-rabbitkit-original-queue"] = route.queue.name
+                # Set the original queue in headers for retry routing.
+                # H2 (spoofing): ALWAYS overwrite — a legitimate retry round-trip
+                # returns to this same queue, so the overwrite is always
+                # correct, while honoring a producer-set value would let a
+                # malicious/buggy publisher steer retries into another
+                # route's delay ladder (cross-queue injection) or a
+                # nonexistent queue (requeue hot loop).
+                message.headers["x-rabbitkit-original-queue"] = route.queue.name
 
                 # Populate named routing-key segments for Path() DI
                 message.path = extract_path(message.routing_key, route.queue.routing_key)

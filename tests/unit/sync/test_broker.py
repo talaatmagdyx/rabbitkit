@@ -854,10 +854,15 @@ class TestDeclareTopologyEdgeCases:
         # Should not raise — delay queue declared with empty exchange_name
         assert mock_channel.queue_declare.call_count >= 2
 
-    def test_start_with_retry_and_no_confirms_warns(self) -> None:
-        """M4: a retry-enabled route on a broker with confirm_delivery=False
-        must warn -- RetryMiddleware acks the source as soon as its
-        delay-queue republish is SENT (fire-and-forget), not confirmed."""
+    def test_start_with_retry_and_no_confirms_does_not_warn(self) -> None:
+        """L4: the retry context must NOT warn under confirm_delivery=False —
+        retry envelopes publish mandatory=True, which forces per-publish
+        confirm mode on the transport regardless, so the
+        ack-after-confirmed-outcome invariant holds and the old warning was
+        a false positive. (The @publisher result-forward context still
+        warns — covered separately.)"""
+        import warnings as _warnings
+
         from rabbitkit.core.config import PublisherConfig, RetryConfig
 
         config = RabbitConfig(
@@ -876,8 +881,12 @@ class TestDeclareTopologyEdgeCases:
                 mock_channel.is_open = True
                 mock_conn.return_value.channel.return_value = mock_channel
                 mock_conn.return_value.is_open = True
-                with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+                with _warnings.catch_warnings(record=True) as caught:
+                    _warnings.simplefilter("always")
                     broker.start()
+        assert not any(
+            "confirm_delivery=False" in str(w.message) for w in caught
+        ), "retry context must not emit the confirms warning (mandatory=True forces confirms)"
 
     def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
         """M4: confirm_delivery=True (the default) must not trigger the warning."""
@@ -1331,8 +1340,13 @@ class TestStartConsumerEdgeCases:
         assert msg.headers["x-rabbitkit-original-queue"] == "orders"
         assert pipeline_calls[0] is msg
 
-    def test_on_message_skips_header_if_already_set(self) -> None:
-        """on_message does NOT overwrite existing x-rabbitkit-original-queue."""
+    def test_on_message_always_overwrites_original_queue_header(self) -> None:
+        """H2 (spoofing): on_message ALWAYS overwrites
+        x-rabbitkit-original-queue — a producer-set value would otherwise
+        steer retries into another route's delay ladder (cross-queue
+        injection) or a nonexistent queue (requeue hot loop). A legitimate
+        retry round-trip returns to this same queue, so overwriting is
+        always correct."""
         from rabbitkit.core.message import RabbitMessage
 
         broker = SyncBroker()
@@ -1378,7 +1392,7 @@ class TestStartConsumerEdgeCases:
             headers={"x-rabbitkit-original-queue": "already-set"},
         )
         callback(msg)
-        assert msg.headers["x-rabbitkit-original-queue"] == "already-set"
+        assert msg.headers["x-rabbitkit-original-queue"] == "orders"
 
     def test_pooled_callback_submits_to_pool(self) -> None:
         """When pool is set, on_message_pooled submits work to the pool."""
@@ -2468,3 +2482,37 @@ class TestStartedProperty:
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             assert _get_started(broker) is False
+
+
+class TestUserSuppliedRetryMiddlewareWiring:
+    """H1 (architect review): a user-constructed RetryMiddleware in
+    middlewares=[...] alongside retry= used to be left with NO publish fn —
+    every transient failure fell into the ack-without-publish drop path.
+    The broker must inject its own publish fn at start()."""
+
+    def test_start_injects_publish_fn_into_user_retry_middleware(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        assert user_mw._publish_fn is None
+
+        broker = SyncBroker(RabbitConfig())
+
+        @broker.subscriber(
+            queue="orders",
+            retry=RetryConfig(max_retries=1, delays=(5,)),
+            middlewares=[user_mw],
+        )
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+                broker.start()
+
+        assert user_mw._publish_fn is not None

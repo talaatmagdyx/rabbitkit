@@ -11,7 +11,7 @@ Mechanism: TTL + DLX (dead-letter exchange)
 from __future__ import annotations
 
 import logging
-import random
+import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -19,7 +19,7 @@ from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.errors import ErrorPredicate
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitQueue
-from rabbitkit.core.types import REQUEUED_FOR_RETRY, ErrorSeverity, MessageEnvelope
+from rabbitkit.core.types import REQUEUED_FOR_RETRY, ErrorSeverity, MessageEnvelope, QueueType
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 
@@ -86,10 +86,14 @@ def retry_middleware_insertion_index(middlewares: Sequence[Any]) -> int:
     return index
 
 
-def warn_retry_without_confirms(route_name: str, *, context: str = "retry") -> None:
-    """Warn when a route republishes internally (retry delay-queue, or a
-    ``@publisher()`` result forward) but its broker publishes with
-    ``PublisherConfig.confirm_delivery=False`` (M4).
+def warn_retry_without_confirms(route_name: str, *, context: str = "result") -> None:
+    """Warn when a route's ``@publisher()`` result forward runs on a broker
+    with ``PublisherConfig.confirm_delivery=False`` (M4).
+
+    The RETRY context no longer warns: retry envelopes are published with
+    ``mandatory=True``, which forces per-publish confirm mode on both
+    transports even when ``confirm_delivery=False`` — the delay-queue publish
+    is always confirm-gated, so the warning was a false positive there.
 
     Both ``RetryMiddleware`` and the pipeline's result-publish step (Contract
     5) settle the SOURCE message as soon as their republish reports
@@ -175,6 +179,26 @@ class RetryMiddleware(BaseMiddleware):
         # has no metrics opinion otherwise.
         self._metrics_collector = metrics_collector
         self._metrics_config = metrics_config
+
+    def ensure_publish_fns(
+        self,
+        publish_fn: Callable[[MessageEnvelope], Any] | None = None,
+        publish_async_fn: Callable[[MessageEnvelope], Any] | None = None,
+    ) -> None:
+        """Fill in whichever publish function is not already set.
+
+        Called by the broker at start() for USER-CONSTRUCTED RetryMiddleware
+        instances found in ``middlewares=[...]``: previously such an instance
+        with no publish fn silently fell into the ack-without-publish drop
+        path on every transient failure (now a nack+RuntimeWarning, but still
+        a hot loop). Injecting the broker's own confirmed-publish fn makes a
+        manually-added ``RetryMiddleware(config)`` behave identically to the
+        auto-wired one. Explicitly-passed fns are never overwritten.
+        """
+        if self._publish_fn is None and publish_fn is not None:
+            self._publish_fn = publish_fn
+        if self._publish_async_fn is None and publish_async_fn is not None:
+            self._publish_async_fn = publish_async_fn
 
     def _record_metric(self, metric_name: str | None, message: RabbitMessage) -> None:
         if self._metrics_collector is None or metric_name is None:
@@ -278,16 +302,6 @@ class RetryMiddleware(BaseMiddleware):
             retry_count = 0
         return max(0, min(retry_count, self._config.max_retries))
 
-    def _compute_delay(self, retry_count: int) -> int:
-        """Compute delay for this retry attempt (with jitter)."""
-        delays = self._config.delays
-        idx = min(retry_count, len(delays) - 1)
-        base_delay = delays[idx]
-
-        # Apply jitter
-        jitter = base_delay * self._config.jitter_factor
-        return max(1, int(base_delay + random.uniform(-jitter, jitter)))  # noqa: S311 — jitter, not crypto
-
     def _build_retry_envelope(self, message: RabbitMessage, retry_count: int) -> MessageEnvelope:
         """Build envelope for the delay queue."""
         # Determine delay queue name
@@ -326,7 +340,12 @@ class RetryMiddleware(BaseMiddleware):
             # long enough for the eventual (retried) reply to route back.
             reply_to=message.reply_to,
             priority=message.priority,
-            expiration=message.expiration,
+            # expiration is deliberately NOT preserved: a producer-set
+            # per-message TTL shorter than the delay tier's x-message-ttl
+            # would expire the message INSIDE the delay queue and dead-letter
+            # it back to the source early, collapsing the whole backoff
+            # ladder into a fast retry storm. The delay queue's own TTL is
+            # the timing authority for the retry wait.
             type=message.type,
             app_id=message.app_id,
             user_id=message.user_id,
@@ -343,19 +362,39 @@ class RetryMiddleware(BaseMiddleware):
         """Publish to delay queue and ack source (sync)."""
         envelope = self._build_retry_envelope(message, retry_count)
 
-        if self._publish_fn is not None:
-            outcome = self._publish_fn(envelope)
-            if outcome is not None and not outcome.ok:
-                # Delay-queue publish failed — DO NOT ack, or the message is
-                # lost forever (never retried, never dead-lettered). Nack with
-                # requeue so the broker redelivers it.
-                if not message.is_settled:
-                    message.nack(requeue=True)
-                logger.warning(
-                    "Retry publish failed; nacked for redelivery: routing_key=%s",
-                    envelope.routing_key,
-                )
-                return
+        if self._publish_fn is None:
+            # No sync publish fn wired (manual middleware construction, or a
+            # RetryMiddleware carrying only publish_async_fn on a sync
+            # broker). Acking here would DROP the message — nothing was ever
+            # published to the delay queue. Nack for redelivery and warn
+            # loudly; broker-wired routes never hit this (the broker injects
+            # its own publish fn at start()).
+            if not message.is_settled:
+                message.nack(requeue=True)
+            warnings.warn(
+                "RetryMiddleware has no publish_fn wired for a sync route — the "
+                "transient failure was nacked (requeued), NOT routed to a delay "
+                "queue. Pass publish_fn=broker.publish, or set retry= on the "
+                "route/broker and let rabbitkit wire it.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        outcome = self._publish_fn(envelope)
+        # A None outcome (a custom/duck-typed publish fn that returns nothing)
+        # is UNVERIFIED, not success — treat like a failed publish.
+        if outcome is None or not outcome.ok:
+            # Delay-queue publish failed — DO NOT ack, or the message is
+            # lost forever (never retried, never dead-lettered). Nack with
+            # requeue so the broker redelivers it.
+            if not message.is_settled:
+                message.nack(requeue=True)
+            logger.warning(
+                "Retry publish failed or unverified; nacked for redelivery: routing_key=%s",
+                envelope.routing_key,
+            )
+            return
 
         # Ack source message (it's safely in the delay queue now)
         if not message.is_settled:
@@ -375,17 +414,32 @@ class RetryMiddleware(BaseMiddleware):
         """Publish to delay queue and ack source (async)."""
         envelope = self._build_retry_envelope(message, retry_count)
 
-        if self._publish_async_fn is not None:
-            outcome = await self._publish_async_fn(envelope)
-            if outcome is not None and not outcome.ok:
-                # Delay-queue publish failed — DO NOT ack (see sync variant).
-                if not message.is_settled:
-                    await message.nack_async(requeue=True)
-                logger.warning(
-                    "Retry publish failed; nacked for redelivery: routing_key=%s",
-                    envelope.routing_key,
-                )
-                return
+        if self._publish_async_fn is None:
+            # See the sync variant: acking without a publish would DROP the
+            # message. Nack for redelivery and warn loudly.
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
+            warnings.warn(
+                "RetryMiddleware has no publish_async_fn wired for an async route — "
+                "the transient failure was nacked (requeued), NOT routed to a delay "
+                "queue. Pass publish_async_fn=broker.publish, or set retry= on the "
+                "route/broker and let rabbitkit wire it.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        outcome = await self._publish_async_fn(envelope)
+        # None outcome = unverified publish = failure (see sync variant).
+        if outcome is None or not outcome.ok:
+            # Delay-queue publish failed — DO NOT ack (see sync variant).
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
+            logger.warning(
+                "Retry publish failed or unverified; nacked for redelivery: routing_key=%s",
+                envelope.routing_key,
+            )
+            return
 
         if not message.is_settled:
             await message.ack_async()
@@ -473,6 +527,8 @@ class RetryRouter:
         self,
         source_queue_name: str,
         source_exchange_name: str,  # kept for signature stability (M5) — see docstring
+        *,
+        source_queue_type: QueueType | None = None,
     ) -> list[RabbitQueue]:
         """Generate delay queue definitions for a source queue.
 
@@ -516,7 +572,13 @@ class RetryRouter:
                         "x-message-ttl": max(1, int(delay_ms * mult)),
                         "x-dead-letter-exchange": "",  # default exchange (M5)
                         "x-dead-letter-routing-key": source_queue_name,
-                        "x-queue-type": "classic",  # classic for delay queues
+                        # Delay queues stay CLASSIC deliberately, even for a
+                        # quorum source: they hold messages only for the delay
+                        # window (bounded seconds/minutes), have no consumers,
+                        # and quorum queues historically had weaker per-message
+                        # TTL behavior. The DLQ below is different — it stores
+                        # messages indefinitely, so it inherits quorum.
+                        "x-queue-type": "classic",
                     },
                 )
                 queues.append(queue)
@@ -525,9 +587,16 @@ class RetryRouter:
         # The source queue's x-dead-letter-exchange (set via
         # get_source_queue_dlq_arguments) routes nacked/rejected messages here.
         dlq_name = self.get_dlq_name(source_queue_name)
+        # The DLQ inherits QUORUM from a quorum source: it stores failed
+        # messages indefinitely — the exact data the replicated source queue
+        # was chosen to protect. Leaving it classic silently downgrades those
+        # messages to unreplicated single-node storage. (Streams are not
+        # inherited: basic_get-based DLQ inspection/replay doesn't apply to
+        # stream semantics.)
         dlq = RabbitQueue(
             name=dlq_name,
             durable=True,
+            queue_type=QueueType.QUORUM if source_queue_type == QueueType.QUORUM else QueueType.CLASSIC,
         )
         queues.append(dlq)
 

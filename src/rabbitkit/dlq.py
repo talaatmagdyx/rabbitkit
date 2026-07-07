@@ -149,6 +149,7 @@ class DLQInspector:
         target_exchange: str | None = None,
         *,
         reset_retry_count: bool = False,
+        limit: int | None = None,
     ) -> ReplayResult:
         """Replay messages from the DLQ.
 
@@ -172,6 +173,13 @@ class DLQInspector:
                 False preserves headers verbatim — meaning a previously
                 max-retried message is terminal after ONE failed attempt and
                 returns to the DLQ.
+            limit: Maximum number of messages to fetch this call (None =
+                drain until empty). Set this when a LIVE consumer on the
+                target can fail a replayed message back into this same DLQ
+                faster than the drain completes — the held-until-drained
+                termination guarantee below covers self-refetch, but not a
+                message that genuinely re-arrives via dead-lettering
+                mid-drain, which an unbounded loop would replay again.
 
         Returns:
             :class:`ReplayResult` — int-compatible replayed count, with
@@ -194,11 +202,13 @@ class DLQInspector:
         held_for_requeue: list[RabbitMessage] = []
         failed = 0
         requeued = 0
+        fetched = 0
 
-        while True:
+        while limit is None or fetched < limit:
             msg = self._transport.basic_get(queue)
             if msg is None:
                 break
+            fetched += 1
 
             # Apply predicate filter -- hold, don't nack yet (see docstring).
             if predicate is not None and not predicate(msg):
@@ -208,7 +218,9 @@ class DLQInspector:
 
             envelope = self._build_replay_envelope(msg, target_queue, target_exchange, reset_retry_count)
             outcome = self._transport.publish(envelope)
-            if outcome is not None and not outcome.ok:
+            # A None outcome (duck-typed transport returning nothing) is an
+            # UNVERIFIED publish — treat as failure, never ack against it.
+            if outcome is None or not outcome.ok:
                 # Republish failed — DO NOT ack, or the message is lost
                 # forever. Hold for nack-requeue so it stays on the DLQ.
                 logger.error(
@@ -270,6 +282,7 @@ class DLQInspector:
         target_exchange: str | None = None,
         *,
         reset_retry_count: bool = False,
+        limit: int | None = None,
     ) -> ReplayResult:
         """Async variant of ``replay`` -- see its docstring for the
         outcome-checked ack, ``reset_retry_count``, and why non-matching /
@@ -279,11 +292,13 @@ class DLQInspector:
         held_for_requeue: list[RabbitMessage] = []
         failed = 0
         requeued = 0
+        fetched = 0
 
-        while True:
+        while limit is None or fetched < limit:
             msg = await self._transport.basic_get(queue)
             if msg is None:
                 break
+            fetched += 1
 
             if predicate is not None and not predicate(msg):
                 held_for_requeue.append(msg)
@@ -292,7 +307,8 @@ class DLQInspector:
 
             envelope = self._build_replay_envelope(msg, target_queue, target_exchange, reset_retry_count)
             outcome = await self._transport.publish(envelope)
-            if outcome is not None and not outcome.ok:
+            # None outcome = unverified publish = failure (see sync variant).
+            if outcome is None or not outcome.ok:
                 logger.error(
                     "DLQ replay publish failed (status=%s); message stays on %r: routing_key=%s message_id=%s",
                     getattr(outcome, "status", "unknown"),

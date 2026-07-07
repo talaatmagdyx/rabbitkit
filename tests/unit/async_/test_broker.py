@@ -272,10 +272,14 @@ class TestLifecycle:
             )
 
     @pytest.mark.asyncio
-    async def test_start_with_retry_and_no_confirms_warns(self) -> None:
-        """M4: a retry-enabled route on a broker with confirm_delivery=False
-        must warn -- RetryMiddleware acks the source as soon as its
-        delay-queue republish is SENT (fire-and-forget), not confirmed."""
+    async def test_start_with_retry_and_no_confirms_does_not_warn(self) -> None:
+        """L4: the retry context must NOT warn under confirm_delivery=False —
+        retry envelopes publish mandatory=True, which forces per-publish
+        confirm mode regardless, so the old warning was a false positive.
+        (The @publisher result-forward context still warns — covered
+        separately.)"""
+        import warnings as _warnings
+
         config = RabbitConfig(
             retry=RetryConfig(max_retries=1, delays=(5,)),
             publisher=PublisherConfig(confirm_delivery=False),
@@ -294,8 +298,12 @@ class TestLifecycle:
         mock_transport.consume = AsyncMock(return_value="tag")
 
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
-            with pytest.warns(RuntimeWarning, match="confirm_delivery=False"):
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
                 await broker.start()
+        assert not any(
+            "confirm_delivery=False" in str(w.message) for w in caught
+        ), "retry context must not emit the confirms warning (mandatory=True forces confirms)"
 
     @pytest.mark.asyncio
     async def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
@@ -1493,8 +1501,11 @@ class TestOnMessageCallback:
                 assert msg.headers["x-rabbitkit-original-queue"] == "orders"
                 mock_process.assert_called_once()
 
-    async def test_on_message_does_not_override_existing_original_queue_header(self) -> None:
-        """on_message does NOT override existing x-rabbitkit-original-queue header."""
+    async def test_on_message_always_overwrites_original_queue_header(self) -> None:
+        """H2 (spoofing): on_message ALWAYS overwrites
+        x-rabbitkit-original-queue — honoring a producer-set value would let
+        a publisher steer retries into another route's delay ladder or a
+        nonexistent queue. See the sync broker twin test."""
         from rabbitkit.core.message import RabbitMessage
 
         broker = AsyncBroker()
@@ -1526,8 +1537,8 @@ class TestOnMessageCallback:
                 )
                 await captured_callback(msg)
 
-                # Should NOT be overwritten
-                assert msg.headers["x-rabbitkit-original-queue"] == "original-queue"
+                # H2: producer-set value is ALWAYS overwritten with the real queue
+                assert msg.headers["x-rabbitkit-original-queue"] == "orders"
 
     async def test_on_message_pooled_submits_to_pool(self) -> None:
         """With a worker pool, on_message_pooled submits to pool.submit()."""
@@ -2417,3 +2428,35 @@ class TestStartedProperty:
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             assert _get_started(broker) is False
+
+
+class TestUserSuppliedRetryMiddlewareWiring:
+    """Async twin of the sync wiring-injection test — see there for why."""
+
+    @pytest.mark.asyncio
+    async def test_start_injects_publish_async_fn_into_user_retry_middleware(self) -> None:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        user_mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        assert user_mw._publish_async_fn is None
+
+        broker = AsyncBroker(RabbitConfig())
+
+        @broker.subscriber(
+            queue="orders",
+            retry=RetryConfig(max_retries=1, delays=(5,)),
+            middlewares=[user_mw],
+        )
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
+            await broker.start()
+
+        assert user_mw._publish_async_fn is not None

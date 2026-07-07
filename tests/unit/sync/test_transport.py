@@ -2240,3 +2240,195 @@ class TestStartConsumingIoLoopDeath:
         transport._connection.process_data_events.side_effect = ValueError("bad time_limit")
         with pytest.raises(ValueError, match="bad time_limit"):
             transport.start_consuming()
+
+
+# ── Architect review: sync transport blockers ─────────────────────────────
+
+
+class TestNonOwnerReconnectGuard:
+    """B1 (blocker): once a consume loop has ever run, a NON-owner thread
+    hitting a dead connection must get a clean ERROR outcome — never call
+    connect() and steal ownership (two threads on one BlockingConnection)."""
+
+    def test_non_owner_publish_on_dead_connection_returns_error_no_reconnect(self) -> None:
+        transport = _make_transport()
+        transport._connected = False  # connection died
+        transport._ever_consumed = True
+        transport._owner_ident = -12345  # someone else owns it
+
+        connect_calls: list[bool] = []
+        transport.connect = lambda: connect_calls.append(True)  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.ERROR
+        assert isinstance(outcome.error, ConnectionError)
+        assert connect_calls == [], "non-owner thread must never reconnect"
+
+    def test_sticky_flag_blocks_reconnect_mid_recovery(self) -> None:
+        """L1: after disconnect() reset _ever_consumed/_owner_ident, the
+        sticky _ever_consumed_any must still fail the guard for a non-owner
+        caller... but with owner_ident None the caller can't be 'non-owner'.
+        The guard keys on ever-consumed + not-owner + dead: verify the
+        marshal gate honors the sticky flag instead."""
+        transport = _make_transport()
+        transport._ever_consumed_any = True
+        transport._ever_consumed = False
+        transport._owner_ident = -12345  # owner is another (reconnecting) thread
+        transport._connected = False
+
+        connect_calls: list[bool] = []
+        transport.connect = lambda: connect_calls.append(True)  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+        assert outcome.status is PublishStatus.ERROR
+        assert connect_calls == []
+
+
+class TestCancelConsumerKeepsChannelOpen:
+    """H1 (consumer review): cancel_consumer must basic_cancel but NOT close
+    the channel — Channel.Close instantly requeues every unacked delivery
+    while workers still run those handlers, and their acks then die on the
+    closed channel. The channel is parked and closed by disconnect()."""
+
+    def test_cancel_does_not_close_channel(self) -> None:
+        transport = _make_transport()
+        transport._connected = True
+        transport._connection = MagicMock()
+        transport._connection.is_open = True
+        transport._channel = MagicMock()
+        transport._channel.is_open = True
+        channel = MagicMock()
+        channel.is_open = True
+        transport._consumer_channels["orders"] = channel
+        transport._consumer_tags["orders"] = "ctag-1"
+
+        transport.cancel_consumer("ctag-1")
+
+        channel.basic_cancel.assert_called_once_with(consumer_tag="ctag-1")
+        channel.close.assert_not_called()
+        assert channel in transport._cancelled_channels
+
+    def test_disconnect_closes_parked_cancelled_channels(self) -> None:
+        transport = _make_transport()
+        channel = MagicMock()
+        channel.is_open = True
+        transport._consumer_channels["orders"] = channel
+        transport._consumer_tags["orders"] = "ctag-1"
+        transport._connected = True
+        transport._connection = MagicMock()
+        transport._connection.is_open = True
+        transport._channel = MagicMock()
+        transport._channel.is_open = True
+
+        transport.cancel_consumer("ctag-1")
+        channel.close.assert_not_called()
+
+        transport.disconnect()
+        channel.close.assert_called_once()
+        assert transport._cancelled_channels == []
+
+
+class TestWarnContinueConfirmRecovery:
+    """M2 (transport review): the warn_continue 406 recovery must put the
+    reopened publisher channel back into confirm mode — otherwise every
+    subsequent publish is fire-and-forget yet still reported CONFIRMED."""
+
+    @staticmethod
+    def _exc(code: int = 406, text: str = "inequivalent arg") -> Exception:
+        class _Fake406(Exception):
+            reply_code = code
+            reply_text = text
+
+        return _Fake406(text)
+
+    def test_reopened_channel_reenters_confirm_mode(self) -> None:
+        transport = _make_transport(confirm_delivery=True, on_topology_conflict="warn_continue")
+        new_channel = MagicMock()
+        transport._connection = MagicMock()
+        transport._connection.channel.return_value = new_channel
+
+        transport._raise_precondition_failed_or_reraise("queue", "orders", self._exc())
+
+        new_channel.confirm_delivery.assert_called_once()
+        assert transport._channel_key(new_channel) in transport._confirmed_channel_ids
+
+    def test_conflicting_dlx_declaration_escalates_even_under_warn_continue(self) -> None:
+        """Retry-review M1: a 406 on a declaration that carried an injected
+        x-dead-letter-exchange must raise — continuing with the existing
+        DLX-less queue silently DISCARDS every terminal reject."""
+        from rabbitkit.core.errors import ConfigurationError
+
+        transport = _make_transport(on_topology_conflict="warn_continue")
+        transport._connection = MagicMock()
+
+        with pytest.raises(ConfigurationError, match="DISCARDED"):
+            transport._raise_precondition_failed_or_reraise(
+                "queue",
+                "orders",
+                self._exc(),
+                declared_arguments={"x-dead-letter-exchange": "", "x-dead-letter-routing-key": "orders.dlq"},
+            )
+
+
+class TestIdlePublishRetryOnce:
+    """M4 (transport review): the FIRST publish after an idle heartbeat
+    death must reconnect and retry exactly once (owner/pure-producer only)
+    instead of returning ERROR for a message that was never sent."""
+
+    def test_pure_producer_retries_once_after_connection_error(self) -> None:
+        transport = _make_transport()
+        transport._connected = True
+        transport._connection = MagicMock()
+        transport._connection.is_open = True
+        transport._channel = MagicMock()
+        transport._channel.is_open = True
+
+        from rabbitkit.core.types import PublishOutcome
+        from rabbitkit.sync.connection import get_connection_errors
+
+        conn_err = get_connection_errors()[0]("socket died")
+        attempts: list[str] = []
+
+        def fake_publish_on_channel(channel, envelope):
+            attempts.append("try")
+            if len(attempts) == 1:
+                return PublishOutcome(
+                    status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err
+                )
+            return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key=envelope.routing_key)
+
+        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
+        reconnects: list[bool] = []
+        transport._ensure_connected = lambda: reconnects.append(True)  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        assert len(attempts) == 2
+        assert len(reconnects) >= 1
+
+
+class TestReconnectBackoffLiveness:
+    """H3 (consumer review): each reconnect-backoff iteration must fire the
+    io-tick so liveness sees forward progress during a broker outage —
+    otherwise every sync consumer pod restarts mid-outage."""
+
+    def test_io_tick_fired_during_backoff(self) -> None:
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 2
+        ticks: list[bool] = []
+        transport.on_io_tick(lambda: ticks.append(True))
+
+        def failing_connect() -> None:
+            raise pika.exceptions.AMQPConnectionError("down")
+
+        transport.connect = failing_connect  # type: ignore[method-assign]
+
+        with patch("time.sleep"):
+            with pytest.raises(pika.exceptions.AMQPConnectionError):
+                transport._ensure_connected()
+
+        assert len(ticks) >= 2  # one tick per backoff iteration

@@ -690,7 +690,8 @@ class AsyncBroker:
 
         # Cancel all consumers FIRST — stop new deliveries before draining
         # anything, so nothing new arrives while the pool/in-flight drain runs.
-        assert self._transport is not None
+        if self._transport is None:  # pragma: no cover — defensive (assert was stripped under -O)
+            return
         for route in self._registry.routes:
             if route.consumer_tag:
                 await self._transport.cancel_consumer(route.consumer_tag)

@@ -321,7 +321,11 @@ class SyncBroker:
                 "side effects). For slow handlers, pass "
                 "start(worker_config=WorkerConfig(worker_count=N)) so handlers run off the "
                 "I/O thread, or raise ConnectionConfig.heartbeat well above your worst-case "
-                "handler duration.",
+                "handler duration. Additionally (M5): a handler on THIS thread that "
+                "publishes with confirms waits for the broker confirm UNBOUNDED — "
+                "confirm_timeout cannot be enforced from the owner thread itself; "
+                "worker_count>1 publishes marshal through the bounded cross-thread "
+                "path instead.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -423,7 +427,8 @@ class SyncBroker:
 
         # Cancel all consumers FIRST — stop new deliveries before draining
         # anything, so nothing new arrives while the pool/in-flight drain runs.
-        assert self._transport is not None
+        if self._transport is None:  # pragma: no cover — defensive (assert was stripped under -O)
+            return
         for route in self._registry.routes:
             if route.consumer_tag:
                 self._transport.cancel_consumer(route.consumer_tag)

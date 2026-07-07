@@ -89,6 +89,15 @@ class SyncTransport:
         # a worker thread's ack must never run inline just because the loop
         # has momentarily stopped pumping (see _run_on_io_thread).
         self._ever_consumed = False
+        # Sticky variant (architect review L1/B1): once ANY consume loop has
+        # ever run on this transport, cross-thread callers must marshal (or
+        # fail) forever — even mid-recovery, after disconnect() reset
+        # _ever_consumed/_owner_ident — and must never reconnect themselves.
+        self._ever_consumed_any = False
+        # Channels cancelled by cancel_consumer but deliberately left OPEN
+        # until disconnect() so the in-flight drain can still settle on them
+        # (H1: closing at cancel time force-requeues every unacked delivery).
+        self._cancelled_channels: list[Any] = []
 
         # Per-queue consumer channels (H-SRE1): each queue gets its own channel
         # so per-queue basic_qos does not overwrite other consumers and fair
@@ -110,7 +119,7 @@ class SyncTransport:
         # to report a return at all (see pika's own basic_publish docstring).
         # A mandatory=True publish upgrades its target channel to confirm mode
         # on demand (once, idempotently) regardless of confirm_delivery.
-        self._confirmed_channel_ids: set[int] = set()
+        self._confirmed_channel_ids: set[tuple[int, int]] = set()
 
         # Backpressure callbacks (FlowController registers here). Each is a
         # zero-arg callable; pika's blocked/unblocked frames are adapted to it.
@@ -228,7 +237,7 @@ class SyncTransport:
         self._channel = self._connection.channel()
         if self._confirm_delivery:
             self._channel.confirm_delivery()
-            self._confirmed_channel_ids.add(id(self._channel))
+            self._confirmed_channel_ids.add(self._channel_key(self._channel))
 
         # Register connection blocked/unblocked callbacks (C-6) so a
         # FlowController can throttle publishes when RabbitMQ raises an alarm.
@@ -258,14 +267,17 @@ class SyncTransport:
             return
 
         try:
-            # Close per-queue consumer channels first
-            for ch in list(self._consumer_channels.values()):
+            # Close per-queue consumer channels first — including channels
+            # parked by cancel_consumer (H1: cancelled but deliberately left
+            # open until the in-flight drain finished).
+            for ch in list(self._consumer_channels.values()) + self._cancelled_channels:
                 try:
                     if ch.is_open:
                         ch.close()
                 except Exception:  # pragma: no cover — best effort
                     pass
             self._consumer_channels.clear()
+            self._cancelled_channels.clear()
             self._consumer_tags = {}
 
             if self._channel and self._channel.is_open:
@@ -282,6 +294,10 @@ class SyncTransport:
             self._connected = False
             self._owner_ident = None
             self._ever_consumed = False
+            # _ever_consumed_any deliberately NOT reset (architect review L1):
+            # during run()-recovery a worker thread settling between
+            # disconnect() and the owner's reconnect must keep taking the
+            # marshal-or-fail path, never the inline cross-thread branch.
             logger.info("Disconnected from RabbitMQ")
 
     def is_connected(self) -> bool:
@@ -340,6 +356,12 @@ class SyncTransport:
                 return
             except connection_errors as e:
                 attempts += 1
+                # H3 (architect review): each backoff iteration is provable
+                # forward progress — refresh the liveness heartbeat so a
+                # broker outage longer than wedged_timeout doesn't flip
+                # liveness and restart the whole consumer fleet mid-outage
+                # (docs/kubernetes.md promises exactly that it won't).
+                self._fire_io_tick()
                 # Full jitter: sleep a random fraction of the current backoff to
                 # spread reconnects across clients (H-SRE3).
                 sleep_for = random.uniform(0.0, backoff)  # noqa: S311
@@ -409,10 +431,12 @@ class SyncTransport:
         late drain (after the caller has already nacked+requeued and moved on)
         becomes a no-op instead of settling an already-redelivered message.
         """
-        if (
-            self._owner_ident is None
-            or threading.get_ident() == self._owner_ident
-            or not self._ever_consumed
+        # L1: gate on the STICKY flag — after disconnect() during recovery
+        # (_owner_ident None, _ever_consumed reset) a worker thread must keep
+        # marshaling (and fail loudly if nothing pumps) rather than touch the
+        # connection inline, cross-thread, while the owner is reconnecting.
+        if threading.get_ident() == self._owner_ident or not (
+            self._ever_consumed or self._ever_consumed_any
         ):
             return fn()
 
@@ -517,11 +541,13 @@ class SyncTransport:
         self._channel = None
         self._reply_to_channel = None
         self._consumer_channels = {}
+        self._cancelled_channels = []
         self._consumer_tags = {}
         self._confirmed_channel_ids = set()
         self._connected = False
         self._owner_ident = None
         self._ever_consumed = False
+        # _ever_consumed_any stays True (sticky) — see __init__.
 
     def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.
@@ -535,6 +561,33 @@ class SyncTransport:
         direct reply-to; publishing on a different channel raises
         "PRECONDITION_FAILED - fast reply consumer does not exist".
         """
+        # B1 (architect review, blocker): once a consume loop has ever run,
+        # a NON-owner thread must never reconnect. A worker-thread handler
+        # publishing during a connection blip used to call
+        # _ensure_connected(), create a NEW BlockingConnection on the worker
+        # thread, and steal _owner_ident — while the real I/O thread's next
+        # loop tick picked up self._connection and started pumping it: two
+        # unsynchronized threads driving one pika connection (frame
+        # corruption, lost acks, mass redelivery). Reconnection is owned
+        # exclusively by the owner thread (SyncBroker.run()'s recovery loop);
+        # here we fail fast with a clean outcome instead.
+        if (
+            (self._ever_consumed or self._ever_consumed_any)
+            and threading.get_ident() != self._owner_ident
+            and not self.is_connected()
+        ):
+            return PublishOutcome(
+                status=PublishStatus.ERROR,
+                exchange=envelope.exchange,
+                routing_key=envelope.routing_key,
+                error=ConnectionError(
+                    "Connection is down and this thread does not own it — "
+                    "reconnection is handled by the broker's recovery loop on the "
+                    "owner thread. The publish was NOT sent; treat as transient "
+                    "and retry/nack."
+                ),
+            )
+
         self._ensure_connected()
 
         channel = self._channel
@@ -544,8 +597,58 @@ class SyncTransport:
             and self._reply_to_channel.is_open
         ):
             channel = self._reply_to_channel
+            # m1: this consumer channel is not in confirm mode by default, so
+            # without this the outcome below would claim CONFIRMED for a
+            # fire-and-forget RPC publish. Enabling confirms on it keeps the
+            # reported status truthful (confirm.select is legal on a channel
+            # with an active consumer).
+            if self._confirm_delivery:
+                self._ensure_mandatory_confirms(channel)
 
-        return self._publish_on_channel(channel, envelope)
+        outcome = self._publish_on_channel(channel, envelope)
+
+        # M4 (architect review): a pure-producer connection that nobody pumps
+        # gets heartbeat-closed broker-side, and pika's is_open stays True
+        # until the socket is read — so the FIRST publish after an idle gap
+        # fails with a connection error. When this thread is allowed to
+        # reconnect (owner, or nothing ever consumed), reconnect and retry
+        # exactly once: safe pre-confirm (at-least-once), and it turns the
+        # "first publish after a quiet night" page into a non-event.
+        if (
+            outcome.status is PublishStatus.ERROR
+            and outcome.error is not None
+            and isinstance(outcome.error, get_connection_errors())
+        ):
+            allowed_to_reconnect = not (
+                self._ever_consumed or self._ever_consumed_any
+            ) or threading.get_ident() == self._owner_ident
+            if allowed_to_reconnect:
+                logger.warning(
+                    "Publish hit a dead connection (%s); reconnecting and retrying once",
+                    type(outcome.error).__name__,
+                )
+                self._connected = False
+                self._ensure_connected()
+                retry_channel = self._channel
+                if (
+                    envelope.reply_to == DIRECT_REPLY_TO_QUEUE
+                    and self._reply_to_channel is not None
+                    and self._reply_to_channel.is_open
+                ):
+                    retry_channel = self._reply_to_channel
+                return self._publish_on_channel(retry_channel, envelope)
+
+        return outcome
+
+    @staticmethod
+    def _channel_key(channel: Any) -> tuple[int, int]:
+        """Identity key for confirmed-channel tracking (architect review m5):
+        ``id()`` alone can be reused after a tracked channel is GC'd, which
+        would mark a fresh unconfirmed channel as confirmed and silently
+        disable Basic.Return detection for mandatory publishes. Pairing it
+        with the AMQP channel number makes accidental collision practically
+        impossible while staying hashable and cheap."""
+        return (id(channel), int(getattr(channel, "channel_number", -1)))
 
     def _ensure_mandatory_confirms(self, channel: Any) -> None:
         """Enable publisher confirms on *channel* if not already active.
@@ -557,10 +660,10 @@ class SyncTransport:
         pika logging a spurious "confirmation was already enabled" error.
         Marshaled like ``basic_publish`` since it drives blocking I/O.
         """
-        if id(channel) in self._confirmed_channel_ids:
+        if self._channel_key(channel) in self._confirmed_channel_ids:
             return
         self._run_on_io_thread(channel.confirm_delivery)
-        self._confirmed_channel_ids.add(id(channel))
+        self._confirmed_channel_ids.add(self._channel_key(channel))
 
     def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish *envelope* on a specific already-open channel."""
@@ -590,7 +693,9 @@ class SyncTransport:
 
             # I-10: bound the publish+confirm wait by confirm_timeout so a
             # missing confirm cannot stall the worker forever.
-            publish_timeout = min(30.0, self._confirm_timeout)
+            # m4: honor the configured confirm_timeout as-is — the old
+            # min(30, x) silently clamped an operator's deliberate 60 s to 30.
+            publish_timeout = self._confirm_timeout
             def do_publish() -> None:
                 channel.basic_publish(
                     exchange=envelope.exchange,
@@ -788,9 +893,18 @@ class SyncTransport:
             else:
                 self._channel.queue_declare(**kwargs)
         except pika.exceptions.ChannelClosedByBroker as exc:
-            self._raise_precondition_failed_or_reraise("queue", kwargs["queue"], exc)
+            self._raise_precondition_failed_or_reraise(
+                "queue", kwargs["queue"], exc, declared_arguments=kwargs.get("arguments")
+            )
 
-    def _raise_precondition_failed_or_reraise(self, kind: str, name: str, exc: Any) -> None:
+    def _raise_precondition_failed_or_reraise(
+        self,
+        kind: str,
+        name: str,
+        exc: Any,
+        *,
+        declared_arguments: dict[str, Any] | None = None,
+    ) -> None:
         """M6: turn a 406 PRECONDITION_FAILED into a typed, actionable error.
 
         Declaring a queue/exchange with arguments that conflict with an
@@ -809,10 +923,34 @@ class SyncTransport:
         we reopen it first (connection stays open) for subsequent declares.
         """
         if exc.reply_code == 406 and self._on_topology_conflict == "warn_continue":
+            # Architect review M1: if OUR declaration carried a dead-letter
+            # exchange (retry/safety-injected DLX), continuing with the
+            # existing DLX-less queue silently converts every terminal
+            # reject(requeue=False) into a broker-side DISCARD — the DLQ
+            # stays green and empty while poison messages vanish. That is
+            # never an acceptable "drift"; escalate even under warn_continue.
+            if declared_arguments and "x-dead-letter-exchange" in declared_arguments:
+                raise ConfigurationError(
+                    f"Queue {name!r} exists with arguments that conflict with the "
+                    f"dead-letter configuration rabbitkit needs to declare "
+                    f"(broker said: {exc.reply_text}). Continuing would mean "
+                    f"terminal rejects on this queue are DISCARDED (no DLX on the "
+                    f"existing queue) — refusing even under "
+                    f"on_topology_conflict='warn_continue'. Reconcile the existing "
+                    f"queue's x-dead-letter-exchange or declare the topology "
+                    f"externally and use TopologyMode.PASSIVE_ONLY."
+                ) from exc
             # Reopen the broker-closed channel so the rest of topology
             # declaration can proceed on the existing (drifted) entity.
             self._channel = self._connection.channel()
-            self._confirmed_channel_ids.discard(id(self._channel))
+            self._confirmed_channel_ids.discard(self._channel_key(self._channel))
+            # Architect review M2: the 406 killed the old publisher channel —
+            # the replacement must re-enter confirm mode, or every subsequent
+            # publish is fire-and-forget while still being reported CONFIRMED
+            # (silent loss on the reliability path).
+            if self._confirm_delivery:
+                self._channel.confirm_delivery()
+                self._confirmed_channel_ids.add(self._channel_key(self._channel))
             logger.warning(
                 "Topology drift on %s %r (broker: %s); on_topology_conflict='warn_continue' "
                 "— continuing with the EXISTING definition (rabbitkit's declaration was NOT "
@@ -903,13 +1041,18 @@ class SyncTransport:
         except Exception as e:
             logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
         finally:
-            try:
-                if channel is not None and channel.is_open:
-                    channel.close()
-            except Exception:  # pragma: no cover - best effort
-                pass
+            # Architect review H1: do NOT close the channel here. Channel.Close
+            # makes RabbitMQ instantly requeue every unacked delivery on it --
+            # while worker threads are still executing those very handlers
+            # (guaranteed concurrent duplicate processing on every graceful
+            # shutdown), and each worker's eventual ack then dies on the
+            # closed channel, so the drain could never settle anything.
+            # basic_cancel alone stops new deliveries; the channel is parked
+            # and closed by disconnect() AFTER the in-flight drain completes.
             self._consumer_tags.pop(queue_name, None)
             self._consumer_channels.pop(queue_name, None)
+            if channel is not None and channel is not self._reply_to_channel:
+                self._cancelled_channels.append(channel)
             if channel is self._reply_to_channel:
                 self._reply_to_channel = None
 
@@ -925,6 +1068,7 @@ class SyncTransport:
         self._ensure_connected()
         self._consuming = True
         self._ever_consumed = True
+        self._ever_consumed_any = True  # sticky — never reset (L1)
         self._owner_ident = threading.get_ident()
         try:
             while self._consuming:

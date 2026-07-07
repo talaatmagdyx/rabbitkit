@@ -910,9 +910,10 @@ class TestDeclareTopologyEdgeCases:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     broker.start()
-                # M4: no confirm-related warning. (A separate H2 single-worker
-                # heartbeat warning is expected here and is not what M4 checks.)
-                assert not any("confirm" in str(w.message).lower() for w in caught)
+                # M4: no confirms-off warning — narrowed to the exact phrase,
+                # since the expected H2/M5 single-worker heartbeat warning
+                # legitimately mentions confirm_timeout.
+                assert not any("confirm_delivery=False" in str(w.message) for w in caught)
 
     def test_start_with_result_publisher_and_no_confirms_warns(self) -> None:
         """M4: a route with a @publisher() result forward on a broker with

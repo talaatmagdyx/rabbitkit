@@ -47,3 +47,49 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # A tag alone never appears in the repo's Releases list — v0.10.0 shipped
+  # to PyPI with no visible GitHub Release until one was created by hand.
+  # Create it automatically, with the notes extracted from the tag's own
+  # CHANGELOG section, and attach the built artifacts.
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Extract this version's CHANGELOG section
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" <<'EOF'
+          import sys
+          version = sys.argv[1]
+          s = open("CHANGELOG.md").read()
+          marker = f"## [{version}]"
+          if marker not in s:
+              # Tag without a matching CHANGELOG section — still make a release.
+              notes = f"See CHANGELOG.md for {version}."
+          else:
+              start = s.index(marker)
+              body = s[s.index("\n", start) + 1 :]
+              end = body.find("\n## [")
+              notes = body[: end if end != -1 else len(body)].strip()
+          notes += (
+              f"\n\n---\n\n**Install:** `pip install rabbitkit=={version}`\n"
+              "**Upgrade guide:** https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/migration.md\n"
+          )
+          open("/tmp/notes.md", "w").write(notes)
+          EOF
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "rabbitkit $GITHUB_REF_NAME" \
+            --notes-file /tmp/notes.md \
+            --verify-tag

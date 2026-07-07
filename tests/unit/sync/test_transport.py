@@ -2266,11 +2266,11 @@ class TestNonOwnerReconnectGuard:
         assert connect_calls == [], "non-owner thread must never reconnect"
 
     def test_sticky_flag_blocks_reconnect_mid_recovery(self) -> None:
-        """L1: after disconnect() reset _ever_consumed/_owner_ident, the
-        sticky _ever_consumed_any must still fail the guard for a non-owner
-        caller... but with owner_ident None the caller can't be 'non-owner'.
-        The guard keys on ever-consumed + not-owner + dead: verify the
-        marshal gate honors the sticky flag instead."""
+        """L1: after disconnect() reset _ever_consumed, the sticky
+        _ever_consumed_any must still trip the guard for a caller that is
+        not the owner thread (with _owner_ident=None, get_ident() != None
+        is True for EVERY thread, so all callers are non-owners until the
+        owner reconnects and reclaims it)."""
         transport = _make_transport()
         transport._ever_consumed_any = True
         transport._ever_consumed = False
@@ -2432,3 +2432,91 @@ class TestReconnectBackoffLiveness:
                 transport._ensure_connected()
 
         assert len(ticks) >= 2  # one tick per backoff iteration
+
+
+class TestEnsureConnectedOwnership:
+    """Verification gap 2: ownership is enforced INSIDE _ensure_connected,
+    so every entry point (publish TOCTOU, DLQInspector.basic_get,
+    declare/bind helpers) is covered — a non-owner thread reaching it on a
+    dead connection fails cleanly instead of creating a second
+    BlockingConnection cross-thread."""
+
+    def test_non_owner_thread_cannot_reconnect(self) -> None:
+        transport = _make_transport()
+        transport._connected = False
+        transport._ever_consumed_any = True
+        transport._owner_ident_any = -12345  # historical owner is another thread
+
+        connect_calls: list[bool] = []
+        transport.connect = lambda: connect_calls.append(True)  # type: ignore[method-assign]
+
+        with pytest.raises(ConnectionError, match="recovery loop"):
+            transport._ensure_connected()
+        assert connect_calls == []
+
+    def test_owner_thread_may_reconnect_during_recovery(self) -> None:
+        import threading
+
+        transport = _make_transport()
+        transport._connected = False
+        transport._ever_consumed_any = True
+        transport._owner_ident_any = threading.get_ident()  # we ARE the owner
+
+        def fake_connect() -> None:
+            transport._connected = True
+            transport._connection = MagicMock()
+            transport._connection.is_open = True
+            transport._channel = MagicMock()
+            transport._channel.is_open = True
+
+        transport.connect = fake_connect  # type: ignore[method-assign]
+        transport._ensure_connected()  # must not raise
+        assert transport.is_connected()
+
+    def test_pure_producer_any_thread_may_reconnect(self) -> None:
+        transport = _make_transport()
+        transport._connected = False  # never consumed: no ownership
+
+        def fake_connect() -> None:
+            transport._connected = True
+            transport._connection = MagicMock()
+            transport._connection.is_open = True
+            transport._channel = MagicMock()
+            transport._channel.is_open = True
+
+        transport.connect = fake_connect  # type: ignore[method-assign]
+        transport._ensure_connected()
+        assert transport.is_connected()
+
+
+class TestIdlePublishRetryDeniedForNonOwner:
+    """Verification gap 3: the retry-once path's False branch — a non-owner
+    thread (post-consume) gets the ERROR outcome back verbatim, with no
+    reconnect attempt."""
+
+    def test_non_owner_gets_error_without_retry(self) -> None:
+        from rabbitkit.core.types import PublishOutcome
+        from rabbitkit.sync.connection import get_connection_errors
+
+        transport = _make_transport()
+        transport._connected = True
+        transport._connection = MagicMock()
+        transport._connection.is_open = True
+        transport._channel = MagicMock()
+        transport._channel.is_open = True
+        transport._ever_consumed = True
+        transport._owner_ident = -12345  # another thread owns the loop
+        transport._owner_ident_any = -12345
+
+        conn_err = get_connection_errors()[0]("socket died")
+        attempts: list[str] = []
+
+        def fake_publish_on_channel(channel, envelope):
+            attempts.append("try")
+            return PublishOutcome(status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err)
+
+        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+        assert outcome.status is PublishStatus.ERROR
+        assert attempts == ["try"]  # exactly one attempt, no retry

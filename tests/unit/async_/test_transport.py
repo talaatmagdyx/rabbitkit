@@ -1964,3 +1964,55 @@ class TestMandatoryChannelTimeoutRecycle:
         channel.close.assert_called_once()
         assert transport._mandatory_channel_recycle is False
         assert outcomes == {"fast": PublishStatus.TIMEOUT, "slow": PublishStatus.CONFIRMED}
+
+
+class TestBindingRestoreAfterReconnect:
+    """Verification gap 3/4: bindings recorded by bind_queue/bind_exchange
+    are re-applied after a robust reconnect (they are not in RobustChannel's
+    restoration registry)."""
+
+    @pytest.mark.asyncio
+    async def test_bind_queue_records_binding(self) -> None:
+        transport = _make_transport()
+        transport._connected = True
+        topo = AsyncMock()
+        topo.is_closed = False
+        transport._topology_channel = topo
+
+        await transport.bind_queue(queue="orders", exchange="events", routing_key="orders.*")
+
+        assert ("queue", "orders", "events", "orders.*", None) in transport._recorded_bindings
+
+    @pytest.mark.asyncio
+    async def test_reapply_bindings_rebinds_and_stops_when_done(self) -> None:
+        import asyncio as _asyncio
+        from unittest.mock import patch as _patch
+
+        transport = _make_transport()
+        topo = AsyncMock()
+        topo.is_closed = False
+        transport._topology_channel = topo
+        transport._recorded_bindings.append(("queue", "orders", "events", "orders.*", None))
+
+        q = AsyncMock()
+        ex = AsyncMock()
+        topo.get_queue.return_value = q
+        topo.get_exchange.return_value = ex
+
+        with _patch.object(_asyncio, "sleep", new=AsyncMock()):
+            await transport._reapply_bindings()
+
+        q.bind.assert_awaited_once_with(ex, routing_key="orders.*", arguments=None)
+
+    @pytest.mark.asyncio
+    async def test_reapply_bindings_noop_when_topology_channel_gone(self) -> None:
+        """Shutdown-during-reconnect: the task must exit cleanly."""
+        import asyncio as _asyncio
+        from unittest.mock import patch as _patch
+
+        transport = _make_transport()
+        transport._topology_channel = None
+        transport._recorded_bindings.append(("queue", "orders", "events", "", None))
+
+        with _patch.object(_asyncio, "sleep", new=AsyncMock()):
+            await transport._reapply_bindings()  # must not raise

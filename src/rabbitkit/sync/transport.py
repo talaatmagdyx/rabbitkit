@@ -12,6 +12,7 @@ TopologyMode: respected in declare_exchange/declare_queue/bind_queue.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import threading
@@ -94,6 +95,14 @@ class SyncTransport:
         # fail) forever — even mid-recovery, after disconnect() reset
         # _ever_consumed/_owner_ident — and must never reconnect themselves.
         self._ever_consumed_any = False
+        # Sticky owner identity: the thread that ran start_consuming(),
+        # surviving disconnect() (unlike _owner_ident). Reconnection after a
+        # consume loop has existed is allowed ONLY for this thread (the
+        # broker's recovery loop runs on it) -- enforced in
+        # _ensure_connected so every entry point (publish, declare_*,
+        # bind_*, basic_get, purge_queue) is covered, closing the
+        # check-then-reconnect race a publish()-only guard would leave.
+        self._owner_ident_any: int | None = None
         # Channels cancelled by cancel_consumer but deliberately left OPEN
         # until disconnect() so the in-flight drain can still settle on them
         # (H1: closing at cancel time force-requeues every unacked delivery).
@@ -339,6 +348,21 @@ class SyncTransport:
         """
         if self.is_connected():
             return
+
+        # Verification gap 2: once a consume loop has ever run, only the
+        # historical owner thread may reconnect -- ANY other thread reaching
+        # here (publish TOCTOU after its guard, DLQInspector.basic_get from
+        # ops tooling, declare/bind helpers) must fail cleanly instead of
+        # creating a second BlockingConnection cross-thread.
+        if (
+            self._ever_consumed_any
+            and self._owner_ident_any is not None
+            and threading.get_ident() != self._owner_ident_any
+        ):
+            raise ConnectionError(
+                "Connection is down and this thread does not own it — reconnection "
+                "is handled by the broker's recovery loop on the owner thread."
+            )
 
         self._connected = False
         backoff = self._connection_config.reconnect_backoff_base
@@ -716,10 +740,16 @@ class SyncTransport:
                 # by using worker_count > 1, so a handler's publish marshals
                 # through the already-bounded cross-thread path instead.
                 do_publish()
-            elif self._owner_ident is None or not self._ever_consumed:
-                # No consume loop can be sharing this connection (pure
-                # producer, or nothing has ever consumed yet) -- safe to
-                # bound with a dedicated helper thread.
+            elif not (self._ever_consumed or self._ever_consumed_any):
+                # No consume loop has EVER shared this transport (pure
+                # producer) -- safe to bound with a dedicated helper thread.
+                # STICKY flag (verification gap 1): during the
+                # _recover_consumers window _ever_consumed is reset and
+                # _owner_ident may be None while the connection is already
+                # alive -- a worker publish must NOT run on a raw helper
+                # thread concurrently with the owner rebuilding topology on
+                # the same new connection; it falls through to the marshaled
+                # branch below instead.
                 self._publish_confirm_wait_bounded(do_publish, timeout=publish_timeout)
             else:
                 # Cross-thread: marshal onto the owner's I/O loop, which
@@ -1054,6 +1084,12 @@ class SyncTransport:
             if channel is not None and channel is not self._reply_to_channel:
                 self._cancelled_channels.append(channel)
             if channel is self._reply_to_channel:
+                # The direct-reply-to consumer is no-ack — no unacked
+                # deliveries can exist on this channel, so closing at cancel
+                # time is safe (and leaving it untracked would leak it).
+                with contextlib.suppress(Exception):
+                    if channel.is_open:
+                        channel.close()
                 self._reply_to_channel = None
 
     def start_consuming(self) -> None:
@@ -1070,6 +1106,7 @@ class SyncTransport:
         self._ever_consumed = True
         self._ever_consumed_any = True  # sticky — never reset (L1)
         self._owner_ident = threading.get_ident()
+        self._owner_ident_any = threading.get_ident()  # sticky owner identity
         try:
             while self._consuming:
                 # process_data_events drains ALL channels' consumers + queued

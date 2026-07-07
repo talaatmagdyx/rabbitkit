@@ -1026,6 +1026,29 @@ class TestRetryWithoutPublishFn:
         msg._ack_fn.assert_not_called()
         msg._nack_fn.assert_called_once_with(True)
 
+    @pytest.mark.asyncio
+    async def test_async_none_outcome_is_failure_not_success(self) -> None:
+        """L3 async twin: a publish_async_fn returning None is UNVERIFIED —
+        nack, never ack."""
+
+        async def publish_none(env: MessageEnvelope) -> None:
+            return None
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)), publish_async_fn=publish_none)
+        msg = _make_message()
+        nacked: list[bool] = []
+
+        async def nack_async(requeue: bool = True) -> None:
+            nacked.append(requeue)
+
+        msg._nack_async_fn = nack_async
+        msg._nack_fn = None
+
+        await mw._route_to_delay_queue_async(msg, retry_count=0)
+
+        msg._ack_fn.assert_not_called()
+        assert nacked == [True]
+
     def test_ensure_publish_fns_fills_only_unset(self) -> None:
         sentinel_sync = MagicMock()
         mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)), publish_fn=sentinel_sync)

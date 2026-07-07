@@ -154,23 +154,48 @@ class AsyncTransportImpl:
                 task.add_done_callback(self._binding_restore_tasks.discard)
 
     async def _reapply_bindings(self) -> None:
-        """Re-apply all recorded bindings after a robust reconnect (m3)."""
-        # Give RobustChannel a moment to finish restoring channels/entities.
-        await asyncio.sleep(1.0)
-        for kind, a, b, routing_key, arguments in list(self._recorded_bindings):
-            try:
-                if self._topology_channel is None or self._topology_channel.is_closed:
-                    return
-                if kind == "queue":
-                    q = await self._topology_channel.get_queue(a, ensure=False)
-                    ex = await self._topology_channel.get_exchange(b, ensure=False)
-                    await q.bind(ex, routing_key=routing_key, arguments=arguments)
-                else:
-                    dest_ex = await self._topology_channel.get_exchange(a, ensure=False)
-                    src_ex = await self._topology_channel.get_exchange(b, ensure=False)
-                    await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
-            except Exception:  # pragma: no cover - best effort, logged
-                logger.exception("Failed to re-apply %s binding %r -> %r after reconnect", kind, a, b)
+        """Re-apply all recorded bindings after a robust reconnect (m3).
+
+        Retries each pass with backoff (verification gap 4): RobustChannel
+        restoration timing is not observable from here, so a single fixed
+        sleep could race it — a binding that fails to re-apply would then
+        stay missing until the NEXT reconnect, silently unrouting publishes
+        in the interim. Bounded so shutdown can't be held hostage.
+        """
+        delays = (1.0, 2.0, 4.0, 8.0)
+        pending = list(self._recorded_bindings)
+        for attempt, delay in enumerate(delays, start=1):
+            await asyncio.sleep(delay)
+            if self._topology_channel is None or self._topology_channel.is_closed:
+                return  # shutting down / not reconnected yet — nothing to do
+            failed: list[tuple[str, str, str, str, dict[str, Any] | None]] = []
+            for kind, a, b, routing_key, arguments in pending:
+                try:
+                    if kind == "queue":
+                        q = await self._topology_channel.get_queue(a, ensure=False)
+                        ex = await self._topology_channel.get_exchange(b, ensure=False)
+                        await q.bind(ex, routing_key=routing_key, arguments=arguments)
+                    else:
+                        dest_ex = await self._topology_channel.get_exchange(a, ensure=False)
+                        src_ex = await self._topology_channel.get_exchange(b, ensure=False)
+                        await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
+                except Exception:
+                    failed.append((kind, a, b, routing_key, arguments))
+            if not failed:
+                return
+            pending = failed
+            logger.warning(
+                "%d binding(s) failed to re-apply after reconnect (attempt %d/%d); retrying",
+                len(pending),
+                attempt,
+                len(delays),
+            )
+        logger.error(
+            "Giving up re-applying %d binding(s) after reconnect — publishes through the "
+            "affected exchange(s) may be unroutable until the next reconnect: %s",
+            len(pending),
+            [(k, a, b) for k, a, b, _rk, _args in pending],
+        )
 
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
@@ -240,10 +265,15 @@ class AsyncTransportImpl:
         # blocked hooks + watchdog — it carries the topology channel and the
         # direct-reply-to channel (RPC request publishes go out on it), so a
         # block there used to stall RPC with no watchdog and is_blocked False.
-        try:
-            from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        from rabbitkit.async_.connection import install_blocked_connection_watchdog
 
+        try:
             await install_blocked_connection_watchdog(pub_conn, self._connection_config.blocked_connection_timeout)
+        except Exception:  # pragma: no cover - best effort
+            logger.debug("Could not install publisher blocked-connection watchdog")
+        # Separate try (verification gap 4): a publisher-watchdog failure
+        # must not silently skip the consumer connection's wiring too.
+        try:
             consumer_conn_wd = await self._conn_pool.get_consumer_connection()
             if consumer_conn_wd is not pub_conn:
                 try:
@@ -255,7 +285,7 @@ class AsyncTransportImpl:
                     consumer_conn_wd, self._connection_config.blocked_connection_timeout
                 )
         except Exception:  # pragma: no cover - best effort
-            logger.debug("Could not install blocked-connection watchdog")
+            logger.debug("Could not install consumer blocked-connection watchdog")
 
         # Open topology channel on consumer connection
         consumer_conn = await self._conn_pool.get_consumer_connection()

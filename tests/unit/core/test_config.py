@@ -712,3 +712,31 @@ class TestSafetyConfig:
         assert RabbitConfig().safety == SafetyConfig()
         custom = RabbitConfig(safety=SafetyConfig(reject_without_dlx="error"))
         assert custom.safety.reject_without_dlx == "error"
+
+
+class TestPrefetchValidation:
+    """Architect review M1: prefetch 0 = AMQP 'unlimited' — the whole queue
+    backlog buffered in process memory. Reject at construction."""
+
+    def test_prefetch_count_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="UNLIMITED"):
+            ConsumerConfig(prefetch_count=0)
+
+    def test_prefetch_count_negative_rejected(self) -> None:
+        with pytest.raises(ValueError, match="prefetch_count"):
+            ConsumerConfig(prefetch_count=-1)
+
+    def test_graceful_timeout_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="graceful_timeout"):
+            ConsumerConfig(graceful_timeout=0)
+
+    def test_prefetch_per_worker_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="prefetch_per_worker"):
+            WorkerConfig(prefetch_per_worker=0)
+
+    def test_prefetch_per_worker_none_allowed(self) -> None:
+        assert WorkerConfig().prefetch_per_worker is None
+
+    def test_valid_values_pass(self) -> None:
+        assert ConsumerConfig(prefetch_count=1).prefetch_count == 1
+        assert WorkerConfig(prefetch_per_worker=2).prefetch_per_worker == 2

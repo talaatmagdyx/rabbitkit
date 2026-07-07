@@ -103,6 +103,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **RabbitMQ-architect review remediation** — a three-lens external-style
+  review (transport AMQP correctness, retry/DLX topology & delivery
+  guarantees, consumer/QoS/lifecycle) surfaced and fixed, in order of
+  severity:
+  - *Retry loss path*: `RetryMiddleware` with a missing/mismatched publish
+    fn ACKED transient failures without publishing (silent drop) — now
+    nack+warn, brokers inject their publish fn into user-constructed
+    instances, and a `None` publish outcome counts as failure (also in
+    `DLQInspector.replay`).
+  - *Spoofable retry routing*: `x-rabbitkit-original-queue` is now always
+    overwritten at delivery — a producer-set value could steer retries
+    into another route's delay ladder or a requeue hot loop.
+  - *Sync cross-thread reconnect hijack*: a non-owner thread publishing on
+    a dead connection created a new `BlockingConnection` and stole
+    ownership (two threads on one pika connection); now a clean ERROR
+    outcome, reconnection owned solely by the recovery loop.
+  - *Sync shutdown mass-redelivery*: `cancel_consumer` closed the channel
+    before the in-flight drain, force-requeuing every unacked delivery
+    while workers still ran those handlers; channels are now parked and
+    closed after the drain.
+  - *`warn_continue` silent-loss modes*: the 406 recovery re-enables
+    publisher confirms on the reopened channel (previously reported
+    CONFIRMED while fire-and-forget), and a conflict on a declaration
+    carrying an injected DLX escalates instead of silently converting
+    terminal rejects into discards.
+  - *Async shared mandatory channel*: one publish's confirm timeout no
+    longer closes the channel under concurrent sibling publishes
+    (ref-counted deferred recycle).
+  - Plus: idle-death publish retry-once (sync), liveness heartbeat during
+    reconnect backoff (no more restart storms during broker outages),
+    `AsyncTransportImpl.__aexit__` (real `async with` support), blocked
+    hooks + watchdog on the async consumer connection, binding re-apply
+    after robust reconnect, retry envelopes no longer preserve
+    producer `expiration` (collapsed the backoff ladder), auto-DLQs
+    inherit QUORUM from quorum sources, `prefetch_count`/
+    `prefetch_per_worker` validated >= 1 (0 meant AMQP *unlimited*),
+    `DLQInspector.replay(limit=)`, confirm-timeout clamp removed, and
+    confirmed-channel tracking hardened against `id()` reuse.
+  - *Docs*: `docs/kubernetes.md` probes rewritten to in-process HTTP
+    endpoints (the documented CLI subcommands never existed and exec
+    probes structurally cannot see the running broker — deployments from
+    the old guide CrashLooped); `docs/retry-and-dlq.md` corrected to the
+    real topology (no retry exchange; `{queue}.retry.{attempt}` via the
+    default exchange; `x-rabbitkit-retry-count`; `strict_delays`; CLI
+    replay continues past failures and resets the counter only with
+    `--reset-retry-count`); `docs/rabbitmq-retry-architecture.md` §0
+    rewritten against current behavior (retry= auto-wires middleware;
+    failed publishes nack; AUTO dead-letters exhausted retries);
+    `WorkerConfig.stop_timeout` documented as the fallback it actually is
+    (the shutdown budget is `ConsumerConfig.graceful_timeout`);
+    active/standby via `single_active_consumer` documented.
+
 - **`RabbitConfig.pool` was silently ignored by `AsyncBroker`** —
   `AsyncBroker.start()` constructed its transport without passing
   `pool_config=`, so the transport always used the default `PoolConfig()`

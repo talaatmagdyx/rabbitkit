@@ -103,7 +103,11 @@ class RabbitQueue:
 
     # Quorum-specific
     delivery_limit: int | None = None  # x-delivery-limit (quorum only)
-    single_active_consumer: bool = False  # x-single-active-consumer
+    # x-single-active-consumer — NOT quorum-specific: valid on classic
+    # (RabbitMQ 3.8+) and quorum queues alike. The standard active/standby
+    # pattern: N replicas subscribe, the broker delivers to exactly one and
+    # fails over automatically when it dies.
+    single_active_consumer: bool = False
 
     # Overflow
     overflow: str | None = None  # "drop-head" | "reject-publish" | "reject-publish-dlx"

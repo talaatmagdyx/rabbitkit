@@ -39,46 +39,61 @@ orders.exchange (topic)
         |
         | routing key: orders.created
         v
-orders.created.queue  ──[DLX]──> orders.retry.exchange
-        |                                |
-        |                       ┌────────┴─────────┐
-        |                       v                   v
-        |              orders.created.retry.5s   orders.created.retry.30s
-        |              (TTL=5000ms, DLX back     (TTL=30000ms, DLX back
-        |               to orders.exchange)       to orders.exchange)
+orders.created.queue ──(transient failure: middleware republishes)──┐
+        ^                                                            v
+        |                                     orders.created.queue.retry.1
+        |                                     (TTL=5000ms, DLX="" routed
+        |                                      back by QUEUE NAME)
+        └──(TTL expiry dead-letters via the ────┘
+            DEFAULT exchange, routing key =
+            "orders.created.queue")
         |
-        |  (after max_retries exhausted)
+        |  (after max_retries exhausted: reject → source queue's own DLX)
         v
-orders.created.dlq
+orders.created.queue.dlq
 ```
 
-Each retry queue is a standard durable queue with a `x-message-ttl` and a `x-dead-letter-exchange` pointing back to the original exchange. When the TTL expires, the message is re-routed to the original queue for reprocessing.
+There is **no retry exchange**. Each delay queue is a standard durable
+classic queue with a uniform queue-level `x-message-ttl` and
+`x-dead-letter-exchange: ""` (the **default exchange**) with the source
+queue's *name* as the dead-letter routing key. On the default exchange a
+routing key that equals a queue's name always delivers directly to that
+queue — completely independent of how the source queue is bound to its
+real exchange. (Dead-lettering back through the source's own exchange —
+what an earlier design did — silently loses the message whenever the queue
+is bound by a pattern like `orders.*` rather than literally by its name.)
 
 ---
 
 ## How Retry Queues Are Declared with TTL
 
-For `RetryConfig(max_retries=3, delays=(5, 30, 120))`, RabbitKit declares:
+For `RetryConfig(max_retries=3, delays=(5, 30, 120))` on a queue named
+`orders.created.queue`, RabbitKit declares one delay queue **per attempt**:
 
-| Queue | x-message-ttl | x-dead-letter-exchange |
-|---|---|---|
-| `orders.created.retry.5s` | 5000 ms | `orders.exchange` |
-| `orders.created.retry.30s` | 30000 ms | `orders.exchange` |
-| `orders.created.retry.120s` | 120000 ms | `orders.exchange` |
+| Queue | x-message-ttl | x-dead-letter-exchange | x-dead-letter-routing-key |
+|---|---|---|---|
+| `orders.created.queue.retry.1` | 5000 ms | `""` (default) | `orders.created.queue` |
+| `orders.created.queue.retry.2` | 30000 ms | `""` (default) | `orders.created.queue` |
+| `orders.created.queue.retry.3` | 120000 ms | `""` (default) | `orders.created.queue` |
 
-The number of retry queues equals the number of delay values in the `delays` tuple. If `max_retries` exceeds `len(delays)`, the last delay is reused for subsequent retries.
+One delay queue per retry attempt, each with a **uniform** queue-level TTL
+(never per-message TTL — RabbitMQ only expires messages at the queue head,
+so mixed TTLs in one queue would let a long delay block expired short ones).
+By default `RetryConfig` requires `len(delays) >= max_retries`
+(`strict_delays=True` raises `ConfigValidationError` otherwise); pass
+`strict_delays=False` to reuse the last delay for the remaining attempts.
 
 ---
 
 ## How Retry Count Is Tracked
 
-The retry count is stored in the AMQP message header `x-retry-count`. On each retry delivery:
+The retry count is stored in the AMQP message header `x-rabbitkit-retry-count` (configurable via `RetryConfig.retry_header`). On each retry delivery:
 
-1. RabbitKit reads `x-retry-count` from the incoming message headers.
+1. RabbitKit reads `x-rabbitkit-retry-count` from the incoming message headers.
 2. It increments the value and sets it on the outbound retry message.
 3. The incremented value is used to select the appropriate delay queue for the current attempt.
 
-Headers are preserved across re-deliveries. If `x-retry-count` is absent, it is treated as `0` (first attempt).
+Headers are preserved across re-deliveries. If `x-rabbitkit-retry-count` is absent, it is treated as `0` (first attempt).
 
 ---
 
@@ -143,7 +158,7 @@ def handle(order: Order) -> None:
 
 ## What Happens After max_retries
 
-When `x-retry-count` equals `max_retries` and the handler raises again (or the
+When `x-rabbitkit-retry-count` equals `max_retries` and the handler raises again (or the
 error is permanent), `RetryMiddleware` tags the exception `_rabbitkit_terminal`
 and re-raises it rather than routing to another delay queue. The pipeline
 recognizes that marker and rejects the message
@@ -266,7 +281,11 @@ To re-publish all messages from a DLQ back to the original exchange for reproces
 rabbitkit dlq replay orders.created.dlq orders
 ```
 
-The second argument is the target exchange name. Messages are republished with the original routing key and headers, with `x-retry-count` reset to `0` so the full retry budget is available again.
+The second argument is the target exchange name. Messages are republished
+with the original routing key and headers **verbatim** — including
+`x-rabbitkit-retry-count`, meaning a previously max-retried message is
+terminal after ONE failed attempt and returns to the DLQ. Pass
+`--reset-retry-count` to strip the header and grant a fresh retry ladder.
 
 To replay only a subset:
 
@@ -274,7 +293,11 @@ To replay only a subset:
 rabbitkit dlq replay orders.created.dlq orders --limit 10
 ```
 
-Replay uses publisher confirms. If a message fails to publish, replay stops and reports the error rather than silently dropping messages.
+Replay uses publisher confirms and `mandatory=True`, and acks each DLQ
+original only after its republish is confirmed. A message whose republish
+fails is **left on the DLQ** (nack-requeued) and replay **continues** with
+the rest, reporting the failure count (non-zero exit) at the end — one
+poison target doesn't strand the remaining replayable messages.
 
 
 ## Retry jitter: `jitter_mode="sharded"`

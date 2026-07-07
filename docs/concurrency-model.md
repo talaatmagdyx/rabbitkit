@@ -62,6 +62,18 @@ would make every subsequent hook (including SIGTERM shutdown hooks) time
 out spuriously. The hung worker lingers until process exit; the timeout
 bounds the *caller*, not the hook.
 
+### Single-worker confirm waits are unbounded (M5)
+
+With `worker_count=1`, a handler publishing with confirms runs ON the
+connection's owner thread — `confirm_timeout` cannot be enforced there
+(pika's `BlockingChannel` offers no owner-thread way to bound the confirm
+wait), so a broker that never confirms wedges the consumer with a live
+heartbeat. A startup `RuntimeWarning` calls this out. With
+`worker_count > 1`, handler publishes marshal through the bounded
+cross-thread path instead — but note each marshaled publish executes inside
+`process_data_events` on the I/O thread, so a slow confirm delays delivery
+and settlement for ALL queues for up to one confirm round-trip.
+
 ### `SyncBatchPublisher`
 
 The exception to "sync = single-threaded": it owns a dedicated

@@ -14,13 +14,46 @@
 
 Read these first. They are the non-obvious facts that determine whether your retry system works or silently loses messages.
 
-1. **`retry=RetryConfig(...)` on a subscriber only declares topology.** It makes the broker declare the delay queues + DLQ and re-declare the source queue with dead-letter arguments. It does **not** install retry behavior at runtime. To actually retry, you must add `RetryMiddleware(cfg, publish_async_fn=broker.publish)` to the route's `middlewares=[]`. Forget this and you get **zero delayed retries** — terminal failures still dead-letter, but transient ones won't back off.
+1. **`retry=RetryConfig(...)` on a subscriber does BOTH: declares topology
+   AND installs the retry middleware.** The broker declares the delay
+   queues + DLQ, re-declares the source queue with dead-letter arguments,
+   and auto-wires a `RetryMiddleware` with its own confirmed publish
+   function into the route at `start()`. You do **not** add
+   `RetryMiddleware` manually — one switch, both halves. (If you DO
+   construct your own `RetryMiddleware` in `middlewares=[...]`, the broker
+   injects its publish fn into it at start when you left it unset, so even
+   manual wiring can no longer create the publish-less loss path this
+   section used to warn about.)
 
-2. **A failed retry/result publish now nacks instead of acking** (data-integrity fix shipped in this codebase). This only protects you if `RetryMiddleware` is wired with a `publish_async_fn` that returns a real `PublishOutcome` — i.e. `broker.publish`. If you leave `publish_async_fn=None`, retries cannot publish and the message is nacked+requeued (hot-loop risk). Wire it.
+2. **A failed, unverified, or impossible retry publish nacks — never
+   acks.** The retry republish is `mandatory=True` and confirm-gated; the
+   source message is acked only after the outcome reports OK. A publish fn
+   that is missing, mismatched (sync fn on an async route), or returns
+   `None` results in `nack(requeue=True)` plus a `RuntimeWarning` — a hot
+   loop you will see, not a silent drop.
 
-3. **Only four retry headers are set for you:** `x-rabbitkit-retry-count`, `x-rabbitkit-original-exchange`, `x-rabbitkit-original-routing-key`, `x-rabbitkit-original-queue`. The richer forensic headers in §9 (`x-first-failure-at`, `x-error-type`, `x-trace-id`, `x-tenant-id`, `x-idempotency-key`, …) are **your** responsibility — add them via the producer or a small enrichment middleware.
+3. **Only four retry headers are set for you:** `x-rabbitkit-retry-count`
+   (clamped to `[0, max_retries]` — a producer cannot spoof it),
+   `x-rabbitkit-original-exchange`, `x-rabbitkit-original-routing-key`,
+   and `x-rabbitkit-original-queue` (**always overwritten** at delivery
+   with the real source queue — a producer-set value is never trusted for
+   retry routing). The richer forensic headers in §9 (`x-first-failure-at`,
+   `x-error-type`, `x-trace-id`, `x-tenant-id`, `x-idempotency-key`, …)
+   are **your** responsibility — add them via the producer or a small
+   enrichment middleware.
 
-4. **Use `AckPolicy.NACK_ON_ERROR` on retry+DLQ routes, not `AckPolicy.AUTO`.** `RetryMiddleware` acks every non-terminal retry itself, so only *terminal* failures reach the pipeline. `NACK_ON_ERROR` nacks those with `requeue=False` → straight to the DLQ. `AUTO` instead does `nack(requeue=True)` for anything still classified transient — so an *exhausted-transient* message (downstream down for the full retry window) hot-loops at full speed instead of dead-lettering. Classification is also TYPE-based only (§7): custom transient errors must subclass `OSError`, permanent must subclass `ValueError`, or they default to PERMANENT and skip retries.
+4. **`AckPolicy.AUTO` dead-letters exhausted retries correctly.**
+   `RetryMiddleware` acks every non-terminal retry itself and marks
+   terminal failures (retry budget exhausted, or permanent classification)
+   so the pipeline rejects them with `requeue=False` → the source queue's
+   DLX → the DLQ — under `AUTO` as well as `NACK_ON_ERROR`. The historical
+   claim that AUTO hot-loops exhausted-transient failures is stale; the
+   terminal marker closed it. What remains true: on **retry-less** routes,
+   AUTO nack-requeues transient failures indefinitely by design (opt into
+   `ConsumerConfig(reject_transient_on_redelivery=True)` for a 2-strike
+   cap). Classification is TYPE-based (§7): custom transient errors must
+   subclass `OSError`/`TimeoutError`, or register a predicate — unknown
+   errors default to PERMANENT and skip retries.
 
 Everything else is detail.
 

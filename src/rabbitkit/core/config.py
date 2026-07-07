@@ -312,6 +312,22 @@ class ConsumerConfig:
     # reject_without_dlx="auto_provision" (C3) gives AUTO routes one.
     reject_transient_on_redelivery: bool = False
 
+    def __post_init__(self) -> None:
+        # Architect review M1: prefetch_count=0 means AMQP "unlimited" — a
+        # deep queue then buffers its whole backlog in process memory
+        # (OOMKill → mass redelivery → crash loop). Nobody sets 0 on purpose
+        # to mean that; reject it. graceful_timeout=0 is also nonsensical.
+        if self.prefetch_count < 1:
+            raise ConfigValidationError(
+                f"ConsumerConfig.prefetch_count must be >= 1, got {self.prefetch_count} "
+                "(0 would mean UNLIMITED prefetch in AMQP — the whole queue backlog "
+                "buffered in process memory)."
+            )
+        if self.graceful_timeout <= 0:
+            raise ConfigValidationError(
+                f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}"
+            )
+
 
 # ── Pool ───────────────────────────────────────────────────────────────────
 
@@ -800,10 +816,14 @@ class WorkerConfig:
 
     Accepted by broker.start(), NOT part of RabbitConfig. Added in 0.2.0.
 
-    ``stop_timeout`` (H12): the drain deadline given to a multi-worker pool's
-    ``stop()`` — it must exceed your slowest handler's expected run time, and
-    should be a few seconds *less* than ``terminationGracePeriodSeconds`` (k8s)
-    so the graceful drain always has a chance to finish before SIGKILL. A
+    ``stop_timeout`` (H12): a FALLBACK drain deadline for the worker pool's
+    ``stop()`` — consulted only when no explicit timeout is passed. On the
+    standard shutdown path (``broker.stop()``) the pool drain budget is
+    **``ConsumerConfig.graceful_timeout``**, NOT this field — tune THAT (and
+    keep ``terminationGracePeriodSeconds`` a few seconds above it) for
+    Kubernetes; setting only ``stop_timeout`` there has no effect
+    (architect review M2 — the old text here said the opposite).
+    ``stop_timeout`` matters when you drive a worker pool directly. A
     handler still running past this deadline is **abandoned, not killed**:
     the sync pool's daemon thread keeps running in the background (it is
     never forcibly stopped — Python cannot interrupt an arbitrary thread),
@@ -835,6 +855,15 @@ class WorkerConfig:
             raise ConfigValidationError(f"WorkerConfig.worker_count must be >= 1, got {self.worker_count}")
         if self.max_queue_size < 0:
             raise ConfigValidationError(f"WorkerConfig.max_queue_size must be >= 0, got {self.max_queue_size}")
+        # Architect review M1: prefetch_per_worker=0 made the effective
+        # prefetch worker_count * 0 = 0 = AMQP "unlimited" — see
+        # ConsumerConfig.prefetch_count for why that is never intended.
+        if self.prefetch_per_worker is not None and self.prefetch_per_worker < 1:
+            raise ConfigValidationError(
+                f"WorkerConfig.prefetch_per_worker must be >= 1 when set, got "
+                f"{self.prefetch_per_worker} (0 would make the effective prefetch "
+                "UNLIMITED, not disabled)."
+            )
 
 
 # ── Top-Level Config ─────────────────────────────────────────────────────

@@ -3,7 +3,9 @@
 A scannable list of what to configure before trusting rabbitkit with real
 traffic. Each item links to where it's explained in depth. This list is a
 promoted, cleaned-up version of the checklist used internally during
-rabbitkit's own production-readiness reviews.
+rabbitkit's own production-readiness reviews. For the same material as
+copy-paste reference code with the reasoning inline, see
+[Production patterns](patterns.md).
 
 ## Delivery & retry
 

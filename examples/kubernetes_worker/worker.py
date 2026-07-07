@@ -36,6 +36,7 @@ from rabbitkit.core.config import (
     WorkerConfig,
 )
 from rabbitkit.health import broker_health_check_async
+from rabbitkit.serialization import JSONSerializer
 
 
 def make_config() -> RabbitConfig:
@@ -59,7 +60,8 @@ def make_config() -> RabbitConfig:
 
 
 config = make_config()
-broker = AsyncBroker(config)
+# serializer= enables `body: dict` handlers — without it they receive bytes.
+broker = AsyncBroker(config, serializer=JSONSerializer())
 
 
 @broker.subscriber(queue=os.environ.get("QUEUE_NAME", "k8s-orders"))

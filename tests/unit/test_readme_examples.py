@@ -118,3 +118,44 @@ class TestReadmeTestBrokerExampleRuns:
         test_fn = namespace.get("test_order_handler")
         assert test_fn is not None, "expected a test_order_handler() function in the TestBroker example block"
         test_fn()  # must not raise
+
+    def test_testbroker_quickstart_handler_actually_succeeds(self, readme_blocks: list[str]) -> None:
+        """Regression guard for the serializer bug: the pipeline SETTLES a
+        handler exception (classifies + rejects) instead of propagating it,
+        so "test_fn() didn't raise" alone proved nothing about the handler.
+        The README example once shipped a `body: dict` handler on a broker
+        with no serializer -- the handler got bytes, raised TypeError, the
+        message was quietly rejected, and this file stayed green. Re-run the
+        block and assert every consumed message was ACKED (handler ran to
+        completion), so a broken example fails CI instead of shipping.
+        """
+        candidates = [b for b in readme_blocks if "TestBroker" in b and "def test_" in b]
+        block = candidates[0]
+
+        # Capture the broker the example creates so we can inspect settlement.
+        from rabbitkit.testing import TestBroker as _RealTestBroker
+
+        created: list[object] = []
+
+        class _CapturingTestBroker(_RealTestBroker):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+                created.append(self)
+
+        namespace: dict[str, object] = {}
+        exec(compile(block, "<README.md TestBroker example>", "exec"), namespace)  # noqa: S102
+        namespace["TestBroker"] = _CapturingTestBroker
+        test_fn = namespace["test_order_handler"]
+        test_fn()  # type: ignore[operator]
+
+        assert created, "the example never constructed a TestBroker"
+        broker = created[0]
+        consumed = broker.consumed_messages  # type: ignore[attr-defined]
+        assert consumed, "the example's publish never reached the handler"
+        not_acked = [m for m in consumed if m._disposition != "acked"]
+        assert not not_acked, (
+            f"README TestBroker example handler did not succeed -- "
+            f"dispositions: {[m._disposition for m in consumed]} (a rejected "
+            f"message means the handler raised, e.g. bytes given to a dict "
+            f"handler because serializer= is missing)"
+        )

@@ -23,8 +23,9 @@ rabbitkit smooths those edges **without hiding the broker from you**.
 
 ```python
 from rabbitkit import AsyncBroker, RabbitConfig
+from rabbitkit.serialization import JSONSerializer
 
-broker = AsyncBroker(RabbitConfig())
+broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 @broker.subscriber(queue="orders.created")
 async def handle_order(order: dict) -> None:
@@ -147,8 +148,11 @@ Each step is shown below.
 
 ```python
 from rabbitkit import RabbitConfig, AsyncBroker
+from rabbitkit.serialization import JSONSerializer
 
-broker = AsyncBroker(RabbitConfig())
+# serializer= is what turns the raw bytes into your handler's annotation —
+# without it, `body: dict` receives bytes.
+broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 @broker.subscriber(queue="orders.created")
 async def handle_order(body: dict) -> None:
@@ -212,9 +216,10 @@ discard behavior.
 
 ```python
 from rabbitkit.testing import TestBroker
+from rabbitkit.serialization import JSONSerializer
 
 def test_order_handler():
-    broker = TestBroker()
+    broker = TestBroker(serializer=JSONSerializer())
 
     @broker.subscriber(queue="orders.created")
     def handle(body: dict) -> None:
@@ -239,7 +244,7 @@ from fastapi import FastAPI
 from rabbitkit import RabbitConfig, AsyncBroker
 from rabbitkit.fastapi import rabbitkit_lifespan
 
-api_broker = AsyncBroker(RabbitConfig())
+api_broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 @api_broker.subscriber(queue="orders.created")
 async def handle_order_event(body: dict) -> None:
@@ -372,8 +377,9 @@ routing-key segments, and shared dependencies:
 ```python
 from rabbitkit import AsyncBroker, Context, Depends, Header, Path, RabbitConfig
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.serialization import JSONSerializer
 
-di_broker = AsyncBroker(RabbitConfig())
+di_broker = AsyncBroker(RabbitConfig(), serializer=JSONSerializer())
 
 def get_db() -> str:
     return "db-connection"
@@ -559,6 +565,7 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Full Guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/guide/full-guide.md)
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
+- [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)
 - [Idempotency Contract](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/idempotency.md)
 - [Kubernetes](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/kubernetes.md)

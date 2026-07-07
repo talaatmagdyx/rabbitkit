@@ -159,6 +159,72 @@ async def test_async_multiple_queues(rabbitmq_url: str) -> None:
     await broker.stop()
 
 
+async def test_async_ten_queues_one_broker_isolated_and_concurrent(rabbitmq_url: str) -> None:
+    """One AsyncBroker, 10 subscribers on 10 distinct queues (the 'one service,
+    10 worker queues' deployment shape).
+
+    Verifies at real-broker scale what test_async_multiple_queues only shows
+    for 2 queues x 1 message:
+    - every queue's handler receives exactly its own messages (no
+      cross-queue leaks, no loss) across 10 queues x 5 messages, and
+    - handlers for *different* queues genuinely run concurrently on the one
+      shared connection (each queue has its own consumer, so a slow queue
+      must not serialize the other nine).
+    """
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.types import MessageEnvelope
+
+    num_queues = 10
+    msgs_per_queue = 5
+    total = num_queues * msgs_per_queue
+
+    received: dict[int, list[bytes]] = {i: [] for i in range(num_queues)}
+    in_flight = 0
+    max_in_flight = 0
+    processed = 0
+    done = asyncio.Event()
+
+    config = _make_async_config(rabbitmq_url)
+    broker = AsyncBroker(config=config)
+
+    def _make_handler(idx: int) -> Any:
+        async def handle(body: bytes) -> None:
+            nonlocal in_flight, max_in_flight, processed
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.05)  # hold the slot so cross-queue overlap is observable
+            in_flight -= 1
+            received[idx].append(body)
+            processed += 1
+            if processed >= total:
+                done.set()
+
+        return handle
+
+    for i in range(num_queues):
+        broker.subscriber(queue=f"integ-10q-{i}")(_make_handler(i))
+
+    await broker.start()
+    await asyncio.sleep(0.3)
+
+    for i in range(num_queues):
+        for n in range(msgs_per_queue):
+            await broker.publish(
+                MessageEnvelope(routing_key=f"integ-10q-{i}", body=f"q{i}-m{n}".encode())
+            )
+
+    await asyncio.wait_for(done.wait(), timeout=30.0)
+    await broker.stop()
+
+    for i in range(num_queues):
+        assert sorted(received[i]) == sorted(
+            f"q{i}-m{n}".encode() for n in range(msgs_per_queue)
+        ), f"queue {i} got wrong messages: {received[i]!r}"
+    # 10 independent consumers with 0.05s handlers and 50 messages: if the
+    # queues were being drained serially this stays 1.
+    assert max_in_flight >= 2, "handlers on different queues never overlapped"
+
+
 async def test_async_topic_exchange_routing(rabbitmq_url: str) -> None:
     """Topic exchange with wildcards routes to matching subscribers only."""
     from rabbitkit.async_.broker import AsyncBroker
@@ -1421,6 +1487,73 @@ def test_sync_worker_pool_concurrent_acks(rabbitmq_url: str) -> None:
 
     assert len(processed) == num_messages
     assert sorted(processed) == sorted(f"m{i}".encode() for i in range(num_messages))
+
+
+def test_sync_ten_queues_shared_ten_worker_pool(rabbitmq_url: str) -> None:
+    """One SyncBroker, 10 subscribers on 10 distinct queues, one shared
+    WorkerConfig(worker_count=10) thread pool — the 'one service, 10 worker
+    queues' deployment shape, sync flavor.
+
+    Verifies every queue's handler receives exactly its own messages (no
+    cross-queue leaks, no loss) when all 10 routes drain through the same
+    worker pool, with handlers slow enough that pool threads overlap across
+    queues (a per-queue ordering bug or a pool-routing bug would surface as
+    leaks or a short count).
+    """
+    from rabbitkit.core.config import WorkerConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.sync.broker import SyncBroker
+
+    num_queues = 10
+    msgs_per_queue = 3
+    total = num_queues * msgs_per_queue
+
+    received: dict[int, list[bytes]] = {i: [] for i in range(num_queues)}
+    lock = threading.Lock()
+    done = threading.Event()
+
+    config = _make_sync_config(rabbitmq_url)
+    broker = SyncBroker(config=config)
+
+    def _make_handler(idx: int) -> Any:
+        def handle(body: bytes) -> None:
+            time.sleep(0.01)  # overlap pool threads across queues
+            with lock:
+                received[idx].append(body)
+                if sum(len(v) for v in received.values()) >= total:
+                    done.set()
+
+        return handle
+
+    for i in range(num_queues):
+        broker.subscriber(queue=f"sync-10q-{i}")(_make_handler(i))
+
+    broker.start(worker_config=WorkerConfig(worker_count=10))
+
+    for i in range(num_queues):
+        for n in range(msgs_per_queue):
+            broker.publish(MessageEnvelope(routing_key=f"sync-10q-{i}", body=f"q{i}-m{n}".encode()))
+
+    # Drive the real consume loop on a background thread (same pattern as
+    # test_sync_worker_pool_concurrent_acks): handlers run on pool threads,
+    # settlement marshals back to the connection's I/O thread.
+    assert broker._transport is not None
+    conn = broker._transport._connection
+    consume_thread = threading.Thread(target=broker._transport.start_consuming, daemon=True)
+    consume_thread.start()
+
+    got = done.wait(timeout=30.0)
+    count = sum(len(v) for v in received.values())
+    assert got, f"only {count}/{total} processed"
+
+    conn.add_callback_threadsafe(broker._transport.stop_consuming)
+    consume_thread.join(timeout=5.0)
+    broker.stop()
+
+    for i in range(num_queues):
+        assert sorted(received[i]) == sorted(
+            f"q{i}-m{n}".encode() for n in range(msgs_per_queue)
+        ), f"queue {i} got wrong messages: {received[i]!r}"
 
 
 def test_sync_stop_drains_cleanly_under_load(rabbitmq_url: str) -> None:

@@ -84,6 +84,33 @@ class TestLifecycle:
             mock_transport.consume.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_start_passes_configured_pool_to_transport(self) -> None:
+        """RabbitConfig.pool must reach the transport — it was silently
+        dropped (transport always used the default PoolConfig()), so
+        channel_pool_size tuning had no effect on AsyncBroker.
+        """
+        from rabbitkit.core.config import PoolConfig, RabbitConfig
+
+        pool = PoolConfig(channel_pool_size=32)
+        broker = AsyncBroker(config=RabbitConfig(pool=pool))
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        mock_transport = AsyncMock()
+        mock_transport.connect = AsyncMock()
+        mock_transport.declare_queue = AsyncMock()
+        mock_transport.consume = AsyncMock(return_value="tag")
+
+        with patch(
+            "rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport
+        ) as transport_cls:
+            await broker.start()
+
+        assert transport_cls.call_args.kwargs["pool_config"] is pool
+
+    @pytest.mark.asyncio
     async def test_start_idempotent(self) -> None:
         broker = AsyncBroker()
 

@@ -23,12 +23,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Produces the long-running-pod evidence (reconnect soak + leak
   detection) that per-push CI cannot.
 
+- **Ten-queues fan-out coverage** — two new real-broker integration tests
+  (`test_async_ten_queues_one_broker_isolated_and_concurrent`,
+  `test_sync_ten_queues_shared_ten_worker_pool`) covering the "one service,
+  10 worker queues" deployment shape at volume: per-queue isolation (no
+  cross-queue leaks, no loss), cross-queue handler concurrency on the one
+  shared connection, and a 10-thread `WorkerConfig` pool shared across all
+  10 sync routes. A matching runnable example,
+  `examples/highload/05_ten_queues_high_volume.py`, drives 10 queues with
+  3,000 concurrently-published messages and reports per-queue counts and
+  end-to-end throughput.
+
 ### Changed
 
 - Dependency ranges widened after full-suite validation on the newest
   releases: `redis >=5,<9` (validated on 8.0.1; rabbitkit touches only
   `set/get/exists/delete/eval`) and `structlog >=23.1,<27` (validated on
   26.1.0).
+
+### Fixed
+
+- **`RabbitConfig.pool` was silently ignored by `AsyncBroker`** —
+  `AsyncBroker.start()` constructed its transport without passing
+  `pool_config=`, so the transport always used the default `PoolConfig()`
+  (publisher channel pool of 10) no matter what the user configured;
+  `PoolConfig(channel_pool_size=...)` tuning had no effect at all on the
+  async side (the sync transport has no channel pool, so it was
+  unaffected). The M-P5 small-pool warning even read
+  `self._config.pool.channel_pool_size` as if it were effective. Found by
+  actually running the new ten-queues example with a
+  `channel_pool_size=32` config and watching "Channel pool exhausted
+  (pool_size=10)" warnings still appear. Fixed by passing
+  `pool_config=self._config.pool` through; locked in by a unit test
+  asserting the transport receives the exact configured `PoolConfig`.
+  With the fix the example's concurrent publish throughput rose ~50%.
 
 ## [0.9.1] — 2026-07-04
 

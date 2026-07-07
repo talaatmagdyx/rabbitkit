@@ -349,6 +349,7 @@ class AsyncBroker:
         self._transport = AsyncTransportImpl(
             connection_config=self._config.connection,
             security_config=self._config.security,
+            pool_config=self._config.pool,
             topology_mode=self._config.topology_mode,
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,

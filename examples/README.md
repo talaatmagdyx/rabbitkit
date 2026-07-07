@@ -90,6 +90,7 @@ python examples/quickstart/01_sync_broker.py
 | `highload/02_batch_publisher.py` | Buffered batch publishing |
 | `highload/03_batch_acker.py` | Batched multi-ack |
 | `highload/04_backpressure.py` | FlowController — publish-side pressure |
+| `highload/05_ten_queues_high_volume.py` | One broker, 10 queues, 3,000 messages — fan-out at volume |
 
 ### Configuration
 | File | Description |

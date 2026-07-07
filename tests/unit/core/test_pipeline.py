@@ -2343,3 +2343,76 @@ class TestIsChannelGone:
         exc = ValueError("loop")
         exc.__context__ = exc  # pathological cycle must not hang
         assert _is_channel_gone(exc) is False
+
+
+class TestSettlementLossWarner:
+    """Chaos-suite polish: one channel loss strands the whole prefetch
+    window — the warner must emit ONE immediate warning + ONE summary per
+    window, not `prefetch` identical lines. Asserted via an injected mock
+    logger (global structlog capture is order-dependent across the suite)."""
+
+    def _warner_with_clock(self, start: float = 1000.0):
+        from unittest.mock import MagicMock
+
+        from rabbitkit.core.pipeline import _SettlementLossWarner
+
+        state = {"now": start}
+        log = MagicMock()
+        warner = _SettlementLossWarner(clock=lambda: state["now"], log=log)
+        return warner, state, log
+
+    def test_first_occurrence_warns_immediately(self) -> None:
+        warner, _, log = self._warner_with_clock()
+        warner.warn("ChannelWrongStateError")
+        log.warning.assert_called_once()
+        assert "ChannelWrongStateError" in log.warning.call_args.args
+        log.debug.assert_not_called()
+
+    def test_repeats_within_window_are_suppressed_to_debug(self) -> None:
+        warner, state, log = self._warner_with_clock()
+        for _ in range(20):  # a prefetch-20 window stranded at once
+            warner.warn("ChannelWrongStateError")
+            state["now"] += 0.01
+        assert log.warning.call_count == 1, "only the first occurrence may WARN within a window"
+        assert log.debug.call_count == 19, "repeats must still be visible at DEBUG"
+
+    def test_summary_flushed_when_next_window_opens(self) -> None:
+        warner, state, log = self._warner_with_clock()
+        for _ in range(20):
+            warner.warn("ChannelWrongStateError")
+        state["now"] += 10.0  # past WINDOW_SECONDS
+        warner.warn("StreamLostError")  # next bounce
+
+        # first warn, summary of the 19 suppressed, new window's first warn
+        assert log.warning.call_count == 3
+        summary_args = log.warning.call_args_list[1].args
+        assert 19 in summary_args
+        assert "StreamLostError" in log.warning.call_args_list[2].args
+
+    def test_pipeline_wires_warner_on_channel_gone(self) -> None:
+        """End-to-end through _handle_sync_exception: a settlement failure
+        with a channel-gone error routes through the aggregator."""
+        from unittest.mock import MagicMock
+
+        from rabbitkit.core.message import RabbitMessage
+        from rabbitkit.core.pipeline import HandlerPipeline
+        from rabbitkit.core.route import RouteDefinition
+        from rabbitkit.core.topology import RabbitQueue
+
+        class ChannelWrongStateError(Exception):
+            pass
+
+        pipeline = HandlerPipeline()
+        pipeline._settlement_loss_warner = MagicMock()
+
+        def handler(body: bytes) -> None:  # pragma: no cover - never called
+            pass
+
+        route = RouteDefinition(handler=handler, queue=RabbitQueue(name="q"), exchange=None, name="q")
+        msg = RabbitMessage(body=b"x", routing_key="q")
+        msg._nack_fn = MagicMock(side_effect=ChannelWrongStateError("channel is closed"))
+        msg._ack_fn = MagicMock()
+
+        pipeline._handle_sync_exception(route, msg, TimeoutError("transient"))
+
+        pipeline._settlement_loss_warner.warn.assert_called_once_with("ChannelWrongStateError")

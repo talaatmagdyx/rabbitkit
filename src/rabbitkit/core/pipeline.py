@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
@@ -67,6 +69,64 @@ def _is_channel_gone(exc: BaseException) -> bool:
         seen.add(id(current))
         current = current.__cause__ or current.__context__
     return False
+
+class _SettlementLossWarner:
+    """Aggregate "channel closed before settlement" warnings.
+
+    A channel loss strands the entire prefetch window at once — warning per
+    stranded message turns one broker bounce into `prefetch` identical log
+    lines (observed: 20 lines for a prefetch-20 chaos bounce; a production
+    prefetch-200 consumer would emit 200). Instead: the FIRST occurrence in
+    a window logs the full warning immediately (a single event is never
+    hidden or delayed), repeats within the window are counted (and logged
+    at DEBUG for forensics), and the count is flushed as one summary line
+    when the next occurrence arrives after the window closes.
+
+    Thread-safe: the sync pipeline settles from worker-pool threads.
+    """
+
+    WINDOW_SECONDS = 5.0
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, log: Any = None) -> None:
+        self._clock = clock
+        # Injectable for deterministic tests (module logger has global
+        # structlog config/caching state that makes capture-based
+        # assertions order-dependent across a full suite run).
+        self._log = log if log is not None else logger
+        self._lock = threading.Lock()
+        self._window_start = -self.WINDOW_SECONDS  # first call always opens a window
+        self._suppressed = 0
+
+    def warn(self, exc_name: str) -> None:
+        now = self._clock()
+        with self._lock:
+            if now - self._window_start > self.WINDOW_SECONDS:
+                if self._suppressed:
+                    self._log.warning(
+                        "... and %d more messages were left unsettled for broker "
+                        "redelivery in the previous %.0fs window (same channel-loss "
+                        "event; per-message details at DEBUG)",
+                        self._suppressed,
+                        self.WINDOW_SECONDS,
+                    )
+                self._window_start = now
+                self._suppressed = 0
+                self._log.warning(
+                    "Channel closed before settlement (%s); leaving message "
+                    "unsettled — the broker will redeliver it (at-least-once). "
+                    "Further occurrences in the next %.0fs are aggregated.",
+                    exc_name,
+                    self.WINDOW_SECONDS,
+                )
+            else:
+                self._suppressed += 1
+                self._log.debug(
+                    "Channel closed before settlement (%s); message left unsettled "
+                    "for redelivery (occurrence %d in the current window)",
+                    exc_name,
+                    self._suppressed + 1,
+                )
+
 
 # M10: on the async path, bodies at/above this size are decoded in a worker
 # thread (asyncio.to_thread) so a large JSON/msgspec/pydantic parse doesn't
@@ -342,6 +402,9 @@ class HandlerPipeline:
         self._needs_di_cache: dict[Any, bool] = {}
         # P3: cache serializer.decode availability per serializer.
         self._has_decode_cache: dict[Any, bool] = {}
+        # Aggregate channel-loss settlement warnings (one bounce strands the
+        # whole prefetch window; don't emit `prefetch` identical log lines).
+        self._settlement_loss_warner = _SettlementLossWarner()
         # P4: precompute parameter binding plan per handler.
         self._binding_plan_cache: dict[Any, list[tuple[str, str]]] = {}
         # P5: cache whether handler is a coroutine function.
@@ -1261,11 +1324,7 @@ class HandlerPipeline:
             # secondary exception escape as a full ERROR traceback.
             if not _is_channel_gone(settle_exc):
                 raise
-            logger.warning(
-                "Channel closed before settlement (%s); leaving message "
-                "unsettled — the broker will redeliver it (at-least-once)",
-                type(settle_exc).__name__,
-            )
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
 
     def _handle_sync_exception_inner(
         self,
@@ -1321,11 +1380,7 @@ class HandlerPipeline:
             # settled and the broker redelivers — warn, don't raise.
             if not _is_channel_gone(settle_exc):
                 raise
-            logger.warning(
-                "Channel closed before settlement (%s); leaving message "
-                "unsettled — the broker will redeliver it (at-least-once)",
-                type(settle_exc).__name__,
-            )
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
 
     async def _handle_async_exception_inner(
         self,

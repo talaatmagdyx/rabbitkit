@@ -54,6 +54,7 @@ nav:
       - Retry Architecture: rabbitmq-retry-architecture.md
   - Production:
       - Patterns (reference code): production/patterns.md
+      - Scale & Reliability Handbook: production/scale.md
       - Checklist: production/checklist.md
       - Idempotency Contract: production/idempotency.md
       - Kubernetes: kubernetes.md

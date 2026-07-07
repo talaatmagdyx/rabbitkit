@@ -566,6 +566,7 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
+- [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)
 - [Idempotency Contract](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/idempotency.md)
 - [Kubernetes](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/kubernetes.md)

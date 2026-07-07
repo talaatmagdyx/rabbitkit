@@ -6,7 +6,9 @@ below is set for a reason, and the reason is a specific production incident
 it prevents. Copy the reference code, then delete what you can justify
 deleting.
 
-Companions: the [production checklist](checklist.md) (the audit view of the
+Companions: the [scale & reliability handbook](scale.md) (throughput math,
+reconnect/heartbeat/retry mechanics end to end), the
+[production checklist](checklist.md) (the audit view of the
 same material), [the idempotency contract](idempotency.md) (read it before
 any handler with side effects), [Kubernetes guide](../kubernetes.md),
 [troubleshooting](../troubleshooting.md).

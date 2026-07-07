@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`docs/production/scale.md`** — the scale & reliability handbook:
+  throughput math for millions of messages/day (measured numbers, async
+  and sync), pipelined-confirm batch publishing, prefetch sizing,
+  fleet/KEDA scaling, and the full reliability machinery end to end
+  (heartbeat negotiation and who services it per mode, both transports'
+  auto-reconnect designs, the retry/DLQ/quorum defense-in-depth layers,
+  broker alarms and flow control, graceful shutdown under load). Key
+  claims executed against a real broker before shipping (batched publish
+  measured at ~6.7k msg/s locally). Also `docs/production/patterns.md`
+  (the annotated reference consumer/publisher) — see the docs commit for
+  the serializer doc-bug it surfaced.
+
 - **Advanced benchmark tier** (`python -m benchmarks.advanced`, nightly) —
   interleaved A/B overhead vs raw aio-pika (median ± CV over 5 reps),
   payload-size sweep, classic-vs-quorum consume A/B, and open-loop paced

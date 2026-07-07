@@ -83,6 +83,12 @@ python examples/quickstart/01_sync_broker.py
 | `rpc/02_async_rpc.py` | AsyncRPCClient — async request/response |
 | `rpc/03_broker_request.py` | `broker.request()` shorthand |
 
+### Pipelines
+| File | Description |
+|------|-------------|
+| `pipeline_twitter_dm/async_pipeline.py` | Two-stage DM pipeline (producer → enrich relay → verified sink), async — 100k events measured |
+| `pipeline_twitter_dm/sync_pipeline.py` | The SAME pipeline on SyncBroker — parity-verified against the async twin |
+
 ### High-Load
 | File | Description |
 |------|-------------|

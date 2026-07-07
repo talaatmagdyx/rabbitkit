@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Twitter-DM pipeline scenario — the same two-stage pipeline, sync and
+  async, verified end to end against a real broker.** A mock-DM producer
+  feeds `dm.events`; a relay enriches (normalize/mentions/hashtags/
+  sentiment) and forwards to `dm.enriched` via the `@publisher` result path
+  (source acked only after the forward publish confirms); a sink verifies
+  zero loss, zero duplication, and byte-for-byte correct enrichment via
+  the ONE `enrich()` both transports share — the sync/async parity proof.
+  Ships as `tests/integration/test_pipeline_twitter_dm.py` (volume via
+  `RABBITKIT_PIPELINE_EVENTS`, default 5k for CI, tested at 100k locally:
+  async ~2.1k events/s end-to-end, zero loss) and as runnable
+  `examples/pipeline_twitter_dm/{async,sync}_pipeline.py`.
+
 ## [0.10.0] — 2026-07-07
 
 > **Upgrade notes (read before deploying):** three behavior changes can

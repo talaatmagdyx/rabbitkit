@@ -1172,17 +1172,20 @@ class TestAsyncContextManager:
         assert transport.is_connected()
 
     @pytest.mark.asyncio
-    async def test_aexit_disconnects(self) -> None:
-        """Line 156: __exit__ (used as __aexit__) calls disconnect()."""
+    async def test_async_with_protocol_works_end_to_end(self) -> None:
+        """M1 (architect review): the method was named __exit__, so a real
+        `async with AsyncTransportImpl(...)` raised TypeError on entry —
+        and the old test masked it by calling __exit__ directly. This test
+        uses the actual protocol."""
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
         with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
-                await transport.connect()
+                async with transport as entered:
+                    assert entered is transport
+                    assert transport.is_connected()
 
-        assert transport.is_connected()
-        await transport.__exit__(None, None, None)
         assert not transport.is_connected()
 
 
@@ -1901,3 +1904,63 @@ class TestBasicGetAndPurge:
 
         count = await transport.purge_queue("orders.dlq")
         assert count == 0
+
+
+# ── Architect review M3: shared mandatory channel must survive one caller's
+# confirm timeout while siblings are in flight ────────────────────────────
+
+
+class TestMandatoryChannelTimeoutRecycle:
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_close_channel_while_sibling_in_flight(self) -> None:
+        """One mandatory publish timing out while another is still awaiting
+        its own confirm must NOT close the shared channel under the sibling —
+        it is recycled only when the LAST in-flight publish resolves."""
+        import asyncio as _asyncio
+
+        from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
+
+        transport = _make_transport()
+        transport._connected = True
+
+        channel = AsyncMock()
+        channel.is_closed = False
+        transport._mandatory_publish_channel = channel
+
+        async def get_channel() -> AsyncMock:
+            return channel
+
+        transport._get_mandatory_channel = get_channel  # type: ignore[method-assign]
+
+        slow_gate = _asyncio.Event()
+        outcomes: dict[str, PublishStatus] = {}
+
+        async def fake_publish_on_channel(ch: AsyncMock, envelope: MessageEnvelope) -> PublishOutcome:
+            if envelope.routing_key == "slow":
+                await slow_gate.wait()
+                return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key="slow")
+            return PublishOutcome(status=PublishStatus.TIMEOUT, routing_key="fast")
+
+        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
+
+        slow_task = _asyncio.create_task(
+            transport.publish(MessageEnvelope(routing_key="slow", body=b"x", mandatory=True))
+        )
+        await _asyncio.sleep(0)  # let the slow publish enter the in-flight section
+
+        fast = await transport.publish(MessageEnvelope(routing_key="fast", body=b"x", mandatory=True))
+        outcomes["fast"] = fast.status
+
+        # The fast publish TIMED OUT — but the slow sibling is still in
+        # flight, so the shared channel must NOT have been closed yet.
+        channel.close.assert_not_called()
+        assert transport._mandatory_channel_recycle is True
+
+        slow_gate.set()
+        slow = await slow_task
+        outcomes["slow"] = slow.status
+
+        # Last in-flight resolved → deferred recycle now closes the channel.
+        channel.close.assert_called_once()
+        assert transport._mandatory_channel_recycle is False
+        assert outcomes == {"fast": PublishStatus.TIMEOUT, "slow": PublishStatus.CONFIRMED}

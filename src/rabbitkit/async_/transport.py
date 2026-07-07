@@ -105,6 +105,14 @@ class AsyncTransportImpl:
         # neither the fast channel (no confirms at all) nor the regular pool
         # (confirms follow confirm_delivery, which may be False) guarantee that.
         self._mandatory_publish_channel: Any | None = None
+        # M3: in-flight mandatory publishes on the shared channel + a
+        # deferred-recycle flag set by a confirm timeout (closed at zero).
+        self._mandatory_in_flight = 0
+        self._mandatory_channel_recycle = False
+        # m3: bindings recorded for re-apply after robust reconnect (they are
+        # not in RobustChannel's restoration registry — see bind_queue).
+        self._recorded_bindings: list[tuple[str, str, str, str, dict[str, Any] | None]] = []
+        self._binding_restore_tasks: set[Any] = set()
         self._mandatory_channel_lock: asyncio.Lock = asyncio.Lock()
 
         # Backpressure callbacks (FlowController registers here). Each is a
@@ -135,6 +143,34 @@ class AsyncTransportImpl:
                 cb()
             except Exception:  # pragma: no cover - never break the event loop
                 logger.exception("reconnect callback raised")
+        # m3: re-apply recorded bindings — RobustChannel restores queues,
+        # exchanges, and consumers, but NOT bindings made through
+        # get_queue/get_exchange(ensure=False) handles. Binding is idempotent
+        # server-side, so re-applying on every reconnect is safe.
+        if self._recorded_bindings:
+            with contextlib.suppress(RuntimeError):  # no running loop at teardown
+                task = asyncio.get_running_loop().create_task(self._reapply_bindings())
+                self._binding_restore_tasks.add(task)
+                task.add_done_callback(self._binding_restore_tasks.discard)
+
+    async def _reapply_bindings(self) -> None:
+        """Re-apply all recorded bindings after a robust reconnect (m3)."""
+        # Give RobustChannel a moment to finish restoring channels/entities.
+        await asyncio.sleep(1.0)
+        for kind, a, b, routing_key, arguments in list(self._recorded_bindings):
+            try:
+                if self._topology_channel is None or self._topology_channel.is_closed:
+                    return
+                if kind == "queue":
+                    q = await self._topology_channel.get_queue(a, ensure=False)
+                    ex = await self._topology_channel.get_exchange(b, ensure=False)
+                    await q.bind(ex, routing_key=routing_key, arguments=arguments)
+                else:
+                    dest_ex = await self._topology_channel.get_exchange(a, ensure=False)
+                    src_ex = await self._topology_channel.get_exchange(b, ensure=False)
+                    await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
+            except Exception:  # pragma: no cover - best effort, logged
+                logger.exception("Failed to re-apply %s binding %r -> %r after reconnect", kind, a, b)
 
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
@@ -200,10 +236,24 @@ class AsyncTransportImpl:
         # I-11: install a blocked-connection watchdog so a broker alarm that isn't
         # cleared within blocked_connection_timeout closes the connection (forcing
         # reconnect) — aio-pika has no native knob for this.
+        # m2 (architect review): the CONSUMER connection gets the same
+        # blocked hooks + watchdog — it carries the topology channel and the
+        # direct-reply-to channel (RPC request publishes go out on it), so a
+        # block there used to stall RPC with no watchdog and is_blocked False.
         try:
             from rabbitkit.async_.connection import install_blocked_connection_watchdog
 
             await install_blocked_connection_watchdog(pub_conn, self._connection_config.blocked_connection_timeout)
+            consumer_conn_wd = await self._conn_pool.get_consumer_connection()
+            if consumer_conn_wd is not pub_conn:
+                try:
+                    consumer_conn_wd.connection_blocked.add_callback(self._aio_blocked)
+                    consumer_conn_wd.connection_unblocked.add_callback(self._aio_unblocked)
+                except Exception:  # pragma: no cover - older aio-pika may differ
+                    logger.debug("Could not register consumer-connection blocked callbacks")
+                await install_blocked_connection_watchdog(
+                    consumer_conn_wd, self._connection_config.blocked_connection_timeout
+                )
         except Exception:  # pragma: no cover - best effort
             logger.debug("Could not install blocked-connection watchdog")
 
@@ -222,7 +272,10 @@ class AsyncTransportImpl:
         await self.connect()
         return self
 
-    async def __exit__(self, *args: Any) -> None:
+    async def __aexit__(self, *args: Any) -> None:
+        # Architect review M1: this was named __exit__, so `async with
+        # AsyncTransportImpl(...)` raised TypeError on entry — the protocol
+        # method must be __aexit__.
         await self.disconnect()
 
     async def disconnect(self) -> None:
@@ -514,13 +567,27 @@ class AsyncTransportImpl:
 
             if envelope.mandatory:
                 channel = await self._get_mandatory_channel()
-                outcome = await self._publish_on_channel(channel, envelope)
-                # M17: this channel is a single persistent channel reused across
-                # ALL mandatory publishes — close it AFTER our own call resolves
-                # (not from inside _publish_on_channel) so a timeout doesn't risk
-                # yanking a channel a concurrent mandatory publish is still using.
-                # _get_mandatory_channel() lazily reopens on the next call.
-                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
+                # M3 (architect review): this single persistent channel is
+                # shared by ALL concurrent mandatory publishes. Closing it the
+                # instant OUR publish times out cascades channel-closed errors
+                # into every sibling still awaiting its own confirm (spurious
+                # NACKED/ERROR → caller retries → duplicates). Ref-count
+                # in-flight publishes and recycle the channel only when the
+                # last one resolves; _get_mandatory_channel() lazily reopens.
+                self._mandatory_in_flight += 1
+                try:
+                    outcome = await self._publish_on_channel(channel, envelope)
+                finally:
+                    self._mandatory_in_flight -= 1
+                if outcome.status == PublishStatus.TIMEOUT:
+                    self._mandatory_channel_recycle = True
+                if (
+                    self._mandatory_channel_recycle
+                    and self._mandatory_in_flight == 0
+                    and channel is self._mandatory_publish_channel
+                    and not channel.is_closed
+                ):
+                    self._mandatory_channel_recycle = False
                     with contextlib.suppress(Exception):
                         await channel.close()
                 return outcome
@@ -757,6 +824,13 @@ class AsyncTransportImpl:
         q = await self._topology_channel.get_queue(queue, ensure=False)
         ex = await self._topology_channel.get_exchange(exchange, ensure=False)
         await q.bind(ex, routing_key=routing_key, arguments=arguments)
+        # m3: get_queue/get_exchange(ensure=False) handles are NOT in
+        # RobustChannel's restoration registry, so this binding would not be
+        # re-applied by connect_robust recovery — an auto-delete/exclusive
+        # queue recreated after a broker restart would come back UNBOUND
+        # (consumer silently receives nothing). Record it; the reconnect
+        # callback re-applies all recorded bindings (bind is idempotent).
+        self._recorded_bindings.append(("queue", queue, exchange, routing_key, arguments))
 
     async def bind_exchange(
         self,
@@ -775,6 +849,8 @@ class AsyncTransportImpl:
         dest_ex = await self._topology_channel.get_exchange(destination, ensure=False)
         src_ex = await self._topology_channel.get_exchange(source, ensure=False)
         await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
+        # m3: recorded for post-reconnect re-apply — see bind_queue.
+        self._recorded_bindings.append(("exchange", destination, source, routing_key, arguments))
 
     async def cancel_consumer(self, consumer_tag: str) -> None:
         """Cancel a consumer by tag."""

@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] — 2026-07-08
+
+> **Upgrade notes (read before deploying):** three behavior changes can
+> surface at startup — the quorum-source auto-DLQ now declares as QUORUM
+> (an existing classic `{queue}.dlq` will 406 → `ConfigurationError` until
+> migrated), `max_message_bytes` defaults to 16 MiB, and
+> `prefetch_count=0`/`prefetch_per_worker=0` are rejected. Full migration
+> steps: `docs/migration.md` → "0.10.0 — upgrade notes".
 
 ### Added
 
@@ -20,17 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RABBITKIT_PIPELINE_EVENTS`, default 5k for CI, tested at 100k locally:
   async ~2.1k events/s end-to-end, zero loss) and as runnable
   `examples/pipeline_twitter_dm/{async,sync}_pipeline.py`.
-
-## [0.10.0] — 2026-07-07
-
-> **Upgrade notes (read before deploying):** three behavior changes can
-> surface at startup — the quorum-source auto-DLQ now declares as QUORUM
-> (an existing classic `{queue}.dlq` will 406 → `ConfigurationError` until
-> migrated), `max_message_bytes` defaults to 16 MiB, and
-> `prefetch_count=0`/`prefetch_per_worker=0` are rejected. Full migration
-> steps: `docs/migration.md` → "0.10.0 — upgrade notes".
-
-### Added
 
 - **`docs/production/scale.md`** — the scale & reliability handbook:
   throughput math for millions of messages/day (measured numbers, async

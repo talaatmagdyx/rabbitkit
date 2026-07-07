@@ -783,6 +783,64 @@ retry_config = RetryConfig(
 )
 ```
 
+### Exception taxonomy
+
+Everything rabbitkit raises for *your* mistakes (bad config, invalid
+topology, API misuse) is a typed exception, importable from the package
+root. Every class **also subclasses the builtin it conceptually replaces**
+(`ValueError` or `RuntimeError`), so a plain `except ValueError:` written
+against an older release keeps working — the custom types only add a more
+precise catch point.
+
+| Exception | Builtin base | Raised when |
+|---|---|---|
+| `ConfigValidationError` | `ValueError` | An invalid value is passed to a config object (`RetryConfig(max_retries=-1)`, a malformed `ConnectionConfig.nodes` entry, …) or an AMQP short-string field exceeds 255 bytes (queue/exchange/routing-key names, including on `MessageEnvelope`) |
+| `TopologyValidationError` | `ValueError` | A `RabbitQueue` / `RabbitExchange` declaration is invalid — non-durable quorum queue, priorities on a stream, `delivery_limit` on a classic queue, non-positive `consumer_timeout`, … |
+| `MessageTooLargeError` | `ValueError` | A publish body exceeds `PublisherConfig.max_message_bytes` (default 16 MiB, mirroring the server's `max_message_size`) — raised *before* the bytes hit the wire |
+| `BrokerNotStartedError` | `RuntimeError` | A method that needs a live transport (`publish()`, RPC, …) is called before `start()` (or after `stop()`) |
+| `SettlementError` | `RuntimeError` | Sync settlement (`msg.ack()`) on an async-only message, or async settlement with no settlement function wired |
+| `ConfigurationError` | `Exception` | Registration-time misconfiguration (route conflicts, invalid handler signatures, bad retry/ack combinations). **Base class** of both validation errors above — `except ConfigurationError` catches all misconfiguration in one place |
+| `UnsafeTopologyError` | `ConfigurationError` | Startup with `RejectWithoutDLXPolicy.ERROR` and a route that can reject but has no DLX |
+| `DuplicateRouteError` | `Exception` | Two `@subscriber` handlers registered on the same queue |
+| `MissingDependencyError` | `Exception` | A required DI marker (`Header()`/`Path()`/`Context()`) has no value and no default (classified PERMANENT → DLQ) |
+| `BackpressureError` | `Exception` | Publish blocked by `FlowController` with `on_blocked="raise"` |
+| `PublishError` | `Exception` | Opt-in: `PublishOutcome.raise_for_status()` on a failed publish |
+
+```python
+from rabbitkit import (
+    BrokerNotStartedError,
+    ConfigurationError,
+    ConfigValidationError,
+    MessageTooLargeError,
+    TopologyValidationError,
+)
+
+# Catch precisely...
+try:
+    queue = RabbitQueue(name="orders", queue_type=QueueType.QUORUM, durable=False)
+except TopologyValidationError as exc:
+    ...  # "Quorum queues must be durable"
+
+# ...or broadly: both validation errors ARE ConfigurationErrors
+try:
+    config = build_my_config()
+except ConfigurationError:
+    ...  # any rabbitkit misconfiguration, wherever it was detected
+
+# ...and legacy catches still work (dual inheritance):
+try:
+    broker.publish(envelope)      # 20 MiB body
+except ValueError:                # MessageTooLargeError is a ValueError
+    ...
+```
+
+Handler-time errors (what happens when *message processing* fails) are a
+different axis — that's the error *classification* system above
+(`TRANSIENT` → retry, `PERMANENT` → DLQ). Feature-specific errors live
+with their feature: `RPCTimeoutError`, `ReplyTooLargeError`,
+`HandlerTimeoutError`, `InvalidSignatureError`,
+`CircuitBreakerOpenError`.
+
 ---
 
 ## 9. Serialization

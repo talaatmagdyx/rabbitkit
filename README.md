@@ -310,6 +310,7 @@ duplicates). The rule is simple:
 | Broker blips | Readiness changes; liveness does **not** kill the pod |
 | Pod gets SIGTERM | Consumers stop first, in-flight work drains |
 | CI has no RabbitMQ | `TestBroker` runs the real pipeline in memory |
+| Your own mistake (bad config, invalid topology, publish before `start()`, oversized body) | A **typed exception** at the line that made it — `ConfigValidationError`, `TopologyValidationError`, `BrokerNotStartedError`, `MessageTooLargeError`, … — each subclassing the builtin (`ValueError`/`RuntimeError`) it replaces, so plain `except ValueError` still works |
 
 ## Acknowledgement policies
 

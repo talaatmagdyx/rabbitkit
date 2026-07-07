@@ -73,7 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idiomatic; signing already has `InvalidSignatureError`). Locked in by a
   new `TestCustomErrorTaxonomy` suite asserting each raise site, the
   inheritance contract, top-level exports, and that bare-builtin catches
-  still work.
+  still work. Documented: a full "Exception taxonomy" section (table of
+  every public exception + catch patterns) in the Full Guide's
+  Retry & Error Handling chapter, an Exceptions block on the Core API
+  reference page, a README failure-modes row, and a Stable Core row in
+  the stability policy that explicitly freezes the builtin base classes
+  as part of the contract.
 
 ### Changed
 

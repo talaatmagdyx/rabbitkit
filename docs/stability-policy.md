@@ -47,6 +47,7 @@ README teaches — if you only use these, you're on the most-supported path.
 | `rabbitkit_lifespan` (FastAPI integration) | `rabbitkit` |
 | `Depends`, `Header`, `Path`, `Context` | `rabbitkit` |
 | `TestBroker`, `TestApp` | `rabbitkit.testing` |
+| Exception taxonomy: `ConfigurationError`, `ConfigValidationError`, `TopologyValidationError`, `UnsafeTopologyError`, `MessageTooLargeError`, `BrokerNotStartedError`, `SettlementError`, `DuplicateRouteError`, `MissingDependencyError`, `BackpressureError`, `PublishError` — including their builtin base classes (`ValueError`/`RuntimeError` dual inheritance is part of the contract, not an implementation detail) | `rabbitkit` |
 | `broker_health_check`, `broker_health_check_async`, `broker_liveness`, `broker_liveness_async`, `broker_readiness`, `broker_readiness_async` | `rabbitkit` |
 | `LoggingConfig`, `configure_structlog` | `rabbitkit` |
 | Built-in serializers: JSON, msgspec, Pydantic support | `rabbitkit.serialization.*` |

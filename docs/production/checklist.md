@@ -28,6 +28,8 @@ rabbitkit's own production-readiness reviews.
 - [ ] Kubernetes `terminationGracePeriodSeconds` must exceed `graceful_timeout` plus your `preStop` sleep, or the pod gets `SIGKILL`ed mid-message. See [the idempotency contract](idempotency.md) for why this is recoverable but noisy, not silently unsafe.
 - [ ] Prefer `RabbitApp.run_async()` (or `asyncio.run(broker.run())`) over bare `await broker.start()` for async consumers — the latter's signal-handler-triggered drain is fire-and-forget and isn't guaranteed to finish before the process exits.
 - [ ] `SyncBroker.stop()` must be called from the same thread that ran `start_consuming()` — exactly what `broker.run()` does. Don't wire your own cross-thread shutdown call.
+- [ ] **Sync multi-worker rollout: run one canary through a deploy + broker-restart drill first.** The graceful-shutdown and reconnect-ownership paths are regression-tested, but they live in churn corners only production exercises — verify one service drains cleanly on deploy and rides out a broker bounce before fleet-wide adoption. Async needs no equivalent drill.
+- [ ] Sync handlers that **publish with confirms** need `worker_count > 1`: on a single worker the confirm wait runs on the connection's owner thread and is **unbounded** (`confirm_timeout` cannot be enforced there — a startup `RuntimeWarning` calls this out). See `docs/concurrency-model.md`.
 
 ## Connections
 
@@ -63,6 +65,13 @@ rabbitkit's own production-readiness reviews.
 - [ ] If using message signing: wire a shared `RedisNonceCache` across every process/pod. The default in-memory cache gives you *no* real replay protection in a multi-process deployment — you'll get a `RuntimeWarning` if you skip this.
 - [ ] If using the monitoring dashboard: `auth_token=` is not optional in anything beyond a local, loopback-only environment. See [Security](../security.md).
 - [ ] Never construct `ManagementConfig.url` from user-controllable input.
+
+## Known accepted limitations
+
+Not defects — documented trade-offs you should know exist:
+
+- **Sync pure-producer confirmed publishes spawn a helper thread per publish** (to bound the confirm wait). Fine at modest rates; at high sustained rates use `AsyncBroker` (see the throughput item above).
+- **Async binding re-apply after a robust reconnect is bounded-retry best-effort** (only matters for auto-delete/exclusive queues recreated by recovery; durable topology is unaffected). Failures are logged at error level — alert on them.
 
 ## Before you call it done
 

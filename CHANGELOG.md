@@ -141,6 +141,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `prefetch_per_worker` validated >= 1 (0 meant AMQP *unlimited*),
     `DLQInspector.replay(limit=)`, confirm-timeout clamp removed, and
     confirmed-channel tracking hardened against `id()` reuse.
+  - *Adversarial fix verification*: an independent pass attacking the
+    fixes themselves refuted one and found residuals, all closed — the
+    helper-thread publish dispatch keyed on the non-sticky consume flag
+    (a worker publish during the recovery window could still run
+    concurrently with the owner rebuilding topology on the new
+    connection); reconnect ownership now enforced INSIDE
+    `_ensure_connected` via a sticky owner identity (closing the
+    publish-guard TOCTOU and every other cross-thread entry point,
+    e.g. `DLQInspector.basic_get`); async binding re-apply upgraded to
+    bounded retry with backoff; watchdog installs split per connection;
+    the direct-reply-to channel closed (not leaked) at cancel.
   - *Docs*: `docs/kubernetes.md` probes rewritten to in-process HTTP
     endpoints (the documented CLI subcommands never existed and exec
     probes structurally cannot see the running broker — deployments from

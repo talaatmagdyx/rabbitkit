@@ -74,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context, not the config-clamped value `RetryMiddleware` uses for
   actual retry decisions.
 
+- **`PublishOutcome.classification` property** — callers had no
+  transport-agnostic way to tell *why* a publish failed (`status ==
+  ERROR`) without importing pika/aio-pika exception classes directly,
+  defeating the point of the typed-exception taxonomy rabbitkit already
+  uses elsewhere. Reuses the existing `classify_error()` (`core/errors.py`,
+  previously wired only into the consume/retry path) rather than growing
+  `PublishStatus` with new error-kind members (CHANNEL_ERROR/
+  CONNECTION_ERROR/etc.) — that enum is a small, closed "what happened"
+  set, and adding to it risks breaking exhaustive match/if-chains callers
+  may have written against it. `outcome.classification` returns a
+  `ClassifiedError` (severity + reason) when `status is ERROR` and an
+  exception was captured; `None` otherwise. Computed lazily on access, not
+  stored, so it costs nothing on the CONFIRMED/SENT/NACKED/TIMEOUT/
+  RETURNED hot paths.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

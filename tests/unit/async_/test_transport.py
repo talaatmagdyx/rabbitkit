@@ -500,6 +500,202 @@ class TestPublish:
         channel.close.assert_called()
 
 
+class TestIsConnectionError:
+    """Item 6: _is_connection_error classifies dead-socket-style errors,
+    reusing the same tuple sync/transport.py's reconnect loop uses."""
+
+    def test_connection_reset_is_connection_error(self) -> None:
+        from rabbitkit.async_.transport import _is_connection_error
+
+        assert _is_connection_error(ConnectionResetError("gone")) is True
+
+    def test_timeout_error_is_connection_error(self) -> None:
+        from rabbitkit.async_.transport import _is_connection_error
+
+        assert _is_connection_error(TimeoutError("slow")) is True
+
+    def test_aio_pika_connection_closed_is_connection_error(self) -> None:
+        import aio_pika.exceptions
+
+        from rabbitkit.async_.transport import _is_connection_error
+
+        exc = aio_pika.exceptions.ConnectionClosed.__new__(aio_pika.exceptions.ConnectionClosed)
+        assert _is_connection_error(exc) is True
+
+    def test_value_error_is_not_connection_error(self) -> None:
+        from rabbitkit.async_.transport import _is_connection_error
+
+        assert _is_connection_error(ValueError("bad body")) is False
+
+
+class TestWaitForRecovery:
+    """Item 6: _wait_for_recovery polls is_connected() bounded by a timeout."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_immediately_when_already_connected(self) -> None:
+        transport = _make_transport()
+        with patch.object(transport, "is_connected", return_value=True):
+            assert await transport._wait_for_recovery(timeout=1.0) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_after_timeout_when_never_recovers(self) -> None:
+        transport = _make_transport()
+        with patch.object(transport, "is_connected", return_value=False):
+            assert await transport._wait_for_recovery(timeout=0.05) is False
+
+    @pytest.mark.asyncio
+    async def test_returns_true_once_recovered_mid_poll(self) -> None:
+        transport = _make_transport()
+        calls = {"n": 0}
+
+        def _is_connected() -> bool:
+            calls["n"] += 1
+            return calls["n"] >= 3
+
+        with patch.object(transport, "is_connected", side_effect=_is_connected):
+            assert await transport._wait_for_recovery(timeout=2.0) is True
+
+
+class TestPublishConfirmedRetryOnce:
+    """Item 6: the confirmed (pooled-channel) publish path retries exactly
+    once on a connection-class error, after a bounded wait for aio-pika's
+    own recovery -- and the pool-release cleanup can never overwrite an
+    already-computed outcome (the precondition fix this builds on)."""
+
+    async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
+        mock_connection = _make_mock_connection()
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+        return mock_connection
+
+    @pytest.mark.asyncio
+    async def test_connection_error_retries_once_and_succeeds(self) -> None:
+        transport = _make_transport()
+        mock_connection = await self._connect_transport(transport)
+        conn = transport._conn_pool._publisher_connection
+
+        bad_channel = AsyncMock()
+        bad_channel.is_closed = False
+        good_channel = AsyncMock()
+        good_channel.is_closed = False
+
+        async def _fail_and_close(*args: object, **kwargs: object) -> None:
+            bad_channel.is_closed = True
+            raise ConnectionResetError("connection lost mid-publish")
+
+        bad_channel.default_exchange.publish = AsyncMock(side_effect=_fail_and_close)
+        good_channel.default_exchange.publish = AsyncMock()
+        conn.channel = AsyncMock(side_effect=[bad_channel, good_channel])
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+
+        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED
+        bad_channel.default_exchange.publish.assert_awaited_once()
+        good_channel.default_exchange.publish.assert_awaited_once()  # exactly one retry, no double-publish
+        mock_wait.assert_awaited_once()
+        del mock_connection  # unused beyond connect()
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_within_timeout_returns_error_without_retry(self) -> None:
+        transport = _make_transport()
+        await self._connect_transport(transport)
+        conn = transport._conn_pool._publisher_connection
+
+        bad_channel = AsyncMock()
+        bad_channel.is_closed = False
+        bad_channel.default_exchange.publish = AsyncMock(side_effect=ConnectionResetError("gone"))
+        conn.channel = AsyncMock(return_value=bad_channel)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+
+        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=False)):
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.ERROR
+        bad_channel.default_exchange.publish.assert_awaited_once()  # no retry attempted
+
+    @pytest.mark.asyncio
+    async def test_non_connection_error_does_not_retry(self) -> None:
+        """A broker-decision-level failure (not a dead connection) must not
+        trigger the wait-for-recovery/retry machinery at all."""
+        transport = _make_transport()
+        await self._connect_transport(transport)
+        conn = transport._conn_pool._publisher_connection
+
+        channel = AsyncMock()
+        channel.is_closed = False
+        channel.default_exchange.publish = AsyncMock(side_effect=ValueError("bad body"))
+        conn.channel = AsyncMock(return_value=channel)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+
+        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.ERROR
+        mock_wait.assert_not_awaited()
+        channel.default_exchange.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_second_connection_error_after_retry_still_returns_error(self) -> None:
+        """Retry is exactly ONE attempt -- a persistent connection error
+        across both attempts must not loop, just return ERROR."""
+        transport = _make_transport()
+        await self._connect_transport(transport)
+        conn = transport._conn_pool._publisher_connection
+
+        def _make_bad_channel() -> AsyncMock:
+            ch = AsyncMock()
+            ch.is_closed = False
+
+            async def _fail(*args: object, **kwargs: object) -> None:
+                ch.is_closed = True
+                raise ConnectionResetError("still down")
+
+            ch.default_exchange.publish = AsyncMock(side_effect=_fail)
+            return ch
+
+        first, second = _make_bad_channel(), _make_bad_channel()
+        conn.channel = AsyncMock(side_effect=[first, second])
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+
+        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.ERROR
+        first.default_exchange.publish.assert_awaited_once()
+        second.default_exchange.publish.assert_awaited_once()
+        mock_wait.assert_awaited_once()  # only tried recovery once, not per-attempt-forever
+
+    @pytest.mark.asyncio
+    async def test_release_failure_does_not_override_a_successful_outcome(self) -> None:
+        """The precondition fix: a pool-release-time exception must not
+        mask a message that was actually confirmed."""
+        transport = _make_transport()
+        await self._connect_transport(transport)
+        conn = transport._conn_pool._publisher_connection
+
+        channel = AsyncMock()
+        channel.is_closed = False
+        channel.default_exchange.publish = AsyncMock()
+        conn.channel = AsyncMock(return_value=channel)
+
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+
+        with patch.object(
+            transport._conn_pool, "release_publisher_channel", new=AsyncMock(side_effect=RuntimeError("pool bug"))
+        ):
+            outcome = await transport.publish(envelope)
+
+        assert outcome.status == PublishStatus.CONFIRMED  # NOT ERROR despite the release failure
+        assert outcome.error is None
+
+
 # ── Consume ──────────────────────────────────────────────────────────────
 
 

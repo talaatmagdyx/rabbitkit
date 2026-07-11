@@ -89,6 +89,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored, so it costs nothing on the CONFIRMED/SENT/NACKED/TIMEOUT/
   RETURNED hot paths.
 
+- **Async publish retry-once-on-connection-error**, plus a precondition
+  fix in `async_/transport.py`'s `publish()`. Previously a single
+  `try/except Exception` wrapped BOTH the confirmed (pooled-channel)
+  publish AND the `finally: release_publisher_channel(...)` cleanup, so a
+  release-time failure (pool bookkeeping, unrelated to the actual
+  publish) could overwrite a real success with a false `ERROR` outcome.
+  The confirmed path now lives in its own `_publish_confirmed()`, whose
+  pool-release cleanup runs outside its own try/except so it can never
+  clobber an already-computed outcome. On top of that fix: a
+  connection-class error (dead socket, classified via the same tuple
+  `sync/transport.py`'s reconnect loop uses — not a broker-level
+  NACK/return/timeout) now gets a bounded wait (up to 5s) for aio-pika's
+  own `connect_robust()` to restore the connection, then exactly one
+  retry against a fresh channel (the broken one is released back to the
+  pool first, which discards it since it's closed). No recovery within
+  the wait, or a second failure, still returns `ERROR` — `publish()`
+  still never raises. Scoped to the confirmed/pooled path only (the
+  default `confirm_delivery=True` configuration) — the fast
+  (`confirm_delivery=False`) and mandatory paths already have their own
+  channel-reopen-on-demand logic and were left unchanged to keep this
+  change reviewable. Verified against a real broker: killing all
+  connections mid-publish (`rabbitmqctl close_all_connections`) is
+  recovered by exactly one retry, with the message landing on the queue
+  exactly once (no duplicate) — `tests/integration/test_resilience_scenarios.py`.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

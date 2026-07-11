@@ -5,8 +5,14 @@ Protocol-based approach: works with any Prometheus-compatible client
 
 Metric names:
 - rabbitkit_messages_consumed_total   Counter(queue, status)
+                                      status: success | error
 - rabbitkit_message_processing_seconds Histogram(queue)
 - rabbitkit_messages_published_total  Counter(exchange, status)
+                                      status: confirmed | sent | nacked |
+                                      timeout | returned | error (the real
+                                      PublishOutcome.status value -- a
+                                      raised exception escaping the publish
+                                      call itself is also labeled "error")
 - rabbitkit_message_publish_seconds   Histogram(exchange)
 """
 
@@ -19,7 +25,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
@@ -30,6 +36,25 @@ MESSAGES_CONSUMED_TOTAL = MetricsConfig().consumed_total
 MESSAGE_PROCESSING_SECONDS = MetricsConfig().processing_seconds
 MESSAGES_PUBLISHED_TOTAL = MetricsConfig().published_total
 MESSAGE_PUBLISH_SECONDS = MetricsConfig().publish_seconds
+
+
+def _publish_status_label(result: Any) -> str:
+    """Return the ``status`` label for a publish outcome.
+
+    ``broker.publish()`` never raises on its own -- it returns a
+    ``PublishOutcome`` so callers can branch on NACKED/TIMEOUT/RETURNED/ERROR
+    themselves. Before this fix, ``publish_scope``'s "no exception raised"
+    branch hardcoded the label to ``"success"`` regardless of that outcome's
+    actual ``.status`` -- so a NACKED, TIMEOUT, RETURNED, or even an
+    outcome-level ERROR publish (none of which raise) was counted as a
+    success in Prometheus, silently hiding real failures from dashboards and
+    alerts. Reads the real status when the call returned a ``PublishOutcome``
+    (always true for rabbitkit's own transports); falls back to "success"
+    for a custom/duck-typed publish fn that returns something else.
+    """
+    if isinstance(result, PublishOutcome):
+        return result.status.value
+    return "success"
 
 
 def _queue_label(message: RabbitMessage) -> str:
@@ -333,7 +358,7 @@ class MetricsMiddleware(BaseMiddleware):
         else:
             self._collector.inc_counter(
                 self._cfg.published_total,
-                {"exchange": exchange, "status": "success"},
+                {"exchange": exchange, "status": _publish_status_label(result)},
             )
             self._collector.observe_histogram(
                 self._cfg.publish_seconds,
@@ -369,7 +394,7 @@ class MetricsMiddleware(BaseMiddleware):
         else:
             self._collector.inc_counter(
                 self._cfg.published_total,
-                {"exchange": exchange, "status": "success"},
+                {"exchange": exchange, "status": _publish_status_label(result)},
             )
             self._collector.observe_histogram(
                 self._cfg.publish_seconds,

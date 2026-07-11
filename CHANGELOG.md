@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`rabbitkit_messages_published_total`'s `status` label silently
+  mislabeled every non-confirmed publish outcome as `"success"`.**
+  `broker.publish()` never raises on its own — it returns a
+  `PublishOutcome` so callers can branch on
+  NACKED/TIMEOUT/RETURNED/ERROR themselves. `MetricsMiddleware.publish_scope`
+  (and its async twin) labeled by whether the call *raised*, not by the
+  returned outcome's actual `.status` — so a NACKED, TIMEOUT, RETURNED, or
+  even an outcome-level `ERROR` publish (none of which raise) was counted
+  as `status="success"` in every Prometheus deployment scraping this
+  metric, hiding real publish failures from dashboards and alerts. Fixed
+  by reading the real `PublishOutcome.status` value
+  (confirmed/sent/nacked/timeout/returned/error) when the call returns
+  one; a custom/duck-typed publish fn that returns something else still
+  falls back to `"success"` (unchanged). A genuinely raised exception
+  escaping the call is still labeled `"error"`, unchanged. New
+  `TestPublishStatusLabelReflectsOutcome` suite covers all six statuses
+  on both sync and async paths, plus the fallback and raised-exception
+  cases.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

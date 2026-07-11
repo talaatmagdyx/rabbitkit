@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.middleware.metrics import (
     MESSAGE_PROCESSING_SECONDS,
     MESSAGE_PUBLISH_SECONDS,
@@ -495,6 +495,95 @@ class TestPublishScopeAsync:
         hc = collector.histogram_calls[0]
         assert hc.name == MESSAGE_PUBLISH_SECONDS
         assert hc.value >= 0.0
+
+
+# ── Publish status label reflects the real PublishOutcome.status ─────────
+#
+# Regression coverage for the fix: publish_scope's "no exception raised"
+# branch used to hardcode status="success" no matter what the returned
+# PublishOutcome actually said -- so a NACKED/TIMEOUT/RETURNED/ERROR outcome
+# (none of which raise; broker.publish() never raises on its own) was
+# counted as a success. These tests drive call_next with a real
+# PublishOutcome for every status and assert the counter label matches.
+
+
+class TestPublishStatusLabelReflectsOutcome:
+    @pytest.mark.parametrize(
+        "status",
+        [
+            PublishStatus.CONFIRMED,
+            PublishStatus.SENT,
+            PublishStatus.NACKED,
+            PublishStatus.TIMEOUT,
+            PublishStatus.RETURNED,
+            PublishStatus.ERROR,
+        ],
+    )
+    def test_sync_label_matches_outcome_status(self, status: PublishStatus) -> None:
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        envelope = _make_envelope()
+        outcome = PublishOutcome(status=status, exchange="test.exchange", routing_key="rk")
+        call_next = MagicMock(return_value=outcome)
+
+        result = mw.publish_scope(call_next, envelope)
+
+        assert result is outcome
+        cc = collector.counter_calls[0]
+        assert cc.labels == {"exchange": "test.exchange", "status": status.value}
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            PublishStatus.CONFIRMED,
+            PublishStatus.SENT,
+            PublishStatus.NACKED,
+            PublishStatus.TIMEOUT,
+            PublishStatus.RETURNED,
+            PublishStatus.ERROR,
+        ],
+    )
+    async def test_async_label_matches_outcome_status(self, status: PublishStatus) -> None:
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        envelope = _make_envelope()
+        outcome = PublishOutcome(status=status, exchange="test.exchange", routing_key="rk")
+
+        async def call_next(e: MessageEnvelope) -> PublishOutcome:
+            return outcome
+
+        result = await mw.publish_scope_async(call_next, envelope)
+
+        assert result is outcome
+        cc = collector.counter_calls[0]
+        assert cc.labels == {"exchange": "test.exchange", "status": status.value}
+
+    def test_non_publishoutcome_result_falls_back_to_success(self) -> None:
+        """A custom/duck-typed publish_fn that doesn't return a PublishOutcome
+        keeps the old "success" label (no way to introspect its status)."""
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        envelope = _make_envelope()
+        call_next = MagicMock(return_value={"custom": "result"})
+
+        mw.publish_scope(call_next, envelope)
+
+        cc = collector.counter_calls[0]
+        assert cc.labels["status"] == "success"
+
+    def test_raised_exception_still_labeled_error(self) -> None:
+        """An exception escaping the call (distinct from a returned
+        ERROR-status outcome) is still labeled "error", unchanged."""
+        collector = FakeCollector()
+        mw = MetricsMiddleware(collector)
+        envelope = _make_envelope()
+        call_next = MagicMock(side_effect=ConnectionError("broker down"))
+
+        with pytest.raises(ConnectionError):
+            mw.publish_scope(call_next, envelope)
+
+        cc = collector.counter_calls[0]
+        assert cc.labels["status"] == "error"
 
 
 # ── No-op mode ───────────────────────────────────────────────────────────

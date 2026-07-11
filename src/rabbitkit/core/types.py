@@ -257,6 +257,30 @@ class PublishOutcome:
             raise PublishError(self)
         return self
 
+    @property
+    def classification(self) -> ClassifiedError | None:
+        """Best-effort severity/reason for ``self.error``, via the existing
+        ``classify_error()`` (production-hardening item 5).
+
+        Deliberately NOT a new ``PublishStatus`` enum member: growing that
+        small, closed "what happened" set (CONFIRMED/SENT/NACKED/TIMEOUT/
+        RETURNED/ERROR) risks breaking exhaustive match/if-chains callers
+        may have written against it, for a "why" signal better served by
+        reusing the classification machinery already wired into the
+        consume/retry path (``core/errors.py``) rather than duplicating it.
+        A lazy import avoids a module-level cycle (``core/errors.py``
+        already imports from this module) — same pattern as
+        :meth:`raise_for_status`.
+
+        ``None`` when there's nothing to classify: a non-ERROR status, or
+        an ERROR outcome that (unusually) captured no exception.
+        """
+        if self.status is not PublishStatus.ERROR or self.error is None:
+            return None
+        from rabbitkit.core.errors import classify_error
+
+        return classify_error(self.error)
+
 
 @dataclass(frozen=True, slots=True)
 class MessageEnvelope:

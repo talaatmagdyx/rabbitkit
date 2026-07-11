@@ -11,6 +11,7 @@ import socket
 import ssl
 from typing import Any
 
+from rabbitkit._version import __version__
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SocketConfig, SSLConfig
 
 logger = logging.getLogger(__name__)
@@ -151,8 +152,19 @@ def make_pika_connection_params(
         password=password,
     )
 
-    # Client properties
-    client_properties: dict[str, str] = {}
+    # Client properties (item 8): rabbitkit always identifies itself;
+    # connection_name and any caller-supplied escape-hatch properties
+    # (ConnectionConfig.client_properties) are additive on top. pika merges
+    # this dict INTO its own base properties (product/platform/capabilities/
+    # version) at connect time rather than replacing them wholesale — see
+    # pika.connection.Connection._client_properties — so these never clobber
+    # pika's own identification or capability flags. Key names avoid "product"
+    # /"version"/"platform"/"capabilities"/"information" for that reason.
+    client_properties: dict[str, str] = {
+        "library": "rabbitkit",
+        "library_version": __version__,
+    }
+    client_properties.update(connection.client_properties)
     if connection.connection_name:
         client_properties["connection_name"] = connection.connection_name
 
@@ -166,7 +178,7 @@ def make_pika_connection_params(
             socket_timeout=connection.socket_timeout,
             blocked_connection_timeout=connection.blocked_connection_timeout,
             ssl_options=ssl_options,
-            client_properties=client_properties if client_properties else None,
+            client_properties=client_properties,
         )
 
     endpoints = connection.cluster_endpoints()

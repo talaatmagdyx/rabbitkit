@@ -128,6 +128,70 @@ class TestAsyncChannelPool:
         assert pool.size == 0
 
 
+class TestAsyncChannelPoolLifecycleCallbacks:
+    """Item 3: on_channel_opened/on_channel_rebuilt hooks -- opened fires on
+    every channel this pool creates; rebuilt fires only when the creation
+    replaces a channel discovered closed (not ordinary pool growth)."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_growth_fires_opened_not_rebuilt(self) -> None:
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+        opened: list[int] = []
+        rebuilt: list[int] = []
+
+        pool = AsyncChannelPool(
+            mock_conn,
+            pool_size=5,
+            on_channel_opened=lambda: opened.append(1),
+            on_channel_rebuilt=lambda: rebuilt.append(1),
+        )
+
+        await pool.acquire()
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    @pytest.mark.asyncio
+    async def test_replacing_closed_pooled_channel_fires_opened_and_rebuilt(self) -> None:
+        mock_conn = AsyncMock()
+        closed_channel = AsyncMock()
+        closed_channel.is_closed = True
+        fresh_channel = AsyncMock()
+        fresh_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=fresh_channel)
+        opened: list[int] = []
+        rebuilt: list[int] = []
+
+        pool = AsyncChannelPool(
+            mock_conn,
+            pool_size=5,
+            on_channel_opened=lambda: opened.append(1),
+            on_channel_rebuilt=lambda: rebuilt.append(1),
+        )
+        pool._pool.put_nowait(closed_channel)
+
+        ch = await pool.acquire()
+
+        assert ch is fresh_channel
+        assert opened == [1]
+        assert rebuilt == [1]
+
+    @pytest.mark.asyncio
+    async def test_no_callbacks_is_a_noop(self) -> None:
+        """Callbacks are optional -- omitting them must not raise."""
+        mock_conn = AsyncMock()
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        pool = AsyncChannelPool(mock_conn, pool_size=5)
+
+        await pool.acquire()  # must not raise
+
+
 # ── AsyncConnectionPool ────────────────────────────────────────────────
 
 
@@ -149,6 +213,35 @@ class TestAsyncConnectionPool:
                 conn = await pool.get_publisher_connection()
                 assert conn is not None
                 assert conn is mock_conn
+
+    @pytest.mark.asyncio
+    async def test_channel_lifecycle_callbacks_forwarded_to_channel_pool(self) -> None:
+        """Item 3: AsyncConnectionPool forwards on_channel_opened/rebuilt to
+        every AsyncChannelPool it constructs, so AsyncTransportImpl's
+        metric hooks reach channel-pool creations too."""
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+            on_channel_opened=lambda: opened.append(1),
+            on_channel_rebuilt=lambda: rebuilt.append(1),
+        )
+
+        mock_conn = AsyncMock()
+        mock_conn.is_closed = False
+        mock_channel = AsyncMock()
+        mock_channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=mock_channel)
+
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_conn):
+                await pool.acquire_publisher_channel()
+
+        assert opened == [1]
+        assert rebuilt == []
 
     @pytest.mark.asyncio
     async def test_publisher_connection_reused(self) -> None:

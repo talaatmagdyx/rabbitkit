@@ -273,6 +273,9 @@ class SyncBroker:
             confirm_timeout=self._config.publisher.confirm_timeout,
             on_topology_conflict=self._config.safety.on_topology_conflict,
         )
+        # Reconnect-attempts bound: previously hardcoded on the transport
+        # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
+        self._transport.max_reconnect_attempts = self._config.connection.reconnect_max_attempts
 
         self._transport.connect()
         self._transport.on_io_tick(self._mark_heartbeat)
@@ -848,6 +851,13 @@ class SyncBroker:
         collector = metrics_mw.collector
         metric_name = metrics_mw.config.reconnects_total
         self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
+
+        # Item 3: channel open/rebuild counters — same collector, same
+        # no-route-metrics no-op behavior as the reconnect hook above.
+        opened_name = metrics_mw.config.channels_opened_total
+        rebuilt_name = metrics_mw.config.channel_rebuilds_total
+        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
+        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
 
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""

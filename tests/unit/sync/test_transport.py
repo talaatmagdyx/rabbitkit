@@ -125,6 +125,61 @@ class TestConnection:
 
         assert transport.is_connected()
 
+    def test_connect_fires_channel_opened_but_not_rebuilt_first_time(self) -> None:
+        """Item 3: the publisher channel opened by the FIRST connect() is a
+        fresh open, not a rebuild (nothing existed before to replace)."""
+        transport = _make_transport()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection"):
+                transport.connect()
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    def test_reconnect_fires_channel_opened_and_rebuilt(self) -> None:
+        """Item 3: a connect() after disconnect() replaces the publisher
+        channel -- both channels_opened_total and channel_rebuilds_total
+        must increment."""
+        transport = _make_transport()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                transport.connect()
+                transport.disconnect()
+                transport.connect()
+
+        assert opened == [1, 1]
+        assert rebuilt == [1]
+
+    def test_channel_callback_exception_does_not_break_connect(self) -> None:
+        transport = _make_transport()
+        transport.on_channel_opened(lambda: (_ for _ in ()).throw(RuntimeError("cb boom")))
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                transport.connect()  # must not raise despite the bad callback
+
+        assert transport.is_connected()
+
     def test_disconnect(self) -> None:
         transport = _make_transport()
 
@@ -573,6 +628,38 @@ class TestConsume:
 
         call_kwargs = channel.basic_consume.call_args.kwargs
         assert call_kwargs["auto_ack"] is False
+
+    def test_consume_fires_channel_opened_not_rebuilt_first_time(self) -> None:
+        """Item 3: the first consume() call for a queue opens a fresh
+        per-queue channel -- not a rebuild."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        transport.consume("orders", lambda msg: None)
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    def test_consume_same_queue_again_fires_rebuilt(self) -> None:
+        """Item 3: a second consume() call for a queue ALREADY consumed
+        (the shape of _recover_consumers()'s re-subscribe-after-reconnect
+        loop) is a channel rebuild, not a fresh open."""
+        transport = _make_transport()
+        self._connect_transport(transport)
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        transport.consume("orders", lambda msg: None)
+        transport.consume("orders", lambda msg: None)
+
+        assert opened == [1, 1]
+        assert rebuilt == [1]
 
     def test_consume_declare_false_reply_to_queue_tracks_channel(self) -> None:
         """C2: consuming amq.rabbitmq.reply-to with declare=False remembers the
@@ -2353,6 +2440,23 @@ class TestWarnContinueConfirmRecovery:
         new_channel.confirm_delivery.assert_called_once()
         assert transport._channel_key(new_channel) in transport._confirmed_channel_ids
 
+    def test_reopened_channel_fires_opened_and_rebuilt(self) -> None:
+        """Item 3: the 406 warn_continue reopen replaces a channel the
+        broker just closed -- both channels_opened_total and
+        channel_rebuilds_total must increment."""
+        transport = _make_transport(confirm_delivery=True, on_topology_conflict="warn_continue")
+        transport._connection = MagicMock()
+        transport._connection.channel.return_value = MagicMock()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        transport._raise_precondition_failed_or_reraise("queue", "orders", self._exc())
+
+        assert opened == [1]
+        assert rebuilt == [1]
+
     def test_conflicting_dlx_declaration_escalates_even_under_warn_continue(self) -> None:
         """Retry-review M1: a 406 on a declaration that carried an injected
         x-dead-letter-exchange must raise — continuing with the existing
@@ -2432,6 +2536,65 @@ class TestReconnectBackoffLiveness:
                 transport._ensure_connected()
 
         assert len(ticks) >= 2  # one tick per backoff iteration
+
+
+class TestReconnectBackoffJitterSpread:
+    """Item 9: H-SRE3 claims full-jitter backoff spreads reconnect attempts
+    across a fleet instead of thundering-herding. Previously this was only
+    a code comment -- prove it by running the actual backoff loop (with a
+    fast, deterministic connect() failure) and asserting the recorded sleep
+    durations vary, not a single lockstep value."""
+
+    def test_backoff_sleep_durations_are_not_identical(self) -> None:
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 8
+        recorded_sleeps: list[float] = []
+
+        def failing_connect() -> None:
+            raise pika.exceptions.AMQPConnectionError("down")
+
+        transport.connect = failing_connect  # type: ignore[method-assign]
+
+        with patch("time.sleep", side_effect=recorded_sleeps.append):
+            with pytest.raises(pika.exceptions.AMQPConnectionError):
+                transport._ensure_connected()
+
+        assert len(recorded_sleeps) >= 4, "expected several backoff attempts before exhaustion"
+        distinct = {round(s, 9) for s in recorded_sleeps}
+        assert len(distinct) > 1, (
+            f"full-jitter backoff produced identical sleep durations every "
+            f"attempt ({recorded_sleeps}) -- reconnects would thundering-herd "
+            "instead of spreading across a fleet"
+        )
+
+    def test_backoff_sleep_never_exceeds_current_backoff_ceiling(self) -> None:
+        """Full jitter (H-SRE3) means each sleep is uniform(0, current_backoff)
+        -- never more than the exponentially-growing ceiling itself."""
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 6
+        recorded_sleeps: list[float] = []
+
+        def failing_connect() -> None:
+            raise pika.exceptions.AMQPConnectionError("down")
+
+        transport.connect = failing_connect  # type: ignore[method-assign]
+
+        with patch("time.sleep", side_effect=recorded_sleeps.append):
+            with pytest.raises(pika.exceptions.AMQPConnectionError):
+                transport._ensure_connected()
+
+        base = transport._connection_config.reconnect_backoff_base
+        max_backoff = transport._connection_config.reconnect_backoff_max
+        ceiling = base
+        for sleep_for in recorded_sleeps:
+            assert 0.0 <= sleep_for <= ceiling + 1e-9, (
+                f"sleep {sleep_for} exceeded the current backoff ceiling {ceiling}"
+            )
+            ceiling = min(ceiling * 2, max_backoff)
 
 
 class TestEnsureConnectedOwnership:

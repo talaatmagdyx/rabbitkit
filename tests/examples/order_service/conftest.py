@@ -26,7 +26,14 @@ def _reset_service() -> Iterator[None]:
 
 @pytest.fixture
 def nack_spy(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Record the ``requeue`` value of every async nack (proves requeue=False → DLQ)."""
+    """Record the ``requeue`` value of every async nack (proves requeue=False → DLQ).
+
+    Only fires on routes with NO RetryMiddleware, where AckPolicy.NACK_ON_ERROR's
+    own on_error handler settles terminal failures directly via nack(requeue=False).
+    When a RetryMiddleware IS wired, an exhausted/permanent failure is instead
+    marked ``_rabbitkit_terminal`` and settled via reject(requeue=False) — see
+    ``reject_spy`` below for that path.
+    """
     calls: list[bool] = []
     original = RabbitMessage.nack_async
 
@@ -35,6 +42,25 @@ def nack_spy(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
         await original(self, requeue)
 
     monkeypatch.setattr(RabbitMessage, "nack_async", spy)
+    return calls
+
+
+@pytest.fixture
+def reject_spy(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record the ``requeue`` value of every async reject.
+
+    A RetryMiddleware-exhausted or permanent failure is marked
+    ``_rabbitkit_terminal`` by the middleware; the pipeline settles it via
+    reject(requeue=False) → the source queue's DLX → the DLQ, never via nack.
+    """
+    calls: list[bool] = []
+    original = RabbitMessage.reject_async
+
+    async def spy(self: RabbitMessage, requeue: bool = False) -> None:
+        calls.append(requeue)
+        await original(self, requeue)
+
+    monkeypatch.setattr(RabbitMessage, "reject_async", spy)
     return calls
 
 

@@ -95,6 +95,49 @@ class TestLifecycle:
                 assert mock_channel.queue_bind.called
                 assert mock_channel.basic_consume.called
 
+    def test_start_wires_reconnect_max_attempts_from_config(self) -> None:
+        """Production-hardening item 2: ConnectionConfig.reconnect_max_attempts
+        (previously hardcoded on the transport, unreachable from config) must
+        reach the transport's max_reconnect_attempts at start()."""
+        from rabbitkit.core.config import ConnectionConfig, RabbitConfig
+
+        broker = SyncBroker(RabbitConfig(connection=ConnectionConfig(reconnect_max_attempts=7)))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                broker.start()
+
+        assert broker._transport is not None
+        assert broker._transport.max_reconnect_attempts == 7
+
+    def test_start_uses_default_reconnect_max_attempts(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                broker.start()
+
+        assert broker._transport is not None
+        assert broker._transport.max_reconnect_attempts == 30
+
     def test_start_idempotent(self) -> None:
         broker = SyncBroker()
 
@@ -2229,6 +2272,53 @@ class TestWireReconnectMetric:
         broker = SyncBroker()
         broker._transport = None
         broker._wire_reconnect_metric()  # must not raise
+
+
+class TestWireChannelMetrics:
+    """Production-hardening item 3: _wire_reconnect_metric also registers
+    on_channel_opened/on_channel_rebuilt callbacks that increment
+    channels_opened_total/channel_rebuilds_total via the same
+    MetricsMiddleware collector -- previously no signal existed for channel
+    churn (leaks or reconnect-driven rebuilds), only connection churn."""
+
+    def test_registers_channel_callbacks_when_metrics_middleware_present(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_called_once()
+        broker._transport.on_channel_rebuilt.assert_called_once()
+
+        opened_cb = broker._transport.on_channel_opened.call_args.args[0]
+        rebuilt_cb = broker._transport.on_channel_rebuilt.call_args.args[0]
+        opened_cb()
+        rebuilt_cb()
+
+        assert collector.inc_counter.call_count == 2
+        names = {call.args[0] for call in collector.inc_counter.call_args_list}
+        assert any(name.endswith("_channels_opened_total") for name in names)
+        assert any(name.endswith("_channel_rebuilds_total") for name in names)
+
+    def test_noop_without_metrics_middleware(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_not_called()
+        broker._transport.on_channel_rebuilt.assert_not_called()
 
 
 class TestFlowControlledInternalPublish:

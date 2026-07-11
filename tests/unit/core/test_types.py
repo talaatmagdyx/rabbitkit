@@ -143,6 +143,35 @@ class TestPublishOutcome:
         assert outcome.ok is False
         assert outcome.error is err
 
+    def test_classification_transient_error(self) -> None:
+        """Item 5: classify_error() reuse -- a transport-style OSError
+        classifies TRANSIENT, without needing a new PublishStatus member."""
+        outcome = PublishOutcome(status=PublishStatus.ERROR, error=ConnectionResetError("gone"))
+        classified = outcome.classification
+        assert classified is not None
+        assert classified.severity == ErrorSeverity.TRANSIENT
+        assert classified.original is outcome.error
+
+    def test_classification_permanent_error(self) -> None:
+        outcome = PublishOutcome(status=PublishStatus.ERROR, error=ValueError("bad body"))
+        classified = outcome.classification
+        assert classified is not None
+        assert classified.severity == ErrorSeverity.PERMANENT
+
+    def test_classification_none_for_non_error_status(self) -> None:
+        """Only an ERROR outcome has anything to classify."""
+        outcome = PublishOutcome(status=PublishStatus.NACKED)
+        assert outcome.classification is None
+
+    def test_classification_none_when_error_status_has_no_exception(self) -> None:
+        """An ERROR outcome that (unusually) captured no exception object."""
+        outcome = PublishOutcome(status=PublishStatus.ERROR, error=None)
+        assert outcome.classification is None
+
+    def test_classification_returns_classified_error_type(self) -> None:
+        outcome = PublishOutcome(status=PublishStatus.ERROR, error=RuntimeError("x"))
+        assert isinstance(outcome.classification, ClassifiedError)
+
     def test_raise_for_status_returns_self_when_ok(self) -> None:
         """M1: raise_for_status is a no-op that chains on success."""
         outcome = PublishOutcome(status=PublishStatus.CONFIRMED)

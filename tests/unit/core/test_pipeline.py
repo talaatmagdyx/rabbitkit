@@ -2123,6 +2123,56 @@ class TestDebugLoggingPath:
         mock_bind.assert_called_once()
         mock_clear.assert_called_once()
 
+    def test_sync_debug_path_binds_correlation_id_and_retry_count(self) -> None:
+        """Item 4: correlation_id and retry_count join the existing
+        debug-gated bind_contextvars call -- previously only
+        message_id/routing_key/queue/handler were bound."""
+        import structlog.contextvars
+
+        msg = _make_message(
+            correlation_id="corr-123",
+            headers={"x-rabbitkit-retry-count": 2},
+        )
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+
+        with patch("rabbitkit.core.pipeline._stdlib_logger") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            with patch.object(structlog.contextvars, "bind_contextvars") as mock_bind:
+                with patch.object(structlog.contextvars, "clear_contextvars"):
+                    pipeline.process_sync(route, msg)
+
+        kwargs = mock_bind.call_args.kwargs
+        assert kwargs["correlation_id"] == "corr-123"
+        assert kwargs["retry_count"] == 2
+
+    def test_sync_debug_path_retry_count_defaults_to_zero(self) -> None:
+        """Item 4: no x-rabbitkit-retry-count header -> retry_count=0."""
+        import structlog.contextvars
+
+        msg = _make_message()
+        _wire_sync(msg)
+
+        def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+
+        with patch("rabbitkit.core.pipeline._stdlib_logger") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            with patch.object(structlog.contextvars, "bind_contextvars") as mock_bind:
+                with patch.object(structlog.contextvars, "clear_contextvars"):
+                    pipeline.process_sync(route, msg)
+
+        assert mock_bind.call_args.kwargs["retry_count"] == 0
+        assert mock_bind.call_args.kwargs["correlation_id"] is None
+
     @pytest.mark.asyncio
     async def test_async_debug_path_binds_and_clears_contextvars(self) -> None:
         """Lines 347, 393: async debug path bind/clear."""
@@ -2145,6 +2195,33 @@ class TestDebugLoggingPath:
 
         mock_bind.assert_called_once()
         mock_clear.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_debug_path_binds_correlation_id_and_retry_count(self) -> None:
+        """Async mirror of the sync correlation_id/retry_count test."""
+        import structlog.contextvars
+
+        msg = _make_message(
+            correlation_id="corr-456",
+            headers={"x-rabbitkit-retry-count": "3"},
+        )
+        _wire_async(msg)
+
+        async def handler(body: bytes) -> None:
+            pass
+
+        route = _make_route(handler=handler)
+        pipeline = HandlerPipeline()
+
+        with patch("rabbitkit.core.pipeline._stdlib_logger") as mock_logger:
+            mock_logger.isEnabledFor.return_value = True
+            with patch.object(structlog.contextvars, "bind_contextvars") as mock_bind:
+                with patch.object(structlog.contextvars, "clear_contextvars"):
+                    await pipeline.process_async(route, msg)
+
+        kwargs = mock_bind.call_args.kwargs
+        assert kwargs["correlation_id"] == "corr-456"
+        assert kwargs["retry_count"] == 3  # string header coerced to int
 
 
 # ── _get_body_type cache hit ──────────────────────────────────────────────
@@ -2317,6 +2394,36 @@ class TestChannelGoneSettlement:
         route = _make_route(handler=lambda body: None)
         with pytest.raises(OSError, match="disk on fire"):
             await HandlerPipeline()._handle_async_exception(route, msg, ValueError("bad"))
+
+
+class TestRetryCountFromHeaders:
+    """Item 4: _retry_count_from_headers is a tolerant, read-only parse for
+    the debug-log context -- no config-driven clamping (that's
+    RetryMiddleware._get_retry_count's job for actual retry decisions)."""
+
+    def test_absent_header_defaults_to_zero(self) -> None:
+        from rabbitkit.core.pipeline import _retry_count_from_headers
+
+        msg = _make_message()
+        assert _retry_count_from_headers(msg) == 0
+
+    def test_int_header(self) -> None:
+        from rabbitkit.core.pipeline import _retry_count_from_headers
+
+        msg = _make_message(headers={"x-rabbitkit-retry-count": 5})
+        assert _retry_count_from_headers(msg) == 5
+
+    def test_string_header_coerced(self) -> None:
+        from rabbitkit.core.pipeline import _retry_count_from_headers
+
+        msg = _make_message(headers={"x-rabbitkit-retry-count": "7"})
+        assert _retry_count_from_headers(msg) == 7
+
+    def test_malformed_header_defaults_to_zero(self) -> None:
+        from rabbitkit.core.pipeline import _retry_count_from_headers
+
+        msg = _make_message(headers={"x-rabbitkit-retry-count": "not-a-number"})
+        assert _retry_count_from_headers(msg) == 0
 
 
 class TestIsChannelGone:

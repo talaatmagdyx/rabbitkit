@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from rabbitkit.core.config import RetryConfig
@@ -24,6 +25,12 @@ from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 
 logger = logging.getLogger(__name__)
+
+# Item 7: DLQ-triage headers. error-message is length-capped (matching the
+# item-8 client_properties precedent) so an exception with a huge/binary
+# str() (e.g. wrapping a stack-trace-like payload) can't bloat every retry
+# republish indefinitely.
+_ERROR_MESSAGE_MAX_LEN = 512
 
 
 def _shard_index(message_id: str, shards: int) -> int:
@@ -252,7 +259,7 @@ class RetryMiddleware(BaseMiddleware):
 
         if classified.severity == ErrorSeverity.TRANSIENT and retry_count < self._config.max_retries:
             # Route to delay queue
-            self._route_to_delay_queue_sync(message, retry_count)
+            self._route_to_delay_queue_sync(message, retry_count, exc)
             return
 
         # Terminal: permanent or exhausted
@@ -264,7 +271,7 @@ class RetryMiddleware(BaseMiddleware):
         retry_count = self._get_retry_count(message)
 
         if classified.severity == ErrorSeverity.TRANSIENT and retry_count < self._config.max_retries:
-            await self._route_to_delay_queue_async(message, retry_count)
+            await self._route_to_delay_queue_async(message, retry_count, exc)
             return
 
         self._mark_terminal_and_raise(exc, classified.severity, retry_count, message)
@@ -302,7 +309,7 @@ class RetryMiddleware(BaseMiddleware):
             retry_count = 0
         return max(0, min(retry_count, self._config.max_retries))
 
-    def _build_retry_envelope(self, message: RabbitMessage, retry_count: int) -> MessageEnvelope:
+    def _build_retry_envelope(self, message: RabbitMessage, retry_count: int, exc: Exception) -> MessageEnvelope:
         """Build envelope for the delay queue."""
         # Determine delay queue name
         attempt = retry_count + 1
@@ -323,6 +330,19 @@ class RetryMiddleware(BaseMiddleware):
             headers["x-rabbitkit-original-routing-key"] = message.routing_key
         if "x-rabbitkit-original-queue" not in headers:
             headers["x-rabbitkit-original-queue"] = ""  # set by broker at consume time
+
+        # Item 7: DLQ-triage headers -- previously the only way to learn why
+        # a message ended up on the DLQ was application logs, which may have
+        # long since rotated out by the time anyone looks. error-type/message
+        # describe THIS failure; first-failed-at is set once and preserved
+        # across every subsequent retry (mirrors the original-* pattern
+        # above); last-failed-at is overwritten on every retry.
+        headers["x-rabbitkit-error-type"] = type(exc).__name__
+        headers["x-rabbitkit-error-message"] = str(exc)[:_ERROR_MESSAGE_MAX_LEN]
+        now = datetime.now(UTC).isoformat()
+        if "x-rabbitkit-first-failed-at" not in headers:
+            headers["x-rabbitkit-first-failed-at"] = now
+        headers["x-rabbitkit-last-failed-at"] = now
 
         return MessageEnvelope(
             routing_key=delay_queue_rk,
@@ -358,9 +378,9 @@ class RetryMiddleware(BaseMiddleware):
             mandatory=True,
         )
 
-    def _route_to_delay_queue_sync(self, message: RabbitMessage, retry_count: int) -> None:
+    def _route_to_delay_queue_sync(self, message: RabbitMessage, retry_count: int, exc: Exception) -> None:
         """Publish to delay queue and ack source (sync)."""
-        envelope = self._build_retry_envelope(message, retry_count)
+        envelope = self._build_retry_envelope(message, retry_count, exc)
 
         if self._publish_fn is None:
             # No sync publish fn wired (manual middleware construction, or a
@@ -410,9 +430,9 @@ class RetryMiddleware(BaseMiddleware):
             envelope.routing_key,
         )
 
-    async def _route_to_delay_queue_async(self, message: RabbitMessage, retry_count: int) -> None:
+    async def _route_to_delay_queue_async(self, message: RabbitMessage, retry_count: int, exc: Exception) -> None:
         """Publish to delay queue and ack source (async)."""
-        envelope = self._build_retry_envelope(message, retry_count)
+        envelope = self._build_retry_envelope(message, retry_count, exc)
 
         if self._publish_async_fn is None:
             # See the sync variant: acking without a publish would DROP the

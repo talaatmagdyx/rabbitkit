@@ -5,6 +5,216 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`rabbitkit_messages_published_total`'s `status` label silently
+  mislabeled every non-confirmed publish outcome as `"success"`.**
+  `broker.publish()` never raises on its own — it returns a
+  `PublishOutcome` so callers can branch on
+  NACKED/TIMEOUT/RETURNED/ERROR themselves. `MetricsMiddleware.publish_scope`
+  (and its async twin) labeled by whether the call *raised*, not by the
+  returned outcome's actual `.status` — so a NACKED, TIMEOUT, RETURNED, or
+  even an outcome-level `ERROR` publish (none of which raise) was counted
+  as `status="success"` in every Prometheus deployment scraping this
+  metric, hiding real publish failures from dashboards and alerts. Fixed
+  by reading the real `PublishOutcome.status` value
+  (confirmed/sent/nacked/timeout/returned/error) when the call returns
+  one; a custom/duck-typed publish fn that returns something else still
+  falls back to `"success"` (unchanged). A genuinely raised exception
+  escaping the call is still labeled `"error"`, unchanged. New
+  `TestPublishStatusLabelReflectsOutcome` suite covers all six statuses
+  on both sync and async paths, plus the fallback and raised-exception
+  cases.
+
+### Added
+
+- **`ConnectionConfig.reconnect_max_attempts`** (default `30`) — the sync
+  transport's reconnect-loop bound was previously hardcoded on
+  `SyncTransport` (30 attempts) with no path from `RabbitConfig` at all,
+  even though the transport constructor already accepted an override
+  nobody could reach. `SyncBroker.start()` now wires
+  `ConnectionConfig.reconnect_max_attempts` through to the transport.
+  Validated `>= 1` (raises `ConfigValidationError` otherwise). This bounds
+  only the **sync** transport's reconnect loop; async's ongoing
+  (post-first-connect) reconnect stays deliberately unbounded — it's
+  owned by `aio_pika.connect_robust`'s own indefinite, jittered retry,
+  which is the correct pattern for a long-running consumer (let
+  Kubernetes decide whether to kill a wedged pod via liveness, rather
+  than have the client give up on its own).
+
+- **`rabbitkit_channels_opened_total` / `rabbitkit_channel_rebuilds_total`
+  metrics** — no signal previously existed for channel churn (only
+  `rabbitkit_reconnects_total` for connection-level churn), so a channel
+  leak or an unexpectedly hot reconnect-driven rebuild loop was invisible.
+  `channels_opened_total` increments on every new channel either transport
+  creates (publisher/topology channel, per-queue consumer channel, async
+  channel-pool growth, dedicated fast/mandatory channels).
+  `channel_rebuilds_total` isolates the subset that REPLACES a channel
+  lost to a reconnect, a 406 topology-drift close, or a mandatory/fast
+  channel recycle — the signal that something upstream actually failed,
+  as opposed to ordinary first-time opens or pool growth. Wired through
+  the same `MetricsMiddleware` collector as `reconnects_total`, so it's a
+  no-op without a route carrying metrics. Note: like `reconnects_total`,
+  the very first channel opened during a broker's initial `start()` (the
+  publisher/topology channel) predates the metrics wiring and is not
+  counted — the counters track churn from "the broker has finished
+  starting" onward, not a from-zero channel census.
+
+- **`correlation_id` and `retry_count` bound into the debug-log structlog
+  context** (`core/pipeline.py`) — the existing debug-gated context
+  (`message_id`/`routing_key`/`queue`/`handler`) omitted both, even
+  though `retry_count` already reached OTel span attributes separately.
+  Both now join the same debug-gated `bind_contextvars()` call in
+  `process_sync`/`process_async` (no change to the existing perf
+  optimization that skips binding entirely outside `DEBUG`).
+  `retry_count` is read from the `x-rabbitkit-retry-count` header,
+  defaulting to 0 when absent — a tolerant, read-only parse for log
+  context, not the config-clamped value `RetryMiddleware` uses for
+  actual retry decisions.
+
+- **`PublishOutcome.classification` property** — callers had no
+  transport-agnostic way to tell *why* a publish failed (`status ==
+  ERROR`) without importing pika/aio-pika exception classes directly,
+  defeating the point of the typed-exception taxonomy rabbitkit already
+  uses elsewhere. Reuses the existing `classify_error()` (`core/errors.py`,
+  previously wired only into the consume/retry path) rather than growing
+  `PublishStatus` with new error-kind members (CHANNEL_ERROR/
+  CONNECTION_ERROR/etc.) — that enum is a small, closed "what happened"
+  set, and adding to it risks breaking exhaustive match/if-chains callers
+  may have written against it. `outcome.classification` returns a
+  `ClassifiedError` (severity + reason) when `status is ERROR` and an
+  exception was captured; `None` otherwise. Computed lazily on access, not
+  stored, so it costs nothing on the CONFIRMED/SENT/NACKED/TIMEOUT/
+  RETURNED hot paths.
+
+- **Async publish retry-once-on-connection-error**, plus a precondition
+  fix in `async_/transport.py`'s `publish()`. Previously a single
+  `try/except Exception` wrapped BOTH the confirmed (pooled-channel)
+  publish AND the `finally: release_publisher_channel(...)` cleanup, so a
+  release-time failure (pool bookkeeping, unrelated to the actual
+  publish) could overwrite a real success with a false `ERROR` outcome.
+  The confirmed path now lives in its own `_publish_confirmed()`, whose
+  pool-release cleanup runs outside its own try/except so it can never
+  clobber an already-computed outcome. On top of that fix: a
+  connection-class error (dead socket, classified via the same tuple
+  `sync/transport.py`'s reconnect loop uses — not a broker-level
+  NACK/return/timeout) now gets a bounded wait (up to 5s) for aio-pika's
+  own `connect_robust()` to restore the connection, then exactly one
+  retry against a fresh channel (the broken one is released back to the
+  pool first, which discards it since it's closed). No recovery within
+  the wait, or a second failure, still returns `ERROR` — `publish()`
+  still never raises. Scoped to the confirmed/pooled path only (the
+  default `confirm_delivery=True` configuration) — the fast
+  (`confirm_delivery=False`) and mandatory paths already have their own
+  channel-reopen-on-demand logic and were left unchanged to keep this
+  change reviewable. Verified against a real broker: killing all
+  connections mid-publish (`rabbitmqctl close_all_connections`) is
+  recovered by exactly one retry, with the message landing on the queue
+  exactly once (no duplicate) — `tests/integration/test_resilience_scenarios.py`.
+
+- **4 new DLQ-triage headers on retry-envelope republishes**:
+  `x-rabbitkit-error-type`, `x-rabbitkit-error-message`,
+  `x-rabbitkit-first-failed-at`, `x-rabbitkit-last-failed-at`
+  (`middleware/retry.py`). Previously, why a message ended up on the DLQ
+  was knowable only from application logs, which may have long since
+  rotated out by the time anyone looks. `error-type`/`error-message`
+  describe the triggering exception (message length-capped at 512 chars
+  so a huge `str(exc)` can't bloat every retry republish);
+  `first-failed-at` is set once and preserved across every subsequent
+  retry hop (same pattern as the existing `x-rabbitkit-original-*`
+  headers); `last-failed-at` is overwritten on every retry. Pure,
+  backward-compatible addition — existing headers are unchanged.
+  Deliberately does NOT add `x-rabbitkit-trace-id`: rabbitkit already has
+  correct, standards-based distributed tracing (OTel W3C
+  `traceparent`/`tracestate` propagated over AMQP headers), and a
+  parallel custom trace-id header would be a redundant, non-standard
+  second mechanism. Scoped to the retry-envelope path only — a message
+  that hits a PERMANENT error on its very first attempt (never routed
+  through a delay queue) does not get these headers; only messages that
+  pass through at least one retry hop before exhausting/dead-lettering
+  do. Verified against a real broker: a message exhausting 2 retries
+  arrived at its DLQ carrying all 4 headers (`error-type=OSError`,
+  `first-failed-at` < `last-failed-at`), with no `x-rabbitkit-trace-id`.
+
+- **Auto-populated AMQP `client_properties`** — both transports now always
+  identify the connection as `library=rabbitkit` + `library_version=<installed
+  version>`, visible in the management UI's Connections tab, regardless of
+  whether `connection_name` is set. Previously `client_properties` was only
+  ever set (non-`None`) when `connection_name` was provided, so an
+  unnamed connection carried zero rabbitkit identification. Also adds
+  `ConnectionConfig.client_properties: dict[str, str]` — an escape hatch
+  for extra caller-supplied properties (e.g. `service_name`/`environment`/
+  `pod_name`), additive on top of rabbitkit's own identification.
+  Validated strings-only and length-capped (256 chars/value) — an AMQP
+  field-table value could otherwise smuggle an arbitrary type through, or
+  a runaway value could bloat every connection's handshake frame.
+  **Security note** (also on the field's own docstring): every key/value
+  here is visible in PLAINTEXT to anyone with management-UI/API read
+  access — never put secrets, credentials, or tenant-identifying PII here.
+  Both pika and aiormq *merge* the caller-supplied dict into their own base
+  properties (product/platform/capabilities/version) rather than replacing
+  them wholesale, so this can never clobber either library's own
+  identification or capability flags (`authentication_failure_close`,
+  `connection.blocked`, etc.) — key names deliberately avoid
+  `product`/`version`/`platform`/`capabilities`/`information` to not
+  collide with those. Verified against a real broker: the management
+  API's `/api/connections` endpoint showed `library`, `library_version`,
+  and caller-supplied `service_name`/`environment` alongside pika's own
+  unmodified `product`/`capabilities`.
+
+### Testing
+
+- **Channel-count-stability regression guard** — a real-broker test
+  publishing 50 messages through the confirmed (pooled-channel) path now
+  asserts `channels_opened_total` stays bounded near the configured pool
+  size, not growing with publish count — would have caught a channel-pool
+  leak (e.g. a `release()` bug that never returns a channel to the pool)
+  automatically in CI (`tests/integration/test_resilience_scenarios.py`).
+- **Reconnect-jitter-spread verification** — H-SRE3's full-jitter backoff
+  claim (spreads reconnect attempts across a fleet instead of thundering-
+  herding) was previously only a code comment. New unit tests drive the
+  sync transport's actual backoff loop against a deterministic connect()
+  failure and assert the recorded sleep durations vary (not a single
+  lockstep value) and never exceed the current exponential ceiling
+  (`tests/unit/sync/test_transport.py`).
+
+### Documentation
+
+- **`docs/observability.md`** — a dedicated reference page listing every
+  metric rabbitkit actually emits (name, type, labels, meaning, and which
+  component emits it), covering consume-side, publish-side, connection/
+  channel-churn, retry/DLQ/dedup/rate-limit counters, and
+  `QueueMetricsPoller`'s queue-depth gauges. Also calls out, by name, the
+  `MetricsConfig` properties that are defined but not wired to any
+  emission point (`publish_total`, `publish_failures_total`,
+  `publish_confirm_latency_seconds`, `in_flight_messages`,
+  `worker_pool_pending`, `broker_connected`, `consumer_active`) — exactly
+  the kind of naming confusion a dedicated reference page prevents.
+  Written after the label fix and the new channel-churn counters landed
+  above, so it documents the corrected/expanded metric set, not the
+  previous mislabeled one. Linked from `docs/production/checklist.md`
+  (replacing a vague "check MetricsMiddleware's docs" pointer) and
+  `docs/guide/full-guide.md`.
+
+- **Small doc tightenings**: `docs/production/scale.md`'s heartbeat
+  section now explicitly warns against both extremes — too low
+  (`heartbeat=10`, spurious reconnects on transient noise) and too high
+  (`heartbeat=600`, which hides a wedged single-worker consumer from both
+  the broker's dead-peer timeout *and* rabbitkit's own liveness staleness
+  check simultaneously). `docs/guide/full-guide.md`'s Topology section
+  gained a note that `declare_queue`/`declare_exchange` have no dedicated
+  timeout (only the connection-level one, transitively) plus a warning
+  against dynamically declaring a queue per request/session/tenant (each
+  is a permanent broker object and a permanent new metric time series).
+  `docs/concurrency-model.md` gained a short "why there's no
+  `threading.Lock`/`asyncio.Lock` around reconnection" explainer for both
+  transports, preempting the question for a future reviewer — the
+  owner-thread-identity check (sync) and aio-pika's own `connect_robust()`
+  (async) are each strictly better than a lock would be, not just an
+  equivalent with extra ceremony.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

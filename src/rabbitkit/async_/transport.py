@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from rabbitkit.async_.connection import get_connection_errors
 from rabbitkit.async_.pool import AsyncConnectionPool
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 from rabbitkit.core.errors import ConfigurationError
@@ -35,6 +37,21 @@ from rabbitkit.core.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Item 6: how long publish() waits for aio-pika's own connect_robust() to
+# restore the connection before giving up on the retry-once (rather than
+# retrying immediately against a connection that is still down).
+_PUBLISH_RECOVERY_WAIT_SECONDS = 5.0
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """True if *exc* looks like a dead connection/channel, not a message- or
+    broker-decision-level failure (item 6). Reuses the same tuple
+    ``sync/transport.py``'s reconnect loop classifies against — unlike
+    ``core/pipeline.py``'s ``_is_channel_gone`` (name-matched, since core/
+    cannot import aio-pika), this file already depends on aio-pika directly.
+    """
+    return isinstance(exc, get_connection_errors())
 
 
 class AsyncTransportImpl:
@@ -73,6 +90,8 @@ class AsyncTransportImpl:
             self._security_config,
             self._pool_config,
             publisher_confirms=self._confirm_delivery,
+            on_channel_opened=self._fire_channel_opened,
+            on_channel_rebuilt=self._fire_channel_rebuilt,
         )
         self._connected = False
 
@@ -124,6 +143,16 @@ class AsyncTransportImpl:
         # aio-pika's RobustConnection.reconnect_callbacks.
         self._reconnect_callbacks: list[Callable[[], None]] = []
 
+        # Channel-lifecycle signal (item 3), mirroring SyncTransport:
+        # channels_opened_total counts every new channel THIS transport
+        # explicitly creates (aio-pika restores the topology/consumer
+        # channels it owns transparently on reconnect -- those restores are
+        # invisible here by design, see the module docstring). rebuilt is the
+        # subset that replaces a channel lost to a 406 topology conflict or a
+        # mandatory/fast-channel recycle.
+        self._channel_opened_callbacks: list[Callable[[], None]] = []
+        self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
+
         # L15: passive blocked-state tracking, independent of whether a
         # FlowController is registered above -- health.broker_health_check
         # reads this (via the is_blocked property) so a broker/disk/memory
@@ -136,6 +165,32 @@ class AsyncTransportImpl:
         counted, so a flapping broker/network was invisible to metrics
         alerting."""
         self._reconnect_callbacks.append(callback)
+
+    def on_channel_opened(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired every time this transport creates a new
+        channel (channels_opened_total metric hook)."""
+        self._channel_opened_callbacks.append(callback)
+
+    def on_channel_rebuilt(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired when a channel is created to REPLACE
+        one lost to a 406 topology conflict or a mandatory/fast-channel
+        recycle (channel_rebuilds_total metric hook) — a subset of
+        :meth:`on_channel_opened`."""
+        self._channel_rebuilt_callbacks.append(callback)
+
+    def _fire_channel_opened(self) -> None:
+        for cb in list(self._channel_opened_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never break the event loop
+                logger.exception("channel_opened callback raised")
+
+    def _fire_channel_rebuilt(self) -> None:
+        for cb in list(self._channel_rebuilt_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never break the event loop
+                logger.exception("channel_rebuilt callback raised")
 
     def _aio_reconnected(self, *_args: Any) -> None:
         for cb in list(self._reconnect_callbacks):
@@ -290,6 +345,7 @@ class AsyncTransportImpl:
         # Open topology channel on consumer connection
         consumer_conn = await self._conn_pool.get_consumer_connection()
         self._topology_channel = await consumer_conn.channel()
+        self._fire_channel_opened()
 
         self._connected = True
         logger.info(
@@ -408,6 +464,27 @@ class AsyncTransportImpl:
             pass
         return False
 
+    async def _wait_for_recovery(self, timeout: float = _PUBLISH_RECOVERY_WAIT_SECONDS) -> bool:
+        """Bounded wait for aio-pika's own ``connect_robust()`` to restore the
+        publisher connection after a connection-class publish error (item 6).
+
+        aio-pika owns reconnection entirely here -- this only OBSERVES it via
+        :meth:`is_connected`, which re-checks the live connection's
+        ``is_closed`` flag on every call. ``self._connected`` itself is NOT a
+        usable recovery signal: it is set once at the first successful
+        ``connect()`` and never flipped by connect_robust's background
+        recovery, so ``_ensure_connected()`` alone can't detect a mid-flight
+        reconnect the way the sync transport's ``_ensure_connected()`` does.
+        Polls rather than awaiting a callback since aio-pika exposes no
+        awaitable "reconnected" event.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_connected():
+                return True
+            await asyncio.sleep(0.1)
+        return self.is_connected()
+
     async def _ensure_connected(self) -> None:
         """Ensure connection is established."""
         if self._connected:
@@ -431,7 +508,11 @@ class AsyncTransportImpl:
             conn = self._conn_pool._publisher_connection
             if conn is None:
                 raise RuntimeError("Publisher connection is not available")
+            is_rebuild = ch is not None  # replacing a channel found closed above
             self._fast_publish_channel = await conn.channel(publisher_confirms=False)
+            self._fire_channel_opened()
+            if is_rebuild:
+                self._fire_channel_rebuilt()
             return self._fast_publish_channel
 
     async def _get_mandatory_channel(self) -> Any:
@@ -457,9 +538,13 @@ class AsyncTransportImpl:
             conn = self._conn_pool._publisher_connection
             if conn is None:
                 raise RuntimeError("Publisher connection is not available")
+            is_rebuild = ch is not None  # replacing a closed/recycled channel
             self._mandatory_publish_channel = await conn.channel(
                 publisher_confirms=True, on_return_raises=True
             )
+            self._fire_channel_opened()
+            if is_rebuild:
+                self._fire_channel_rebuilt()
             return self._mandatory_publish_channel
 
     def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
@@ -585,6 +670,10 @@ class AsyncTransportImpl:
         from :meth:`_get_mandatory_channel`, regardless of ``confirm_delivery``
         — see that method's docstring for why neither the fast nor the regular
         pool channel can reliably report an unroutable ``Basic.Return``.
+
+        The confirmed (pooled-channel) path is handled by
+        :meth:`_publish_confirmed`, OUTSIDE this method's own try/except
+        (item 6) — see that method's docstring for why.
         """
         try:
             if not self._connected:
@@ -646,22 +735,6 @@ class AsyncTransportImpl:
                     routing_key=envelope.routing_key,
                 )
 
-            # Confirmed path: pool channel per publish so each confirm is isolated
-            channel = await self._conn_pool.acquire_publisher_channel()
-            try:
-                outcome = await self._publish_on_channel(channel, envelope)
-                # M17: close a timed-out channel before returning it to the pool
-                # so the pool doesn't hand out a possibly-wedged channel next.
-                # This channel is exclusively ours for this single publish (not
-                # shared concurrently), so closing here — after our own call has
-                # fully resolved — is safe.
-                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
-                    with contextlib.suppress(Exception):
-                        await channel.close()
-                return outcome
-            finally:
-                await self._conn_pool.release_publisher_channel(channel)
-
         except Exception as e:
             logger.error("Async publish failed: %s", e)
             return PublishOutcome(
@@ -670,6 +743,75 @@ class AsyncTransportImpl:
                 routing_key=envelope.routing_key,
                 error=e,
             )
+
+        return await self._publish_confirmed(envelope)
+
+    async def _publish_confirmed(self, envelope: MessageEnvelope) -> PublishOutcome:
+        """Confirmed (pooled-channel) publish path — pool channel per publish
+        so each confirm is isolated. Item 6:
+
+        1. The pool-release cleanup (``finally: release_publisher_channel``)
+           runs OUTSIDE this method's own try/except, so a release-time
+           failure (pool bookkeeping) can never overwrite a real outcome
+           already computed. Previously a single ``try/except Exception``
+           wrapped both the publish AND the release cleanup, so ANY
+           exception from the release step — unrelated to the actual
+           publish — masked a successful confirm as ``PublishStatus.ERROR``.
+        2. A connection-class error (dead socket, not a broker-level
+           NACK/return/timeout) gets one bounded-wait-then-retry: wait up to
+           ``_PUBLISH_RECOVERY_WAIT_SECONDS`` for aio-pika's own
+           ``connect_robust()`` to restore the connection
+           (:meth:`_wait_for_recovery`), then retry exactly once against a
+           fresh channel (the broken one is released back to the pool first,
+           which discards it since it's closed). No wait/recovery, or a
+           second failure, returns ERROR — never raises.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            channel = None
+            try:
+                channel = await self._conn_pool.acquire_publisher_channel()
+                outcome = await self._publish_on_channel(channel, envelope)
+            except Exception as e:
+                last_exc = e
+                if channel is not None:
+                    with contextlib.suppress(Exception):
+                        await self._conn_pool.release_publisher_channel(channel)
+                if attempt == 0 and _is_connection_error(e) and await self._wait_for_recovery():
+                    logger.warning(
+                        "Publish hit a connection error, retrying once after recovery: "
+                        "exchange=%s routing_key=%s",
+                        envelope.exchange,
+                        envelope.routing_key,
+                    )
+                    continue
+                logger.error("Async publish failed: %s", e)
+                return PublishOutcome(
+                    status=PublishStatus.ERROR,
+                    exchange=envelope.exchange,
+                    routing_key=envelope.routing_key,
+                    error=e,
+                )
+            else:
+                # M17: close a timed-out channel before returning it to the pool
+                # so the pool doesn't hand out a possibly-wedged channel next.
+                # This channel is exclusively ours for this single publish (not
+                # shared concurrently), so closing here — after our own call has
+                # fully resolved — is safe.
+                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
+                    with contextlib.suppress(Exception):
+                        await channel.close()
+                with contextlib.suppress(Exception):
+                    await self._conn_pool.release_publisher_channel(channel)
+                return outcome
+
+        return PublishOutcome(  # pragma: no cover — defensive; the loop always returns above
+            status=PublishStatus.ERROR,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+            error=last_exc,
+        )
+
     async def consume(
         self,
         queue: str,
@@ -711,6 +853,7 @@ class AsyncTransportImpl:
         # Dedicated channel per consumer queue for isolated QoS
         consumer_conn = await self._conn_pool.get_consumer_connection()
         channel = await consumer_conn.channel()
+        self._fire_channel_opened()
         await channel.set_qos(prefetch_count=prefetch)
         self._consumer_channels[queue] = channel
 
@@ -814,6 +957,8 @@ class AsyncTransportImpl:
         if self._on_topology_conflict == "warn_continue":
             consumer_conn = await self._conn_pool.get_consumer_connection()
             self._topology_channel = await consumer_conn.channel()
+            self._fire_channel_opened()
+            self._fire_channel_rebuilt()  # replacing a channel the broker just closed
             logger.warning(
                 "Topology drift on %s %r (broker: %s); on_topology_conflict='warn_continue' "
                 "— continuing with the EXISTING definition (rabbitkit's declaration was NOT "

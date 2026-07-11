@@ -18,6 +18,9 @@ from rabbitkit.core.types import ErrorSeverity, TopologyMode
 
 # ── Connection ─────────────────────────────────────────────────────────────
 
+# Item 8: max length for a single ConnectionConfig.client_properties value.
+_CLIENT_PROPERTY_VALUE_MAX_LEN = 256
+
 
 def _masked_repr(obj: object, *, secret_fields: tuple[str, ...] = ("password",)) -> str:
     """L2: generic ``__repr__`` for a config dataclass that masks *secret_fields*.
@@ -54,6 +57,17 @@ class ConnectionConfig:
     connection_name: str | None = None
     reconnect_backoff_base: float = 1.0
     reconnect_backoff_max: float = 30.0
+    # Bound on the SYNC transport's reconnect loop only (H-SRE4: never retry
+    # forever). Previously hardcoded (30 attempts) and unreachable from
+    # config -- the transport constructor accepted no override and
+    # RabbitConfig had no path to it at all. Async's *ongoing* reconnect
+    # (after the first successful connect) is deliberately NOT bounded here:
+    # it is owned entirely by aio-pika's connect_robust, which retries
+    # indefinitely with a jittered interval -- the correct pattern for a
+    # long-running consumer (let Kubernetes/the supervisor decide whether to
+    # kill a wedged pod via liveness, rather than have the client give up on
+    # its own). See docs/concurrency-model.md for the full reasoning.
+    reconnect_max_attempts: int = 30
     # M13: credential rotation. When set, called at each (re)connect to fetch
     # fresh (username, password) — e.g. from Vault/short-lived secrets — so a
     # rotated credential is picked up on the next reconnect WITHOUT a redeploy
@@ -67,6 +81,19 @@ class ConnectionConfig:
     # initial connect (connect_robust then pins to the chosen node — put a
     # load balancer / DNS round-robin in front for per-reconnect failover).
     nodes: tuple[str, ...] = ()
+    # Item 8: escape-hatch for extra AMQP client_properties, shown in the
+    # management UI's Connections tab alongside connection_name -- e.g.
+    # service_name/environment/pod_name for fleet-wide "which pod owns this
+    # connection" triage. rabbitkit ALWAYS adds its own library/
+    # library_version identification regardless of this field; these are
+    # purely additive on top (see sync/connection.py, async_/connection.py).
+    #
+    # SECURITY: every key/value here is visible in PLAINTEXT to anyone with
+    # RabbitMQ management-UI/API read access -- there is no additional authn
+    # on top of that. Never put secrets, credentials, or tenant-identifying
+    # PII here; service_name/environment/pod_name/region are fine, customer
+    # IDs or API keys are not.
+    client_properties: dict[str, str] = field(default_factory=dict)
 
     def resolve_credentials(self) -> tuple[str, str]:
         """Return ``(username, password)`` — from ``credentials_provider`` if
@@ -137,6 +164,28 @@ class ConnectionConfig:
                 raise ConfigValidationError(
                     f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; "
                     "use 'host' or 'host:port'."
+                )
+        if self.reconnect_max_attempts < 1:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_max_attempts must be >= 1, got "
+                f"{self.reconnect_max_attempts} (this bounds the sync transport's "
+                "reconnect loop only -- see the field docstring)."
+            )
+        # Item 8: basic validation for the client_properties escape hatch --
+        # strings only (AMQP field-table values could otherwise smuggle
+        # arbitrary types through to the broker), length-capped so a runaway
+        # value can't bloat every connection's handshake frame.
+        for key, cp_value in self.client_properties.items():
+            if not isinstance(key, str) or not isinstance(cp_value, str):
+                raise ConfigValidationError(
+                    f"ConnectionConfig.client_properties keys and values must be "
+                    f"strings, got {key!r}={cp_value!r}."
+                )
+            if len(cp_value) > _CLIENT_PROPERTY_VALUE_MAX_LEN:
+                raise ConfigValidationError(
+                    f"ConnectionConfig.client_properties[{key!r}] is "
+                    f"{len(cp_value)} chars, exceeding the "
+                    f"{_CLIENT_PROPERTY_VALUE_MAX_LEN}-char limit."
                 )
 
     @classmethod
@@ -535,6 +584,28 @@ class MetricsConfig:
         previously logged but never counted, so a flapping broker/network
         was invisible to metrics-based alerting."""
         return f"{self.namespace}_reconnects_total"
+
+    @property
+    def channels_opened_total(self) -> str:
+        """Incremented every time either transport actually creates a new
+        low-level channel — the publisher/topology channel, a per-queue
+        consumer channel, an async channel-pool slot, or a dedicated
+        fast/mandatory/reply-to channel. A steady climb with no matching
+        traffic growth signals a channel leak (a "cache" of channels that
+        never shrinks) — previously invisible, since only the connection
+        churn (``reconnects_total``) was counted."""
+        return f"{self.namespace}_channels_opened_total"
+
+    @property
+    def channel_rebuilds_total(self) -> str:
+        """Incremented when a channel is created to REPLACE one that died —
+        a reconnect-driven per-queue consumer channel recreate (sync), a
+        406-drift publisher channel reopen (sync), or a mandatory/fast
+        channel recycle after a timeout or closed-channel discovery (async).
+        Unlike ``channels_opened_total`` (every creation, including ordinary
+        pool growth and first-ever opens), this isolates the subset that
+        indicates something upstream actually failed."""
+        return f"{self.namespace}_channel_rebuilds_total"
 
     @property
     def published_total(self) -> str:

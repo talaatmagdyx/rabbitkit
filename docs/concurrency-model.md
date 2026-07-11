@@ -40,6 +40,22 @@ thread**: publishing, topology declaration, `pump_idle()`, `stop()`.
 pika's `BlockingConnection` is not thread-safe; rabbitkit does not try
 to make it so — it makes the boundary explicit instead.
 
+**Why there's no `threading.Lock` around reconnect.** The obvious-looking
+fix for "don't let two threads reconnect at once" is a lock around the
+reconnect call. rabbitkit deliberately doesn't have one — the sticky
+owner-thread-identity check inside `_ensure_connected()` is strictly
+*stronger*: a non-owner thread reaching a dead connection gets a clean,
+immediate `ConnectionError` (reconnection is the owner thread's job,
+period), rather than blocking on a lock only to then either reconnect
+redundantly or touch a connection object it doesn't own. A lock would
+also invite a second bug class a pure identity check can't have: a
+non-owner thread that queues up on the lock, waits through a slow
+reconnect, and then proceeds to use the (still not thread-safe)
+`BlockingConnection` from the wrong thread once the lock releases — the
+identity check forecloses that path entirely instead of just
+serializing it. If you're reviewing this code expecting a lock here,
+this is why one was deliberately not added.
+
 ### Handlers and settlement
 
 - Default (`worker_count=1`): handlers run **inline on the I/O thread**.
@@ -101,6 +117,15 @@ Two places work intentionally leaves the loop:
 - **`AsyncWorkerPool`** is tasks, not threads — it bounds *concurrency*,
   not CPU parallelism. CPU-heavy handlers need `to_thread`/process pools
   of your own.
+
+**Why there's no `asyncio.Lock` around reconnection either.**
+`AsyncConnectionPool` does hold an `asyncio.Lock`, but it scopes to
+guarding *first-time* connection creation only (so two concurrent
+callers racing to establish the initial connection don't each create
+one). Ongoing reconnection — after that first connect — is owned
+entirely by aio-pika's own `connect_robust()` machinery internally; a
+rabbitkit-level lock wrapped around a process rabbitkit doesn't control
+would serialize nothing real and just add latency for no safety gain.
 
 ## Health checks and probes
 

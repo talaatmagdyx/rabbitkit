@@ -59,6 +59,22 @@ _CHANNEL_GONE_NAMES = frozenset(
 )
 
 
+def _retry_count_from_headers(message: RabbitMessage) -> int:
+    """Read ``x-rabbitkit-retry-count`` for the debug-log context (item 4).
+
+    Defaults to 0 when absent. No config-driven clamping here (unlike
+    ``RetryMiddleware._get_retry_count``, which bounds it against
+    ``max_retries`` for retry-routing decisions) — this is a read-only
+    observability value, not something a decision is made from, so a
+    tolerant best-effort parse is enough.
+    """
+    raw = message.headers.get("x-rabbitkit-retry-count")
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_channel_gone(exc: BaseException) -> bool:
     """True if *exc* (or its cause chain) is a transport channel/connection-death error."""
     seen: set[int] = set()
@@ -558,6 +574,8 @@ class HandlerPipeline:
                 routing_key=message.routing_key,
                 queue=route.queue.name,
                 handler=getattr(route.handler, "__qualname__", repr(route.handler)),
+                correlation_id=message.correlation_id,
+                retry_count=_retry_count_from_headers(message),
             )
 
         try:
@@ -635,6 +653,8 @@ class HandlerPipeline:
                 routing_key=message.routing_key,
                 queue=route.queue.name,
                 handler=getattr(route.handler, "__qualname__", repr(route.handler)),
+                correlation_id=message.correlation_id,
+                retry_count=_retry_count_from_headers(message),
             )
 
         try:

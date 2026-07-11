@@ -229,7 +229,33 @@ class TestMakeAioPikaConnectKwargs:
         assert "client_properties" in kwargs
         assert kwargs["client_properties"]["connection_name"] == "my-service"
 
+    def test_escape_hatch_properties_merged(self) -> None:
+        """Item 8: ConnectionConfig.client_properties is additive on top of
+        rabbitkit's own library/library_version identification."""
+        try:
+            import aio_pika  # noqa: F401
+        except ImportError:
+            pytest.skip("aio-pika not installed")
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(
+            connection_name="my-service",
+            client_properties={"service_name": "orders-worker", "environment": "prod"},
+        )
+        sec = SecurityConfig()
+
+        kwargs = make_aio_pika_connect_kwargs(conn, sec)
+
+        assert kwargs["client_properties"]["library"] == "rabbitkit"
+        assert kwargs["client_properties"]["connection_name"] == "my-service"
+        assert kwargs["client_properties"]["service_name"] == "orders-worker"
+        assert kwargs["client_properties"]["environment"] == "prod"
+
     def test_without_connection_name(self) -> None:
+        """Item 8: client_properties is now ALWAYS present (rabbitkit
+        identifies itself via library/library_version) even with no
+        connection_name and no escape-hatch properties set."""
         try:
             import aio_pika  # noqa: F401
         except ImportError:
@@ -242,7 +268,10 @@ class TestMakeAioPikaConnectKwargs:
 
         kwargs = make_aio_pika_connect_kwargs(conn, sec)
 
-        assert "client_properties" not in kwargs
+        assert "client_properties" in kwargs
+        assert "connection_name" not in kwargs["client_properties"]
+        assert kwargs["client_properties"]["library"] == "rabbitkit"
+        assert kwargs["client_properties"]["library_version"]
 
     def test_with_ssl(self) -> None:
         """SSL options are applied when enabled."""

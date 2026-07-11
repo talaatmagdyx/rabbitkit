@@ -2313,6 +2313,50 @@ class TestWireReconnectMetricAsync:
         broker._wire_reconnect_metric()  # must not raise
 
 
+class TestWireChannelMetricsAsync:
+    """Async mirror of the sync TestWireChannelMetrics -- item 3's
+    channels_opened_total/channel_rebuilds_total wiring."""
+
+    def test_registers_channel_callbacks_when_metrics_middleware_present(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_called_once()
+        broker._transport.on_channel_rebuilt.assert_called_once()
+
+        opened_cb = broker._transport.on_channel_opened.call_args.args[0]
+        rebuilt_cb = broker._transport.on_channel_rebuilt.call_args.args[0]
+        opened_cb()
+        rebuilt_cb()
+
+        assert collector.inc_counter.call_count == 2
+        names = {call.args[0] for call in collector.inc_counter.call_args_list}
+        assert any(name.endswith("_channels_opened_total") for name in names)
+        assert any(name.endswith("_channel_rebuilds_total") for name in names)
+
+    def test_noop_without_metrics_middleware(self) -> None:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_not_called()
+        broker._transport.on_channel_rebuilt.assert_not_called()
+
+
 class TestFlowControlledInternalPublishAsync:
     """M18 async mirror — see the sync test class docstring for rationale."""
 

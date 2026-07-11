@@ -55,11 +55,11 @@ copy-paste reference code with the reasoning inline, see
 
 ## Observability
 
-- [ ] Scrape the emitted metrics (ack/nack/reject/retry/dead-letter counters, handler duration/errors). Don't build alerts on a metric name that isn't actually emitted — check `MetricsMiddleware`'s docs for the current list.
+- [ ] Scrape the emitted metrics (ack/nack/reject/retry/dead-letter counters, handler duration/errors). Don't build alerts on a metric name that isn't actually emitted — see [`docs/observability.md`](../observability.md) for the exact, current list (a few `MetricsConfig` properties are defined but not wired to any emission point).
 - [ ] **Wire `QueueMetricsPoller`** (bridges the management API into your `MetricsCollector`) — queue depth and consumer lag are the #1 RabbitMQ incident signal, and the consume/publish counters cannot see them. Without it, "DLQ depth > 0" below has no metric to alert on.
-- [ ] Alert on rising `rabbitkit_messages_redelivered_total` (handlers dying/timing out before acking — crash loops, heartbeat kills) and `rabbitkit_reconnects_total` (flapping broker/network) — both invisible in the success/error counters.
+- [ ] Alert on rising `rabbitkit_messages_redelivered_total` (handlers dying/timing out before acking — crash loops, heartbeat kills), `rabbitkit_reconnects_total` (flapping broker/network), and `rabbitkit_channel_rebuilds_total` (channel churn from reconnects/topology drift) — all invisible in the success/error counters.
 - [ ] Avoid raw routing keys as metric labels if your routing keys embed IDs or tenant names — that's unbounded cardinality. Use the bound queue name or a static route pattern instead.
-- [ ] Alert on: DLQ depth > 0, sustained retry rate, publish-confirm failures, consumer-active count == 0, connection blocked, worker-pool backlog.
+- [ ] Alert on: DLQ depth > 0 (`rabbitkit_queue_messages_ready` on the `.dlq` queue), sustained `rabbitkit_messages_retried_total`/`rabbitkit_messages_dead_lettered_total`, `rabbitkit_queue_consumers == 0`, connection blocked (`broker_readiness`), and rising `rabbitkit_channels_opened_total` with no matching traffic growth (channel leak).
 - [ ] Structured logging: `LoggingConfig.redact_keys` is on by default and redacts credential-shaped fields in *your own* log calls, not just rabbitkit's internal ones (which never log bodies/headers to begin with). Don't disable it without a reason.
 
 ## Security

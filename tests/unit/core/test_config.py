@@ -42,6 +42,7 @@ class TestConnectionConfig:
         assert config.connection_name is None
         assert config.reconnect_backoff_base == 1.0
         assert config.reconnect_backoff_max == 30.0
+        assert config.reconnect_max_attempts == 30
 
     def test_url_property(self) -> None:
         config = ConnectionConfig(host="rabbit.local", port=5673, username="app", password="secret", vhost="prod")
@@ -178,6 +179,57 @@ class TestConnectionConfig:
             warnings.simplefilter("error", RuntimeWarning)
             config = ConnectionConfig.from_url("amqp://guest:guest@host/")
         assert config.port == 5672
+
+
+class TestReconnectMaxAttempts:
+    """Production-hardening checklist item 2: reconnect_max_attempts was
+    previously hardcoded on SyncTransport (30) and unreachable from
+    RabbitConfig at all -- see sync/broker.py's wiring."""
+
+    def test_default_is_30(self) -> None:
+        assert ConnectionConfig().reconnect_max_attempts == 30
+
+    def test_custom_value_accepted(self) -> None:
+        assert ConnectionConfig(reconnect_max_attempts=5).reconnect_max_attempts == 5
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_max_attempts must be >= 1"):
+            ConnectionConfig(reconnect_max_attempts=0)
+
+    def test_negative_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_max_attempts must be >= 1"):
+            ConnectionConfig(reconnect_max_attempts=-1)
+
+
+class TestClientProperties:
+    """Production-hardening checklist item 8: an escape hatch for extra AMQP
+    client_properties (service_name/environment/pod_name etc.), validated
+    strings-only and length-capped -- these are visible in plaintext to any
+    management-API reader, so no secrets/tenant-identifying data belongs
+    here (docstring warning on the field itself)."""
+
+    def test_default_is_empty(self) -> None:
+        assert ConnectionConfig().client_properties == {}
+
+    def test_custom_value_accepted(self) -> None:
+        config = ConnectionConfig(client_properties={"service_name": "orders-worker", "environment": "prod"})
+        assert config.client_properties == {"service_name": "orders-worker", "environment": "prod"}
+
+    def test_non_string_value_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be strings"):
+            ConnectionConfig(client_properties={"pod_name": 123})  # type: ignore[dict-item]
+
+    def test_non_string_key_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be strings"):
+            ConnectionConfig(client_properties={42: "x"})  # type: ignore[dict-item]
+
+    def test_value_too_long_rejected(self) -> None:
+        with pytest.raises(ValueError, match="exceeding"):
+            ConnectionConfig(client_properties={"pod_name": "x" * 300})
+
+    def test_value_at_limit_accepted(self) -> None:
+        config = ConnectionConfig(client_properties={"pod_name": "x" * 256})
+        assert len(config.client_properties["pod_name"]) == 256
 
 
 class TestConsumerConfigM6:
@@ -594,6 +646,22 @@ class TestMetricsConfigProperties:
     def test_messages_dead_lettered_total(self) -> None:
         cfg = MetricsConfig()
         assert cfg.messages_dead_lettered_total == "rabbitkit_messages_dead_lettered_total"
+
+    def test_channels_opened_total(self) -> None:
+        cfg = MetricsConfig()
+        assert cfg.channels_opened_total == "rabbitkit_channels_opened_total"
+
+    def test_channel_rebuilds_total(self) -> None:
+        cfg = MetricsConfig()
+        assert cfg.channel_rebuilds_total == "rabbitkit_channel_rebuilds_total"
+
+    def test_channels_opened_total_custom_namespace(self) -> None:
+        cfg = MetricsConfig(namespace="myapp")
+        assert cfg.channels_opened_total == "myapp_channels_opened_total"
+
+    def test_channel_rebuilds_total_custom_namespace(self) -> None:
+        cfg = MetricsConfig(namespace="myapp")
+        assert cfg.channel_rebuilds_total == "myapp_channel_rebuilds_total"
 
     def test_publish_total_default(self) -> None:
         cfg = MetricsConfig()

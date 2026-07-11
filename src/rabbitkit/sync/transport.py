@@ -112,6 +112,11 @@ class SyncTransport:
         # so per-queue basic_qos does not overwrite other consumers and fair
         # dispatch is preserved. The publisher/topology channel stays separate.
         self._consumer_channels: dict[str, Any] = {}
+        # Queues ever passed to consume() (item 3) — unlike _consumer_channels,
+        # NOT cleared by disconnect(), so a queue seen here already means this
+        # consume() call is recreating a channel after _recover_consumers()'s
+        # reconnect + re-subscribe, not a first-ever open.
+        self._queues_ever_consumed: set[str] = set()
 
         # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
         # consume(declare=False), cleared on cancel/disconnect). RabbitMQ's
@@ -149,8 +154,10 @@ class SyncTransport:
         # a heartbeat update when a message was actually delivered).
         self._io_tick_callbacks: list[Callable[[], None]] = []
 
-        # Reconnect bound (H-SRE4): never retry forever. Hardcoded sane default;
-        # the broker may override via attribute if desired.
+        # Reconnect bound (H-SRE4): never retry forever. Sane default;
+        # SyncBroker overrides this from ConnectionConfig.reconnect_max_attempts
+        # right after construction, so 0 (== use the fallback below) only
+        # applies when this transport is built directly, bypassing the broker.
         self.max_reconnect_attempts: int = 0  # 0 == use the time-bounded default below
         self._reconnect_total_timeout: float = 300.0
 
@@ -159,6 +166,13 @@ class SyncTransport:
         # Fired on every successful connect() AFTER the first (see connect()).
         self._reconnect_callbacks: list[Callable[[], None]] = []
         self._ever_connected = False
+
+        # Channel-lifecycle signal (item 3): channels_opened_total counts
+        # every new channel this transport creates; channel_rebuilds_total
+        # isolates the subset that REPLACES a channel lost to a reconnect or
+        # a broker-side close, as opposed to an ordinary first-ever open.
+        self._channel_opened_callbacks: list[Callable[[], None]] = []
+        self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
 
     def on_reconnect(self, callback: Callable[[], None]) -> None:
         """Register a callback fired on every re-connection after the first
@@ -171,6 +185,31 @@ class SyncTransport:
                 cb()
             except Exception:  # pragma: no cover — never let a cb break connect
                 logger.exception("reconnect callback raised")
+
+    def on_channel_opened(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired every time this transport creates a new
+        channel (channels_opened_total metric hook)."""
+        self._channel_opened_callbacks.append(callback)
+
+    def on_channel_rebuilt(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired when a channel is created to REPLACE
+        one lost to a reconnect or a broker-side close (channel_rebuilds_total
+        metric hook) — a subset of :meth:`on_channel_opened`."""
+        self._channel_rebuilt_callbacks.append(callback)
+
+    def _fire_channel_opened(self) -> None:
+        for cb in list(self._channel_opened_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never let a cb break the caller
+                logger.exception("channel_opened callback raised")
+
+    def _fire_channel_rebuilt(self) -> None:
+        for cb in list(self._channel_rebuilt_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never let a cb break the caller
+                logger.exception("channel_rebuilt callback raised")
 
     def on_blocked(self, callback: Callable[[], None]) -> None:
         """Register a connection-blocked callback (e.g. FlowController.on_blocked)."""
@@ -244,6 +283,12 @@ class SyncTransport:
         self._connection = pika.BlockingConnection(params)
         # Publisher/topology channel (confirm_delivery for publisher confirms).
         self._channel = self._connection.channel()
+        self._fire_channel_opened()
+        if self._ever_connected:
+            # This connect() call is itself a reconnect (see _fire_reconnect
+            # below) — the fresh publisher channel is replacing one lost to
+            # the disconnect, not a first-ever open.
+            self._fire_channel_rebuilt()
         if self._confirm_delivery:
             self._channel.confirm_delivery()
             self._confirmed_channel_ids.add(self._channel_key(self._channel))
@@ -854,7 +899,16 @@ class SyncTransport:
         self._ensure_connected()
 
         # Dedicated channel per consumer queue for isolated QoS / fair dispatch.
+        # A queue seen here before means a previous channel for it is being
+        # replaced — the broker's _recover_consumers() re-subscribes every
+        # route's queue after a reconnect, so this is a rebuild, not a
+        # first-ever open.
+        is_rebuild = queue in self._queues_ever_consumed
+        self._queues_ever_consumed.add(queue)
         consumer_channel = self._connection.channel()
+        self._fire_channel_opened()
+        if is_rebuild:
+            self._fire_channel_rebuilt()
         consumer_channel.basic_qos(prefetch_count=prefetch)
         self._consumer_channels[queue] = consumer_channel
 
@@ -973,6 +1027,8 @@ class SyncTransport:
             # Reopen the broker-closed channel so the rest of topology
             # declaration can proceed on the existing (drifted) entity.
             self._channel = self._connection.channel()
+            self._fire_channel_opened()
+            self._fire_channel_rebuilt()  # replacing a channel the broker just closed
             self._confirmed_channel_ids.discard(self._channel_key(self._channel))
             # Architect review M2: the 406 killed the old publisher channel —
             # the replacement must re-enter confirm mode, or every subsequent

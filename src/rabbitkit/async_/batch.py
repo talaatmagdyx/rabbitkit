@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Capped backoff for resilient channel acquisition (see _acquire_channel). A
+# flush worker retries acquiring a publisher channel across a broker outage
+# instead of dying, so it resumes draining once the connection recovers.
+_ACQUIRE_BACKOFF_INITIAL = 0.05
+_ACQUIRE_BACKOFF_MAX = 5.0
+
 
 class AsyncBatchPublisher:
     """Transparent batch-publish wrapper for AsyncTransportImpl.
@@ -72,6 +78,29 @@ class AsyncBatchPublisher:
             return self._config.flush_workers
         return min(16, max(1, self._config.max_in_flight // self._config.batch_size))
 
+    async def _acquire_channel(self) -> Any:
+        """Acquire a publisher channel, surviving transient connection failures.
+
+        A flush worker must NOT die (nor hang forever) when the broker is
+        briefly unreachable: if it did, nothing would drain ``_pending`` after
+        the connection recovered and every ``publish()`` future would hang (the
+        worker tasks are not supervised/restarted). ``acquire_publisher_channel``
+        now raises rather than hanging when the connection is down (see the
+        channel-creation timeout in ``AsyncChannelPool.acquire``), so here we
+        retry with capped backoff and let only ``CancelledError`` (from
+        ``stop()``) abort the worker.
+        """
+        backoff = _ACQUIRE_BACKOFF_INITIAL
+        while True:
+            try:
+                return await self._transport._conn_pool.acquire_publisher_channel()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # connection down / channel-open timeout — retry
+                logger.warning("Batch flush channel acquire failed (%s); retrying in %.2fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _ACQUIRE_BACKOFF_MAX)
+
     async def start(self) -> None:
         """Start N concurrent flush loops (one per channel slot)."""
         n = self._worker_count()
@@ -109,7 +138,7 @@ class AsyncBatchPublisher:
         channel: Any = None
         batch: list[tuple[MessageEnvelope, asyncio.Future[PublishOutcome]]] = []
         try:
-            channel = await self._transport._conn_pool.acquire_publisher_channel()
+            channel = await self._acquire_channel()
             while True:
                 batch = []
 
@@ -157,7 +186,7 @@ class AsyncBatchPublisher:
                         old, channel = channel, None
                         with contextlib.suppress(Exception):
                             await self._transport._conn_pool.release_publisher_channel(old)
-                        channel = await self._transport._conn_pool.acquire_publisher_channel()
+                        channel = await self._acquire_channel()
                     else:
                         raise  # CancelledError must propagate
                 else:
@@ -167,7 +196,7 @@ class AsyncBatchPublisher:
                         old, channel = channel, None
                         with contextlib.suppress(Exception):
                             await self._transport._conn_pool.release_publisher_channel(old)
-                        channel = await self._transport._conn_pool.acquire_publisher_channel()
+                        channel = await self._acquire_channel()
         except BaseException:
             # Any exception escaping the loop (e.g. CancelledError at pending.get()
             # or straggler wait) — settle any dequeued-but-unresolved futures.

@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counted — the counters track churn from "the broker has finished
   starting" onward, not a from-zero channel census.
 
+- **`correlation_id` and `retry_count` bound into the debug-log structlog
+  context** (`core/pipeline.py`) — the existing debug-gated context
+  (`message_id`/`routing_key`/`queue`/`handler`) omitted both, even
+  though `retry_count` already reached OTel span attributes separately.
+  Both now join the same debug-gated `bind_contextvars()` call in
+  `process_sync`/`process_async` (no change to the existing perf
+  optimization that skips binding entirely outside `DEBUG`).
+  `retry_count` is read from the `x-rabbitkit-retry-count` header,
+  defaulting to 0 when absent — a tolerant, read-only parse for log
+  context, not the config-clamped value `RetryMiddleware` uses for
+  actual retry decisions.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

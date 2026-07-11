@@ -273,6 +273,9 @@ class SyncBroker:
             confirm_timeout=self._config.publisher.confirm_timeout,
             on_topology_conflict=self._config.safety.on_topology_conflict,
         )
+        # Reconnect-attempts bound: previously hardcoded on the transport
+        # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
+        self._transport.max_reconnect_attempts = self._config.connection.reconnect_max_attempts
 
         self._transport.connect()
         self._transport.on_io_tick(self._mark_heartbeat)

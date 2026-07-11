@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on both sync and async paths, plus the fallback and raised-exception
   cases.
 
+### Added
+
+- **`ConnectionConfig.reconnect_max_attempts`** (default `30`) — the sync
+  transport's reconnect-loop bound was previously hardcoded on
+  `SyncTransport` (30 attempts) with no path from `RabbitConfig` at all,
+  even though the transport constructor already accepted an override
+  nobody could reach. `SyncBroker.start()` now wires
+  `ConnectionConfig.reconnect_max_attempts` through to the transport.
+  Validated `>= 1` (raises `ConfigValidationError` otherwise). This bounds
+  only the **sync** transport's reconnect loop; async's ongoing
+  (post-first-connect) reconnect stays deliberately unbounded — it's
+  owned by `aio_pika.connect_robust`'s own indefinite, jittered retry,
+  which is the correct pattern for a long-running consumer (let
+  Kubernetes decide whether to kill a wedged pod via liveness, rather
+  than have the client give up on its own).
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

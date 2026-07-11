@@ -54,6 +54,17 @@ class ConnectionConfig:
     connection_name: str | None = None
     reconnect_backoff_base: float = 1.0
     reconnect_backoff_max: float = 30.0
+    # Bound on the SYNC transport's reconnect loop only (H-SRE4: never retry
+    # forever). Previously hardcoded (30 attempts) and unreachable from
+    # config -- the transport constructor accepted no override and
+    # RabbitConfig had no path to it at all. Async's *ongoing* reconnect
+    # (after the first successful connect) is deliberately NOT bounded here:
+    # it is owned entirely by aio-pika's connect_robust, which retries
+    # indefinitely with a jittered interval -- the correct pattern for a
+    # long-running consumer (let Kubernetes/the supervisor decide whether to
+    # kill a wedged pod via liveness, rather than have the client give up on
+    # its own). See docs/concurrency-model.md for the full reasoning.
+    reconnect_max_attempts: int = 30
     # M13: credential rotation. When set, called at each (re)connect to fetch
     # fresh (username, password) — e.g. from Vault/short-lived secrets — so a
     # rotated credential is picked up on the next reconnect WITHOUT a redeploy
@@ -138,6 +149,12 @@ class ConnectionConfig:
                     f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; "
                     "use 'host' or 'host:port'."
                 )
+        if self.reconnect_max_attempts < 1:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_max_attempts must be >= 1, got "
+                f"{self.reconnect_max_attempts} (this bounds the sync transport's "
+                "reconnect loop only -- see the field docstring)."
+            )
 
     @classmethod
     def from_url(cls, url: str) -> ConnectionConfig:

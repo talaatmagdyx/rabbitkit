@@ -42,6 +42,7 @@ class TestConnectionConfig:
         assert config.connection_name is None
         assert config.reconnect_backoff_base == 1.0
         assert config.reconnect_backoff_max == 30.0
+        assert config.reconnect_max_attempts == 30
 
     def test_url_property(self) -> None:
         config = ConnectionConfig(host="rabbit.local", port=5673, username="app", password="secret", vhost="prod")
@@ -178,6 +179,26 @@ class TestConnectionConfig:
             warnings.simplefilter("error", RuntimeWarning)
             config = ConnectionConfig.from_url("amqp://guest:guest@host/")
         assert config.port == 5672
+
+
+class TestReconnectMaxAttempts:
+    """Production-hardening checklist item 2: reconnect_max_attempts was
+    previously hardcoded on SyncTransport (30) and unreachable from
+    RabbitConfig at all -- see sync/broker.py's wiring."""
+
+    def test_default_is_30(self) -> None:
+        assert ConnectionConfig().reconnect_max_attempts == 30
+
+    def test_custom_value_accepted(self) -> None:
+        assert ConnectionConfig(reconnect_max_attempts=5).reconnect_max_attempts == 5
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_max_attempts must be >= 1"):
+            ConnectionConfig(reconnect_max_attempts=0)
+
+    def test_negative_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_max_attempts must be >= 1"):
+            ConnectionConfig(reconnect_max_attempts=-1)
 
 
 class TestConsumerConfigM6:

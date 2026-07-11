@@ -95,6 +95,49 @@ class TestLifecycle:
                 assert mock_channel.queue_bind.called
                 assert mock_channel.basic_consume.called
 
+    def test_start_wires_reconnect_max_attempts_from_config(self) -> None:
+        """Production-hardening item 2: ConnectionConfig.reconnect_max_attempts
+        (previously hardcoded on the transport, unreachable from config) must
+        reach the transport's max_reconnect_attempts at start()."""
+        from rabbitkit.core.config import ConnectionConfig, RabbitConfig
+
+        broker = SyncBroker(RabbitConfig(connection=ConnectionConfig(reconnect_max_attempts=7)))
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                broker.start()
+
+        assert broker._transport is not None
+        assert broker._transport.max_reconnect_attempts == 7
+
+    def test_start_uses_default_reconnect_max_attempts(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_channel = MagicMock()
+                mock_channel.is_open = True
+                mock_conn.return_value.channel.return_value = mock_channel
+                mock_conn.return_value.is_open = True
+
+                broker.start()
+
+        assert broker._transport is not None
+        assert broker._transport.max_reconnect_attempts == 30
+
     def test_start_idempotent(self) -> None:
         broker = SyncBroker()
 

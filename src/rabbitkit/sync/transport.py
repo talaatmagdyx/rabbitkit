@@ -149,8 +149,10 @@ class SyncTransport:
         # a heartbeat update when a message was actually delivered).
         self._io_tick_callbacks: list[Callable[[], None]] = []
 
-        # Reconnect bound (H-SRE4): never retry forever. Hardcoded sane default;
-        # the broker may override via attribute if desired.
+        # Reconnect bound (H-SRE4): never retry forever. Sane default;
+        # SyncBroker overrides this from ConnectionConfig.reconnect_max_attempts
+        # right after construction, so 0 (== use the fallback below) only
+        # applies when this transport is built directly, bypassing the broker.
         self.max_reconnect_attempts: int = 0  # 0 == use the time-bounded default below
         self._reconnect_total_timeout: float = 300.0
 

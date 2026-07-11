@@ -56,6 +56,7 @@ nav:
       - Patterns (reference code): production/patterns.md
       - Scale & Reliability Handbook: production/scale.md
       - Checklist: production/checklist.md
+      - Observability Reference: observability.md
       - Idempotency Contract: production/idempotency.md
       - Kubernetes: kubernetes.md
       - Troubleshooting: troubleshooting.md

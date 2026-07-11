@@ -180,6 +180,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockstep value) and never exceed the current exponential ceiling
   (`tests/unit/sync/test_transport.py`).
 
+### Documentation
+
+- **`docs/observability.md`** — a dedicated reference page listing every
+  metric rabbitkit actually emits (name, type, labels, meaning, and which
+  component emits it), covering consume-side, publish-side, connection/
+  channel-churn, retry/DLQ/dedup/rate-limit counters, and
+  `QueueMetricsPoller`'s queue-depth gauges. Also calls out, by name, the
+  `MetricsConfig` properties that are defined but not wired to any
+  emission point (`publish_total`, `publish_failures_total`,
+  `publish_confirm_latency_seconds`, `in_flight_messages`,
+  `worker_pool_pending`, `broker_connected`, `consumer_active`) — exactly
+  the kind of naming confusion a dedicated reference page prevents.
+  Written after the label fix and the new channel-churn counters landed
+  above, so it documents the corrected/expanded metric set, not the
+  previous mislabeled one. Linked from `docs/production/checklist.md`
+  (replacing a vague "check MetricsMiddleware's docs" pointer) and
+  `docs/guide/full-guide.md`.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

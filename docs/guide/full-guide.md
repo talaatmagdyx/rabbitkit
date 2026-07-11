@@ -630,7 +630,10 @@ and, when a `RetryMiddleware` is also on the route,
 on every consume-side metric is the BOUND queue name, not the raw routing
 key — a topic/`Path()` routing key can embed an unbounded per-message value
 (tenant id, order id, etc.), which would otherwise blow up your metrics
-backend's cardinality.
+backend's cardinality. See [`docs/observability.md`](../observability.md)
+for the complete, current metric name/label/meaning reference (connection
+and channel-churn counters, retry/DLQ/dedup/rate-limit counters, and the
+`QueueMetricsPoller` queue-depth gauges aren't covered above).
 
 ### Using middleware
 

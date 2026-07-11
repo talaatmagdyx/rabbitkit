@@ -28,6 +28,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on both sync and async paths, plus the fallback and raised-exception
   cases.
 
+- **`AsyncBatchPublisher` permanent wedge after a broker outage.**
+  A connection drop mid-flush used to kill flush-worker tasks outright:
+  `_flush_loop()`'s channel-reacquire call (on a connection error) was
+  unguarded, so if it raised or hung, the exception escaped the loop
+  entirely and the worker task died — silently, since nothing supervises
+  or restarts `_flush_tasks`. Once every worker had died this way, new
+  `publish()` calls kept enqueueing onto `_pending` successfully (the
+  queue itself was fine) but nothing was left to ever dequeue and flush
+  them, so every caller's `await fut` hung forever. Root cause underneath
+  that: aio-pika's `RobustConnection.channel()` *blocks* rather than
+  raising on a connection whose heartbeat hasn't yet detected the drop,
+  and even once the broker returns, reusing that same connection object
+  doesn't reliably recover.
+  Fixed in three parts: (1) flush workers now retry channel acquisition
+  with capped backoff instead of ever letting the failure propagate out
+  of the loop (`AsyncBatchPublisher._acquire_channel`); (2)
+  `AsyncChannelPool.acquire()` bounds channel creation with a timeout, so
+  a dead connection surfaces as a prompt failure instead of a hang; (3)
+  `AsyncConnectionPool.acquire_publisher_channel()` rebuilds the publisher
+  connection + channel pool from scratch on failure and retries once,
+  with single-rebuild coordination so concurrent workers don't each
+  rebuild independently. A remaining gap in that design — a second
+  consecutive rebuild failure fell through to `get_publisher_connection()`'s
+  own **unbounded** 30-attempt connect loop, turning a should-be-seconds
+  recovery into a potential ~10+ minute stall per retry cycle — is now
+  closed by bounding that path the same way the rebuild path already was.
+  Verified against a real broker: force-killing all connections mid-flush
+  (`rabbitmqctl close_all_connections`) now recovers within ~4 seconds,
+  with every batch after the kill succeeding — previously this class of
+  failure left the publisher wedged indefinitely.
+
 ### Added
 
 - **`ConnectionConfig.reconnect_max_attempts`** (default `30`) — the sync

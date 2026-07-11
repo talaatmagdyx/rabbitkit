@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -161,6 +161,43 @@ class TestPublish:
         with pytest.raises(ValueError, match="publish error"):
             await asyncio.wait_for(pub.publish(_env()), timeout=5.0)
         await pub.stop()
+
+
+class TestAcquireChannelRetriesWithBackoff:
+    """Batch-outage wedge fix: a flush worker must retry acquiring a
+    publisher channel across a broker outage instead of dying -- if it died,
+    nothing would ever drain _pending after the connection recovered, and
+    every publish() future would hang forever (flush workers are not
+    supervised/restarted)."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_failure_and_eventually_succeeds(self) -> None:
+        transport, _, pool = _make_transport()
+        good_channel = MagicMock()
+        good_channel.is_closed = False
+        pool.acquire_publisher_channel = AsyncMock(
+            side_effect=[RuntimeError("down"), RuntimeError("still down"), good_channel]
+        )
+
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=1))
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            channel = await pub._acquire_channel()
+
+        assert channel is good_channel
+        assert pool.acquire_publisher_channel.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates_without_retry(self) -> None:
+        transport, _, pool = _make_transport()
+        pool.acquire_publisher_channel = AsyncMock(side_effect=asyncio.CancelledError())
+
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=1))
+
+        with pytest.raises(asyncio.CancelledError):
+            await pub._acquire_channel()
+
+        pool.acquire_publisher_channel.assert_awaited_once()  # no retry attempted
 
 
 # ── channel-per-worker ───────────────────────────────────────────────────────

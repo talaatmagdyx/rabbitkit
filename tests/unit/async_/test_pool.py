@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from rabbitkit.async_.pool import AsyncChannelPool, AsyncConnectionPool
-from rabbitkit.core.config import ConnectionConfig, SecurityConfig
+from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 
 # ── AsyncChannelPool ────────────────────────────────────────────────────
 
@@ -213,6 +214,85 @@ class TestAsyncConnectionPool:
                 conn = await pool.get_publisher_connection()
                 assert conn is not None
                 assert conn is mock_conn
+
+    @pytest.mark.asyncio
+    async def test_get_publisher_connection_bounded_by_timeout(self) -> None:
+        """Batch-outage wedge fix: get_publisher_connection() is reachable
+        from acquire_publisher_channel() after a rebuild has torn the pool
+        down (leaving _publisher_channel_pool None) -- an unbounded connect
+        here would defeat the caller's own capped-backoff retry loop (e.g.
+        AsyncBatchPublisher._acquire_channel) by making a single attempt take
+        as long as _create_connection()'s own internal 30-attempt retry
+        loop (~10+ minutes), instead of failing fast enough for the outer
+        loop to actually retry on a sane cadence."""
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+            pool_config=PoolConfig(channel_acquire_timeout=0.05),
+        )
+
+        async def _hangs_forever(**kwargs: Any) -> Any:
+            await asyncio.sleep(60.0)  # far longer than channel_acquire_timeout
+            raise AssertionError("should have been cancelled by the timeout")
+
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
+            with patch("aio_pika.connect_robust", side_effect=_hangs_forever):
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(pool.get_publisher_connection(), timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_acquire_publisher_channel_rebuilds_and_retries_once_on_failure(self) -> None:
+        """acquire_publisher_channel() self-heals: a channel-pool failure
+        triggers _rebuild_publisher_connection() and one retry against the
+        fresh pool, rather than propagating the first failure straight to
+        the caller."""
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+        )
+
+        bad_channel_pool = AsyncMock()
+        bad_channel_pool.acquire = AsyncMock(side_effect=RuntimeError("dead connection"))
+        bad_conn = AsyncMock()
+        bad_conn.is_closed = False
+        pool._publisher_connection = bad_conn
+        pool._publisher_channel_pool = bad_channel_pool
+
+        good_channel = AsyncMock()
+        good_conn = AsyncMock()
+        good_conn.channel = AsyncMock(return_value=good_channel)
+
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=good_conn):
+                channel = await pool.acquire_publisher_channel()
+
+        assert channel is good_channel
+        assert pool._publisher_connection is good_conn
+        bad_channel_pool.acquire.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_publisher_connection_single_rebuild_coordination(self) -> None:
+        """_rebuild_publisher_connection(): a caller whose stale reference no
+        longer matches self._publisher_connection (another worker already
+        rebuilt it) must be a no-op, not a second rebuild."""
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(),
+            security_config=SecurityConfig(),
+        )
+        current_conn = AsyncMock()
+        current_conn.is_closed = False
+        pool._publisher_connection = current_conn
+        pool._publisher_channel_pool = AsyncMock()
+
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock) as mock_connect:
+            await pool._rebuild_publisher_connection(stale=object())  # some other, already-replaced connection
+
+        mock_connect.assert_not_awaited()
+        assert pool._publisher_connection is current_conn  # untouched
 
     @pytest.mark.asyncio
     async def test_channel_lifecycle_callbacks_forwarded_to_channel_pool(self) -> None:

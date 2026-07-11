@@ -728,7 +728,7 @@ class TestRetryEnvelopeNoOriginalQueue:
         # Message with NO x-rabbitkit-original-queue header
         msg = _make_message(headers={}, routing_key="orders")
 
-        envelope = mw._build_retry_envelope(msg, retry_count=0)
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("test error"))
 
         assert envelope.headers.get("x-rabbitkit-original-queue") == ""
 
@@ -740,7 +740,7 @@ class TestRetryEnvelopeNoOriginalQueue:
 
         mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
         msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
-        envelope = mw._build_retry_envelope(msg, retry_count=0)
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("test error"))
         assert envelope.mandatory is True
 
     def test_build_retry_envelope_preserves_message_properties(self) -> None:
@@ -768,7 +768,7 @@ class TestRetryEnvelopeNoOriginalQueue:
             app_id="order-service",
             user_id="guest",
         )
-        envelope = mw._build_retry_envelope(msg, retry_count=0)
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("test error"))
 
         assert envelope.reply_to == "amq.rabbitmq.reply-to"
         assert envelope.priority == 7
@@ -776,6 +776,87 @@ class TestRetryEnvelopeNoOriginalQueue:
         assert envelope.type == "order.created"
         assert envelope.app_id == "order-service"
         assert envelope.user_id == "guest"
+
+
+class TestRetryEnvelopeDlqTriageHeaders:
+    """Item 7: x-rabbitkit-error-type/-error-message/-first-failed-at/
+    -last-failed-at -- previously the only way to learn why a message ended
+    up on the DLQ was application logs, which may have long since rotated
+    out. Deliberately skips x-rabbitkit-trace-id (superseded by existing
+    OTel W3C traceparent/tracestate propagation)."""
+
+    def test_error_type_and_message_set(self) -> None:
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=ValueError("bad payload"))
+
+        assert envelope.headers["x-rabbitkit-error-type"] == "ValueError"
+        assert envelope.headers["x-rabbitkit-error-message"] == "bad payload"
+
+    def test_error_message_is_length_capped(self) -> None:
+        from rabbitkit.middleware.retry import _ERROR_MESSAGE_MAX_LEN, RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+        huge = "x" * (_ERROR_MESSAGE_MAX_LEN * 3)
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=ValueError(huge))
+
+        assert len(envelope.headers["x-rabbitkit-error-message"]) == _ERROR_MESSAGE_MAX_LEN
+
+    def test_first_failed_at_set_on_first_attempt(self) -> None:
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("boom"))
+
+        assert "x-rabbitkit-first-failed-at" in envelope.headers
+        assert envelope.headers["x-rabbitkit-first-failed-at"] == envelope.headers["x-rabbitkit-last-failed-at"]
+
+    def test_first_failed_at_preserved_across_retries(self) -> None:
+        """The FIRST failure's timestamp must survive every subsequent
+        retry hop -- mirrors the x-rabbitkit-original-* preservation
+        pattern already used above in this file."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
+        msg = _make_message(
+            headers={
+                "x-rabbitkit-original-queue": "orders",
+                "x-rabbitkit-first-failed-at": "2020-01-01T00:00:00+00:00",
+                "x-rabbitkit-last-failed-at": "2020-01-01T00:00:00+00:00",
+            },
+            routing_key="orders",
+        )
+        envelope = mw._build_retry_envelope(msg, retry_count=1, exc=RuntimeError("boom again"))
+
+        assert envelope.headers["x-rabbitkit-first-failed-at"] == "2020-01-01T00:00:00+00:00"
+        assert envelope.headers["x-rabbitkit-last-failed-at"] != "2020-01-01T00:00:00+00:00"
+
+    def test_last_failed_at_updates_every_retry(self) -> None:
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=3, delays=(5, 30, 120)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+
+        env1 = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("first"))
+        msg2 = _make_message(headers=dict(env1.headers), routing_key="orders")
+        env2 = mw._build_retry_envelope(msg2, retry_count=1, exc=RuntimeError("second"))
+
+        assert env2.headers["x-rabbitkit-first-failed-at"] == env1.headers["x-rabbitkit-first-failed-at"]
+        assert env2.headers["x-rabbitkit-error-message"] == "second"
+
+    def test_no_trace_id_header(self) -> None:
+        """Explicitly NOT added — superseded by existing OTel propagation."""
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
+        envelope = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("boom"))
+
+        assert "x-rabbitkit-trace-id" not in envelope.headers
 
 
 class TestRetryPredicates:
@@ -928,8 +1009,8 @@ class TestShardedJitter:
         )
         mw = RetryMiddleware(cfg)
         msg = _make_message(message_id="stable-id-42")
-        rk1 = mw._build_retry_envelope(msg, retry_count=0).routing_key
-        rk2 = mw._build_retry_envelope(msg, retry_count=0).routing_key
+        rk1 = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("test error")).routing_key
+        rk2 = mw._build_retry_envelope(msg, retry_count=0, exc=RuntimeError("test error")).routing_key
         assert rk1 == rk2  # deterministic
         shard = _shard_index("stable-id-42", 3)
         expected = "orders-queue.retry.1" if shard == 0 else f"orders-queue.retry.1.s{shard}"
@@ -950,7 +1031,7 @@ class TestShardedJitter:
 
     def test_off_mode_envelope_unchanged(self) -> None:
         mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
-        env = mw._build_retry_envelope(_make_message(message_id="x"), retry_count=0)
+        env = mw._build_retry_envelope(_make_message(message_id="x"), retry_count=0, exc=RuntimeError("test error"))
         assert env.routing_key == "orders-queue.retry.1"
 
     def test_config_validation(self) -> None:
@@ -976,7 +1057,7 @@ class TestRetryWithoutPublishFn:
         msg = _make_message()
 
         with pytest.warns(RuntimeWarning, match="no publish_fn"):
-            mw._route_to_delay_queue_sync(msg, retry_count=0)
+            mw._route_to_delay_queue_sync(msg, retry_count=0, exc=RuntimeError("test error"))
 
         msg._ack_fn.assert_not_called()
         msg._nack_fn.assert_called_once_with(True)
@@ -992,7 +1073,7 @@ class TestRetryWithoutPublishFn:
         msg = _make_message()
 
         with pytest.warns(RuntimeWarning, match="no publish_fn"):
-            mw._route_to_delay_queue_sync(msg, retry_count=0)
+            mw._route_to_delay_queue_sync(msg, retry_count=0, exc=RuntimeError("test error"))
 
         msg._ack_fn.assert_not_called()
         msg._nack_fn.assert_called_once_with(True)
@@ -1010,7 +1091,7 @@ class TestRetryWithoutPublishFn:
         msg._nack_fn = None
 
         with pytest.warns(RuntimeWarning, match="no publish_async_fn"):
-            await mw._route_to_delay_queue_async(msg, retry_count=0)
+            await mw._route_to_delay_queue_async(msg, retry_count=0, exc=RuntimeError("test error"))
 
         msg._ack_fn.assert_not_called()
         assert nacked == [True]
@@ -1022,7 +1103,7 @@ class TestRetryWithoutPublishFn:
             publish_fn=lambda env: None,
         )
         msg = _make_message()
-        mw._route_to_delay_queue_sync(msg, retry_count=0)
+        mw._route_to_delay_queue_sync(msg, retry_count=0, exc=RuntimeError("test error"))
         msg._ack_fn.assert_not_called()
         msg._nack_fn.assert_called_once_with(True)
 
@@ -1044,7 +1125,7 @@ class TestRetryWithoutPublishFn:
         msg._nack_async_fn = nack_async
         msg._nack_fn = None
 
-        await mw._route_to_delay_queue_async(msg, retry_count=0)
+        await mw._route_to_delay_queue_async(msg, retry_count=0, exc=RuntimeError("test error"))
 
         msg._ack_fn.assert_not_called()
         assert nacked == [True]

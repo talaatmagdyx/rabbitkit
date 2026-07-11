@@ -114,6 +114,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovered by exactly one retry, with the message landing on the queue
   exactly once (no duplicate) — `tests/integration/test_resilience_scenarios.py`.
 
+- **4 new DLQ-triage headers on retry-envelope republishes**:
+  `x-rabbitkit-error-type`, `x-rabbitkit-error-message`,
+  `x-rabbitkit-first-failed-at`, `x-rabbitkit-last-failed-at`
+  (`middleware/retry.py`). Previously, why a message ended up on the DLQ
+  was knowable only from application logs, which may have long since
+  rotated out by the time anyone looks. `error-type`/`error-message`
+  describe the triggering exception (message length-capped at 512 chars
+  so a huge `str(exc)` can't bloat every retry republish);
+  `first-failed-at` is set once and preserved across every subsequent
+  retry hop (same pattern as the existing `x-rabbitkit-original-*`
+  headers); `last-failed-at` is overwritten on every retry. Pure,
+  backward-compatible addition — existing headers are unchanged.
+  Deliberately does NOT add `x-rabbitkit-trace-id`: rabbitkit already has
+  correct, standards-based distributed tracing (OTel W3C
+  `traceparent`/`tracestate` propagated over AMQP headers), and a
+  parallel custom trace-id header would be a redundant, non-standard
+  second mechanism. Scoped to the retry-envelope path only — a message
+  that hits a PERMANENT error on its very first attempt (never routed
+  through a delay queue) does not get these headers; only messages that
+  pass through at least one retry hop before exhausting/dead-lettering
+  do. Verified against a real broker: a message exhausting 2 retries
+  arrived at its DLQ carrying all 4 headers (`error-type=OSError`,
+  `first-failed-at` < `last-failed-at`), with no `x-rabbitkit-trace-id`.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

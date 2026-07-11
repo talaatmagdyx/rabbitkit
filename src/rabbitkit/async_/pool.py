@@ -10,6 +10,7 @@ connections for publisher vs consumer separation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 from collections.abc import Callable
@@ -101,9 +102,18 @@ class AsyncChannelPool:
 
         if need_create:
             try:
-                channel = await self._connection.channel(publisher_confirms=self._publisher_confirms)
+                # Bound channel creation: aio-pika ``RobustConnection.channel()``
+                # BLOCKS (does not raise) while the connection is down — no
+                # heartbeat has detected the drop yet — waiting for a
+                # ``channel.open-ok`` that never arrives. Without this bound a
+                # BatchPublisher flush worker replacing a channel closed by an
+                # outage hangs, and every publish behind it stalls. The timeout
+                # turns the hang into a raise so ``acquire_publisher_channel``
+                # can rebuild the connection.
+                async with asyncio.timeout(self._acquire_timeout):
+                    channel = await self._connection.channel(publisher_confirms=self._publisher_confirms)
             except BaseException:
-                # creation failed — give the reserved slot back.
+                # creation failed (or timed out) — give the reserved slot back.
                 async with self._lock:
                     self._created = max(0, self._created - 1)
                 raise
@@ -310,11 +320,63 @@ class AsyncConnectionPool:
             return self._consumer_connection
 
     async def acquire_publisher_channel(self) -> Any:
-        """Acquire a channel from the publisher channel pool."""
+        """Acquire a channel from the publisher channel pool.
+
+        Self-heals a wedged connection. After a broker outage aio-pika's
+        RobustConnection can be left in a state where ``channel()`` hangs (no
+        heartbeat has yet detected the drop) or keeps failing even once the
+        broker is back. When channel acquisition fails, we rebuild the
+        publisher connection + channel pool from scratch and retry once, so the
+        caller gets a channel on a fresh connection rather than looping on a
+        dead one. ``AsyncChannelPool.acquire`` bounds channel creation with a
+        timeout so this failure surfaces promptly instead of hanging.
+        """
         if self._publisher_channel_pool is None:
             await self.get_publisher_connection()
-        assert self._publisher_channel_pool is not None
-        return await self._publisher_channel_pool.acquire()
+        pool = self._publisher_channel_pool
+        assert pool is not None
+        try:
+            return await pool.acquire()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Publisher channel acquire failed (%s); rebuilding connection", exc)
+            await self._rebuild_publisher_connection(stale=self._publisher_connection)
+            assert self._publisher_channel_pool is not None
+            return await self._publisher_channel_pool.acquire()
+
+    async def _rebuild_publisher_connection(self, stale: Any) -> None:
+        """Replace the (likely dead) publisher connection + channel pool.
+
+        Single-rebuild coordination: N flush workers can fail on the same dead
+        connection concurrently, but only the first rebuilds it — the rest see
+        ``self._publisher_connection is not stale`` and return, then retry
+        ``acquire`` on the fresh pool. Every teardown/create is time-bounded so
+        a rebuild attempted while the broker is still down fails fast (the
+        caller retries with backoff) instead of hanging on a dead-connection
+        close or on ``connect_robust``.
+        """
+        timeout = self._pool_config.channel_acquire_timeout
+        async with self._lock:
+            if self._publisher_connection is not stale:
+                return  # another worker already rebuilt it
+            old_pool, self._publisher_channel_pool = self._publisher_channel_pool, None
+            old_conn, self._publisher_connection = self._publisher_connection, None
+            if old_pool is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(old_pool.close_all(), timeout=timeout)
+            if old_conn is not None and not old_conn.is_closed:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(old_conn.close(), timeout=timeout)
+            self._publisher_connection = await asyncio.wait_for(
+                self._create_connection(), timeout=timeout
+            )
+            self._publisher_channel_pool = AsyncChannelPool(
+                self._publisher_connection,
+                pool_size=self._pool_config.channel_pool_size,
+                acquire_timeout=timeout,
+                publisher_confirms=self._publisher_confirms,
+            )
 
     async def release_publisher_channel(self, channel: Any) -> None:
         """Return a publisher channel to the pool."""

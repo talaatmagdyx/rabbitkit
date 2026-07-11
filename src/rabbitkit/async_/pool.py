@@ -295,14 +295,24 @@ class AsyncConnectionPool:
         """Get a connection dedicated for publishing.
 
         Creates the connection lazily on first call.
+
+        Bounded the same way ``_rebuild_publisher_connection`` bounds its own
+        ``_create_connection()`` call: this is also reachable from
+        ``acquire_publisher_channel()`` after a rebuild has torn down the
+        pool (leaving ``_publisher_channel_pool is None``), so an unbounded
+        30-attempt/backoff connect here would defeat the caller's OWN
+        capped-backoff retry loop (e.g. ``AsyncBatchPublisher._acquire_channel``)
+        by making a single attempt take up to ~10+ minutes instead of failing
+        fast enough for that outer loop to actually retry on a sane cadence.
         """
         async with self._lock:
             if self._publisher_connection is None:
-                self._publisher_connection = await self._create_connection()
+                timeout = self._pool_config.channel_acquire_timeout
+                self._publisher_connection = await asyncio.wait_for(self._create_connection(), timeout=timeout)
                 self._publisher_channel_pool = AsyncChannelPool(
                     self._publisher_connection,
                     pool_size=self._pool_config.channel_pool_size,
-                    acquire_timeout=self._pool_config.channel_acquire_timeout,
+                    acquire_timeout=timeout,
                     publisher_confirms=self._publisher_confirms,
                     on_channel_opened=self._on_channel_opened,
                     on_channel_rebuilt=self._on_channel_rebuilt,

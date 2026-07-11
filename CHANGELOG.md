@@ -164,6 +164,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and caller-supplied `service_name`/`environment` alongside pika's own
   unmodified `product`/`capabilities`.
 
+### Testing
+
+- **Channel-count-stability regression guard** — a real-broker test
+  publishing 50 messages through the confirmed (pooled-channel) path now
+  asserts `channels_opened_total` stays bounded near the configured pool
+  size, not growing with publish count — would have caught a channel-pool
+  leak (e.g. a `release()` bug that never returns a channel to the pool)
+  automatically in CI (`tests/integration/test_resilience_scenarios.py`).
+- **Reconnect-jitter-spread verification** — H-SRE3's full-jitter backoff
+  claim (spreads reconnect attempts across a fleet instead of thundering-
+  herding) was previously only a code comment. New unit tests drive the
+  sync transport's actual backoff loop against a deterministic connect()
+  failure and assert the recorded sleep durations vary (not a single
+  lockstep value) and never exceed the current exponential ceiling
+  (`tests/unit/sync/test_transport.py`).
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

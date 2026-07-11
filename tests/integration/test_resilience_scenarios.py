@@ -16,6 +16,12 @@ Scenarios:
   5. Async publish retry-once-on-connection-error (item 6): killing the
      connection mid-publish is recovered by exactly one retry, with no
      double-confirm / duplicate delivery.
+  6. Channel-count stability (item 9): N publishes through the pooled
+     (confirmed) path must not grow channels_opened_total unboundedly --
+     a regression guard against a channel leak.
+
+(Item 9's other new test -- reconnect-jitter spread -- doesn't need a real
+broker and lives in tests/unit/sync/test_transport.py instead.)
 
 Skipped when testcontainers / Docker is unavailable.
 """
@@ -436,3 +442,78 @@ async def test_async_publish_retries_once_after_mid_publish_connection_kill() ->
             pass
 
         assert received == [b"retry-me"], f"expected exactly one delivery (no duplicate), got {received}"
+
+
+# ── 6. Channel-count stability (item 9) ──────────────────────────────────────
+
+
+class _CountingCollector:
+    """Minimal MetricsCollector that just accumulates counter totals."""
+
+    def __init__(self) -> None:
+        self.counters: dict[str, float] = {}
+
+    def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None:
+        self.counters[name] = self.counters.get(name, 0.0) + value
+
+    def observe_histogram(self, name: str, labels: dict[str, str], value: float) -> None:
+        pass
+
+    def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+        pass
+
+
+async def test_channel_count_stays_bounded_across_many_publishes() -> None:
+    """Item 9: N publishes through the confirmed (pooled-channel) path must
+    not grow channels_opened_total unboundedly -- a regression guard
+    against a channel-pool leak (e.g. a release() bug that never returns a
+    channel to the pool, forcing a fresh channel per publish instead of
+    reusing the pool)."""
+    _skip_no_docker()
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import ConnectionConfig, PoolConfig, RabbitConfig
+    from rabbitkit.core.types import MessageEnvelope
+    from rabbitkit.middleware.metrics import MetricsMiddleware
+
+    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
+        url = _amqp_url(container)
+        pool_size = 5
+        config = RabbitConfig(
+            connection=ConnectionConfig.from_url(url),
+            pool=PoolConfig(channel_pool_size=pool_size),
+        )
+        broker = AsyncBroker(config=config)
+        collector = _CountingCollector()
+
+        @broker.subscriber(
+            queue="sre-channel-count-q",
+            middlewares=[MetricsMiddleware(collector)],
+        )
+        async def handle(body: bytes) -> None:
+            pass
+
+        await broker.start()
+
+        n_publishes = 50
+        for i in range(n_publishes):
+            outcome = await broker.publish(
+                MessageEnvelope(routing_key="sre-channel-count-q", body=f"m{i}".encode())
+            )
+            assert outcome.ok, f"publish {i} failed: {outcome.status} {outcome.error}"
+
+        opened = collector.counters.get("rabbitkit_channels_opened_total", 0.0)
+
+        try:
+            await broker.stop(timeout=10.0)
+        except Exception:
+            pass
+
+    assert opened < n_publishes, (
+        f"channels_opened_total ({opened}) grew with publish count "
+        f"({n_publishes}) -- the channel pool is not being reused across "
+        "publishes (leak regression)"
+    )
+    assert opened <= pool_size + 3, (
+        f"expected channel opens bounded near pool_size={pool_size}, got {opened} "
+        "-- more channels were created than the pool should ever need"
+    )

@@ -2538,6 +2538,65 @@ class TestReconnectBackoffLiveness:
         assert len(ticks) >= 2  # one tick per backoff iteration
 
 
+class TestReconnectBackoffJitterSpread:
+    """Item 9: H-SRE3 claims full-jitter backoff spreads reconnect attempts
+    across a fleet instead of thundering-herding. Previously this was only
+    a code comment -- prove it by running the actual backoff loop (with a
+    fast, deterministic connect() failure) and asserting the recorded sleep
+    durations vary, not a single lockstep value."""
+
+    def test_backoff_sleep_durations_are_not_identical(self) -> None:
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 8
+        recorded_sleeps: list[float] = []
+
+        def failing_connect() -> None:
+            raise pika.exceptions.AMQPConnectionError("down")
+
+        transport.connect = failing_connect  # type: ignore[method-assign]
+
+        with patch("time.sleep", side_effect=recorded_sleeps.append):
+            with pytest.raises(pika.exceptions.AMQPConnectionError):
+                transport._ensure_connected()
+
+        assert len(recorded_sleeps) >= 4, "expected several backoff attempts before exhaustion"
+        distinct = {round(s, 9) for s in recorded_sleeps}
+        assert len(distinct) > 1, (
+            f"full-jitter backoff produced identical sleep durations every "
+            f"attempt ({recorded_sleeps}) -- reconnects would thundering-herd "
+            "instead of spreading across a fleet"
+        )
+
+    def test_backoff_sleep_never_exceeds_current_backoff_ceiling(self) -> None:
+        """Full jitter (H-SRE3) means each sleep is uniform(0, current_backoff)
+        -- never more than the exponentially-growing ceiling itself."""
+        import pika
+
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 6
+        recorded_sleeps: list[float] = []
+
+        def failing_connect() -> None:
+            raise pika.exceptions.AMQPConnectionError("down")
+
+        transport.connect = failing_connect  # type: ignore[method-assign]
+
+        with patch("time.sleep", side_effect=recorded_sleeps.append):
+            with pytest.raises(pika.exceptions.AMQPConnectionError):
+                transport._ensure_connected()
+
+        base = transport._connection_config.reconnect_backoff_base
+        max_backoff = transport._connection_config.reconnect_backoff_max
+        ceiling = base
+        for sleep_for in recorded_sleeps:
+            assert 0.0 <= sleep_for <= ceiling + 1e-9, (
+                f"sleep {sleep_for} exceeded the current backoff ceiling {ceiling}"
+            )
+            ceiling = min(ceiling * 2, max_backoff)
+
+
 class TestEnsureConnectedOwnership:
     """Verification gap 2: ownership is enforced INSIDE _ensure_connected,
     so every entry point (publish TOCTOU, DLQInspector.basic_get,

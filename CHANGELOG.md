@@ -138,6 +138,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrived at its DLQ carrying all 4 headers (`error-type=OSError`,
   `first-failed-at` < `last-failed-at`), with no `x-rabbitkit-trace-id`.
 
+- **Auto-populated AMQP `client_properties`** — both transports now always
+  identify the connection as `library=rabbitkit` + `library_version=<installed
+  version>`, visible in the management UI's Connections tab, regardless of
+  whether `connection_name` is set. Previously `client_properties` was only
+  ever set (non-`None`) when `connection_name` was provided, so an
+  unnamed connection carried zero rabbitkit identification. Also adds
+  `ConnectionConfig.client_properties: dict[str, str]` — an escape hatch
+  for extra caller-supplied properties (e.g. `service_name`/`environment`/
+  `pod_name`), additive on top of rabbitkit's own identification.
+  Validated strings-only and length-capped (256 chars/value) — an AMQP
+  field-table value could otherwise smuggle an arbitrary type through, or
+  a runaway value could bloat every connection's handshake frame.
+  **Security note** (also on the field's own docstring): every key/value
+  here is visible in PLAINTEXT to anyone with management-UI/API read
+  access — never put secrets, credentials, or tenant-identifying PII here.
+  Both pika and aiormq *merge* the caller-supplied dict into their own base
+  properties (product/platform/capabilities/version) rather than replacing
+  them wholesale, so this can never clobber either library's own
+  identification or capability flags (`authentication_failure_close`,
+  `connection.blocked`, etc.) — key names deliberately avoid
+  `product`/`version`/`platform`/`capabilities`/`information` to not
+  collide with those. Verified against a real broker: the management
+  API's `/api/connections` endpoint showed `library`, `library_version`,
+  and caller-supplied `service_name`/`environment` alongside pika's own
+  unmodified `product`/`capabilities`.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

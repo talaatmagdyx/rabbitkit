@@ -18,6 +18,9 @@ from rabbitkit.core.types import ErrorSeverity, TopologyMode
 
 # ── Connection ─────────────────────────────────────────────────────────────
 
+# Item 8: max length for a single ConnectionConfig.client_properties value.
+_CLIENT_PROPERTY_VALUE_MAX_LEN = 256
+
 
 def _masked_repr(obj: object, *, secret_fields: tuple[str, ...] = ("password",)) -> str:
     """L2: generic ``__repr__`` for a config dataclass that masks *secret_fields*.
@@ -78,6 +81,19 @@ class ConnectionConfig:
     # initial connect (connect_robust then pins to the chosen node — put a
     # load balancer / DNS round-robin in front for per-reconnect failover).
     nodes: tuple[str, ...] = ()
+    # Item 8: escape-hatch for extra AMQP client_properties, shown in the
+    # management UI's Connections tab alongside connection_name -- e.g.
+    # service_name/environment/pod_name for fleet-wide "which pod owns this
+    # connection" triage. rabbitkit ALWAYS adds its own library/
+    # library_version identification regardless of this field; these are
+    # purely additive on top (see sync/connection.py, async_/connection.py).
+    #
+    # SECURITY: every key/value here is visible in PLAINTEXT to anyone with
+    # RabbitMQ management-UI/API read access -- there is no additional authn
+    # on top of that. Never put secrets, credentials, or tenant-identifying
+    # PII here; service_name/environment/pod_name/region are fine, customer
+    # IDs or API keys are not.
+    client_properties: dict[str, str] = field(default_factory=dict)
 
     def resolve_credentials(self) -> tuple[str, str]:
         """Return ``(username, password)`` — from ``credentials_provider`` if
@@ -155,6 +171,22 @@ class ConnectionConfig:
                 f"{self.reconnect_max_attempts} (this bounds the sync transport's "
                 "reconnect loop only -- see the field docstring)."
             )
+        # Item 8: basic validation for the client_properties escape hatch --
+        # strings only (AMQP field-table values could otherwise smuggle
+        # arbitrary types through to the broker), length-capped so a runaway
+        # value can't bloat every connection's handshake frame.
+        for key, cp_value in self.client_properties.items():
+            if not isinstance(key, str) or not isinstance(cp_value, str):
+                raise ConfigValidationError(
+                    f"ConnectionConfig.client_properties keys and values must be "
+                    f"strings, got {key!r}={cp_value!r}."
+                )
+            if len(cp_value) > _CLIENT_PROPERTY_VALUE_MAX_LEN:
+                raise ConfigValidationError(
+                    f"ConnectionConfig.client_properties[{key!r}] is "
+                    f"{len(cp_value)} chars, exceeding the "
+                    f"{_CLIENT_PROPERTY_VALUE_MAX_LEN}-char limit."
+                )
 
     @classmethod
     def from_url(cls, url: str) -> ConnectionConfig:

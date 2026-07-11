@@ -13,6 +13,7 @@ import ssl
 from typing import Any
 from urllib.parse import quote
 
+from rabbitkit._version import __version__
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SSLConfig
 
 logger = logging.getLogger(__name__)
@@ -188,11 +189,23 @@ def make_aio_pika_connect_kwargs(
     if ssl_context is not None:
         kwargs["ssl_context"] = ssl_context
 
-    # Client properties
+    # Client properties (item 8): rabbitkit always identifies itself;
+    # connection_name and any caller-supplied escape-hatch properties
+    # (ConnectionConfig.client_properties) are additive on top. aiormq merges
+    # this dict INTO its own base properties (product/platform/capabilities/
+    # version) at connect time rather than replacing them wholesale — see
+    # aiormq.connection.Connection._client_properties — so these never
+    # clobber aiormq's own identification or capability flags. Key names
+    # avoid "product"/"version"/"platform"/"capabilities"/"information" for
+    # that reason.
+    client_properties: dict[str, str] = {
+        "library": "rabbitkit",
+        "library_version": __version__,
+    }
+    client_properties.update(connection.client_properties)
     if connection.connection_name:
-        kwargs["client_properties"] = {
-            "connection_name": connection.connection_name,
-        }
+        client_properties["connection_name"] = connection.connection_name
+    kwargs["client_properties"] = client_properties
 
     return kwargs
 

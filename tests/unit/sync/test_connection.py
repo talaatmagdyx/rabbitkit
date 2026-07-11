@@ -211,6 +211,37 @@ class TestMakePikaConnectionParams:
         assert params.client_properties is not None
         assert params.client_properties["connection_name"] == "my-service"
 
+    def test_library_identification_always_present(self) -> None:
+        """Item 8: rabbitkit always identifies itself, even with no
+        connection_name and no escape-hatch properties set."""
+        pytest.importorskip("pika")
+
+        from rabbitkit.sync.connection import make_pika_connection_params
+
+        params = make_pika_connection_params(ConnectionConfig(), SocketConfig(), SecurityConfig())
+
+        assert params.client_properties["library"] == "rabbitkit"
+        assert params.client_properties["library_version"]
+        assert "connection_name" not in params.client_properties
+
+    def test_escape_hatch_properties_merged(self) -> None:
+        """Item 8: ConnectionConfig.client_properties is additive on top of
+        rabbitkit's own library/library_version identification."""
+        pytest.importorskip("pika")
+
+        from rabbitkit.sync.connection import make_pika_connection_params
+
+        conn = ConnectionConfig(
+            connection_name="my-service",
+            client_properties={"service_name": "orders-worker", "environment": "prod"},
+        )
+        params = make_pika_connection_params(conn, SocketConfig(), SecurityConfig())
+
+        assert params.client_properties["library"] == "rabbitkit"
+        assert params.client_properties["connection_name"] == "my-service"
+        assert params.client_properties["service_name"] == "orders-worker"
+        assert params.client_properties["environment"] == "prod"
+
     def test_with_ssl(self) -> None:
         """SSL options are applied when enabled."""
         pytest.importorskip("pika")

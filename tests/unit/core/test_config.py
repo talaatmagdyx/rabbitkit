@@ -201,6 +201,37 @@ class TestReconnectMaxAttempts:
             ConnectionConfig(reconnect_max_attempts=-1)
 
 
+class TestClientProperties:
+    """Production-hardening checklist item 8: an escape hatch for extra AMQP
+    client_properties (service_name/environment/pod_name etc.), validated
+    strings-only and length-capped -- these are visible in plaintext to any
+    management-API reader, so no secrets/tenant-identifying data belongs
+    here (docstring warning on the field itself)."""
+
+    def test_default_is_empty(self) -> None:
+        assert ConnectionConfig().client_properties == {}
+
+    def test_custom_value_accepted(self) -> None:
+        config = ConnectionConfig(client_properties={"service_name": "orders-worker", "environment": "prod"})
+        assert config.client_properties == {"service_name": "orders-worker", "environment": "prod"}
+
+    def test_non_string_value_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be strings"):
+            ConnectionConfig(client_properties={"pod_name": 123})  # type: ignore[dict-item]
+
+    def test_non_string_key_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be strings"):
+            ConnectionConfig(client_properties={42: "x"})  # type: ignore[dict-item]
+
+    def test_value_too_long_rejected(self) -> None:
+        with pytest.raises(ValueError, match="exceeding"):
+            ConnectionConfig(client_properties={"pod_name": "x" * 300})
+
+    def test_value_at_limit_accepted(self) -> None:
+        config = ConnectionConfig(client_properties={"pod_name": "x" * 256})
+        assert len(config.client_properties["pod_name"]) == 256
+
+
 class TestConsumerConfigM6:
     def test_reject_transient_on_redelivery_default_off(self) -> None:
         assert ConsumerConfig().reject_transient_on_redelivery is False

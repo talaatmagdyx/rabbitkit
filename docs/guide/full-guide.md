@@ -268,6 +268,29 @@ of an opaque low-level channel-closed traceback. Delete/reconcile the
 existing object, adjust your `RabbitQueue`/`RabbitExchange` definition to
 match, or use `TopologyMode.PASSIVE_ONLY` to just verify it exists.
 
+**Topology-declare timeout:** `declare_queue`/`declare_exchange` calls are
+NOT individually bounded by their own timeout — they only inherit the
+connection-level timeout transitively (`socket_timeout` on sync,
+`ConnectionConfig.socket_timeout` passed to `connect_robust` on async). A
+broker that accepts the TCP connection but stalls mid-handshake on a
+declare (a rare but real failure mode — an overloaded cluster, a partition
+mid-election) can hang startup for the full connection timeout rather than
+failing fast. There's no separate, shorter timeout knob for this today on
+either transport; size `socket_timeout` with that in mind if fast-failing
+during startup topology declaration matters for your readiness-probe
+budget.
+
+**Avoid dynamically declaring a new queue per request/session/tenant.**
+`TopologyMode.AUTO_DECLARE` is designed for a small, fixed set of queues
+declared once at startup — not for creating a queue on the fly for every
+inbound request or user session. Each such queue is a permanent broker
+object (RAM/disk overhead, one more entry in every topology listing) that
+outlives the request unless something explicitly deletes it, and every
+`queue`-labeled metric (see [`docs/observability.md`](../observability.md))
+plus `QueueMetricsPoller`'s gauges gains one new time series per queue,
+forever. Prefer a bounded number of long-lived queues with a routing-key
+or header dimension for per-tenant/per-session distinction instead.
+
 ---
 
 ## 3. Configuration

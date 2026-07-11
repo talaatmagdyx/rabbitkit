@@ -198,6 +198,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (replacing a vague "check MetricsMiddleware's docs" pointer) and
   `docs/guide/full-guide.md`.
 
+- **Small doc tightenings**: `docs/production/scale.md`'s heartbeat
+  section now explicitly warns against both extremes — too low
+  (`heartbeat=10`, spurious reconnects on transient noise) and too high
+  (`heartbeat=600`, which hides a wedged single-worker consumer from both
+  the broker's dead-peer timeout *and* rabbitkit's own liveness staleness
+  check simultaneously). `docs/guide/full-guide.md`'s Topology section
+  gained a note that `declare_queue`/`declare_exchange` have no dedicated
+  timeout (only the connection-level one, transitively) plus a warning
+  against dynamically declaring a queue per request/session/tenant (each
+  is a permanent broker object and a permanent new metric time series).
+  `docs/concurrency-model.md` gained a short "why there's no
+  `threading.Lock`/`asyncio.Lock` around reconnection" explainer for both
+  transports, preempting the question for a future reviewer — the
+  owner-thread-identity check (sync) and aio-pika's own `connect_robust()`
+  (async) are each strictly better than a lock would be, not just an
+  equivalent with extra ceremony.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

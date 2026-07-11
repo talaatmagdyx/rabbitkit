@@ -179,6 +179,24 @@ instead of discovering it.
   detection in ~2 missed beats ≈ 60 s. Raise it only for handlers that
   legitimately monopolize a single-worker sync loop (better: don't do
   that).
+- **Too low (e.g. `heartbeat=10`):** dead-peer detection triggers in ~20s,
+  which sounds appealing, but a brief GC pause, a scheduler hiccup under
+  load, or an ordinary network blip that would have recovered on its own
+  now looks identical to a dead connection — you trade a faster *true*
+  outage detection for spurious reconnects on transient noise. Don't go
+  below the default without a specific, measured reason.
+- **Too high (e.g. `heartbeat=600`):** this doesn't just delay dead-peer
+  detection — it actively **hides** a wedged single-worker consumer from
+  two independent signals at once: the broker's own dead-peer timeout
+  (which won't fire for ~20 minutes), *and* rabbitkit's own liveness
+  staleness check (`broker_liveness()`'s `wedged_timeout`, calibrated
+  against the heartbeat interval — see [Health Probes](../kubernetes.md#health-probes)).
+  A hung handler on a single-worker sync consumer can then sit silently
+  un-restarted for the full raised interval instead of a Kubernetes
+  liveness probe catching it in seconds. If a handler genuinely needs more
+  time than the default heartbeat tolerates, prefer `worker_count > 1`
+  (handlers run off the I/O thread, so heartbeats keep flowing regardless
+  of handler duration) over raising the heartbeat.
 - **Who services them:**
   - *Async:* aio-pika runs heartbeats as an independent task — always
     serviced, no action needed, even mid-reconnect.

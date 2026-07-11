@@ -2,7 +2,7 @@
 
 > **Production-grade RabbitMQ toolkit for Python** — sync (pika) and async (aio-pika),
 > decorator-based routing, middleware pipeline, retry, compression, DI, RPC, and more.
-> Version 0.10.0 · Python ≥ 3.11 · MIT License
+> Version 0.11.0 · Python ≥ 3.11 · MIT License
 
 ## Table of Contents
 

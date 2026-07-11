@@ -852,6 +852,13 @@ class SyncBroker:
         metric_name = metrics_mw.config.reconnects_total
         self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
 
+        # Item 3: channel open/rebuild counters — same collector, same
+        # no-route-metrics no-op behavior as the reconnect hook above.
+        opened_name = metrics_mw.config.channels_opened_total
+        rebuilt_name = metrics_mw.config.channel_rebuilds_total
+        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
+        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
+
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
         if self._transport is None:

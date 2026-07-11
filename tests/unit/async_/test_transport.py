@@ -96,6 +96,25 @@ class TestConnection:
                 assert not transport.is_connected()
 
     @pytest.mark.asyncio
+    async def test_connect_fires_channel_opened_not_rebuilt(self) -> None:
+        """Item 3: connect() opens the topology channel once -- a fresh
+        open, not a rebuild (aio-pika restores it transparently on its own
+        reconnects, so this only fires once here)."""
+        transport = _make_transport()
+        mock_connection = _make_mock_connection()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
+                await transport.connect()
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    @pytest.mark.asyncio
     async def test_connect_idempotent(self) -> None:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
@@ -214,10 +233,17 @@ class TestTopology:
         new_conn = AsyncMock()
         new_conn.channel = AsyncMock(return_value=reopened)
         transport._conn_pool.get_consumer_connection = AsyncMock(return_value=new_conn)
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
 
         await transport.declare_queue(RabbitQueue(name="orders"))  # must NOT raise
 
         assert transport._topology_channel is reopened  # reopened for further declares
+        # Item 3: this reopen replaces a channel the broker just closed.
+        assert opened == [1]
+        assert rebuilt == [1]
 
     @pytest.mark.asyncio
     async def test_declare_exchange_precondition_failed_raises_configuration_error(self) -> None:
@@ -500,6 +526,19 @@ class TestConsume:
         assert tag.startswith("rabbitkit.")
 
     @pytest.mark.asyncio
+    async def test_consume_fires_channel_opened(self) -> None:
+        """Item 3: consume() opens a dedicated per-queue channel."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        channel.get_queue = AsyncMock(return_value=AsyncMock())
+        opened: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+
+        await transport.consume("orders", AsyncMock(), prefetch=10)
+
+        assert opened == [1]
+
+    @pytest.mark.asyncio
     async def test_consume_sets_prefetch(self) -> None:
         """consume() sets QoS per-consumer channel."""
         transport = _make_transport()
@@ -620,6 +659,39 @@ class TestReconnectCallbacks:
         transport.on_reconnect(lambda: fired.append(1))
 
         transport._aio_reconnected()  # must not raise
+
+        assert fired == [1]
+
+
+class TestChannelLifecycleCallbacks:
+    """Item 3: on_channel_opened/on_channel_rebuilt registration + firing,
+    mirroring TestReconnectCallbacks above."""
+
+    def test_channel_opened_callback_fires(self) -> None:
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_channel_opened(lambda: fired.append(1))
+
+        transport._fire_channel_opened()
+
+        assert fired == [1]
+
+    def test_channel_rebuilt_callback_fires(self) -> None:
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_channel_rebuilt(lambda: fired.append(1))
+
+        transport._fire_channel_rebuilt()
+
+        assert fired == [1]
+
+    def test_channel_opened_callback_exception_does_not_break_others(self) -> None:
+        transport = _make_transport()
+        fired: list[int] = []
+        transport.on_channel_opened(lambda: (_ for _ in ()).throw(RuntimeError("cb boom")))
+        transport.on_channel_opened(lambda: fired.append(1))
+
+        transport._fire_channel_opened()  # must not raise
 
         assert fired == [1]
 
@@ -1392,6 +1464,45 @@ class TestGetFastChannel:
         with pytest.raises(RuntimeError, match="Publisher connection is not available"):
             await transport._get_fast_channel()
 
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_first_creation_fires_opened_not_rebuilt(self) -> None:
+        """Item 3: a first-ever fast-channel open is not a rebuild."""
+        transport = _make_transport()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        mock_pub_conn = MagicMock()
+        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        await transport._get_fast_channel()
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    @pytest.mark.asyncio
+    async def test_get_fast_channel_reopen_fires_opened_and_rebuilt(self) -> None:
+        """Item 3: reopening a found-closed fast channel is a rebuild."""
+        transport = _make_transport()
+        closed_ch = MagicMock()
+        closed_ch.is_closed = True
+        transport._fast_publish_channel = closed_ch
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        mock_pub_conn = MagicMock()
+        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        await transport._get_fast_channel()
+
+        assert opened == [1]
+        assert rebuilt == [1]
+
 
 # ── _get_mandatory_channel (H1) ──────────────────────────────────────────
 
@@ -1416,6 +1527,46 @@ class TestGetMandatoryChannel:
 
         with pytest.raises(RuntimeError, match="Publisher connection is not available"):
             await transport._get_mandatory_channel()
+
+    @pytest.mark.asyncio
+    async def test_get_mandatory_channel_first_creation_fires_opened_not_rebuilt(self) -> None:
+        """Item 3: a first-ever mandatory-channel open is not a rebuild."""
+        transport = _make_transport()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        mock_pub_conn = MagicMock()
+        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        await transport._get_mandatory_channel()
+
+        assert opened == [1]
+        assert rebuilt == []
+
+    @pytest.mark.asyncio
+    async def test_get_mandatory_channel_reopen_fires_opened_and_rebuilt(self) -> None:
+        """Item 3: reopening a found-closed mandatory channel (e.g. after a
+        confirm-timeout recycle) is a rebuild."""
+        transport = _make_transport()
+        closed_ch = MagicMock()
+        closed_ch.is_closed = True
+        transport._mandatory_publish_channel = closed_ch
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+
+        mock_pub_conn = MagicMock()
+        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
+        transport._conn_pool._publisher_connection = mock_pub_conn
+
+        await transport._get_mandatory_channel()
+
+        assert opened == [1]
+        assert rebuilt == [1]
 
 
 # ── _publish_on_channel timeout ───────────────────────────────────────────

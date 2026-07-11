@@ -2274,6 +2274,53 @@ class TestWireReconnectMetric:
         broker._wire_reconnect_metric()  # must not raise
 
 
+class TestWireChannelMetrics:
+    """Production-hardening item 3: _wire_reconnect_metric also registers
+    on_channel_opened/on_channel_rebuilt callbacks that increment
+    channels_opened_total/channel_rebuilds_total via the same
+    MetricsMiddleware collector -- previously no signal existed for channel
+    churn (leaks or reconnect-driven rebuilds), only connection churn."""
+
+    def test_registers_channel_callbacks_when_metrics_middleware_present(self) -> None:
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock()
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_called_once()
+        broker._transport.on_channel_rebuilt.assert_called_once()
+
+        opened_cb = broker._transport.on_channel_opened.call_args.args[0]
+        rebuilt_cb = broker._transport.on_channel_rebuilt.call_args.args[0]
+        opened_cb()
+        rebuilt_cb()
+
+        assert collector.inc_counter.call_count == 2
+        names = {call.args[0] for call in collector.inc_counter.call_args_list}
+        assert any(name.endswith("_channels_opened_total") for name in names)
+        assert any(name.endswith("_channel_rebuilds_total") for name in names)
+
+    def test_noop_without_metrics_middleware(self) -> None:
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders")
+        def handle(body: bytes) -> None:
+            pass
+
+        broker._transport = MagicMock()
+        broker._wire_reconnect_metric()
+
+        broker._transport.on_channel_opened.assert_not_called()
+        broker._transport.on_channel_rebuilt.assert_not_called()
+
+
 class TestFlowControlledInternalPublish:
     """M18: RetryMiddleware's delay-queue republish and the pipeline's
     result-publish previously bypassed FlowController entirely -- a broker

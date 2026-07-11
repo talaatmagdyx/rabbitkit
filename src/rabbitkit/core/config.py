@@ -554,6 +554,28 @@ class MetricsConfig:
         return f"{self.namespace}_reconnects_total"
 
     @property
+    def channels_opened_total(self) -> str:
+        """Incremented every time either transport actually creates a new
+        low-level channel — the publisher/topology channel, a per-queue
+        consumer channel, an async channel-pool slot, or a dedicated
+        fast/mandatory/reply-to channel. A steady climb with no matching
+        traffic growth signals a channel leak (a "cache" of channels that
+        never shrinks) — previously invisible, since only the connection
+        churn (``reconnects_total``) was counted."""
+        return f"{self.namespace}_channels_opened_total"
+
+    @property
+    def channel_rebuilds_total(self) -> str:
+        """Incremented when a channel is created to REPLACE one that died —
+        a reconnect-driven per-queue consumer channel recreate (sync), a
+        406-drift publisher channel reopen (sync), or a mandatory/fast
+        channel recycle after a timeout or closed-channel discovery (async).
+        Unlike ``channels_opened_total`` (every creation, including ordinary
+        pool growth and first-ever opens), this isolates the subset that
+        indicates something upstream actually failed."""
+        return f"{self.namespace}_channel_rebuilds_total"
+
+    @property
     def published_total(self) -> str:
         return self.published_counter or f"{self.namespace}_messages_published_total"
 

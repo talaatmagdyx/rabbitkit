@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Kubernetes decide whether to kill a wedged pod via liveness, rather
   than have the client give up on its own).
 
+- **`rabbitkit_channels_opened_total` / `rabbitkit_channel_rebuilds_total`
+  metrics** — no signal previously existed for channel churn (only
+  `rabbitkit_reconnects_total` for connection-level churn), so a channel
+  leak or an unexpectedly hot reconnect-driven rebuild loop was invisible.
+  `channels_opened_total` increments on every new channel either transport
+  creates (publisher/topology channel, per-queue consumer channel, async
+  channel-pool growth, dedicated fast/mandatory channels).
+  `channel_rebuilds_total` isolates the subset that REPLACES a channel
+  lost to a reconnect, a 406 topology-drift close, or a mandatory/fast
+  channel recycle — the signal that something upstream actually failed,
+  as opposed to ordinary first-time opens or pool growth. Wired through
+  the same `MetricsMiddleware` collector as `reconnects_total`, so it's a
+  no-op without a route carrying metrics. Note: like `reconnects_total`,
+  the very first channel opened during a broker's initial `start()` (the
+  publisher/topology channel) predates the metrics wiring and is not
+  counted — the counters track churn from "the broker has finished
+  starting" onward, not a from-zero channel census.
+
 ## [0.10.0] — 2026-07-08
 
 > **Upgrade notes (read before deploying):** three behavior changes can

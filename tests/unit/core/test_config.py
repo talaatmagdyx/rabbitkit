@@ -616,6 +616,22 @@ class TestMetricsConfigProperties:
         cfg = MetricsConfig()
         assert cfg.messages_dead_lettered_total == "rabbitkit_messages_dead_lettered_total"
 
+    def test_channels_opened_total(self) -> None:
+        cfg = MetricsConfig()
+        assert cfg.channels_opened_total == "rabbitkit_channels_opened_total"
+
+    def test_channel_rebuilds_total(self) -> None:
+        cfg = MetricsConfig()
+        assert cfg.channel_rebuilds_total == "rabbitkit_channel_rebuilds_total"
+
+    def test_channels_opened_total_custom_namespace(self) -> None:
+        cfg = MetricsConfig(namespace="myapp")
+        assert cfg.channels_opened_total == "myapp_channels_opened_total"
+
+    def test_channel_rebuilds_total_custom_namespace(self) -> None:
+        cfg = MetricsConfig(namespace="myapp")
+        assert cfg.channel_rebuilds_total == "myapp_channel_rebuilds_total"
+
     def test_publish_total_default(self) -> None:
         cfg = MetricsConfig()
         assert cfg.publish_total == "rabbitkit_publish_total"

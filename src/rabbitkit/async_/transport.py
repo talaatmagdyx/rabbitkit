@@ -73,6 +73,8 @@ class AsyncTransportImpl:
             self._security_config,
             self._pool_config,
             publisher_confirms=self._confirm_delivery,
+            on_channel_opened=self._fire_channel_opened,
+            on_channel_rebuilt=self._fire_channel_rebuilt,
         )
         self._connected = False
 
@@ -124,6 +126,16 @@ class AsyncTransportImpl:
         # aio-pika's RobustConnection.reconnect_callbacks.
         self._reconnect_callbacks: list[Callable[[], None]] = []
 
+        # Channel-lifecycle signal (item 3), mirroring SyncTransport:
+        # channels_opened_total counts every new channel THIS transport
+        # explicitly creates (aio-pika restores the topology/consumer
+        # channels it owns transparently on reconnect -- those restores are
+        # invisible here by design, see the module docstring). rebuilt is the
+        # subset that replaces a channel lost to a 406 topology conflict or a
+        # mandatory/fast-channel recycle.
+        self._channel_opened_callbacks: list[Callable[[], None]] = []
+        self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
+
         # L15: passive blocked-state tracking, independent of whether a
         # FlowController is registered above -- health.broker_health_check
         # reads this (via the is_blocked property) so a broker/disk/memory
@@ -136,6 +148,32 @@ class AsyncTransportImpl:
         counted, so a flapping broker/network was invisible to metrics
         alerting."""
         self._reconnect_callbacks.append(callback)
+
+    def on_channel_opened(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired every time this transport creates a new
+        channel (channels_opened_total metric hook)."""
+        self._channel_opened_callbacks.append(callback)
+
+    def on_channel_rebuilt(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired when a channel is created to REPLACE
+        one lost to a 406 topology conflict or a mandatory/fast-channel
+        recycle (channel_rebuilds_total metric hook) — a subset of
+        :meth:`on_channel_opened`."""
+        self._channel_rebuilt_callbacks.append(callback)
+
+    def _fire_channel_opened(self) -> None:
+        for cb in list(self._channel_opened_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never break the event loop
+                logger.exception("channel_opened callback raised")
+
+    def _fire_channel_rebuilt(self) -> None:
+        for cb in list(self._channel_rebuilt_callbacks):
+            try:
+                cb()
+            except Exception:  # pragma: no cover — never break the event loop
+                logger.exception("channel_rebuilt callback raised")
 
     def _aio_reconnected(self, *_args: Any) -> None:
         for cb in list(self._reconnect_callbacks):
@@ -290,6 +328,7 @@ class AsyncTransportImpl:
         # Open topology channel on consumer connection
         consumer_conn = await self._conn_pool.get_consumer_connection()
         self._topology_channel = await consumer_conn.channel()
+        self._fire_channel_opened()
 
         self._connected = True
         logger.info(
@@ -431,7 +470,11 @@ class AsyncTransportImpl:
             conn = self._conn_pool._publisher_connection
             if conn is None:
                 raise RuntimeError("Publisher connection is not available")
+            is_rebuild = ch is not None  # replacing a channel found closed above
             self._fast_publish_channel = await conn.channel(publisher_confirms=False)
+            self._fire_channel_opened()
+            if is_rebuild:
+                self._fire_channel_rebuilt()
             return self._fast_publish_channel
 
     async def _get_mandatory_channel(self) -> Any:
@@ -457,9 +500,13 @@ class AsyncTransportImpl:
             conn = self._conn_pool._publisher_connection
             if conn is None:
                 raise RuntimeError("Publisher connection is not available")
+            is_rebuild = ch is not None  # replacing a closed/recycled channel
             self._mandatory_publish_channel = await conn.channel(
                 publisher_confirms=True, on_return_raises=True
             )
+            self._fire_channel_opened()
+            if is_rebuild:
+                self._fire_channel_rebuilt()
             return self._mandatory_publish_channel
 
     def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
@@ -711,6 +758,7 @@ class AsyncTransportImpl:
         # Dedicated channel per consumer queue for isolated QoS
         consumer_conn = await self._conn_pool.get_consumer_connection()
         channel = await consumer_conn.channel()
+        self._fire_channel_opened()
         await channel.set_qos(prefetch_count=prefetch)
         self._consumer_channels[queue] = channel
 
@@ -814,6 +862,8 @@ class AsyncTransportImpl:
         if self._on_topology_conflict == "warn_continue":
             consumer_conn = await self._conn_pool.get_consumer_connection()
             self._topology_channel = await consumer_conn.channel()
+            self._fire_channel_opened()
+            self._fire_channel_rebuilt()  # replacing a channel the broker just closed
             logger.warning(
                 "Topology drift on %s %r (broker: %s); on_topology_conflict='warn_continue' "
                 "— continuing with the EXISTING definition (rabbitkit's declaration was NOT "

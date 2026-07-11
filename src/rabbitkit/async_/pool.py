@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -38,6 +39,8 @@ class AsyncChannelPool:
         pool_size: int = 10,
         acquire_timeout: float = 10.0,
         publisher_confirms: bool = True,
+        on_channel_opened: Callable[[], None] | None = None,
+        on_channel_rebuilt: Callable[[], None] | None = None,
     ) -> None:
         self._connection = connection
         self._pool_size = pool_size
@@ -49,14 +52,22 @@ class AsyncChannelPool:
         # Channels currently checked out by callers; closed in close_all() so they
         # are not orphaned if a caller forgets to release (leak detection).
         self._in_use: set[Any] = set()
+        # Item 3: channel-lifecycle metric hooks (optional, no-op if None).
+        self._on_channel_opened = on_channel_opened
+        self._on_channel_rebuilt = on_channel_rebuilt
 
-    async def acquire(self) -> Any:
+    async def acquire(self, *, _found_closed: bool = False) -> Any:
         """Acquire a channel from the pool.
 
         Creates a new channel if the pool is empty and under the size limit.
         Waits up to ``acquire_timeout`` seconds when all channels are in use;
         raises ``asyncio.TimeoutError`` if the wait expires, preventing
         deadlocks when handlers publish while processing messages.
+
+        ``_found_closed`` is internal: set by a recursive call after this
+        method already discovered and discarded a dead pooled channel, so the
+        channel this call goes on to create is a rebuild, not a fresh-growth
+        open (item 3's channel_rebuilds_total).
         """
         try:
             channel = self._pool.get_nowait()
@@ -70,6 +81,7 @@ class AsyncChannelPool:
             # closed-idle channel is pulled from the pool).
             async with self._lock:
                 self._created = max(0, self._created - 1)
+            _found_closed = True
         except asyncio.QueueEmpty:
             pass
 
@@ -95,6 +107,10 @@ class AsyncChannelPool:
                 async with self._lock:
                     self._created = max(0, self._created - 1)
                 raise
+            if self._on_channel_opened is not None:
+                self._on_channel_opened()
+            if _found_closed and self._on_channel_rebuilt is not None:
+                self._on_channel_rebuilt()
             async with self._lock:
                 self._in_use.add(channel)
                 return channel
@@ -121,7 +137,7 @@ class AsyncChannelPool:
         if channel.is_closed:
             async with self._lock:
                 self._created = max(0, self._created - 1)
-            return await self.acquire()
+            return await self.acquire(_found_closed=True)
         async with self._lock:
             self._in_use.add(channel)
         return channel
@@ -218,11 +234,16 @@ class AsyncConnectionPool:
         security_config: SecurityConfig,
         pool_config: PoolConfig | None = None,
         publisher_confirms: bool = True,
+        on_channel_opened: Callable[[], None] | None = None,
+        on_channel_rebuilt: Callable[[], None] | None = None,
     ) -> None:
         self._connection_config = connection_config
         self._security_config = security_config
         self._pool_config = pool_config or PoolConfig()
         self._publisher_confirms = publisher_confirms
+        # Item 3: forwarded to every AsyncChannelPool this pool constructs.
+        self._on_channel_opened = on_channel_opened
+        self._on_channel_rebuilt = on_channel_rebuilt
 
         self._publisher_connection: Any | None = None
         self._consumer_connection: Any | None = None
@@ -241,6 +262,8 @@ class AsyncConnectionPool:
                     pool_size=self._pool_config.channel_pool_size,
                     acquire_timeout=self._pool_config.channel_acquire_timeout,
                     publisher_confirms=self._publisher_confirms,
+                    on_channel_opened=self._on_channel_opened,
+                    on_channel_rebuilt=self._on_channel_rebuilt,
                 )
             if self._consumer_connection is None:
                 self._consumer_connection = await self._create_connection()
@@ -271,6 +294,8 @@ class AsyncConnectionPool:
                     pool_size=self._pool_config.channel_pool_size,
                     acquire_timeout=self._pool_config.channel_acquire_timeout,
                     publisher_confirms=self._publisher_confirms,
+                    on_channel_opened=self._on_channel_opened,
+                    on_channel_rebuilt=self._on_channel_rebuilt,
                 )
             return self._publisher_connection
 

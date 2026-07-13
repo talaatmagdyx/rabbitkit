@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`examples/production_pipeline/`** — the production checklist as one
+  executable sync (pika) service: a consume+publish order processor wiring
+  quorum queues + `delivery_limit` backstop, the retry ladder + DLQ triage
+  headers, confirmed result publishing (ack-after-confirmed via
+  `@publisher`), Pydantic body validation, optional Redis dedup, Prometheus
+  metrics, a correct liveness/readiness split, `broker.run()` graceful
+  drain/reconnect, env-driven config with credential hygiene, and the
+  mandatory `worker_count > 1` for handlers that publish with confirms.
+  Ships with an outcome-checked producer (`PublishOutcome` branching,
+  `mandatory=True` RETURNED demo, `outcome.classification`) and a
+  TestBroker contract test. Verified end-to-end against a real broker:
+  probes go ready, all seeds CONFIRMED, transient failures walk the
+  2s/10s/30s ladder into the DLQ (2 dead letters: exhausted + permanent),
+  the sink drains the processed queue, and SIGTERM exits 0 after a clean
+  drain.
+
 ## [0.11.0] — 2026-07-11
 
 ### Fixed

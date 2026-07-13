@@ -86,6 +86,9 @@ python examples/quickstart/01_sync_broker.py
 ### Pipelines
 | File | Description |
 |------|-------------|
+| `production_pipeline/app.py` | **The production checklist, executable** — sync consume+publish worker: quorum queues + delivery-limit backstop, retry ladder + DLQ triage headers, confirmed result publishing, Pydantic validation, metrics, liveness/readiness split, graceful drain |
+| `production_pipeline/producer.py` | The publish contract: branch on every `PublishOutcome`, `mandatory=True` unroutable detection, `outcome.classification` |
+| `production_pipeline/test_pipeline.py` | The pipeline's business contract under TestBroker — no RabbitMQ needed |
 | `pipeline_twitter_dm/async_pipeline.py` | Two-stage DM pipeline (producer → enrich relay → verified sink), async — 100k events measured |
 | `pipeline_twitter_dm/sync_pipeline.py` | The SAME pipeline on SyncBroker — parity-verified against the async twin |
 

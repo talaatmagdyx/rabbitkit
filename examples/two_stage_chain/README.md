@@ -13,7 +13,9 @@ stages on one `SyncBroker`, verifies the result, exits.
 1. **Stage 1 — forward safely.** `@publisher` publishes the handler's return
    value to the next queue *with confirms*, and the source message is acked
    only after that publish is broker-confirmed. A lost forward nack-requeues
-   the source; nothing silently vanishes between queues.
+   the source; nothing silently vanishes between queues. Transient failures
+   in the operation walk a 2s/10s/30s retry ladder, then dead-letter with
+   triage headers.
 
 2. **Stage 2 — `AckPolicy.MANUAL`: tie the ack to the side effect.** The
    message is acked by your code, only after the operation (persisting to a
@@ -26,6 +28,17 @@ stages on one `SyncBroker`, verifies the result, exits.
    gets nacked, is redelivered, stores, and is acked — the final store holds
    every reading exactly once (the store write is keyed, so a redelivered
    duplicate overwrites instead of double-inserting).
+
+**Production decisions carried (explicitly, not by default-reliance):**
+
+| Decision | Why |
+|----------|-----|
+| `PublisherConfig(confirm_delivery=True, persistent=True)` | Every publish resolves only on broker ack; messages survive a restart. (These are rabbitkit's defaults — set explicitly so the choice is visible.) |
+| `mandatory=True` on seeds + `assert outcome.ok` | `publish()` never raises on delivery failure — you branch on the `PublishOutcome`; unroutable → `RETURNED`, never a false confirm |
+| Quorum queues, `delivery_limit=6` | Replicated, and the **broker-enforced** cap on stage 2's nack/requeue loop — without it, a permanently-down store would redeliver forever |
+| Per-route `retry=` on stage 1 only | Stage 2 has **no retry middleware on purpose**: under MANUAL ack your code owns settlement; its transient path is the explicit nack+requeue, bounded by `delivery_limit` |
+| `worker_count=4` | Required, not tuning: stage 1 publishes with confirms from its handler — unbounded on a single sync worker (rabbitkit warns) |
+| Env-driven connection, `connection_name` | No hardcoded prod credentials; identifiable in the management UI |
 
 ## Run
 

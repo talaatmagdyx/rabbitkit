@@ -8,8 +8,9 @@ The flow (one self-contained script: seeds, runs both stages, verifies, exits):
 Stage 1 (``readings.raw``) — receive raw sensor data, do the operation
 (Fahrenheit -> Celsius + anomaly flag), and publish the result to the next
 queue via ``@publisher``. The source message is acked ONLY after the
-forwarded publish is broker-confirmed — a lost forward nack-requeues the
-source instead of vanishing.
+forwarded publish is broker-CONFIRMED — a lost forward nack-requeues the
+source instead of vanishing. Transient failures walk a retry ladder; the
+delay queues + DLQ are declared automatically.
 
 Stage 2 (``readings.celsius``) — ``AckPolicy.MANUAL``: the message is acked
 by YOUR code, only after the operation (here: persisting to a store)
@@ -18,9 +19,28 @@ puts the reading back for redelivery — nothing is lost, nothing is acked
 "on faith". This is the policy to reach for when the ack must be tied to a
 side effect completing, not to the handler merely returning.
 
-The script proves it end to end: one reading's first store attempt fails on
-purpose -> it is nacked -> redelivered -> stored -> acked; the final store
-holds every reading exactly once.
+Production decisions carried by this example (the full set, with health
+probes/metrics/k8s wiring, lives in ``examples/production_pipeline/``):
+
+  - Publisher CONFIRMS + persistent delivery, set EXPLICITLY (they are also
+    rabbitkit's defaults — a publish resolves only when the broker acks it,
+    and ``broker.publish()`` returns a PublishOutcome you must branch on).
+  - ``mandatory=True`` on seeds: an unroutable publish comes back RETURNED
+    instead of being confirmed into the void.
+  - QUORUM queues with ``delivery_limit=6``: a broker-enforced redelivery
+    cap. Critical for stage 2 specifically — its nack(requeue=True) would
+    otherwise hot-loop FOREVER if the store stayed down; after 6
+    redeliveries RabbitMQ itself dead-letters the message.
+  - Retry ladder on stage 1 (per-route ``retry=``). Stage 2 deliberately
+    has NO retry middleware: under MANUAL ack your code owns settlement,
+    and its transient-failure path is the nack+requeue you see below,
+    bounded by the delivery_limit backstop.
+  - Env-driven connection config; bounded prefetch; ``worker_count > 1``
+    (required: stage 1 publishes with confirms from its handler).
+
+The script proves the manual-ack path end to end: one reading's first store
+attempt fails on purpose -> nacked -> redelivered -> stored -> acked; the
+final store holds every reading exactly once.
 
 Run:
     docker run -d --rm -p 5672:5672 rabbitmq:3.13-management-alpine
@@ -35,7 +55,17 @@ import os
 import threading
 import time
 
-from rabbitkit import ConnectionConfig, ConsumerConfig, MessageEnvelope, RabbitConfig, WorkerConfig
+from rabbitkit import (
+    ConnectionConfig,
+    ConsumerConfig,
+    MessageEnvelope,
+    PublisherConfig,
+    QueueType,
+    RabbitConfig,
+    RabbitQueue,
+    RetryConfig,
+    WorkerConfig,
+)
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import AckPolicy
 from rabbitkit.sync import SyncBroker
@@ -47,18 +77,36 @@ broker = SyncBroker(
         connection=ConnectionConfig(
             host=os.environ.get("RABBITMQ_HOST", "localhost"),
             port=int(os.environ.get("RABBITMQ_PORT", "5672")),
+            username=os.environ.get("RABBITMQ_USER", "guest"),
+            password=os.environ.get("RABBITMQ_PASSWORD", "guest"),
+            vhost=os.environ.get("RABBITMQ_VHOST", "/"),
+            connection_name="two-stage-chain",  # identifiable in the mgmt UI
         ),
-        consumer=ConsumerConfig(prefetch_count=16),
+        # Explicit, though these are also the defaults: every publish waits
+        # for the broker's ack (CONFIRMED) and messages survive a restart.
+        publisher=PublisherConfig(confirm_delivery=True, persistent=True, confirm_timeout=5.0),
+        # Bounded prefetch = backpressure lives in RabbitMQ, not our memory.
+        consumer=ConsumerConfig(prefetch_count=16, graceful_timeout=30.0),
     )
 )
+
+
+def quorum(name: str) -> RabbitQueue:
+    """Replicated queue + broker-enforced redelivery cap (poison backstop)."""
+    return RabbitQueue(name=name, queue_type=QueueType.QUORUM, durable=True, delivery_limit=6)
 
 
 # ── Stage 1: receive raw -> operate -> publish to the next queue ────────────
 # @publisher (inner) + @subscriber (outer): the handler's return value is
 # published to readings.celsius with confirms, and the raw message is acked
-# only after that publish is broker-confirmed.
+# only after that publish is broker-confirmed. A transient failure here
+# (e.g. a downstream lookup timing out) walks the 2s/10s/30s ladder, then
+# dead-letters to readings.raw.dlq with x-rabbitkit-error-* triage headers.
 
-@broker.subscriber(queue="readings.raw")
+@broker.subscriber(
+    queue=quorum("readings.raw"),
+    retry=RetryConfig(max_retries=3, delays=(2, 10, 30)),
+)
 @broker.publisher(routing_key="readings.celsius")
 def convert(body: bytes) -> bytes:
     reading = json.loads(body)
@@ -73,7 +121,10 @@ def convert(body: bytes) -> bytes:
 
 
 # ── Stage 2: operate -> ACK (manual) ────────────────────────────────────────
-# The ack is tied to the SIDE EFFECT succeeding, not to the handler returning.
+# The ack is tied to the SIDE EFFECT succeeding, not to the handler
+# returning. No retry middleware here on purpose: under MANUAL ack this
+# handler owns settlement — transient = nack(requeue=True) below, and the
+# queue's delivery_limit=6 is the broker-side bound on that loop.
 
 store: dict[str, dict] = {}
 store_lock = threading.Lock()
@@ -86,7 +137,8 @@ def save_to_store(event: dict) -> None:
     """The stage-2 operation. Fails ONCE for sensor-7 to prove the
     nack -> redeliver -> ack path. A real version writes to a database —
     keyed on sensor_id+taken_at so a redelivered duplicate overwrites
-    instead of double-inserting (idempotent)."""
+    instead of double-inserting (idempotent: at-least-once delivery WILL
+    occasionally rerun this)."""
     if event["sensor_id"] == "sensor-7" and not flaky_first_attempt_done.is_set():
         flaky_first_attempt_done.set()
         raise ConnectionError("store briefly unavailable")
@@ -96,7 +148,7 @@ def save_to_store(event: dict) -> None:
             all_stored.set()
 
 
-@broker.subscriber(queue="readings.celsius", ack_policy=AckPolicy.MANUAL)
+@broker.subscriber(queue=quorum("readings.celsius"), ack_policy=AckPolicy.MANUAL)
 def persist(body: bytes, msg: RabbitMessage) -> None:
     event = json.loads(body)
     with store_lock:
@@ -104,12 +156,13 @@ def persist(body: bytes, msg: RabbitMessage) -> None:
     try:
         save_to_store(event)
     except ConnectionError:
-        # Operation failed transiently: DO NOT ack — put it back for redelivery.
+        # Operation failed transiently: DO NOT ack — put it back for
+        # redelivery (bounded by the queue's delivery_limit backstop).
         msg.nack(requeue=True)
         return
     except (KeyError, ValueError):
-        # Malformed payload: rerunning can never succeed — reject (no requeue,
-        # so it dead-letters if the queue has a DLX, or is dropped otherwise).
+        # Malformed payload: rerunning can never succeed — reject (no
+        # requeue) so it dead-letters to readings.celsius.dlq.
         msg.reject(requeue=False)
         return
     # Only now — the side effect is durable — acknowledge.
@@ -123,7 +176,7 @@ def main() -> None:
     # which on a single sync worker cannot be time-bounded (rabbitkit warns).
     broker.start(worker_config=WorkerConfig(worker_count=4))
 
-    print(f"[seed] publishing {READINGS} raw readings ...")
+    print(f"[seed] publishing {READINGS} raw readings (confirmed, persistent, mandatory) ...")
     for i in range(READINGS):
         outcome = broker.publish(MessageEnvelope(
             routing_key="readings.raw",
@@ -133,8 +186,11 @@ def main() -> None:
                 "taken_at": f"2026-07-13T10:00:{i:02d}Z",
             }).encode(),
             message_id=f"reading-{i}",
+            # An unroutable publish comes back RETURNED, never a false confirm.
+            mandatory=True,
         ))
-        assert outcome.ok, f"seed publish {i} failed: {outcome.status}"
+        # publish() NEVER raises on delivery failure — branch on the outcome.
+        assert outcome.ok, f"seed publish {i} failed: {outcome.status} ({outcome.error})"
 
     # Drive the consume loop; wait until stage 2 has stored everything.
     consume_thread = threading.Thread(target=broker._transport.start_consuming, daemon=True)

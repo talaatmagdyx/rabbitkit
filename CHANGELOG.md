@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sink drains the processed queue, and SIGTERM exits 0 after a clean
   drain.
 
+- **`examples/two_stage_chain/`** — the minimal two-stage relay: receive →
+  operate → publish to the next queue; the next queue operates → **acks
+  manually**, tying the ack to the side effect (a store write) actually
+  succeeding rather than the handler merely returning. Demonstrates
+  `AckPolicy.MANUAL`'s full decision tree (ack on success, nack+requeue on
+  a transient store failure, reject on malformed payload) and proves the
+  redelivery path end-to-end: one reading's first store attempt fails on
+  purpose, is nacked, redelivered, and stored exactly once. Verified
+  against a real broker; self-verifying single script (seeds, runs both
+  stages, asserts, exits 0).
+
 ## [0.11.0] — 2026-07-11
 
 ### Fixed

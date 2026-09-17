@@ -52,6 +52,7 @@ nav:
       - Getting Started: guide/getting-started.md
       - Full Guide: guide/full-guide.md
       - Retry Architecture: rabbitmq-retry-architecture.md
+      - Bulk Operations & Reliability Profiles: bulk-operations.md
   - Production:
       - Patterns (reference code): production/patterns.md
       - Scale & Reliability Handbook: production/scale.md
@@ -73,6 +74,7 @@ nav:
       - Dependency Injection: api/di.md
       - Serialization: api/serialization.md
       - High-Load: api/highload.md
+      - Bulk Operations & Reliability: api/bulk.md
       - RPC: api/rpc.md
       - Health Checks: api/health.md
       - Locking: api/locking.md

@@ -1127,4 +1127,12 @@ class AsyncTransportImpl:
         message._nack_async_fn = nack_fn
         message._reject_async_fn = reject_fn
 
+        def _channel_alive() -> bool:
+            ch = getattr(aio_message, "channel", None)
+            if ch is None:
+                return True  # unknown — do not claim staleness we cannot see
+            return not bool(getattr(ch, "is_closed", False))
+
+        message._channel_alive = _channel_alive
+
         return message

@@ -19,8 +19,10 @@ from typing import Any
 from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.errors import ErrorPredicate
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.retry_handoff import RetryHandoffTracker
+from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.topology import RabbitQueue
-from rabbitkit.core.types import REQUEUED_FOR_RETRY, ErrorSeverity, MessageEnvelope, QueueType
+from rabbitkit.core.types import REQUEUED_FOR_RETRY, ErrorSeverity, HandoffState, MessageEnvelope, QueueType
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 
@@ -60,9 +62,7 @@ def _shard_ttl_multipliers(shards: int, jitter_factor: float) -> list[float]:
     if shards == 2:
         return [1.0, 1.0 + jitter_factor]
     rest = shards - 1
-    return [1.0] + [
-        1.0 + jitter_factor * (-1.0 + 2.0 * i / (rest - 1)) for i in range(rest)
-    ]
+    return [1.0] + [1.0 + jitter_factor * (-1.0 + 2.0 * i / (rest - 1)) for i in range(rest)]
 
 
 def retry_middleware_insertion_index(middlewares: Sequence[Any]) -> int:
@@ -169,8 +169,30 @@ class RetryMiddleware(BaseMiddleware):
         predicates: Sequence[ErrorPredicate] = (),
         metrics_collector: Any | None = None,
         metrics_config: Any | None = None,
+        sanitizer: ErrorSanitizer | None = None,
+        handoff_tracker: RetryHandoffTracker | None = None,
+        on_handoff_failure: Callable[[float, RetryHandoffTracker], Any] | None = None,
+        on_handoff_exhausted: Callable[[RetryHandoffTracker], Any] | None = None,
+        sleep_on_handoff_failure: bool = True,
     ) -> None:
         self._config = config
+        # Plan §5.3: allowlisted category/code + bounded, redacted summary on
+        # the retry/DLQ triage headers. Never raw exception text by default.
+        self._sanitizer = sanitizer or ErrorSanitizer(
+            policy=config.error_detail, max_summary_len=_ERROR_MESSAGE_MAX_LEN
+        )
+        # Plan §5.2: retry-PUBLISH failures are tracked separately from
+        # handler attempts, with capped exponential backoff and an exhausted
+        # state an owner can act on (stop the consumer / close the channel).
+        self._handoff = handoff_tracker or RetryHandoffTracker(config.handoff)
+        self._on_handoff_failure = on_handoff_failure
+        self._on_handoff_exhausted = on_handoff_exhausted
+        # Async handlers await the backoff (a coroutine sleeping never blocks
+        # the loop). The sync path NEVER sleeps here — with worker_count == 1
+        # the handler runs on pika's I/O thread and a sleep would stall
+        # heartbeats; the backoff is surfaced through on_handoff_failure
+        # instead so the owner can pause admission.
+        self._sleep_on_handoff_failure = sleep_on_handoff_failure
         # predicates run first (True=transient, False=permanent, None=defer to the
         # built-in type tuples, then unknown_policy). Lets callers classify by
         # something other than exception type (e.g. an HTTP status attribute).
@@ -216,6 +238,56 @@ class RetryMiddleware(BaseMiddleware):
     @property
     def config(self) -> RetryConfig:
         return self._config
+
+    @property
+    def handoff_tracker(self) -> RetryHandoffTracker:
+        """Consecutive retry-publish failure state for this middleware."""
+        return self._handoff
+
+    @property
+    def sanitizer(self) -> ErrorSanitizer:
+        return self._sanitizer
+
+    def _record_handoff_failure(self, message: RabbitMessage) -> float:
+        """Count a failed delay-queue handoff; return the backoff to apply."""
+        backoff = self._handoff.record_failure()
+        if self._metrics_config is not None:
+            self._record_metric(self._metrics_config.retry_handoff_failures_total, message)
+            self._set_paused_gauge(message, 1.0)
+        state = self._handoff.state
+        logger.warning(
+            "Retry handoff failed (consecutive=%d, state=%s, backoff=%.2fs): routing_key=%s",
+            self._handoff.consecutive_failures,
+            state.value,
+            backoff,
+            message.routing_key,
+        )
+        if self._on_handoff_failure is not None:
+            try:
+                self._on_handoff_failure(backoff, self._handoff)
+            except Exception:
+                logger.exception("on_handoff_failure hook raised")
+        if state is HandoffState.EXHAUSTED and self._on_handoff_exhausted is not None:
+            try:
+                self._on_handoff_exhausted(self._handoff)
+            except Exception:
+                logger.exception("on_handoff_exhausted hook raised")
+        return backoff
+
+    def _record_handoff_success(self, message: RabbitMessage) -> None:
+        was_paused = self._handoff.is_paused
+        self._handoff.record_success()
+        if was_paused and self._metrics_config is not None:
+            self._set_paused_gauge(message, 0.0)
+
+    def _set_paused_gauge(self, message: RabbitMessage, value: float) -> None:
+        if self._metrics_collector is None or self._metrics_config is None:
+            return
+        set_gauge = getattr(self._metrics_collector, "set_gauge", None)
+        if set_gauge is None:
+            return
+        queue = message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown"
+        set_gauge(self._metrics_config.retry_handoff_paused, {"queue": str(queue)}, value)
 
     def consume_scope(
         self,
@@ -337,8 +409,13 @@ class RetryMiddleware(BaseMiddleware):
         # describe THIS failure; first-failed-at is set once and preserved
         # across every subsequent retry (mirrors the original-* pattern
         # above); last-failed-at is overwritten on every retry.
-        headers["x-rabbitkit-error-type"] = type(exc).__name__
-        headers["x-rabbitkit-error-message"] = str(exc)[:_ERROR_MESSAGE_MAX_LEN]
+        # Plan §5.3: allowlisted category/code + bounded, REDACTED summary.
+        # ``error_detail="omit"`` writes no message text at all; ``"raw"`` is
+        # the legacy opt-in. A previous attempt's message header is dropped
+        # so a sanitized retry cannot carry forward stale raw text.
+        headers.pop("x-rabbitkit-error-message", None)
+        sanitized = self._sanitizer.sanitize(exc, self._classifier.classify(exc).severity)
+        headers.update(sanitized.as_headers())
         now = datetime.now(UTC).isoformat()
         if "x-rabbitkit-first-failed-at" not in headers:
             headers["x-rabbitkit-first-failed-at"] = now
@@ -401,7 +478,15 @@ class RetryMiddleware(BaseMiddleware):
             )
             return
 
-        outcome = self._publish_fn(envelope)
+        try:
+            outcome = self._publish_fn(envelope)
+        except Exception as exc_pub:
+            # A RAISED publish is a handoff failure too (connection drop,
+            # channel error) — same treatment as a not-ok outcome, and the
+            # handoff may or may not have reached the broker (duplicates are
+            # possible on recovery; the source is never acked here).
+            logger.warning("Retry publish raised %s; treating as handoff failure", type(exc_pub).__name__)
+            outcome = None
         # A None outcome (a custom/duck-typed publish fn that returns nothing)
         # is UNVERIFIED, not success — treat like a failed publish.
         if outcome is None or not outcome.ok:
@@ -414,11 +499,13 @@ class RetryMiddleware(BaseMiddleware):
                 "Retry publish failed or unverified; nacked for redelivery: routing_key=%s",
                 envelope.routing_key,
             )
+            self._record_handoff_failure(message)
             return
 
         # Ack source message (it's safely in the delay queue now)
         if not message.is_settled:
             message.ack()
+        self._record_handoff_success(message)
 
         if self._metrics_config is not None:
             self._record_metric(self._metrics_config.messages_retried_total, message)
@@ -449,7 +536,11 @@ class RetryMiddleware(BaseMiddleware):
             )
             return
 
-        outcome = await self._publish_async_fn(envelope)
+        try:
+            outcome = await self._publish_async_fn(envelope)
+        except Exception as exc_pub:
+            logger.warning("Retry publish raised %s; treating as handoff failure", type(exc_pub).__name__)
+            outcome = None
         # None outcome = unverified publish = failure (see sync variant).
         if outcome is None or not outcome.ok:
             # Delay-queue publish failed — DO NOT ack (see sync variant).
@@ -459,10 +550,18 @@ class RetryMiddleware(BaseMiddleware):
                 "Retry publish failed or unverified; nacked for redelivery: routing_key=%s",
                 envelope.routing_key,
             )
+            backoff = self._record_handoff_failure(message)
+            if self._sleep_on_handoff_failure and backoff > 0:
+                # Brake the redelivery hot loop. This coroutine sleeping does
+                # not block the event loop; the message is already nacked.
+                import asyncio
+
+                await asyncio.sleep(backoff)
             return
 
         if not message.is_settled:
             await message.ack_async()
+        self._record_handoff_success(message)
 
         if self._metrics_config is not None:
             self._record_metric(self._metrics_config.messages_retried_total, message)
@@ -539,8 +638,8 @@ class RetryRouter:
         """
         dlq_name = self.get_dlq_name(source_queue_name)
         return {
-            "x-dead-letter-exchange": "",          # default exchange
-            "x-dead-letter-routing-key": dlq_name, # route directly by queue name
+            "x-dead-letter-exchange": "",  # default exchange
+            "x-dead-letter-routing-key": dlq_name,  # route directly by queue name
         }
 
     def get_delay_queue_definitions(
@@ -592,13 +691,15 @@ class RetryRouter:
                         "x-message-ttl": max(1, int(delay_ms * mult)),
                         "x-dead-letter-exchange": "",  # default exchange (M5)
                         "x-dead-letter-routing-key": source_queue_name,
-                        # Delay queues stay CLASSIC deliberately, even for a
-                        # quorum source: they hold messages only for the delay
-                        # window (bounded seconds/minutes), have no consumers,
-                        # and quorum queues historically had weaker per-message
-                        # TTL behavior. The DLQ below is different — it stores
-                        # messages indefinitely, so it inherits quorum.
-                        "x-queue-type": "classic",
+                        # Plan §5.1: configurable. The legacy default is
+                        # CLASSIC (delay queues hold messages only for the
+                        # delay window, have no consumers, and quorum queues
+                        # historically had weaker per-message TTL behavior).
+                        # "quorum" makes the whole retry chain replicated for
+                        # critical work; "inherit" follows the source queue.
+                        "x-queue-type": self._resolve_queue_type(
+                            self._config.delay_queue_type, source_queue_type, default="classic"
+                        ),
                     },
                 )
                 queues.append(queue)
@@ -613,14 +714,27 @@ class RetryRouter:
         # messages to unreplicated single-node storage. (Streams are not
         # inherited: basic_get-based DLQ inspection/replay doesn't apply to
         # stream semantics.)
+        dlq_type = self._resolve_queue_type(self._config.dlq_queue_type, source_queue_type, default="classic")
         dlq = RabbitQueue(
             name=dlq_name,
             durable=True,
-            queue_type=QueueType.QUORUM if source_queue_type == QueueType.QUORUM else QueueType.CLASSIC,
+            queue_type=QueueType.QUORUM if dlq_type == "quorum" else QueueType.CLASSIC,
         )
         queues.append(dlq)
 
         return queues
+
+    @staticmethod
+    def _resolve_queue_type(setting: str, source_queue_type: QueueType | None, *, default: str) -> str:
+        """``"inherit"`` → the source queue's type (quorum/classic; streams
+        fall back to *default* — a stream cannot be a delay/DLQ target)."""
+        if setting == "inherit":
+            if source_queue_type == QueueType.QUORUM:
+                return "quorum"
+            if source_queue_type == QueueType.CLASSIC:
+                return "classic"
+            return default
+        return setting
 
     def _get_delay_ms(self, index: int) -> int:
         """Get delay in milliseconds for retry attempt."""

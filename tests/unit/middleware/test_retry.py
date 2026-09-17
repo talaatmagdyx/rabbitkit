@@ -800,7 +800,10 @@ class TestRetryEnvelopeDlqTriageHeaders:
 
         mw = RetryMiddleware(RetryConfig(max_retries=1, delays=(5,)))
         msg = _make_message(headers={"x-rabbitkit-original-queue": "orders"}, routing_key="orders")
-        huge = "x" * (_ERROR_MESSAGE_MAX_LEN * 3)
+        # Words, not one opaque token: the sanitizer redacts 40+ char
+        # unbroken alphanumeric runs as probable secrets (see
+        # core/sanitizer.py), which is a separate, tested behavior.
+        huge = "word " * _ERROR_MESSAGE_MAX_LEN
         envelope = mw._build_retry_envelope(msg, retry_count=0, exc=ValueError(huge))
 
         assert len(envelope.headers["x-rabbitkit-error-message"]) == _ERROR_MESSAGE_MAX_LEN

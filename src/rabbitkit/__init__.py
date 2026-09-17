@@ -7,6 +7,13 @@ from rabbitkit.async_.broker import AsyncBroker
 from rabbitkit.asyncapi import AsyncAPIGeneratorConfig, generate_asyncapi_doc, generate_asyncapi_json
 from rabbitkit.concurrency import AsyncWorkerPool, SyncWorkerPool
 from rabbitkit.core.app import AppState, RabbitApp
+from rabbitkit.core.bulk import (
+    BulkPublishError,
+    BulkPublishItem,
+    BulkPublishOptions,
+    BulkPublishResult,
+    PublishPreparer,
+)
 from rabbitkit.core.config import (
     RETRY_DISABLED,
     BackpressureConfig,
@@ -23,6 +30,7 @@ from rabbitkit.core.config import (
     RabbitConfig,
     RetryConfig,
     RetryDisabled,
+    RetryHandoffConfig,
     SafetyConfig,
     SecurityConfig,
     SocketConfig,
@@ -42,19 +50,48 @@ from rabbitkit.core.errors import (
 )
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
+from rabbitkit.core.profiles import (
+    PolicyTemplate,
+    PreflightCheck,
+    PreflightReport,
+    ProfileViolation,
+    apply_profile,
+    critical_config,
+    policy_templates,
+    preflight,
+    standard_config,
+    validate_profile,
+)
+from rabbitkit.core.retry_handoff import RetryHandoffTracker
 from rabbitkit.core.router import RabbitRouter
+from rabbitkit.core.sanitizer import ErrorSanitizer, SanitizedError
+from rabbitkit.core.settlement import (
+    SettlementCommand,
+    SettlementCoordinator,
+    SettlementItem,
+    SettlementReport,
+    SettlementReportError,
+)
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
+    BulkPublishStatus,
     ClassifiedError,
     DeduplicationMarkPolicy,
+    DeliveryState,
     ErrorSeverity,
     ExchangeType,
+    FlushReason,
+    HandoffState,
     MessageEnvelope,
+    PreflightStatus,
     PublishOutcome,
     PublishStatus,
     QueueType,
     RejectWithoutDLXPolicy,
+    ReliabilityProfile,
+    SettlementAction,
+    SettlementItemStatus,
     TopologyMode,
 )
 from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
@@ -74,7 +111,16 @@ from rabbitkit.health import (
     broker_readiness_async,
 )
 from rabbitkit.highload.backpressure import FlowController
-from rabbitkit.highload.batch import BatchAcker, BatchPublisher
+from rabbitkit.highload.batch import (
+    BatchAcker,
+    BatchClosedError,
+    BatchFlushError,
+    BatchPublisher,
+    CoalescingAcker,
+    CoalescingFlushReport,
+    FlushItem,
+    FlushReport,
+)
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
@@ -115,13 +161,22 @@ __all__ = [
     "BackpressureError",
     "BatchAckConfig",
     "BatchAcker",
+    "BatchClosedError",
+    "BatchFlushError",
     "BatchPublishConfig",
     "BatchPublisher",
     "BrokerHealthResult",
     "BrokerNotStartedError",
+    "BulkPublishError",
+    "BulkPublishItem",
+    "BulkPublishOptions",
+    "BulkPublishResult",
+    "BulkPublishStatus",
     "CircuitBreakerMiddleware",
     "CircuitBreakerOpenError",
     "ClassifiedError",
+    "CoalescingAcker",
+    "CoalescingFlushReport",
     "CompressionConfig",
     "ConfigValidationError",
     "ConfigurationError",
@@ -135,11 +190,17 @@ __all__ = [
     "DeduplicationConfig",
     "DeduplicationMarkPolicy",
     "DeduplicationMiddleware",
+    "DeliveryState",
     "DependencyScope",
     "Depends",
+    "ErrorSanitizer",
     "ErrorSeverity",
     "ExchangeType",
     "FlowController",
+    "FlushItem",
+    "FlushReason",
+    "FlushReport",
+    "HandoffState",
     "Header",
     "HealthCheckConfig",
     "HealthStatus",
@@ -158,9 +219,15 @@ __all__ = [
     "NackMessage",
     "OTelTracingMiddleware",
     "Path",
+    "PolicyTemplate",
     "PoolConfig",
+    "PreflightCheck",
+    "PreflightReport",
+    "PreflightStatus",
+    "ProfileViolation",
     "PrometheusCollector",
     "PublishOutcome",
+    "PublishPreparer",
     "PublishStatus",
     "PublisherConfig",
     "PydanticDecoder",
@@ -178,14 +245,25 @@ __all__ = [
     "RawDecoder",
     "RejectMessage",
     "RejectWithoutDLXPolicy",
+    "ReliabilityProfile",
     "ReplayResult",
     "RetryConfig",
     "RetryDisabled",
+    "RetryHandoffConfig",
+    "RetryHandoffTracker",
     "SSLConfig",
     "SafetyConfig",
+    "SanitizedError",
     "SecurityConfig",
     "SerializationPipeline",
+    "SettlementAction",
+    "SettlementCommand",
+    "SettlementCoordinator",
     "SettlementError",
+    "SettlementItem",
+    "SettlementItemStatus",
+    "SettlementReport",
+    "SettlementReportError",
     "SocketConfig",
     "SyncBatchPublisher",
     "SyncBroker",
@@ -195,6 +273,7 @@ __all__ = [
     "UnsafeTopologyError",
     "WorkerConfig",
     "__version__",
+    "apply_profile",
     "broker_health_check",
     "broker_health_check_async",
     "broker_liveness",
@@ -202,10 +281,15 @@ __all__ = [
     "broker_readiness",
     "broker_readiness_async",
     "configure_structlog",
+    "critical_config",
     "experimental",
     "generate_asyncapi_doc",
     "generate_asyncapi_json",
     "metrics_app",
+    "policy_templates",
+    "preflight",
     "rabbitkit_lifespan",
+    "standard_config",
     "start_metrics_server",
+    "validate_profile",
 ]

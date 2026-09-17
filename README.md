@@ -286,6 +286,66 @@ dedicated I/O thread), or scale out across processes.
 
 ---
 
+## Bulk operations and reliability profiles
+
+`publish_many` / `iter_publish` publish a bounded collection through the
+**same** middleware, flow-control, size-limit and transport path as
+`publish`, and return one outcome per input — never a guess. `ack_many` /
+`nack_many` settle exactly the deliveries you name, one frame each, and never
+issue a cumulative ack across a still-running sibling.
+
+```python
+from rabbitkit import AsyncBroker, BulkPublishOptions, BulkPublishStatus, MessageEnvelope
+
+
+async def publish_page(broker: AsyncBroker, rows: list[dict]) -> None:
+    envelopes = [
+        MessageEnvelope(
+            message_id=row["event_id"],  # stable, caller-owned id
+            exchange="events",
+            routing_key="tweet.received",
+            body=row["payload"],
+            mandatory=True,
+        )
+        for row in rows
+    ]
+    result = await broker.publish_many(
+        envelopes,
+        BulkPublishOptions(max_in_flight=256, max_buffer_bytes=8 * 1024 * 1024, overall_timeout=30.0),
+    )
+    for item in result.items:  # input-ordered; status ∈ CONFIRMED/UNROUTABLE/NACKED/INVALID/NOT_SENT/UNKNOWN
+        if item.status is BulkPublishStatus.UNKNOWN:
+            print("reconcile", item.message_id, item.attempt_id)  # may have reached the broker
+        elif item.status is BulkPublishStatus.NOT_SENT:
+            print("safe to resubmit", item.index)  # provably never left the process
+```
+
+```python
+from rabbitkit import AckPolicy, RabbitMessage, SyncBroker
+
+broker = SyncBroker()
+held: list[RabbitMessage] = []
+
+
+@broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+def handle(body: bytes, msg: RabbitMessage) -> None:
+    held.append(msg)  # defer settlement to the batch commit
+
+
+def commit_batch(successful: list[RabbitMessage], failed: list[RabbitMessage]) -> None:
+    broker.ack_many(successful).raise_for_status()  # DISPATCHED per item — RabbitMQ never confirms consumer acks
+    broker.nack_many(failed, requeue=False)  # dead-letters via the auto-provisioned DLQ
+```
+
+Opt-in **reliability profiles** (`critical_config()`, `broker.preflight("critical",
+management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
+cap, quorum queues and a quorum retry chain — and report anything they cannot
+verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
+default, and a failing delay-queue handoff backs off instead of hot-looping.
+Full contract: [docs/bulk-operations.md](docs/bulk-operations.md).
+
+---
+
 ## Message safety model
 
 rabbitkit is an **at-least-once** toolkit: a handler may run more than once
@@ -543,7 +603,7 @@ rabbitkit/
   serialization/        # JSON, msgspec, Pydantic, parser/decoder pipeline
   di/                   # Depends, Header, Path, Context
   testing/              # TestBroker and friends
-  highload/             # FlowController, BatchPublisher, BatchAcker
+  highload/             # FlowController, BatchPublisher, BatchAcker, CoalescingAcker
   cli/                  # dlq, topology, migrate, health, run, shell
   fastapi.py            # FastAPI lifespan integration
 ```

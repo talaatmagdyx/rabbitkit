@@ -214,6 +214,90 @@ class PublishStatus(str, Enum):
     ERROR = "error"
 
 
+class BulkPublishStatus(str, Enum):
+    """Actionable per-item state of a bulk publish (``broker.publish_many``).
+
+    Stricter than :class:`PublishStatus` and deliberately preserves
+    uncertainty: ``SENT``, a confirm timeout, and a mid-publish exception all
+    become ``UNKNOWN`` (the publish may have reached the broker) rather than
+    a success or a definite failure. See :mod:`rabbitkit.core.bulk`.
+    """
+
+    CONFIRMED = "confirmed"
+    UNROUTABLE = "unroutable"
+    NACKED = "nacked"
+    INVALID = "invalid"
+    NOT_SENT = "not_sent"
+    UNKNOWN = "unknown"
+
+
+class SettlementAction(str, Enum):
+    """Which consumer settlement a bulk call / coordinator command performs."""
+
+    ACK = "ack"
+    NACK = "nack"
+    REJECT = "reject"
+
+
+class SettlementItemStatus(str, Enum):
+    """Per-item outcome of ``ack_many`` / ``nack_many``.
+
+    ``DISPATCHED`` = handed to the transport (a local wire-write boundary).
+    RabbitMQ never acknowledges a consumer ack, so no member here can mean
+    "broker confirmed".
+    """
+
+    DISPATCHED = "dispatched"
+    ALREADY_SETTLED = "already_settled"
+    DUPLICATE = "duplicate"
+    INVALID = "invalid"
+    STALE = "stale"
+    NOT_ATTEMPTED = "not_attempted"
+    FAILED = "failed"
+
+
+class DeliveryState(str, Enum):
+    """Ledger state of one delivery inside a ``SettlementCoordinator``."""
+
+    OUTSTANDING = "outstanding"
+    SUCCESS = "success"
+    RETRY_PENDING = "retry_pending"
+    NACK = "nack"
+    REJECT = "reject"
+
+
+class FlushReason(str, Enum):
+    """Why a batch helper flushed (metrics label)."""
+
+    SIZE = "size"
+    INTERVAL = "interval"
+    MANUAL = "manual"
+    CLOSE = "close"
+
+
+class ReliabilityProfile(str, Enum):
+    """Opt-in reliability profiles (see :mod:`rabbitkit.core.profiles`)."""
+
+    STANDARD = "standard"
+    CRITICAL = "critical"
+
+
+class PreflightStatus(str, Enum):
+    """Outcome of one preflight check. ``UNVERIFIED`` is reported, never hidden."""
+
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+    FAILED = "failed"
+
+
+class HandoffState(str, Enum):
+    """Retry-handoff tracker state (see :mod:`rabbitkit.core.retry_handoff`)."""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    EXHAUSTED = "exhausted"
+
+
 @dataclass(frozen=True, slots=True)
 class PublishOutcome:
     """Result of a publish operation."""

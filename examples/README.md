@@ -98,9 +98,20 @@ python examples/quickstart/01_sync_broker.py
 |------|-------------|
 | `highload/01_worker_pools.py` | SyncWorkerPool + AsyncWorkerPool |
 | `highload/02_batch_publisher.py` | Buffered batch publishing |
-| `highload/03_batch_acker.py` | Batched multi-ack |
+| `highload/03_batch_acker.py` | BatchAcker — individual acks by default (0.12), cumulative opt-in |
 | `highload/04_backpressure.py` | FlowController — publish-side pressure |
 | `highload/05_ten_queues_high_volume.py` | One broker, 10 queues, 3,000 messages — fan-out at volume |
+
+### Bulk Operations & Reliability (0.12)
+| File | Description |
+|------|-------------|
+| `bulk_operations/01_publish_many_async.py` | `publish_many` — bounded in-flight/bytes/deadline, UNROUTABLE + INVALID items, UNKNOWN vs NOT_SENT handling |
+| `bulk_operations/02_publish_many_sync.py` | Sync `publish_many` + streaming `iter_publish` over a paged generator |
+| `bulk_operations/03_selected_ack_batch_commit.py` | MANUAL handlers → batch DB commit → `ack_many` exact subset, `nack_many` the rest |
+| `bulk_operations/04_coalescing_acker.py` | `CoalescingAcker` with 4 workers finishing out of order — cumulative acks only through a completed prefix |
+| `bulk_operations/05_reliability_profile_preflight.py` | `critical_config`, `validate_profile`, `policy_templates`, `broker.preflight` via the management API |
+| `bulk_operations/06_retry_handoff_and_sanitizer.py` | Sanitized DLQ headers + bounded retry-handoff backoff (no broker needed) |
+| `bulk_operations/07_transactional_outbox_inbox.py` | Outbox → `publish_many` → inbox with SQLite; duplicate absorbed; ack after commit |
 
 ### Configuration
 | File | Description |

@@ -111,8 +111,12 @@ class BulkPublishOptions:
 
     Attributes:
         max_in_flight: Maximum envelopes submitted to the transport but not
-            yet settled (async broker). The sync broker publishes one at a
-            time; the value is validated but has no effect there.
+            yet settled (async broker). Without an ``AsyncBatchPublisher``
+            each in-flight publish holds one pooled channel, so the broker
+            caps the effective value at ``PoolConfig.channel_pool_size``
+            (default 10) — raise the pool or configure batching for more
+            concurrency. The sync broker publishes one at a time; the value
+            is validated but has no effect there.
         max_buffer_bytes: Maximum sum of in-flight body bytes. An envelope
             larger than this can never be admitted and is reported
             ``INVALID`` (``exceeds_max_buffer_bytes``) without being sent.

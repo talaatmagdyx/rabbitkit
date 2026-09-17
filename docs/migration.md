@@ -11,6 +11,53 @@ policy this follows. Experimental API changes are not tracked here — see
 > version was ever distributed, so these entries only matter if you
 > tracked the repository before publication.
 
+## 0.12.0 — upgrade notes
+
+Three behaviour changes, all safety fixes. None re-declares an existing
+queue, so startup is unaffected; review the first two if you use the
+high-load batch helpers directly.
+
+### 1. `BatchAcker` defaults to individual acks
+
+`BatchAcker.flush()` used to issue `ack(max_tag, multiple=True)`. RabbitMQ
+settles **every** outstanding tag on the channel up to `max_tag` — so
+submitting completed tags 1 and 3 also acked a still-processing tag 2 that
+was never submitted. The default is now `mode="individual"` (one
+`multiple=False` frame per tag, ascending). If you relied on the cumulative
+frame **and** this acker is the channel's only settler **and** completions
+are submitted in tag order:
+
+```python
+BatchAckConfig(mode="cumulative", ordered_exclusive_owner=True)
+```
+
+Otherwise use `CoalescingAcker`, which knows every delivery on the channel
+and only coalesces through a completed prefix.
+
+### 2. `BatchPublisher.flush()` accounting
+
+`flush()` still returns an `int`, but it now counts only items whose publish
+did not fail locally (a NACKED / RETURNED / TIMEOUT `PublishOutcome` is no
+longer counted as published). A `publish_fn` that **raises** mid-batch now
+raises `BatchFlushError`; `error.report` (also `publisher.last_flush`) has a
+real outcome for every item already sent, `UNKNOWN` for the raising item and
+the unsent tail in `report.unsent`. Nothing is re-buffered silently.
+`add()` / `add_async()` after `close()` raise `BatchClosedError`. Use
+`flush_report()` for the per-item view.
+
+### 3. Retry / DLQ triage headers are sanitized
+
+`x-rabbitkit-error-message` is now redacted (URL passwords, `password=` /
+`token=` / `api_key=` pairs, bearer tokens, long opaque tokens) and
+length-capped, and a new `x-rabbitkit-error-category` header carries
+`transient` / `permanent`. Set `RetryConfig(error_detail="raw")` for the
+previous text, or `"omit"` for no message text at all.
+
+New, additive: `broker.publish_many` / `iter_publish` / `ack_many` /
+`nack_many` / `preflight`, reliability profiles, `RetryConfig.delay_queue_type`
+/ `dlq_queue_type` / `handoff`, `RabbitManagementClient.put_policy`. See
+[Bulk Operations & Reliability Profiles](bulk-operations.md).
+
 ## 0.10.0 — upgrade notes
 
 Three behavior changes land in 0.10.0. All are safety improvements, and

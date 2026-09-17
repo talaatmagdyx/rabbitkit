@@ -269,6 +269,68 @@ Alert on a sustained `status="unknown"` rate (reconcile), on
 
 ---
 
+## Transactional outbox and inbox
+
+The end-to-end at-least-once recipe. `examples/bulk_operations/07_transactional_outbox_inbox.py`
+runs it with SQLite.
+
+**Outbox (producer side).** Write the business row and the outbox row in one
+database transaction. A relay claims a bounded page of unpublished rows,
+calls `publish_many` with `message_id` = outbox id, and marks **only the
+CONFIRMED rows** as published. `UNKNOWN` rows stay claimed for
+reconciliation; `NOT_SENT` / `INVALID` rows are released for the next page.
+A crash between publish and mark yields a duplicate on the wire, by design.
+
+**Inbox (consumer side).** Insert `(consumer, event_id)` into an inbox table
+and apply the business effect in the same transaction. A duplicate key means
+"already processed": ack without re-applying. Ack **after** the commit, via
+`ack_many` for the exact committed subset. If one event fans out to several
+tenants, put the tenant in the idempotency key.
+
+Do not present a Redis deduplication marker as atomic with a database write;
+the inbox row is what makes the effect idempotent. Claim leases, lease
+renewal and dedup retention must outlive the longest replay you allow.
+
+## DLQ replay
+
+Replay through the existing `DLQInspector` / `rabbitkit dlq replay` with an
+explicit destination, a bounded rate and a stable original `message_id`
+plus a replay audit id. Do not default to replaying everything, and do not
+reset attempt counters indefinitely: a replayed message re-enters the retry
+ladder at attempt 0 by design, so bound replays by a budget.
+
+## FAQ
+
+**Is there a "publish by id" or "pluck from the queue" API?** No, and there
+cannot be one: RabbitMQ queues are not queryable stores and a message id is
+not a delivery handle. Selection always happens in application code (a paged
+query), and `publish_many` takes the resulting envelopes. Deliveries are
+settled by the `RabbitMessage` objects the broker handed you, never by id.
+
+**Does aio-pika / pika have bulk publish or bulk ack?** No. The only bulk
+primitive either client exposes is `basic_ack(multiple=True)`, which is
+exactly what `CoalescingAcker` decides *when* it is safe to call. Everything
+else here (per-item outcomes, bounded admission, stale-handle detection) is
+built on the clients' ordinary `publish`/`ack`/`nack`.
+
+**Why is `SENT` reported as `UNKNOWN`?** With confirms off the frame was
+written to the socket and nothing more is known. Reporting it as confirmed
+would make a lost publish look successful.
+
+**Why does `publish_many` refuse more than `max_items`?** A bulk call is a
+bounded collection you hold in memory; refusing up front (before publishing
+anything) beats discovering the bound halfway through. Use `iter_publish`
+for streams.
+
+## Examples
+
+Runnable, CI-smoke-tested against a real broker:
+[`examples/bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations)
+— async and sync `publish_many`, streaming `iter_publish`, batch-commit
+`ack_many`, `CoalescingAcker` with out-of-order completion, critical-profile
+preflight against the management API, sanitized headers and handoff backoff
+(no broker needed), and the transactional outbox/inbox.
+
 ## Migration notes
 
 * `BatchAcker` default changed to individual acks. If you relied on the

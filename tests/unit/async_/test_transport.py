@@ -66,7 +66,9 @@ class TestConnection:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
                 assert transport.is_connected()
@@ -77,7 +79,9 @@ class TestConnection:
         transport = _make_transport(confirm_delivery=False)
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
                 assert transport.is_connected()
@@ -87,7 +91,9 @@ class TestConnection:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
                 assert transport.is_connected()
@@ -107,7 +113,9 @@ class TestConnection:
         transport.on_channel_opened(lambda: opened.append(1))
         transport.on_channel_rebuilt(lambda: rebuilt.append(1))
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -119,7 +127,9 @@ class TestConnection:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection) as mock_connect:
                 await transport.connect()
                 await transport.connect()  # second call should be no-op
@@ -138,7 +148,9 @@ class TestTopology:
         mock_connection = _make_mock_connection()
         topology_channel = mock_connection.channel.return_value
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -319,7 +331,9 @@ class TestPublish:
         mock_connection = _make_mock_connection()
         publisher_channel = mock_connection.channel.return_value
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -438,9 +452,7 @@ class TestPublish:
         channel = await self._connect_transport(transport)
 
         mock_exchange = AsyncMock()
-        mock_exchange.publish.side_effect = aio_pika.exceptions.PublishError.__new__(
-            aio_pika.exceptions.PublishError
-        )
+        mock_exchange.publish.side_effect = aio_pika.exceptions.PublishError.__new__(aio_pika.exceptions.PublishError)
         channel.get_exchange = AsyncMock(return_value=mock_exchange)
 
         envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex", mandatory=True)
@@ -463,9 +475,7 @@ class TestPublish:
         channel = await self._connect_transport(transport)
 
         mock_exchange = AsyncMock()
-        mock_exchange.publish.side_effect = aio_pika.exceptions.DeliveryError.__new__(
-            aio_pika.exceptions.DeliveryError
-        )
+        mock_exchange.publish.side_effect = aio_pika.exceptions.DeliveryError.__new__(aio_pika.exceptions.DeliveryError)
         channel.get_exchange = AsyncMock(return_value=mock_exchange)
 
         envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="ex")
@@ -564,7 +574,9 @@ class TestPublishConfirmedRetryOnce:
 
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return mock_connection
@@ -703,7 +715,9 @@ class TestConsume:
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -1135,7 +1149,9 @@ class TestDisconnectEdgeCases:
         """Return a fully connected transport with mocked aio-pika."""
         transport = _make_transport()
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return transport
@@ -1195,8 +1211,10 @@ class TestDisconnectEdgeCases:
         transport = await self._connected_transport()
 
         with patch.object(
-            transport._conn_pool, "close_all",
-            new_callable=AsyncMock, side_effect=RuntimeError("pool dead"),
+            transport._conn_pool,
+            "close_all",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("pool dead"),
         ):
             # Must not raise even though close_all explodes
             await transport.disconnect()
@@ -1213,7 +1231,9 @@ class TestEnsureConnected:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 assert not transport.is_connected()
                 await transport._ensure_connected()
@@ -1226,7 +1246,9 @@ class TestEnsureConnected:
 class TestOnMessageCallback:
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return mock_connection.channel.return_value
@@ -1278,7 +1300,9 @@ class TestOnMessageCallback:
 class TestBindExchange:
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return mock_connection.channel.return_value
@@ -1325,7 +1349,9 @@ class TestBindExchange:
 class TestCancelConsumerEdgeCases:
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return mock_connection.channel.return_value
@@ -1432,7 +1458,9 @@ class TestAsyncContextManager:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 result = await transport.__aenter__()
 
@@ -1448,7 +1476,9 @@ class TestAsyncContextManager:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 async with transport as entered:
                     assert entered is transport
@@ -1467,7 +1497,9 @@ class TestDisconnectFastChannel:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -1488,7 +1520,9 @@ class TestDisconnectFastChannel:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -1610,7 +1644,9 @@ class TestGetFastChannel:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
 
@@ -1788,9 +1824,11 @@ class TestPublishOnChannelTimeout:
                 mock_dm.return_value = 2
                 # Patch asyncio.timeout to just raise TimeoutError immediately
                 with patch("asyncio.timeout") as mock_timeout:
+
                     class _FakeCtx:
                         async def __aenter__(self):
                             return self
+
                         async def __aexit__(self, exc_type, exc, tb):
                             return False
 
@@ -1849,9 +1887,7 @@ class TestMandatoryChannelClosedOnTimeout:
 
         mock_conn.channel = AsyncMock(side_effect=[timed_out_channel, fresh_channel])
 
-        with patch.object(
-            transport, "_publish_on_channel", new_callable=AsyncMock
-        ) as mock_pub:
+        with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
             mock_pub.return_value = PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
             envelope = MessageEnvelope(routing_key="q", body=b"x", mandatory=True)
             outcome = await transport.publish(envelope)
@@ -1939,7 +1975,9 @@ class TestPublishFastPath:
     async def _connected_transport(self, confirm_delivery: bool = False) -> AsyncTransportImpl:
         transport = _make_transport(confirm_delivery=confirm_delivery)
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return transport
@@ -1962,15 +2000,15 @@ class TestPublishFastPath:
         mock_exchange = AsyncMock()
         mock_connection.channel.return_value.get_exchange = AsyncMock(return_value=mock_exchange)
 
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 with patch("aio_pika.Message") as mock_msg_cls:
                     with patch("aio_pika.DeliveryMode") as mock_dm:
                         mock_dm.return_value = 2
                         mock_msg_cls.return_value = MagicMock()
-                        outcome = await transport.publish(
-                            MessageEnvelope(routing_key="rk", body=b"x", exchange="ex")
-                        )
+                        outcome = await transport.publish(MessageEnvelope(routing_key="rk", body=b"x", exchange="ex"))
 
         assert len(ensure_called) == 1
         assert outcome.status == PublishStatus.SENT  # M4: confirm_delivery=False -> SENT, not CONFIRMED
@@ -2035,7 +2073,9 @@ class TestReplyToChannelAffinity:
     async def _connected_transport(self, confirm_delivery: bool = False) -> AsyncTransportImpl:
         transport = _make_transport(confirm_delivery=confirm_delivery)
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         return transport
@@ -2177,7 +2217,9 @@ class TestBasicGetAndPurge:
     async def _connected_transport(self) -> tuple[AsyncTransportImpl, AsyncMock]:
         transport = _make_transport()
         mock_connection = _make_mock_connection()
-        with patch("rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}):
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
             with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=mock_connection):
                 await transport.connect()
         topo_ch = mock_connection.channel.return_value
@@ -2363,3 +2405,37 @@ class TestBindingRestoreAfterReconnect:
 
         with _patch.object(_asyncio, "sleep", new=AsyncMock()):
             await transport._reapply_bindings()  # must not raise
+
+
+class TestBuildMessageChannelLiveness:
+    """0.12: consumed messages carry a liveness probe for ``ack_many`` staleness checks."""
+
+    def _aio_msg(self) -> MagicMock:
+        m = MagicMock()
+        m.body = b"{}"
+        m.headers = {}
+        m.expiration = None
+        m.exchange = ""
+        m.delivery_tag = 3
+        return m
+
+    def test_probe_tracks_channel_is_closed(self) -> None:
+        transport = _make_transport()
+        aio = self._aio_msg()
+        aio.channel.is_closed = False
+        msg = transport._build_message(aio)
+        assert msg.channel_alive is True
+        aio.channel.is_closed = True
+        assert msg.channel_alive is False
+
+    def test_probe_without_channel_attribute_is_optimistic(self) -> None:
+        transport = _make_transport()
+        aio = self._aio_msg()
+        aio.channel = None
+        msg = transport._build_message(aio)
+        assert msg.channel_alive is True  # unknown → do not claim staleness we cannot see
+
+    def test_no_ack_delivery_has_no_probe(self) -> None:
+        transport = _make_transport()
+        msg = transport._build_message(self._aio_msg(), no_ack=True)
+        assert msg.channel_alive is None

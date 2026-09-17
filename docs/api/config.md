@@ -26,6 +26,14 @@ All configuration is composed from frozen, immutable dataclasses.
 
 ::: rabbitkit.core.config.RetryConfig
 
+## RetryHandoffConfig
+
+::: rabbitkit.core.config.RetryHandoffConfig
+
+## BulkPublishOptions
+
+::: rabbitkit.core.bulk.BulkPublishOptions
+
 ## CompressionConfig
 
 ::: rabbitkit.core.config.CompressionConfig

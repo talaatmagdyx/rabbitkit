@@ -935,6 +935,16 @@ class AsyncBroker:
         if self._transport is None:
             raise BrokerNotStartedError("Broker not started. Call start() first.")
         opts = options or BulkPublishOptions()
+        # Without a batch publisher every in-flight publish holds one pooled
+        # channel, so admitting more than ``PoolConfig.channel_pool_size`` only
+        # queues callers on the pool (with "pool exhausted" warnings) instead of
+        # adding concurrency. Cap the effective in-flight bound to the pool.
+        # With AsyncBatchPublisher configured, publishes share channels and
+        # the batch queue has its own bound, so the caller's value stands.
+        if self._batch_publisher is None:
+            pool_size = self._config.pool.channel_pool_size
+            if opts.max_in_flight > pool_size:
+                opts = replace(opts, max_in_flight=pool_size)
         preparer = PublishPreparer(
             max_message_bytes=self._config.publisher.max_message_bytes,
             max_buffer_bytes=opts.max_buffer_bytes,

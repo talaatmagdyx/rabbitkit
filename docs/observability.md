@@ -117,18 +117,53 @@ poller.start()  # background daemon thread (sync); poller.start_async() for asyn
 Alert on `queue_messages_ready` growth and `queue_consumers == 0` — those are
 exactly the signals the in-process counters above cannot provide on their own.
 
-## Defined but not emitted
+## Lifecycle gauges & confirm latency (emitted since 0.12)
 
-`MetricsConfig` also defines `publish_total` (a differently-named alias —
-`published_total`/`MESSAGES_PUBLISHED_TOTAL` is the one actually used),
-`publish_failures_total`, `publish_confirm_latency_seconds`,
-`in_flight_messages`, `worker_pool_pending`, `broker_connected`, and
-`consumer_active`. None of these currently have an emission site anywhere
-in rabbitkit — they resolve to a name string like every other property, but
-nothing ever calls `inc_counter`/`observe_histogram`/`set_gauge` for them.
-Don't build a dashboard panel or alert on any of these; if you need the
-signal, wire your own via a custom middleware in the meantime, or open an
-issue.
+These `MetricsConfig` properties were declared for a long time but had no
+emission site. They are now emitted whenever a `MetricsMiddleware` with a
+collector is present (on the broker's `middlewares=[...]` or on any route):
+
+| Metric | Type | Labels | Emitted by |
+|---|---|---|---|
+| `rabbitkit_publish_confirm_latency_seconds` | histogram | `exchange` | `MetricsMiddleware.publish_scope*` — only when the outcome is a real `CONFIRMED` (there is no confirm to time for `SENT`) |
+| `rabbitkit_in_flight_messages` | gauge | `queue` | `MetricsMiddleware.consume_scope*` — handlers currently inside the scope |
+| `rabbitkit_broker_connected` | gauge | — | broker `start()` → 1, `stop()` → 0 |
+| `rabbitkit_consumer_active` | gauge | — | number of registered routes while started, 0 after stop |
+| `rabbitkit_worker_pool_pending` | gauge | — | worker-pool pending count, sampled at start/stop |
+
+Still **not** emitted: `publish_total` (a differently-named alias of
+`published_total`) and `publish_failures_total` (failures are a `status`
+label on `published_total` instead). Don't alert on those two names.
+
+## Bulk operations, settlement & retry handoff (0.12)
+
+All labels are bounded enum values — never a message id, trace id, raw
+exception text or tenant id.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `rabbitkit_bulk_publish_items_total` | counter | `status`, `reason` | One per `publish_many` / `iter_publish` item. `status` ∈ confirmed/unroutable/nacked/invalid/not_sent/unknown; `reason` is the bounded reason code (`confirm_timeout`, `admission_timeout`, `returned`, ...). |
+| `rabbitkit_bulk_publish_batch_size` | histogram | — | `publish_many` input sizes |
+| `rabbitkit_settlement_items_total` | counter | `action`, `status` | One per `ack_many` / `nack_many` item. `status` ∈ dispatched/already_settled/duplicate/invalid/stale/not_attempted/failed. |
+| `rabbitkit_settlement_coalesced_total` | counter | — | Tags settled through a cumulative ack by a `CoalescingAcker` (`CoalescingAcker.coalesced_total` exposes the same number in-process) |
+| `rabbitkit_retry_handoff_failures_total` | counter | `queue` | The RETRY PUBLISH to the delay queue failed (returned / nacked / timed out / raised). Distinct from `messages_retried_total`, which counts handler attempts. |
+| `rabbitkit_retry_handoff_paused` | gauge | `queue` | 1 while a route's handoff tracker is degraded/exhausted, 0 once a handoff succeeds again |
+
+Alerting guidance:
+
+- **`bulk_publish_items_total{status="unknown"}` sustained above ~0** — the
+  broker may hold messages you have not accounted for. Reconcile by
+  `message_id` + `attempt_id`; do not blindly replay the batch.
+- **`bulk_publish_items_total{status="not_sent",reason="admission_timeout"}`**
+  — the producer is outrunning `max_in_flight` / `max_buffer_bytes`. Raise
+  the bounds deliberately or slow the source.
+- **`retry_handoff_failures_total` rising / `retry_handoff_paused == 1`** —
+  the delay-queue topology is unreachable (deleted queue, DLX policy
+  mismatch, connection flapping). Messages are being nack-requeued, not
+  lost, but nothing is progressing.
+- **`settlement_items_total{status="stale"}`** — deferred acks are
+  outliving their channel (reconnects under MANUAL/batch-commit consumers).
+  Shorten the batch window or ack sooner.
 
 ## High-cardinality routing keys / queue names
 

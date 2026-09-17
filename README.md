@@ -342,7 +342,17 @@ management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
 cap, quorum queues and a quorum retry chain — and report anything they cannot
 verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
 default, and a failing delay-queue handoff backs off instead of hot-looping.
-Full contract: [docs/bulk-operations.md](docs/bulk-operations.md).
+`CoalescingAcker` is the only place a cumulative `basic.ack(multiple=True)`
+may originate: it knows every delivery on the channel and coalesces only
+through a completed prefix, so a still-running sibling is never acked early.
+Every bulk path emits bounded-label metrics
+(`rabbitkit_bulk_publish_items_total{status,reason}`,
+`rabbitkit_settlement_items_total{action,status}`,
+`rabbitkit_retry_handoff_failures_total{queue}`).
+
+Full contract: [docs/bulk-operations.md](docs/bulk-operations.md) ·
+runnable: [`examples/bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations) ·
+upgrade notes: [docs/migration.md](docs/migration.md#0120--upgrade-notes).
 
 ---
 
@@ -408,16 +418,18 @@ Structured logs carry message context (`message_id`, `correlation_id`,
 routing, queue, handler, retry count, settlement, duration, error type) with
 secret redaction on by default. Metrics cover consumed/acked/nacked/
 retried/dead-lettered counts, publish outcomes, handler latency,
-redeliveries, reconnects, and — via the management API poller — queue depth
-and consumer lag. Tracing is standard OpenTelemetry
+redeliveries, reconnects, confirm latency, in-flight handlers, broker/consumer
+lifecycle gauges, bulk-publish and settlement outcomes, retry-handoff
+failures, and — via the management API poller — queue depth and consumer lag. Tracing is standard OpenTelemetry
 (`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
 one continuous trace from publish to consume.
 
 ## Advanced & experimental
 
 **Advanced stable** (enable deliberately): publish-side backpressure
-(`FlowController`), batch publishing/acking, pipelined sync confirms
-(`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
+(`FlowController`), batch publishing/acking, bulk `publish_many` / `ack_many`
+with per-item outcomes, safe ack coalescing (`CoalescingAcker`), reliability
+profiles + `preflight`, pipelined sync confirms (`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
 topology validation/drift/migration CLI, health watcher, circuit-breaker
 middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
 pybreaker).
@@ -566,7 +578,7 @@ has before/after code for all three paths; the short version:
 ## Examples
 
 **[examples/](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples)** —
-25 self-contained, runnable projects covering every feature, each with its
+26 self-contained, runnable projects covering every feature, each with its
 own README. They run against a real broker in CI on every nightly build, so
 they can't silently drift from the API.
 
@@ -581,6 +593,7 @@ Start here:
 | Test handlers without a broker | [`testbroker_pytest/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/testbroker_pytest) |
 | Do RPC over RabbitMQ | [`rpc/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/rpc) |
 | Push throughput (batching, pools, backpressure) | [`highload/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/highload) |
+| Bulk publish with per-item outcomes, batch-commit acks, outbox/inbox, critical preflight | [`bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations) |
 | See a full production service | [`order_service/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/order_service) |
 
 ```bash
@@ -589,14 +602,15 @@ docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
 python examples/quickstart/02_async_broker.py
 ```
 
-The full index (all 25, grouped by topic) is in
+The full index (all 26, grouped by topic) is in
 [examples/README.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/examples/README.md).
 
 ## Architecture
 
 ```
 rabbitkit/
-  core/                 # route registry, topology, pipeline, settlement, config
+  core/                 # route registry, topology, pipeline, config, bulk/settlement contracts,
+                        # reliability profiles + preflight, error sanitizer, retry-handoff tracker
   sync/                 # pika adapter (+ SyncBatchPublisher)
   async_/               # aio-pika adapter (+ AsyncBatchPublisher)
   middleware/           # retry, dedup, metrics, otel, compression, rate limit…

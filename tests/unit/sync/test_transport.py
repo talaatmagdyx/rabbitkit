@@ -542,9 +542,7 @@ class TestPublish:
         reply_channel.is_open = True
         transport._reply_to_channel = reply_channel
 
-        envelope = MessageEnvelope(
-            routing_key="rk", body=b"hello", reply_to="amq.rabbitmq.reply-to", mandatory=True
-        )
+        envelope = MessageEnvelope(routing_key="rk", body=b"hello", reply_to="amq.rabbitmq.reply-to", mandatory=True)
         outcome = transport.publish(envelope)
 
         assert outcome.ok
@@ -716,9 +714,7 @@ class TestConsume:
         reply_channel = transport._reply_to_channel
         assert reply_channel is not publisher_channel
 
-        outcome = transport.publish(
-            MessageEnvelope(routing_key="rpc.q", body=b"req", reply_to="amq.rabbitmq.reply-to")
-        )
+        outcome = transport.publish(MessageEnvelope(routing_key="rpc.q", body=b"req", reply_to="amq.rabbitmq.reply-to"))
 
         assert outcome.ok
         reply_channel.basic_publish.assert_called_once()
@@ -2306,9 +2302,7 @@ class TestStartConsumingIoLoopDeath:
 
         transport = self._wired_transport()
         transport._connection.is_closed = False
-        transport._connection.process_data_events.side_effect = ValueError(
-            "Timeout closed before call"
-        )
+        transport._connection.process_data_events.side_effect = ValueError("Timeout closed before call")
         with pytest.raises(pika.exceptions.AMQPConnectionError, match="connection lost mid-poll"):
             transport.start_consuming()
 
@@ -2497,9 +2491,7 @@ class TestIdlePublishRetryOnce:
         def fake_publish_on_channel(channel, envelope):
             attempts.append("try")
             if len(attempts) == 1:
-                return PublishOutcome(
-                    status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err
-                )
+                return PublishOutcome(status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err)
             return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key=envelope.routing_key)
 
         transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
@@ -2683,3 +2675,36 @@ class TestIdlePublishRetryDeniedForNonOwner:
         outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
         assert outcome.status is PublishStatus.ERROR
         assert attempts == ["try"]  # exactly one attempt, no retry
+
+
+class TestBuildMessageChannelLiveness:
+    """0.12: every consumed message carries a liveness probe for its channel so
+    ``ack_many`` can refuse a delivery tag whose channel was rebuilt."""
+
+    def _msg(self, channel: MagicMock, *, no_ack: bool = False):
+        transport = _make_transport()
+        method = MagicMock()
+        method.routing_key = "q"
+        method.exchange = ""
+        method.delivery_tag = 7
+        method.redelivered = False
+        method.consumer_tag = "t"
+        props = MagicMock()
+        props.headers = None
+        props.timestamp = None
+        return transport._build_message(channel, method, props, b"{}", no_ack=no_ack)
+
+    def test_probe_tracks_channel_is_open(self) -> None:
+        channel = MagicMock()
+        channel.is_open = True
+        msg = self._msg(channel)
+        assert msg.channel_alive is True
+        channel.is_open = False
+        assert msg.channel_alive is False
+
+    def test_no_ack_delivery_has_no_probe(self) -> None:
+        channel = MagicMock()
+        channel.is_open = True
+        msg = self._msg(channel, no_ack=True)
+        assert msg.channel_alive is None
+        assert msg._ack_fn is None

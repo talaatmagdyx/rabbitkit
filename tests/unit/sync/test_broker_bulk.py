@@ -246,3 +246,42 @@ class TestLifecycleGauges:
             broker.stop()
         collector.set_gauge.assert_any_call("rabbitkit_broker_connected", {}, 0.0)
         collector.set_gauge.assert_any_call("rabbitkit_consumer_active", {}, 0.0)
+
+
+class TestMetricsPlumbingEdges:
+    def test_lifecycle_gauges_noop_without_metrics(self) -> None:
+        broker = SyncBroker()
+        broker._set_lifecycle_gauges(connected=True)  # no collector → silently nothing
+
+    def test_lifecycle_gauges_tolerate_collector_without_set_gauge(self) -> None:
+        class Minimal:
+            def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None: ...
+
+            def observe_histogram(self, name: str, labels: dict[str, str], value: float) -> None: ...
+
+        broker = SyncBroker(middlewares=[MetricsMiddleware(collector=Minimal())])  # type: ignore[arg-type]
+        broker._set_lifecycle_gauges(connected=True)
+
+    def test_route_metrics_middleware_is_found(self) -> None:
+        collector = MagicMock()
+        broker = SyncBroker()
+
+        @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector=collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        _started(broker, MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED)))
+        broker.publish_many([_env(0)])
+        assert any(c.args[0] == "rabbitkit_bulk_publish_items_total" for c in collector.inc_counter.call_args_list)
+
+    def test_nack_many_metrics_hook(self) -> None:
+        collector = MagicMock()
+        broker = SyncBroker(middlewares=[MetricsMiddleware(collector=collector)])
+        broker.nack_many([_msg(1)], requeue=False)
+        collector.inc_counter.assert_any_call(
+            "rabbitkit_settlement_items_total", {"action": "nack", "status": "dispatched"}
+        )
+
+    def test_iter_publish_requires_started_even_for_empty_input(self) -> None:
+        with pytest.raises(BrokerNotStartedError):
+            SyncBroker().iter_publish([])

@@ -362,3 +362,72 @@ class TestIterPublishAsync:
             iter_publish_async([_env(0)], _aok, options=BulkPublishOptions(overall_timeout=None), preparer=_prep())
         )
         assert items[0].ok
+
+
+class TestIterPublishAsyncAdmissionEdges:
+    async def test_byte_budget_admission_timeout_releases_inflight_slot(self) -> None:
+        release = asyncio.Event()
+
+        async def stuck(e: MessageEnvelope) -> PublishOutcome:
+            await release.wait()
+            return _ok(e)
+
+        # budget fits exactly one 8-byte body; the second cannot be admitted in time
+        opts = BulkPublishOptions(max_in_flight=10, max_buffer_bytes=10, admission_timeout=0.05, overall_timeout=None)
+        prep = _prep(max_buffer_bytes=10)
+        gen = iter_publish_async(
+            [_env(0, size=8), _env(1, size=8), _env(2, size=8)], stuck, options=opts, preparer=prep
+        )
+        first = await gen.__anext__()
+        assert first.index == 1 and first.reason == REASON_ADMISSION_TIMEOUT
+        second = await gen.__anext__()
+        assert second.index == 2 and second.reason == REASON_ADMISSION_TIMEOUT
+        release.set()
+        rest = await _collect(gen)
+        assert [it.index for it in rest] == [0] and rest[0].ok
+
+    async def test_deadline_during_admission_wait_is_overall_timeout(self) -> None:
+        async def stuck(e: MessageEnvelope) -> PublishOutcome:
+            await asyncio.sleep(10)
+            return _ok(e)
+
+        opts = BulkPublishOptions(max_in_flight=1, admission_timeout=5.0, overall_timeout=0.05, drain_grace=0.02)
+        items = await _collect(iter_publish_async([_env(0), _env(1)], stuck, options=opts, preparer=_prep()))
+        by = {it.index: (it.status, it.reason) for it in items}
+        assert by[1] == (BulkPublishStatus.NOT_SENT, REASON_OVERALL_TIMEOUT)  # blocked on the in-flight slot
+        assert by[0] == (BulkPublishStatus.UNKNOWN, REASON_OVERALL_TIMEOUT)  # abandoned in flight
+
+    async def test_publish_returning_non_outcome_is_unknown(self) -> None:
+        async def weird(e: MessageEnvelope) -> Any:
+            return {"not": "an outcome"}
+
+        (item,) = await _collect(iter_publish_async([_env(0)], weird, options=BulkPublishOptions(), preparer=_prep()))
+        assert item.status is BulkPublishStatus.UNKNOWN and item.reason == "no_outcome"
+
+    async def test_empty_input(self) -> None:
+        assert await _collect(iter_publish_async([], _aok, options=BulkPublishOptions(), preparer=_prep())) == []
+
+    async def test_headers_snapshot_async(self) -> None:
+        headers = {"k": "v"}
+        seen: list[MessageEnvelope] = []
+
+        async def pub(e: MessageEnvelope) -> PublishOutcome:
+            seen.append(e)
+            return _ok(e)
+
+        env = MessageEnvelope(routing_key="q", body=b"x", headers=headers)
+        await _collect(iter_publish_async([env], pub, options=BulkPublishOptions(), preparer=_prep()))
+        headers["k"] = "mutated"
+        assert seen[0].headers == {"k": "v"}
+
+
+class TestIterPublishSyncEdges:
+    def test_empty_input(self) -> None:
+        assert list(iter_publish_sync([], _ok, options=BulkPublishOptions(), preparer=_prep())) == []
+
+    def test_attempt_ids_unique_even_for_duplicate_message_ids(self) -> None:
+        envs = [MessageEnvelope(routing_key="q", body=b"x", message_id="same") for _ in range(3)]
+        items = list(iter_publish_sync(envs, _ok, options=BulkPublishOptions(), preparer=_prep()))
+        assert {it.message_id for it in items} == {"same"}
+        assert len({it.attempt_id for it in items}) == 3
+        assert [it.index for it in items] == [0, 1, 2]

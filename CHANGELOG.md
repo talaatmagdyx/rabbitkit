@@ -109,11 +109,30 @@ failure handling. No existing queue is re-declared by any of it.
   `last_error`, `on_error=`; `BatchAcker.acked_total`, `last_error`,
   `on_error=`; `BatchClosedError`, `BatchFlushError`, `FlushReport`,
   `FlushItem`.
-- Docs: `docs/bulk-operations.md`, `docs/api/bulk.md`; README section;
-  integration suite `tests/integration/test_bulk_operations.py` (live
-  broker: bulk publish with unroutable/oversized items, subset ack leaving
-  the sibling unacked on the broker, nack-to-DLQ, preflight against the
-  management API).
+- **`RabbitManagementClient.put_policy` / `get_policy` / `list_policies` /
+  `delete_policy`** — the deliberate, reviewed step for applying
+  `policy_templates()` output (accepts a `PolicyTemplate` directly).
+  rabbitkit still never applies policies on its own.
+- **Examples**: `examples/bulk_operations/` (7 runnable scripts — async and
+  sync `publish_many`, streaming `iter_publish`, batch-commit `ack_many`,
+  `CoalescingAcker` with out-of-order completion, critical-profile preflight
+  against the management API, sanitized headers + handoff backoff with no
+  broker, and a SQLite transactional outbox → `publish_many` → inbox).
+- **Docs**: `docs/bulk-operations.md` (contract, invariants, outbox/inbox
+  recipe, DLQ replay guidance, FAQ), `docs/api/bulk.md`; new sections in the
+  full guide (§10), production patterns (§2b bulk publisher + batch-commit
+  consumer), production checklist, observability reference (lifecycle
+  gauges now emitted; bulk/settlement/handoff metrics + alerting guidance),
+  migration guide (0.12.0 upgrade notes), roadmap; README section.
+- **Tests**: unit coverage for every new module plus transport liveness
+  stamping, public-API exports, management policy endpoints; Hypothesis
+  state machine for `SettlementCoordinator`; live-broker integration suites
+  `tests/integration/test_bulk_operations.py` and
+  `tests/integration/test_reliability_features.py` (streaming
+  `iter_publish`, confirms-off → UNKNOWN, quorum delay chain declared,
+  sanitized headers on the wire, retry handoff failure against a deleted
+  delay queue, policy templates → fully verified preflight, `CoalescingAcker`
+  on a real channel, subset ack leaving the sibling unacked, nack-to-DLQ).
 
 ### Changed
 
@@ -137,6 +156,12 @@ failure handling. No existing queue is re-declared by any of it.
   `RetryConfig(error_detail="raw")` for the previous text.
 - `BatchAckConfig` now validates `batch_size > 0` and
   `flush_interval_ms >= 0`.
+- `AsyncBroker.iter_publish` / `publish_many` cap the effective
+  `max_in_flight` at `PoolConfig.channel_pool_size` when no
+  `AsyncBatchPublisher` is configured: each in-flight publish holds one
+  pooled channel, so a larger value only queued callers on the pool with
+  "channel pool exhausted" warnings. With batching configured the caller's
+  value stands.
 
 ## [0.11.0] — 2026-07-11
 

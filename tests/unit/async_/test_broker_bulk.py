@@ -239,3 +239,47 @@ class TestLifecycleGauges:
             collector.set_gauge.reset_mock()
             await broker.stop()
         collector.set_gauge.assert_any_call("rabbitkit_broker_connected", {}, 0.0)
+
+
+class TestInFlightCappedByChannelPool:
+    async def test_in_flight_capped_to_pool_size_without_batch_publisher(self) -> None:
+        from rabbitkit.core.config import PoolConfig
+
+        broker = AsyncBroker(RabbitConfig(pool=PoolConfig(channel_pool_size=3)))
+        active = 0
+        peak = 0
+
+        async def pub(e: MessageEnvelope) -> PublishOutcome:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.005)
+            active -= 1
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        _started(broker, pub)
+        result = await broker.publish_many([_env(i) for i in range(20)], BulkPublishOptions(max_in_flight=256))
+        assert result.all_confirmed
+        assert peak <= 3
+
+    async def test_batch_publisher_keeps_caller_in_flight(self) -> None:
+        from rabbitkit.core.config import PoolConfig
+
+        broker = AsyncBroker(RabbitConfig(pool=PoolConfig(channel_pool_size=2)), batch_config=BatchPublishConfig())
+        active = 0
+        peak = 0
+
+        async def pub(e: MessageEnvelope) -> PublishOutcome:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.005)
+            active -= 1
+            return PublishOutcome(status=PublishStatus.CONFIRMED)
+
+        _started(broker, AsyncMock(return_value=PublishOutcome(status=PublishStatus.ERROR)))
+        batch = MagicMock()
+        batch.publish = pub
+        broker._batch_publisher = batch
+        await broker.publish_many([_env(i) for i in range(20)], BulkPublishOptions(max_in_flight=8))
+        assert peak > 2  # not capped by the channel pool when batching shares channels

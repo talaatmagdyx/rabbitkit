@@ -588,7 +588,7 @@ has before/after code for all three paths; the short version:
 ## Examples
 
 **[examples/](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples)** —
-26 self-contained, runnable projects covering every feature, each with its
+28 self-contained, runnable projects covering every feature, each with its
 own README. They run against a real broker in CI on every nightly build, so
 they can't silently drift from the API.
 
@@ -612,7 +612,7 @@ docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
 python examples/quickstart/02_async_broker.py
 ```
 
-The full index (all 26, grouped by topic) is in
+The full index (all 28, grouped by topic) is in
 [examples/README.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/examples/README.md).
 
 ## Architecture

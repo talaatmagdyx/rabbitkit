@@ -142,6 +142,32 @@ failure handling. No existing queue is re-declared by any of it.
   delay queue, policy templates → fully verified preflight, `CoalescingAcker`
   on a real channel, subset ack leaving the sibling unacked, nack-to-DLQ).
 
+### Fixed
+
+- **Async publish could report CONFIRMED for a message the broker had
+  RETURNED, when the same `message_id` was re-published on the same channel
+  while its previous publish was still unconfirmed.** aiormq correlates a
+  `Basic.Return` to its publish by `message_id` and pops that mapping when an
+  *earlier* publish of the same id confirms. The retry middleware re-publishes
+  the original `message_id` by design, so on a slow broker (durable-queue
+  fsync lagging behind consumer delivery) the sequence "source publish →
+  delivered → handler fails → retry publish (same id) → source confirm
+  arrives → retry Return" deleted the retry's mapping: aiormq logged
+  `Unhandled message ... returning`, the retry publish resolved as
+  `CONFIRMED`, the source was acked, and the message was gone. Surfaced by
+  the new live-broker test `test_retry_handoff_failure_nacks_and_recovers`
+  in CI. `AsyncTransportImpl._publish_on_channel` now serializes publishes
+  of the same `message_id` on the same channel (waits for the previous one
+  to settle, bounded by `confirm_timeout`), which closes the window on the
+  mandatory channel, batch-publisher channels and the reply-to channel
+  alike. Distinct ids and distinct channels are unaffected.
+- **Nightly examples smoke test false positive.** `examples/smoke_test.py`
+  matched bare exception names anywhere in a killed daemon's output; a
+  benign "coroutine was never awaited" `RuntimeWarning` quoting aio-pika's
+  `contextlib.suppress(AttributeError, RuntimeError)` source line failed
+  `header_inspector/chaos_reconnect.py` every night. The signature now
+  requires an actual exception line (`Name:`).
+
 ### Changed
 
 - **`BatchAcker` default mode is now `individual`** (one `multiple=False`

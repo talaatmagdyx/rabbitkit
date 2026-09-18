@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2439,3 +2440,123 @@ class TestBuildMessageChannelLiveness:
         transport = _make_transport()
         msg = transport._build_message(self._aio_msg(), no_ack=True)
         assert msg.channel_alive is None
+
+
+# ── same-message_id publishes are serialized per channel ─────────────────────
+
+
+class TestSameMessageIdPublishSerialization:
+    """aiormq correlates Basic.Return to a publish by message_id and pops the
+    mapping when an EARLIER publish of that id confirms. Re-publishing an id
+    (the retry middleware does, by design) while the previous publish is still
+    unconfirmed made the second publish's Return unhandled → CONFIRMED (false
+    success → source acked → message lost). The transport now waits for the
+    previous same-id publish on the same channel before publishing."""
+
+    def _channel(self, publish: AsyncMock) -> MagicMock:
+        ch = MagicMock()
+        ch.is_closed = False
+        exchange = MagicMock()
+        exchange.publish = publish
+        ch.default_exchange = exchange
+        return ch
+
+    @pytest.mark.asyncio
+    async def test_second_publish_waits_for_first_with_same_id(self) -> None:
+        transport = _make_transport(confirm_timeout=5.0)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        order: list[str] = []
+
+        async def publish(message: Any, routing_key: str, mandatory: bool) -> None:
+            order.append(f"start:{message.message_id}")
+            if message.message_id == "same" and not first_started.is_set():
+                first_started.set()
+                await release_first.wait()
+            order.append(f"end:{message.message_id}")
+
+        ch = self._channel(AsyncMock(side_effect=publish))
+        e1 = MessageEnvelope(routing_key="q", body=b"1", message_id="same")
+        e2 = MessageEnvelope(routing_key="q", body=b"2", message_id="same")
+
+        with patch("aio_pika.Message", side_effect=lambda **kw: MagicMock(message_id=kw["message_id"])):
+            with patch("aio_pika.DeliveryMode", return_value=2):
+                t1 = asyncio.create_task(transport._publish_on_channel(ch, e1))
+                await first_started.wait()
+                t2 = asyncio.create_task(transport._publish_on_channel(ch, e2))
+                await asyncio.sleep(0.02)
+                assert order == ["start:same"]  # second publish is parked
+                release_first.set()
+                o1, o2 = await asyncio.gather(t1, t2)
+
+        assert order == ["start:same", "end:same", "start:same", "end:same"]
+        assert o1.status is PublishStatus.CONFIRMED and o2.status is PublishStatus.CONFIRMED
+        assert transport._inflight_message_ids == {}  # bookkeeping cleaned up
+
+    @pytest.mark.asyncio
+    async def test_different_ids_or_channels_run_concurrently(self) -> None:
+        transport = _make_transport(confirm_timeout=5.0)
+        in_flight = 0
+        peak = 0
+
+        async def publish(message: Any, routing_key: str, mandatory: bool) -> None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+
+        ch_a = self._channel(AsyncMock(side_effect=publish))
+        ch_b = self._channel(AsyncMock(side_effect=publish))
+        envs = [
+            (ch_a, MessageEnvelope(routing_key="q", body=b"x", message_id="a")),
+            (ch_a, MessageEnvelope(routing_key="q", body=b"x", message_id="b")),
+            (ch_b, MessageEnvelope(routing_key="q", body=b"x", message_id="a")),  # same id, other channel
+        ]
+        with patch("aio_pika.Message", side_effect=lambda **kw: MagicMock(message_id=kw["message_id"])):
+            with patch("aio_pika.DeliveryMode", return_value=2):
+                outcomes = await asyncio.gather(*(transport._publish_on_channel(c, e) for c, e in envs))
+        assert all(o.status is PublishStatus.CONFIRMED for o in outcomes)
+        assert peak == 3
+
+    @pytest.mark.asyncio
+    async def test_waiter_does_not_hang_past_confirm_timeout(self) -> None:
+        transport = _make_transport(confirm_timeout=0.05)
+        stuck = asyncio.Event()
+
+        async def publish(message: Any, routing_key: str, mandatory: bool) -> None:
+            if message.message_id == "same" and not stuck.is_set():
+                stuck.set()
+                await asyncio.sleep(10)  # the first publish never settles
+
+        ch = self._channel(AsyncMock(side_effect=publish))
+        e = MessageEnvelope(routing_key="q", body=b"x", message_id="same")
+        with patch("aio_pika.Message", side_effect=lambda **kw: MagicMock(message_id=kw["message_id"])):
+            with patch("aio_pika.DeliveryMode", return_value=2):
+                t1 = asyncio.create_task(transport._publish_on_channel(ch, e))
+                await stuck.wait()
+                o2 = await asyncio.wait_for(transport._publish_on_channel(ch, e), timeout=2.0)
+                o1 = await t1
+        assert o1.status is PublishStatus.TIMEOUT
+        assert o2.status in (PublishStatus.CONFIRMED, PublishStatus.TIMEOUT)
+
+    @pytest.mark.asyncio
+    async def test_failed_first_publish_releases_the_key(self) -> None:
+        transport = _make_transport(confirm_timeout=5.0)
+        calls = 0
+
+        async def publish(message: Any, routing_key: str, mandatory: bool) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("channel closed")
+
+        ch = self._channel(AsyncMock(side_effect=publish))
+        e = MessageEnvelope(routing_key="q", body=b"x", message_id="same")
+        with patch("aio_pika.Message", side_effect=lambda **kw: MagicMock(message_id=kw["message_id"])):
+            with patch("aio_pika.DeliveryMode", return_value=2):
+                with pytest.raises(RuntimeError):
+                    await transport._publish_on_channel(ch, e)
+                assert transport._inflight_message_ids == {}
+                o = await transport._publish_on_channel(ch, e)
+        assert o.status is PublishStatus.CONFIRMED

@@ -30,3 +30,16 @@ python examples/bulk_operations/01_publish_many_async.py
 There is no "publish by id" or "fetch by id" example because RabbitMQ has no
 such operation: queues are not queryable stores. The selection ("pluck")
 always happens in application code — `01`, `02` and `07` show that step.
+
+## Numbers
+
+`python -m benchmarks.bench_bulk` measures every path above against a real
+broker. On an Apple Silicon laptop (2,000 × 1 KiB, confirms on, median of 3):
+
+| | single | bulk |
+|---|---|---|
+| async publish | 932 msg/s (`publish` loop) | 4,548 msg/s (`publish_many`, defaults) · 9,862 msg/s (+ batch publisher) |
+| sync publish | 833 msg/s | 1,015 msg/s (`publish_many` — sequential by design; you gain outcomes, not speed) |
+| ack | 15,308 msg/s, 1 frame/msg (`ack_async` each) | `ack_many`: 11,808 msg/s, 1 frame/msg, 20 API calls · `CoalescingAcker`: 15,670 msg/s, **0.01 frame/msg** |
+
+Full table, environment and interpretation: [docs/benchmarking.md](../../docs/benchmarking.md#tier-2b-bulk-vs-single-python--m-benchmarksbench_bulk).

@@ -350,6 +350,16 @@ Every bulk path emits bounded-label metrics
 `rabbitkit_settlement_items_total{action,status}`,
 `rabbitkit_retry_handoff_failures_total{queue}`).
 
+Measured on one laptop (2,000 × 1 KiB, confirms on, median of 3; `python -m
+benchmarks.bench_bulk`, every run 2,000/2,000 accounted and the queue verified
+drained):
+
+| | one call per message | bulk API |
+|---|---|---|
+| async publish | 932 msg/s | 4,548 msg/s `publish_many` (defaults) → 9,862 msg/s with the batch publisher |
+| sync publish | 833 msg/s | 1,015 msg/s (sequential by design — outcomes, not speed) |
+| ack | 15,308 msg/s, 1 frame/msg | `ack_many` 11,808 msg/s, 1 frame/msg (correctness API) · `CoalescingAcker` 15,670 msg/s, **0.01 frame/msg** |
+
 Full contract: [docs/bulk-operations.md](docs/bulk-operations.md) ·
 runnable: [`examples/bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations) ·
 upgrade notes: [docs/migration.md](docs/migration.md#0120--upgrade-notes).

@@ -269,6 +269,39 @@ Alert on a sustained `status="unknown"` rate (reconcile), on
 
 ---
 
+## Measured: bulk vs single
+
+Real numbers from `python -m benchmarks.bench_bulk` (details, caveats and
+how to reproduce in [Benchmarking → Tier 2b](benchmarking.md#tier-2b-bulk-vs-single-python--m-benchmarksbench_bulk)):
+
+| Scenario | What it does | Median msg/s | Wire frames / msg | Accounting |
+|---|---|---|---|---|
+| publish single / async | `await broker.publish(e)` one after another | **932** | 1 publish + 1 confirm | `.ok` per call |
+| publish gather / async ×10 | hand-rolled `asyncio.gather` under a 10-slot semaphore | 4,685 | same | none (you write it) |
+| `publish_many` ×10 (default) | default options → in-flight capped to the 10-channel pool | 4,548 | same | one `BulkPublishItem` per input |
+| `publish_many` ×64 | `PoolConfig(channel_pool_size=64)`, `max_in_flight=64` | 8,951 | same | same |
+| `publish_many` + `AsyncBatchPublisher` | batch config, in-flight 256 (pipelined confirms) | **9,862** | same | same |
+| publish single / sync | `SyncBroker.publish` one after another | 833 | same | `.ok` per call |
+| `publish_many` / sync | `SyncBroker.publish_many` (sequential by design) | 1,015 | same | one item per input |
+| ack each | `await msg.ack_async()` per delivery | 15,308 | 1.000 | — |
+| `ack_many` ×100 | park 100, one `ack_many` call | 11,808 | 1.000 (20 API calls) | one `SettlementItem` per delivery |
+| `CoalescingAcker` ×100 | register/complete, in-order completion | **15,670** | **0.010** (20 frames for 2,000) | coordinator ledger |
+
+Environment: Apple Silicon (arm64, 12 cores), Python 3.12.2, RabbitMQ 3.13
+in Docker on the same machine, 2,000 messages × 1 KiB, persistent,
+confirms on, `mandatory=True`, durable classic queue, median of 3 runs,
+git `ed2e8bc`. Every scenario reported 2,000/2,000 CONFIRMED (or settled)
+and the management API showed the queue drained to 0 ready / 0 unacked.
+Absolute numbers are this machine's; the ratios are what travel.
+
+In one sentence each: **bulk publish** is worth ~5× over a sequential loop
+at default settings and ~10× with a bigger pool or the batch publisher, and
+it costs nothing over hand-rolled concurrency while adding per-item
+outcomes; **sync bulk** adds outcomes, not speed; **`ack_many`** is a
+correctness API (one frame per delivery by design), not a throughput one;
+**`CoalescingAcker`** is the wire optimisation — 100× fewer ack frames when
+completions arrive in order, never across an unfinished sibling.
+
 ## Transactional outbox and inbox
 
 The end-to-end at-least-once recipe. `examples/bulk_operations/07_transactional_outbox_inbox.py`

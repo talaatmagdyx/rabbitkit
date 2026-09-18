@@ -124,6 +124,14 @@ failure handling. No existing queue is re-declared by any of it.
   consumer), production checklist, observability reference (lifecycle
   gauges now emitted; bulk/settlement/handoff metrics + alerting guidance),
   migration guide (0.12.0 upgrade notes), roadmap; README section.
+- **Benchmark** `python -m benchmarks.bench_bulk` — bulk vs single for
+  publish (async sequential / gather / `publish_many` at pool 10 and 64 /
+  `publish_many` + batch publisher / sync sequential / sync `publish_many`)
+  and ack (`ack_async` each / `ack_many` ×100 / `CoalescingAcker` ×100), with
+  per-item accounting and management-API drain verification; results with
+  environment fingerprint in `benchmarks/results/bulk_<ts>.json`. Measured
+  numbers and interpretation in `docs/benchmarking.md` (Tier 2b) and
+  `docs/bulk-operations.md`.
 - **Tests**: unit coverage for every new module plus transport liveness
   stamping, public-API exports, management policy endpoints; Hypothesis
   state machine for `SettlementCoordinator`; live-broker integration suites

@@ -97,6 +97,13 @@ class AsyncTransportImpl:
 
         # Per-queue consumer channels: queue_name -> aio_pika channel
         self._consumer_channels: dict[str, Any] = {}
+        # Per-(channel, message_id) in-flight publishes — see
+        # _publish_on_channel. aiormq correlates a Basic.Return to its publish
+        # by message_id and DROPS that mapping when an earlier publish of the
+        # same id on the same channel confirms; re-publishing an id while its
+        # previous publish is unconfirmed makes the second publish's Return
+        # unhandled and the publish resolve as CONFIRMED (a false success).
+        self._inflight_message_ids: dict[tuple[int, str], asyncio.Future[None]] = {}
         self._consumer_tags: dict[str, str] = {}  # queue_name -> consumer_tag
 
         # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
@@ -539,9 +546,7 @@ class AsyncTransportImpl:
             if conn is None:
                 raise RuntimeError("Publisher connection is not available")
             is_rebuild = ch is not None  # replacing a closed/recycled channel
-            self._mandatory_publish_channel = await conn.channel(
-                publisher_confirms=True, on_return_raises=True
-            )
+            self._mandatory_publish_channel = await conn.channel(publisher_confirms=True, on_return_raises=True)
             self._fire_channel_opened()
             if is_rebuild:
                 self._fire_channel_rebuilt()
@@ -586,7 +591,6 @@ class AsyncTransportImpl:
         ``Basic.Nack`` (not a return) raises the more generic
         ``DeliveryError`` and maps to ``PublishStatus.NACKED``.
         """
-        import aio_pika.exceptions
 
         message = self._build_aio_message(envelope)
         exchange = (
@@ -594,6 +598,39 @@ class AsyncTransportImpl:
             if envelope.exchange
             else channel.default_exchange
         )
+        # Serialize publishes of the SAME message_id on the SAME channel.
+        # aiormq keys its Basic.Return correlation by message_id
+        # (``message_id_delivery_tag``) and pops that key when a publish of
+        # that id confirms. The retry middleware deliberately re-publishes
+        # the original message_id; if the source publish's confirm is still
+        # in flight when the retry publish registers the same id (slow fsync
+        # on a durable queue while the consumer already received and failed
+        # the message), the late confirm deletes the RETRY's mapping, its
+        # Basic.Return is logged "Unhandled message ... returning", and the
+        # retry publish resolves as CONFIRMED — the source is then acked with
+        # nothing on the delay queue. Waiting for the previous same-id
+        # publish on this channel to settle first closes that window (its
+        # aiormq done-callback pops the key before our waiter resumes).
+        key = (id(channel), envelope.message_id)
+        prior = self._inflight_message_ids.get(key)
+        if prior is not None and not prior.done():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(prior), timeout=self._confirm_timeout)
+        mine: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._inflight_message_ids[key] = mine
+        try:
+            return await self._publish_on_channel_unguarded(channel, exchange, message, envelope)
+        finally:
+            if self._inflight_message_ids.get(key) is mine:
+                del self._inflight_message_ids[key]
+            if not mine.done():
+                mine.set_result(None)
+
+    async def _publish_on_channel_unguarded(
+        self, channel: Any, exchange: Any, message: Any, envelope: MessageEnvelope
+    ) -> PublishOutcome:
+        import aio_pika.exceptions
+
         try:
             async with asyncio.timeout(self._confirm_timeout):
                 await exchange.publish(
@@ -621,8 +658,7 @@ class AsyncTransportImpl:
             )
         except aio_pika.exceptions.PublishError as e:
             logger.warning(
-                "Publish returned as unroutable (mandatory=True, no matching binding): "
-                "exchange=%s routing_key=%s",
+                "Publish returned as unroutable (mandatory=True, no matching binding): exchange=%s routing_key=%s",
                 envelope.exchange,
                 envelope.routing_key,
             )
@@ -779,8 +815,7 @@ class AsyncTransportImpl:
                         await self._conn_pool.release_publisher_channel(channel)
                 if attempt == 0 and _is_connection_error(e) and await self._wait_for_recovery():
                     logger.warning(
-                        "Publish hit a connection error, retrying once after recovery: "
-                        "exchange=%s routing_key=%s",
+                        "Publish hit a connection error, retrying once after recovery: exchange=%s routing_key=%s",
                         envelope.exchange,
                         envelope.routing_key,
                     )
@@ -1086,29 +1121,29 @@ class AsyncTransportImpl:
         message = RabbitMessage(
             body=aio_message.body,
             headers=dict(aio_message.headers) if aio_message.headers else {},
-        message_id=aio_message.message_id,
-        correlation_id=aio_message.correlation_id,
-        reply_to=aio_message.reply_to,
-        content_type=aio_message.content_type,
-        content_encoding=aio_message.content_encoding,
-        type=aio_message.type,
-        app_id=aio_message.app_id,
-        priority=aio_message.priority,
-        # aio-pika decodes the wire's ms-string expiration into seconds
-        # (float) on IncomingMessage; re-encode to the ms-string convention
-        # RabbitMessage/MessageEnvelope.expiration use everywhere else (matches
-        # the raw string pika.BasicProperties.expiration carries unmodified),
-        # so a retry/DLQ-replay envelope built from this message round-trips
-        # correctly regardless of which transport received it.
-        expiration=(str(int(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
-        user_id=aio_message.user_id,
-        timestamp=aio_message.timestamp,  # was never surfaced on consume
-        routing_key=aio_message.routing_key,
-        exchange=aio_message.exchange or "",
-        delivery_tag=aio_message.delivery_tag,
-        redelivered=aio_message.redelivered,
-        consumer_tag=aio_message.consumer_tag,
-        raw_message=aio_message,
+            message_id=aio_message.message_id,
+            correlation_id=aio_message.correlation_id,
+            reply_to=aio_message.reply_to,
+            content_type=aio_message.content_type,
+            content_encoding=aio_message.content_encoding,
+            type=aio_message.type,
+            app_id=aio_message.app_id,
+            priority=aio_message.priority,
+            # aio-pika decodes the wire's ms-string expiration into seconds
+            # (float) on IncomingMessage; re-encode to the ms-string convention
+            # RabbitMessage/MessageEnvelope.expiration use everywhere else (matches
+            # the raw string pika.BasicProperties.expiration carries unmodified),
+            # so a retry/DLQ-replay envelope built from this message round-trips
+            # correctly regardless of which transport received it.
+            expiration=(str(int(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
+            user_id=aio_message.user_id,
+            timestamp=aio_message.timestamp,  # was never surfaced on consume
+            routing_key=aio_message.routing_key,
+            exchange=aio_message.exchange or "",
+            delivery_tag=aio_message.delivery_tag,
+            redelivered=aio_message.redelivered,
+            consumer_tag=aio_message.consumer_tag,
+            raw_message=aio_message,
         )
 
         if no_ack:
@@ -1126,5 +1161,13 @@ class AsyncTransportImpl:
         message._ack_async_fn = ack_fn
         message._nack_async_fn = nack_fn
         message._reject_async_fn = reject_fn
+
+        def _channel_alive() -> bool:
+            ch = getattr(aio_message, "channel", None)
+            if ch is None:
+                return True  # unknown — do not claim staleness we cannot see
+            return not bool(getattr(ch, "is_closed", False))
+
+        message._channel_alive = _channel_alive
 
         return message

@@ -67,6 +67,19 @@ CLI tooling, API ergonomics, and operational observability.
 
 ---
 
+### v0.12 — Reliability & bulk operations
+
+Bulk publishing with per-item outcomes, selected acknowledgement, safe ack
+coalescing, reliability profiles, sanitized terminal metadata, bounded
+retry-handoff failure handling.
+
+- `publish_many` / `iter_publish` — bounded admission (count, bytes, time), one outcome per input, `UNKNOWN` preserved
+- `ack_many` / `nack_many` — per-delivery settlement with stale-channel detection
+- `SettlementCoordinator` + `CoalescingAcker` — property-tested safe coalescing
+- `standard` / `critical` profiles, `preflight`, `policy_templates`, `put_policy`
+- `ErrorSanitizer`, `RetryConfig.delay_queue_type` / `dlq_queue_type` / `handoff`
+- Lifecycle gauges and confirm-latency histogram finally emitted
+
 ## Planned
 
 ### v1.0 — Stable API
@@ -79,6 +92,19 @@ API freeze, full documentation, full type coverage, and migration support.
 - Migration guide — documented upgrade path from 0.x to 1.0 for any breaking changes introduced during the 0.x stabilization period
 
 ### Under consideration (unscheduled)
+
+- **Batch-handler consumption** (plan §8.4) — a handler receiving N
+  deliveries at once with per-item success/retry/terminal intents, built on
+  the settlement coordinator. Needs prefetch/batch-size coordination so a
+  batch can never deadlock behind a smaller prefetch.
+- **Pipeline-wired coalescing** — auto-registering every delivery with a
+  `CoalescingAcker` so coalescing needs no application code. Blocked on
+  guaranteeing channel-wide ownership from inside the pipeline.
+- **Auto-stop on exhausted retry handoff** — today `on_handoff_exhausted` is
+  a hook; stopping the consumer and closing its channel automatically needs
+  supervisor backoff to avoid restart storms.
+- **Multi-node quorum fault matrix & benchmarks** for the bulk paths
+  (three-node cluster, leader loss, destination unavailable at TTL expiry).
 
 - **SASL `EXTERNAL` authentication (x509 certificate auth)** — for deployments
   that authenticate clients by their TLS client certificate instead of

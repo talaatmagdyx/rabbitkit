@@ -15,13 +15,16 @@ from __future__ import annotations
 import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from rabbitkit.concurrency import SyncWorkerPool
+from rabbitkit.core.bulk import BulkPublishItem, BulkPublishOptions, BulkPublishResult, PublishPreparer
+from rabbitkit.core.bulk_runner import iter_publish_sync
 from rabbitkit.core.config import (
     ConsumerConfig,
     RabbitConfig,
@@ -33,8 +36,11 @@ from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, Mess
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
+from rabbitkit.core.profiles import PreflightReport
+from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
@@ -42,6 +48,8 @@ from rabbitkit.core.types import (
     PublishOutcome,
     PublishStatus,
     QueueType,
+    ReliabilityProfile,
+    SettlementAction,
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
@@ -355,6 +363,7 @@ class SyncBroker:
             self._start_consumer(route)
 
         self._started = True
+        self._set_lifecycle_gauges(connected=True)
         logger.info(
             "SyncBroker started with %d routes",
             len(self._registry.routes),
@@ -459,6 +468,7 @@ class SyncBroker:
             self._transport.disconnect()
 
         self._started = False
+        self._set_lifecycle_gauges(connected=False)
         logger.info("SyncBroker stopped")
 
     def _install_sigterm_handler(self) -> None:
@@ -668,6 +678,190 @@ class SyncBroker:
             return outcome
         return do_transport_publish(envelope)
 
+    # ── Bulk operations: metrics plumbing (plan §11) ─────────────────────
+
+    def _bulk_metrics(self) -> tuple[Any, Any] | None:
+        """``(collector, MetricsConfig)`` from the first MetricsMiddleware with a
+        collector — publish-middlewares first, then any route. None = no metrics."""
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        candidates: list[Any] = list(self._publish_middlewares)
+        for route in self._registry.routes:
+            candidates.extend(route.route_middlewares)
+        for mw in candidates:
+            if isinstance(mw, MetricsMiddleware) and mw.collector is not None:
+                return mw.collector, mw.config
+        return None
+
+    def _record_bulk_item(self, item: BulkPublishItem) -> None:
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        collector.inc_counter(cfg.bulk_publish_items_total, {"status": item.status.value, "reason": item.reason})
+
+    def _record_bulk_batch(self, size: int) -> None:
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        collector.observe_histogram(cfg.bulk_publish_batch_size, {}, float(size))
+
+    def _settlement_item_hook(self, action: SettlementAction) -> Callable[[SettlementItem], None] | None:
+        found = self._bulk_metrics()
+        if found is None:
+            return None
+        collector, cfg = found
+
+        def _hook(item: SettlementItem) -> None:
+            collector.inc_counter(cfg.settlement_items_total, {"action": action.value, "status": item.status.value})
+
+        return _hook
+
+    def _set_lifecycle_gauges(self, *, connected: bool) -> None:
+        """Emit the declared-but-previously-missing lifecycle gauges:
+        ``broker_connected``, ``consumer_active`` and ``worker_pool_pending``."""
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        set_gauge = getattr(collector, "set_gauge", None)
+        if set_gauge is None:
+            return
+        set_gauge(cfg.broker_connected, {}, 1.0 if connected else 0.0)
+        set_gauge(cfg.consumer_active, {}, float(len(self._registry.routes)) if connected else 0.0)
+        pool = self._worker_pool
+        set_gauge(cfg.worker_pool_pending, {}, float(pool.pending_count) if pool is not None else 0.0)
+
+    def preflight(
+        self,
+        profile: ReliabilityProfile | str = ReliabilityProfile.STANDARD,
+        *,
+        management_client: Any | None = None,
+        vhost: str = "/",
+    ) -> PreflightReport:
+        """Verify reliability-profile prerequisites for this broker's config
+        and registered routes (plan §9). Broker-side policy checks need a
+        read-only management client; without one they are reported
+        ``UNVERIFIED`` — never silently green. Pure inspection; no I/O on
+        the AMQP connection and no policy mutation."""
+        return run_preflight(
+            self._config,
+            profile,
+            routes=self._registry.routes,
+            management_client=management_client,
+            vhost=vhost,
+        )
+
+    # ── Bulk publishing (plan §7) ────────────────────────────────────────
+
+    def iter_publish(
+        self,
+        envelopes: Iterable[MessageEnvelope],
+        options: BulkPublishOptions | None = None,
+    ) -> Iterator[BulkPublishItem]:
+        """Publish a (possibly unbounded) iterable, yielding one
+        :class:`~rabbitkit.core.bulk.BulkPublishItem` per input as it settles.
+
+        Every item goes through the SAME path as :meth:`publish` — publish
+        middlewares, flow control, size limit, transport — so single and
+        bulk publishing share every safeguard. The sync transport confirms
+        one publish at a time (pika's BlockingConnection cannot pipeline
+        confirms), so this is sequential; ``options.max_in_flight`` has no
+        effect here. ``options.overall_timeout`` does: past the deadline
+        remaining inputs are yielded ``NOT_SENT`` without touching the wire.
+
+        Memory is bounded by the caller: results are yielded, not collected.
+        """
+        if self._transport is None:
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
+        opts = options or BulkPublishOptions()
+        preparer = PublishPreparer(
+            max_message_bytes=self._config.publisher.max_message_bytes,
+            max_buffer_bytes=opts.max_buffer_bytes,
+        )
+        return iter_publish_sync(
+            envelopes,
+            self.publish,
+            options=opts,
+            preparer=preparer,
+            on_item=self._record_bulk_item,
+        )
+
+    def publish_many(
+        self,
+        envelopes: Sequence[MessageEnvelope],
+        options: BulkPublishOptions | None = None,
+    ) -> BulkPublishResult:
+        """Publish a bounded collection and return input-ordered per-item outcomes.
+
+        Never raises for a failed item — inspect ``result.items`` (or call
+        ``result.raise_for_status()``). Raises ``ValueError`` before publishing
+        anything if ``len(envelopes)`` exceeds ``options.max_items``; use
+        :meth:`iter_publish` for streams. See
+        :class:`~rabbitkit.core.types.BulkPublishStatus` for what each state
+        means and what to do about it — in particular ``UNKNOWN`` items may
+        have reached the broker and must be reconciled, not blindly replayed.
+        """
+        opts = options or BulkPublishOptions()
+        if len(envelopes) > opts.max_items:
+            raise ValueError(
+                f"publish_many received {len(envelopes)} envelopes, more than BulkPublishOptions.max_items "
+                f"({opts.max_items}); use iter_publish() for large or unbounded inputs."
+            )
+        started = datetime.now(UTC)
+        items = list(self.iter_publish(envelopes, opts))
+        self._record_bulk_batch(len(envelopes))
+        return BulkPublishResult(
+            items=tuple(sorted(items, key=lambda it: it.index)),
+            started_at=started,
+            finished_at=datetime.now(UTC),
+        )
+
+    # ── Selected settlement (plan §8) ────────────────────────────────────
+
+    def ack_many(self, messages: Iterable[RabbitMessage], *, fail_fast: bool = True) -> SettlementReport:
+        """Ack exactly the given deliveries — each with its own ``multiple=False``
+        frame. Never a cumulative ack: an unselected, still-running sibling on
+        the same channel is untouched.
+
+        Validation runs before any I/O: duplicates, already-settled messages,
+        no-ack deliveries and STALE handles (channel rebuilt since delivery)
+        are reported per item. With ``fail_fast=True`` (default) any problem
+        aborts the whole call with every valid item ``NOT_ATTEMPTED``.
+
+        The report says ``DISPATCHED``, not "confirmed" — RabbitMQ sends no
+        acknowledgement for a consumer ack. Messages must come from THIS
+        broker (MANUAL ack policy, or a handler that deferred settlement).
+        """
+        return settle_many_sync(
+            messages,
+            SettlementAction.ACK,
+            fail_fast=fail_fast,
+            on_item=self._settlement_item_hook(SettlementAction.ACK),
+        )
+
+    def nack_many(
+        self,
+        messages: Iterable[RabbitMessage],
+        *,
+        requeue: bool = True,
+        fail_fast: bool = True,
+    ) -> SettlementReport:
+        """Nack exactly the given deliveries (individually — see :meth:`ack_many`).
+
+        ``requeue=False`` dead-letters (or, without a DLX, DISCARDS) each
+        message; for ordinary handler failures prefer the retry/terminal
+        path (``RetryConfig``) over raw nacks.
+        """
+        return settle_many_sync(
+            messages,
+            SettlementAction.NACK,
+            requeue=requeue,
+            fail_fast=fail_fast,
+            on_item=self._settlement_item_hook(SettlementAction.NACK),
+        )
+
     def _flow_controlled_internal_publish(self, env: MessageEnvelope) -> PublishOutcome:
         """M18: apply the broker's ``FlowController`` (if configured) to an
         INTERNAL republish — ``RetryMiddleware``'s delay-queue publish, or a
@@ -805,9 +999,7 @@ class SyncBroker:
             index = retry_middleware_insertion_index(route.route_middlewares)
             # M2: wire in an existing route MetricsMiddleware (if any) so
             # messages_retried_total/dead_lettered_total are observable.
-            metrics_mw = next(
-                (mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None
-            )
+            metrics_mw = next((mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None)
             route.route_middlewares.insert(
                 index,
                 RetryMiddleware(
@@ -899,8 +1091,7 @@ class SyncBroker:
             # arg startup failure, caught by the real-broker CI suite. An
             # EXPLICIT per-route retry= on a DLQ consumer still wins.
             is_anothers_dlq = any(
-                other is not route and route.queue.name == f"{other.queue.name}.dlq"
-                for other in self._registry.routes
+                other is not route and route.queue.name == f"{other.queue.name}.dlq" for other in self._registry.routes
             )
             if is_anothers_dlq:
                 safety_dlq_name = None
@@ -963,9 +1154,7 @@ class SyncBroker:
                         # Inherit quorum from a quorum source (see RetryRouter
                         # DLQ note): the DLQ stores failures indefinitely.
                         queue_type=(
-                            QueueType.QUORUM
-                            if route.queue.queue_type == QueueType.QUORUM
-                            else QueueType.CLASSIC
+                            QueueType.QUORUM if route.queue.queue_type == QueueType.QUORUM else QueueType.CLASSIC
                         ),
                     )
                 )

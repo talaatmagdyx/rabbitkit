@@ -404,6 +404,59 @@ class PoolConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RetryHandoffConfig:
+    """Bounded behavior when the RETRY PUBLISH itself fails (plan §5.2).
+
+    A handler failure and a failure to hand the message to its delay queue
+    are different events. When the delay-queue publish is returned,
+    nacked, times out, or the connection drops, ``RetryMiddleware`` never
+    acks the source (it nack-requeues it) — but without a brake that is a
+    hot redelivery loop against a broken destination. This config bounds
+    that loop:
+
+    * ``backoff_initial`` / ``backoff_max`` / ``jitter`` shape a capped
+      exponential delay applied per consecutive handoff failure (async
+      handlers ``await asyncio.sleep``; the sync path never sleeps on the
+      I/O thread — it reports the backoff through the ``on_handoff_failure``
+      hook so the broker/worker can pause admission instead).
+    * ``max_consecutive_failures`` and ``recovery_deadline`` define when the
+      tracker reports ``exhausted`` so an owner can stop the consumer and
+      let the broker redeliver instead of spinning.
+    """
+
+    backoff_initial: float = 0.5
+    backoff_max: float = 30.0
+    jitter: float = 0.2
+    max_consecutive_failures: int = 20
+    recovery_deadline: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.backoff_initial <= 0:
+            raise ConfigValidationError(
+                f"RetryHandoffConfig.backoff_initial must be > 0, got {self.backoff_initial}"
+            )
+        if self.backoff_max < self.backoff_initial:
+            raise ConfigValidationError(
+                f"RetryHandoffConfig.backoff_max ({self.backoff_max}) must be >= backoff_initial "
+                f"({self.backoff_initial})"
+            )
+        if not (0 <= self.jitter < 1):
+            raise ConfigValidationError(f"RetryHandoffConfig.jitter must be in [0, 1), got {self.jitter}")
+        if self.max_consecutive_failures < 1:
+            raise ConfigValidationError(
+                f"RetryHandoffConfig.max_consecutive_failures must be >= 1, got {self.max_consecutive_failures}"
+            )
+        if self.recovery_deadline <= 0:
+            raise ConfigValidationError(
+                f"RetryHandoffConfig.recovery_deadline must be > 0, got {self.recovery_deadline}"
+            )
+
+
+#: Queue types accepted by ``RetryConfig.delay_queue_type`` / ``dlq_queue_type``.
+RETRY_QUEUE_TYPES: tuple[str, ...] = ("classic", "quorum", "inherit")
+
+
+@dataclass(frozen=True, slots=True)
 class RetryConfig:
     """Retry with delay queues configuration.
 
@@ -413,6 +466,20 @@ class RetryConfig:
     ``delays`` must have at least ``max_retries`` entries.  Extra retries
     beyond the length of ``delays`` would silently reuse the last delay,
     which is almost always a misconfiguration.
+
+    Durability knobs (plan §5.1) — all default to the legacy topology so an
+    upgrade never re-declares an existing queue with different arguments:
+
+    * ``delay_queue_type``: ``"classic"`` (legacy default), ``"quorum"``, or
+      ``"inherit"`` (match the source queue). Quorum delay queues make the
+      retry chain replicated end-to-end for critical work; note that a
+      quorum SOURCE does not by itself secure a classic delay queue.
+    * ``dlq_queue_type``: ``"inherit"`` (legacy default — quorum when the
+      source is quorum), ``"classic"``, or ``"quorum"``.
+    * ``error_detail``: what goes into ``x-rabbitkit-error-message`` —
+      ``"sanitized"`` (default: redacted + capped), ``"omit"``, or ``"raw"``
+      (legacy). See :mod:`rabbitkit.core.sanitizer`.
+    * ``handoff``: bounded behavior when the retry publish itself fails.
     """
 
     max_retries: int = 4
@@ -437,10 +504,26 @@ class RetryConfig:
     per_queue: bool = True
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT
     strict_delays: bool = True
+    delay_queue_type: str = "classic"
+    dlq_queue_type: str = "inherit"
+    error_detail: str = "sanitized"
+    handoff: RetryHandoffConfig = field(default_factory=RetryHandoffConfig)
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ConfigValidationError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
+        if self.delay_queue_type not in RETRY_QUEUE_TYPES:
+            raise ConfigValidationError(
+                f"RetryConfig.delay_queue_type must be one of {RETRY_QUEUE_TYPES}, got {self.delay_queue_type!r}"
+            )
+        if self.dlq_queue_type not in RETRY_QUEUE_TYPES:
+            raise ConfigValidationError(
+                f"RetryConfig.dlq_queue_type must be one of {RETRY_QUEUE_TYPES}, got {self.dlq_queue_type!r}"
+            )
+        if self.error_detail not in ("sanitized", "omit", "raw"):
+            raise ConfigValidationError(
+                f"RetryConfig.error_detail must be 'sanitized', 'omit' or 'raw', got {self.error_detail!r}"
+            )
         if self.jitter_mode not in ("off", "sharded"):
             raise ConfigValidationError(
                 f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}"
@@ -642,6 +725,52 @@ class MetricsConfig:
     @property
     def consumer_active(self) -> str:
         return f"{self.namespace}_consumer_active"
+
+    # ── Bulk operations & settlement (plan §11) ──
+
+    @property
+    def bulk_publish_items_total(self) -> str:
+        """Incremented per ``publish_many``/``iter_publish`` item, labeled by
+        ``status`` (confirmed/unroutable/nacked/invalid/not_sent/unknown)
+        and ``reason`` (bounded reason code). A sustained ``unknown`` rate is
+        the "reconcile me" signal."""
+        return f"{self.namespace}_bulk_publish_items_total"
+
+    @property
+    def bulk_publish_batch_size(self) -> str:
+        """Histogram of ``publish_many`` input sizes (items)."""
+        return f"{self.namespace}_bulk_publish_batch_size"
+
+    @property
+    def bulk_publish_admission_wait_seconds(self) -> str:
+        """Histogram of time an item waited for an in-flight/byte slot."""
+        return f"{self.namespace}_bulk_publish_admission_wait_seconds"
+
+    @property
+    def settlement_items_total(self) -> str:
+        """Incremented per ``ack_many``/``nack_many`` item, labeled by
+        ``action`` and ``status`` (dispatched/already_settled/duplicate/
+        invalid/stale/not_attempted/failed)."""
+        return f"{self.namespace}_settlement_items_total"
+
+    @property
+    def settlement_coalesced_total(self) -> str:
+        """Tags settled through a cumulative (multiple=True) ack by a
+        ``CoalescingAcker`` — the coalescing-ratio numerator."""
+        return f"{self.namespace}_settlement_coalesced_total"
+
+    @property
+    def retry_handoff_failures_total(self) -> str:
+        """Incremented when the RETRY PUBLISH (delay-queue handoff) fails —
+        returned, nacked, timed out, or errored — labeled by ``queue``.
+        Distinct from ``messages_retried_total`` (handler attempts)."""
+        return f"{self.namespace}_retry_handoff_failures_total"
+
+    @property
+    def retry_handoff_paused(self) -> str:
+        """Gauge: 1 while a route's retry-handoff tracker is in backoff/
+        exhausted state, labeled by ``queue``."""
+        return f"{self.namespace}_retry_handoff_paused"
 
     # ── Broker-side gauges (H5: polled from the management API) ──
     # Bridged by QueueMetricsPoller — the #1 RabbitMQ incident signal
@@ -870,12 +999,49 @@ class BatchPublishConfig:
             )
 
 
+#: Settlement modes accepted by ``BatchAckConfig.mode``.
+BATCH_ACK_MODES: tuple[str, ...] = ("individual", "cumulative")
+
+
 @dataclass(frozen=True, slots=True)
 class BatchAckConfig:
-    """Batch ack configuration. Active."""
+    """Batch ack configuration. Active.
+
+    ``mode`` (plan §4.1):
+
+    * ``"individual"`` (default, SAFE) — every buffered tag is acked with
+      its own ``multiple=False`` frame. Out-of-order completion can never
+      settle a delivery that was not submitted.
+    * ``"cumulative"`` — legacy ``ack(max_tag, multiple=True)``. RabbitMQ
+      settles EVERY outstanding tag up to ``max_tag`` on the channel, so a
+      still-running sibling delivery gets acked early unless this helper is
+      the only thing that ever acks on that channel AND completions are
+      submitted in tag order. Requires ``ordered_exclusive_owner=True`` as
+      an explicit attestation; otherwise construction fails. For safe
+      coalescing with arbitrary completion order use
+      :class:`rabbitkit.highload.batch.CoalescingAcker` instead.
+    """
 
     batch_size: int = 100
     flush_interval_ms: int = 200
+    mode: str = "individual"
+    ordered_exclusive_owner: bool = False
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ConfigValidationError(f"BatchAckConfig.batch_size must be > 0, got {self.batch_size}")
+        if self.flush_interval_ms < 0:
+            raise ConfigValidationError(f"BatchAckConfig.flush_interval_ms must be >= 0, got {self.flush_interval_ms}")
+        if self.mode not in BATCH_ACK_MODES:
+            raise ConfigValidationError(f"BatchAckConfig.mode must be one of {BATCH_ACK_MODES}, got {self.mode!r}")
+        if self.mode == "cumulative" and not self.ordered_exclusive_owner:
+            raise ConfigValidationError(
+                "BatchAckConfig(mode='cumulative') issues ack(max_tag, multiple=True), which settles EVERY "
+                "outstanding delivery on the channel up to max_tag — including ones still being processed. "
+                "It is only safe when this acker is the channel's sole settler and completions arrive in "
+                "tag order. Set ordered_exclusive_owner=True to attest to that, or keep mode='individual' "
+                "(the default), or use CoalescingAcker for safe out-of-order coalescing."
+            )
 
 
 # ── Worker (active) ─────────────────────────────────────────

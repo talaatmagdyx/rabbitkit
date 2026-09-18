@@ -247,6 +247,66 @@ Rules of the road:
 
 ---
 
+## 2b. The reference BULK publisher and batch-commit consumer (0.12)
+
+```python
+from rabbitkit import BulkPublishOptions, BulkPublishStatus, MessageEnvelope
+
+
+async def publish_outbox_page(broker, rows) -> None:
+    """One call, one outcome per row — and honest about what it does not know."""
+    envelopes = [
+        MessageEnvelope(exchange="events", routing_key="orders.created", body=r.payload,
+                        message_id=r.outbox_id, mandatory=True)          # stable id → dedup/reconcile
+        for r in rows
+    ]
+    result = await broker.publish_many(
+        envelopes,
+        BulkPublishOptions(max_in_flight=256, max_buffer_bytes=8 << 20, overall_timeout=30.0),
+    )
+    for item in result.items:
+        row = rows[item.index]                                            # keyed by INPUT INDEX, never by id
+        if item.status is BulkPublishStatus.CONFIRMED:
+            mark_published(row)
+        elif item.status is BulkPublishStatus.UNKNOWN:
+            leave_claimed_for_reconciliation(row, item.attempt_id)         # may be on the broker
+        else:                                                              # NOT_SENT / INVALID / UNROUTABLE / NACKED
+            release_for_retry_or_fix(row, item.reason)
+```
+
+```python
+from rabbitkit import AckPolicy, RabbitMessage
+
+parked: list[RabbitMessage] = []
+
+@broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+async def collect(body: bytes, msg: RabbitMessage) -> None:
+    parked.append(msg)                                   # settle after the DB commit, not before
+
+async def commit_batch(deliveries: list[RabbitMessage]) -> None:
+    ok, failed = await db.commit_rows([decode(m) for m in deliveries])   # EXACT successful subset
+    (await broker.ack_many([deliveries[i] for i in ok])).raise_for_status()
+    await broker.nack_many([deliveries[i] for i in failed], requeue=False)
+```
+
+Rules of the road:
+
+- **`UNKNOWN` is not a failure and not a success.** It means the publish may
+  be on the broker. Only stable ids + consumer-side deduplication (inbox
+  table / `DeduplicationMiddleware`) make a retry safe.
+- **Never ack before the commit.** `ack_many` after the transaction, and only
+  for the rows the database actually accepted.
+- **Batch window vs. channel lifetime.** A delivery parked across a
+  reconnect is `STALE`; keep batches short and alert on
+  `settlement_items_total{status="stale"}`.
+- **No cumulative acks by hand.** `ack_many` is per-delivery. If you need
+  wire-level coalescing, use `CoalescingAcker` (it knows every delivery on
+  the channel) — never `basic_ack(multiple=True)` from application code.
+- Full contract: [Bulk Operations & Reliability Profiles](../bulk-operations.md);
+  runnable: `examples/bulk_operations/`.
+
+---
+
 ## 3. If you must use the sync broker
 
 The sync broker is production-grade with three rules the async one doesn't

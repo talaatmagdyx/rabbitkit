@@ -52,6 +52,72 @@ the system under test. It also reports the publisher's own schedule lag
 (p99) — if the load generator couldn't hold the pace, the report says so
 instead of publishing flattering numbers.
 
+## Tier 2b: bulk vs single (`python -m benchmarks.bench_bulk`)
+
+Answers "what do `publish_many` / `ack_many` / `CoalescingAcker` actually buy
+over one call per message?" — with the correctness accounting every
+throughput number must carry (every input has a reported state; the queue is
+verified drained through the management API).
+
+| Scenario | What it does | Median msg/s | Wire frames / msg | Accounting |
+|---|---|---|---|---|
+| publish single / async | `await broker.publish(e)` one after another | **932** | 1 publish + 1 confirm | `.ok` per call |
+| publish gather / async ×10 | hand-rolled `asyncio.gather` under a 10-slot semaphore | 4,685 | same | none (you write it) |
+| `publish_many` ×10 (default) | default options → in-flight capped to the 10-channel pool | 4,548 | same | one `BulkPublishItem` per input |
+| `publish_many` ×64 | `PoolConfig(channel_pool_size=64)`, `max_in_flight=64` | 8,951 | same | same |
+| `publish_many` + `AsyncBatchPublisher` | batch config, in-flight 256 (pipelined confirms) | **9,862** | same | same |
+| publish single / sync | `SyncBroker.publish` one after another | 833 | same | `.ok` per call |
+| `publish_many` / sync | `SyncBroker.publish_many` (sequential by design) | 1,015 | same | one item per input |
+| ack each | `await msg.ack_async()` per delivery | 15,308 | 1.000 | — |
+| `ack_many` ×100 | park 100, one `ack_many` call | 11,808 | 1.000 (20 API calls) | one `SettlementItem` per delivery |
+| `CoalescingAcker` ×100 | register/complete, in-order completion | **15,670** | **0.010** (20 frames for 2,000) | coordinator ledger |
+
+Environment: Apple Silicon (arm64, 12 cores), Python 3.12.2, RabbitMQ 3.13
+in Docker on the same machine, 2,000 messages × 1 KiB, persistent,
+confirms on, `mandatory=True`, durable classic queue, median of 3 runs,
+git `ed2e8bc`. Every scenario reported 2,000/2,000 CONFIRMED (or settled)
+and the management API showed the queue drained to 0 ready / 0 unacked.
+Absolute numbers are this machine's; the ratios are what travel.
+
+**How to read it**
+
+- **Bulk publish is a concurrency story, not a wire story.** RabbitMQ has no
+  multi-message publish; `publish_many` sends one message per envelope and
+  pipelines confirms. Sequential `publish` is RTT-bound (~0.9k/s). The same
+  concurrency by hand (`gather` ×10) gets ~4.7k/s, and `publish_many` ×10
+  matches it — the accounting layer costs nothing measurable. Raising the
+  channel pool to 64 doubles it again; the batch publisher (confirms
+  pipelined on shared channels) reaches ~9.9k/s, about 10× sequential.
+- **Sync bulk is honestly not faster.** pika cannot pipeline confirms, so
+  `SyncBroker.publish_many` runs at the same ~1k/s as a loop. What you gain
+  is the per-item outcome contract, not throughput. Use `AsyncBroker` (or
+  `SyncBatchPublisher`) for volume.
+- **`ack_many` is not a throughput feature.** It still emits one
+  `multiple=False` frame per delivery — by design, so it can never settle a
+  sibling that is still running — and it awaits them sequentially inside one
+  call, which is why it measures slightly below per-handler acks that
+  overlap with consumption. Its value is one validation pass, one report and
+  one API call per batch commit (`STALE`/`DUPLICATE`/`ALREADY_SETTLED` per
+  item), i.e. correctness after a database transaction.
+- **Coalescing is the wire optimisation.** `CoalescingAcker` settled 2,000
+  deliveries with 20 cumulative frames (0.01 frames/msg, 100× fewer) at the
+  highest settle rate — because the coordinator knows every outstanding
+  delivery and only acks through a completed prefix. Out-of-order
+  completion lowers the ratio (stranded tags fall back to individual acks
+  after `max_hold` rounds); in-order completion is the ceiling shown here.
+- Handler cost was zero in the ack scenarios, so those rates are a
+  **settlement-overhead ceiling**, not an end-to-end consume rate.
+
+```bash
+# throwaway testcontainers broker (Docker required)
+python -m benchmarks.bench_bulk --n 2000 --size 1024 --reps 3
+# or an existing broker
+python -m benchmarks.bench_bulk --url amqp://guest:guest@localhost:5672/ --mgmt-url http://localhost:15672
+```
+
+Results (with an environment fingerprint) land in
+`benchmarks/results/bulk_<timestamp>.json`.
+
 ## Tier 3: the soak harness (`python -m benchmarks.soak`)
 
 Sustained-runtime evidence for the two questions point-in-time tests

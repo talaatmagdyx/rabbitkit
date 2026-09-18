@@ -19,13 +19,14 @@ Metric names:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
 from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope, PublishOutcome
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
@@ -206,6 +207,11 @@ class MetricsMiddleware(BaseMiddleware):
     ) -> None:
         self._collector = collector
         self._cfg = config or MetricsConfig()
+        # Plan §11: the declared ``in_flight_messages`` gauge was never
+        # emitted. Track handlers currently inside consume_scope (per queue)
+        # and publish the gauge on every enter/exit.
+        self._in_flight: dict[str, int] = {}
+        self._in_flight_lock = threading.Lock()
 
     @property
     def collector(self) -> MetricsCollector | None:
@@ -219,6 +225,35 @@ class MetricsMiddleware(BaseMiddleware):
     @property
     def config(self) -> MetricsConfig:
         return self._cfg
+
+    def _in_flight_delta(self, queue: str, delta: int) -> None:
+        if self._collector is None:
+            return
+        with self._in_flight_lock:
+            value = max(0, self._in_flight.get(queue, 0) + delta)
+            self._in_flight[queue] = value
+        set_gauge = getattr(self._collector, "set_gauge", None)
+        if set_gauge is not None:
+            set_gauge(self._cfg.in_flight_messages, {"queue": queue}, float(value))
+
+    def _observe_publish(self, exchange: str, result: Any, elapsed: float) -> None:
+        """Publish-side counters + histograms shared by both scopes.
+
+        ``publish_confirm_latency_seconds`` (declared, previously never
+        emitted) is observed only when the outcome is a real broker
+        CONFIRMED — for SENT/fire-and-forget there is no confirm to time.
+        """
+        assert self._collector is not None
+        self._collector.inc_counter(
+            self._cfg.published_total,
+            {"exchange": exchange, "status": _publish_status_label(result)},
+        )
+        self._collector.observe_histogram(self._cfg.publish_seconds, {"exchange": exchange}, elapsed)
+        status = getattr(result, "status", None)
+        if status is PublishStatus.CONFIRMED:
+            self._collector.observe_histogram(
+                self._cfg.publish_confirm_latency_seconds, {"exchange": exchange}, elapsed
+            )
 
     def record_settlement(self, message: RabbitMessage, disposition: str) -> None:
         """Emit the ack/nack/reject counter for a settled message (M2).
@@ -262,6 +297,7 @@ class MetricsMiddleware(BaseMiddleware):
                 {"queue": queue},
             )
         start = time.monotonic()
+        self._in_flight_delta(queue, +1)
         try:
             result = call_next(message)
         except BaseException:
@@ -286,6 +322,8 @@ class MetricsMiddleware(BaseMiddleware):
                 time.monotonic() - start,
             )
             return result
+        finally:
+            self._in_flight_delta(queue, -1)
 
     async def consume_scope_async(
         self,
@@ -304,6 +342,7 @@ class MetricsMiddleware(BaseMiddleware):
                 {"queue": queue},
             )
         start = time.monotonic()
+        self._in_flight_delta(queue, +1)
         try:
             result = await call_next(message)
         except BaseException:
@@ -328,6 +367,8 @@ class MetricsMiddleware(BaseMiddleware):
                 time.monotonic() - start,
             )
             return result
+        finally:
+            self._in_flight_delta(queue, -1)
 
     # ── Publish-side ──────────────────────────────────────────────────
 
@@ -356,15 +397,7 @@ class MetricsMiddleware(BaseMiddleware):
             )
             raise
         else:
-            self._collector.inc_counter(
-                self._cfg.published_total,
-                {"exchange": exchange, "status": _publish_status_label(result)},
-            )
-            self._collector.observe_histogram(
-                self._cfg.publish_seconds,
-                {"exchange": exchange},
-                time.monotonic() - start,
-            )
+            self._observe_publish(exchange, result, time.monotonic() - start)
             return result
 
     async def publish_scope_async(
@@ -392,15 +425,7 @@ class MetricsMiddleware(BaseMiddleware):
             )
             raise
         else:
-            self._collector.inc_counter(
-                self._cfg.published_total,
-                {"exchange": exchange, "status": _publish_status_label(result)},
-            )
-            self._collector.observe_histogram(
-                self._cfg.publish_seconds,
-                {"exchange": exchange},
-                time.monotonic() - start,
-            )
+            self._observe_publish(exchange, result, time.monotonic() - start)
             return result
 
 

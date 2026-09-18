@@ -58,10 +58,16 @@ SKIP = {
 # So match only REAL bug signatures: config/topology errors, bad imports, type
 # errors, broker precondition failures. Anything else on a still-running
 # process is benign shutdown noise → RUNNING-OK.
+# Exception NAMES must be followed by ":" — i.e. an actual raised-exception
+# line ("AttributeError: 'X' has no attribute ..."), not a mention inside a
+# source snippet. A daemon killed at timeout can print a benign
+# "coroutine ... was never awaited" RuntimeWarning whose quoted source line is
+# aio_pika's ``contextlib.suppress(AttributeError, RuntimeError)`` — that used
+# to match here and fail the nightly run for a still-healthy consumer.
 _REAL_ERROR = re.compile(
-    r"ConfigurationError|DuplicateRouteError|PRECONDITION_FAILED"
-    r"|ModuleNotFoundError|ImportError|AttributeError|TypeError|NameError"
-    r"|KeyError|ValueError: .*(argument|keyword)",
+    r"(?:ConfigurationError|DuplicateRouteError|ModuleNotFoundError|ImportError"
+    r"|AttributeError|TypeError|NameError|KeyError):"
+    r"|PRECONDITION_FAILED|ValueError: .*(argument|keyword)",
     re.MULTILINE,
 )
 

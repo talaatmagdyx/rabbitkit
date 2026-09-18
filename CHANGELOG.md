@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] — 2026-09-18
+
+Reliability and bulk operations release. Implements the "Reliability and Bulk
+Operations" plan: first-class bulk publishing with per-item outcomes,
+selected acknowledgement, provably safe ack coalescing, reliability profiles
+with preflight, sanitized terminal metadata, and bounded retry-handoff
+failure handling. No existing queue is re-declared by any of it.
 
 ### Added
 
@@ -35,6 +41,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   purpose, is nacked, redelivered, and stored exactly once. Verified
   against a real broker; self-verifying single script (seeds, runs both
   stages, asserts, exits 0).
+
+- **`broker.publish_many(envelopes, options)` / `broker.iter_publish(...)`**
+  on both `SyncBroker` and `AsyncBroker`. Every item goes through the same
+  path as `publish()` (publish middlewares exactly once per attempt, flow
+  controller, size limit, batch publisher when configured, transport) and
+  gets one `BulkPublishItem` keyed by input index with a fresh `attempt_id`
+  and a bounded `reason` code. Statuses: `CONFIRMED`, `UNROUTABLE`,
+  `NACKED`, `INVALID`, `NOT_SENT`, `UNKNOWN` — `SENT` (confirms off), a
+  confirm timeout, an exception mid-publish and cancellation are all
+  `UNKNOWN`, never a success or a definite failure. Admission is bounded by
+  `max_in_flight`, `max_buffer_bytes`, `admission_timeout`,
+  `confirm_timeout`, `overall_timeout` (+ `drain_grace`) and `max_items`.
+  Prepared envelopes snapshot their headers so a caller cannot mutate a
+  queued message. (`core/bulk.py`, `core/bulk_runner.py`)
+- **`broker.ack_many(messages)` / `broker.nack_many(messages, requeue=)`**
+  (sync, async, and `TestBroker`): settle exactly the given deliveries with
+  individual `multiple=False` frames after a validation pass that reports
+  `ALREADY_SETTLED`, `DUPLICATE`, `INVALID` (no-ack delivery / wrong
+  runtime), `STALE` (channel rebuilt since delivery — the tag would name a
+  different message) and `NOT_ATTEMPTED` (fail-fast abort). Reports say
+  `DISPATCHED`, never "confirmed": RabbitMQ does not acknowledge consumer
+  acks. `RabbitMessage.channel_alive` exposes the transport-wired liveness
+  probe. (`core/settlement.py`)
+- **`SettlementCoordinator` + `CoalescingAcker`**: a channel-wide ledger
+  that only emits `ack(tag, multiple=True)` through a tag when every
+  still-outstanding lower tag is approved for success; NACK/REJECT intents
+  are individual and ordered; retry-pending deliveries block coalescing
+  above them; a bounded hold then individual fallback so one slow handler
+  never strands its siblings; `invalidate()` on reconnect drops the whole
+  ledger so old tags are never replayed. Property/state-machine tested.
+- **Reliability profiles** (`core/profiles.py`): `ReliabilityProfile.STANDARD`
+  / `CRITICAL`, `apply_profile()` / `critical_config()` /
+  `standard_config()` (fill requirements; raise on a pinned contradiction),
+  `validate_profile()`, `broker.preflight(profile, management_client=)` —
+  local checks plus read-only management-API verification of queue type,
+  `dead-letter-strategy: at-least-once`, `overflow: reject-publish` and
+  `delivery-limit`; anything unverifiable is reported `UNVERIFIED`, never
+  green — and `policy_templates()` rendering reviewed policy definitions
+  (management JSON / `rabbitmqctl`) for cluster owners to apply.
+- **`ErrorSanitizer`** (`core/sanitizer.py`) and
+  `RetryConfig.error_detail` (`sanitized` default / `omit` / `raw`): retry
+  and DLQ triage headers now carry an allowlisted
+  `x-rabbitkit-error-category` plus a redacted, length-capped message (URL
+  credentials, `password=`/`token=`/`api_key=` pairs, bearer/basic auth,
+  AWS key ids and long opaque tokens are masked). A stale raw message header
+  from a previous attempt is dropped on republish.
+- **`RetryConfig.delay_queue_type`** (`classic` default / `quorum` /
+  `inherit`) and **`dlq_queue_type`** (`inherit` default / `classic` /
+  `quorum`) make retry-chain durability explicit for critical work.
+- **`RetryHandoffConfig` + `RetryHandoffTracker`**: retry-PUBLISH failures
+  (returned, nacked, timed out, raised) are tracked separately from handler
+  attempts, with capped exponential backoff + jitter (awaited on async
+  handlers; surfaced through `on_handoff_failure` on sync ones — the sync
+  path never sleeps on the I/O thread), an `EXHAUSTED` state after
+  `max_consecutive_failures` / `recovery_deadline`, and an
+  `on_handoff_exhausted` hook so an owner can stop the consumer. The source
+  is never acked on a failed handoff.
+- **Metrics**: `bulk_publish_items_total{status,reason}`,
+  `bulk_publish_batch_size`, `settlement_items_total{action,status}`,
+  `settlement_coalesced_total`, `retry_handoff_failures_total{queue}`,
+  `retry_handoff_paused{queue}`; and the previously declared but never
+  emitted `publish_confirm_latency_seconds`, `in_flight_messages`,
+  `broker_connected`, `consumer_active`, `worker_pool_pending` are now
+  emitted.
+- `BatchPublisher.flush_report()` / `flush_report_async()`, `last_flush`,
+  `last_error`, `on_error=`; `BatchAcker.acked_total`, `last_error`,
+  `on_error=`; `BatchClosedError`, `BatchFlushError`, `FlushReport`,
+  `FlushItem`.
+- **`RabbitManagementClient.put_policy` / `get_policy` / `list_policies` /
+  `delete_policy`** — the deliberate, reviewed step for applying
+  `policy_templates()` output (accepts a `PolicyTemplate` directly).
+  rabbitkit still never applies policies on its own.
+- **Examples**: `examples/bulk_operations/` (7 runnable scripts — async and
+  sync `publish_many`, streaming `iter_publish`, batch-commit `ack_many`,
+  `CoalescingAcker` with out-of-order completion, critical-profile preflight
+  against the management API, sanitized headers + handoff backoff with no
+  broker, and a SQLite transactional outbox → `publish_many` → inbox).
+- **Docs**: `docs/bulk-operations.md` (contract, invariants, outbox/inbox
+  recipe, DLQ replay guidance, FAQ), `docs/api/bulk.md`; new sections in the
+  full guide (§10), production patterns (§2b bulk publisher + batch-commit
+  consumer), production checklist, observability reference (lifecycle
+  gauges now emitted; bulk/settlement/handoff metrics + alerting guidance),
+  migration guide (0.12.0 upgrade notes), roadmap; README section.
+- **Benchmark** `python -m benchmarks.bench_bulk` — bulk vs single for
+  publish (async sequential / gather / `publish_many` at pool 10 and 64 /
+  `publish_many` + batch publisher / sync sequential / sync `publish_many`)
+  and ack (`ack_async` each / `ack_many` ×100 / `CoalescingAcker` ×100), with
+  per-item accounting and management-API drain verification; results with
+  environment fingerprint in `benchmarks/results/bulk_<ts>.json`. Measured
+  numbers and interpretation in `docs/benchmarking.md` (Tier 2b) and
+  `docs/bulk-operations.md`.
+- **Tests**: unit coverage for every new module plus transport liveness
+  stamping, public-API exports, management policy endpoints; Hypothesis
+  state machine for `SettlementCoordinator`; live-broker integration suites
+  `tests/integration/test_bulk_operations.py` and
+  `tests/integration/test_reliability_features.py` (streaming
+  `iter_publish`, confirms-off → UNKNOWN, quorum delay chain declared,
+  sanitized headers on the wire, retry handoff failure against a deleted
+  delay queue, policy templates → fully verified preflight, `CoalescingAcker`
+  on a real channel, subset ack leaving the sibling unacked, nack-to-DLQ).
+
+### Fixed
+
+- **Async publish could report CONFIRMED for a message the broker had
+  RETURNED, when the same `message_id` was re-published on the same channel
+  while its previous publish was still unconfirmed.** aiormq correlates a
+  `Basic.Return` to its publish by `message_id` and pops that mapping when an
+  *earlier* publish of the same id confirms. The retry middleware re-publishes
+  the original `message_id` by design, so on a slow broker (durable-queue
+  fsync lagging behind consumer delivery) the sequence "source publish →
+  delivered → handler fails → retry publish (same id) → source confirm
+  arrives → retry Return" deleted the retry's mapping: aiormq logged
+  `Unhandled message ... returning`, the retry publish resolved as
+  `CONFIRMED`, the source was acked, and the message was gone. Surfaced by
+  the new live-broker test `test_retry_handoff_failure_nacks_and_recovers`
+  in CI. `AsyncTransportImpl._publish_on_channel` now serializes publishes
+  of the same `message_id` on the same channel (waits for the previous one
+  to settle, bounded by `confirm_timeout`), which closes the window on the
+  mandatory channel, batch-publisher channels and the reply-to channel
+  alike. Distinct ids and distinct channels are unaffected.
+- **Nightly examples smoke test false positive.** `examples/smoke_test.py`
+  matched bare exception names anywhere in a killed daemon's output; a
+  benign "coroutine was never awaited" `RuntimeWarning` quoting aio-pika's
+  `contextlib.suppress(AttributeError, RuntimeError)` source line failed
+  `header_inspector/chaos_reconnect.py` every night. The signature now
+  requires an actual exception line (`Name:`).
+
+### Changed
+
+- **`BatchAcker` default mode is now `individual`** (one `multiple=False`
+  frame per tag). The previous `ack(max_tag, multiple=True)` acked EVERY
+  outstanding tag on the channel up to the max — including a still-running
+  delivery that was never submitted (submitting 1 and 3 settled 2). The
+  legacy behaviour is `BatchAckConfig(mode="cumulative",
+  ordered_exclusive_owner=True)` and requires that attestation; use
+  `CoalescingAcker` for safe coalescing under arbitrary completion order.
+- **`BatchPublisher.flush()`** counts only items whose publish did not fail
+  locally (a non-ok `PublishOutcome` is no longer counted as published), and
+  a publish that RAISES mid-batch now raises `BatchFlushError` carrying a
+  `FlushReport` with real outcomes for the items already sent, `UNKNOWN`
+  for the raising item, and the unsent tail — nothing is silently
+  re-buffered. `add()` / `add_async()` after close raise
+  `BatchClosedError`; flushes are serialized so a timer flush and a manual
+  flush can never interleave; timer-thread failures are recorded instead of
+  vanishing.
+- `x-rabbitkit-error-message` is sanitized by default (see above). Set
+  `RetryConfig(error_detail="raw")` for the previous text.
+- `BatchAckConfig` now validates `batch_size > 0` and
+  `flush_interval_ms >= 0`.
+- `AsyncBroker.iter_publish` / `publish_many` cap the effective
+  `max_in_flight` at `PoolConfig.channel_pool_size` when no
+  `AsyncBatchPublisher` is configured: each in-flight publish holds one
+  pooled channel, so a larger value only queued callers on the pool with
+  "channel pool exhausted" warnings. With batching configured the caller's
+  value stands.
 
 ## [0.11.0] — 2026-07-11
 

@@ -131,9 +131,13 @@ collector is present (on the broker's `middlewares=[...]` or on any route):
 | `rabbitkit_consumer_active` | gauge | — | number of registered routes while started, 0 after stop |
 | `rabbitkit_worker_pool_pending` | gauge | — | worker-pool pending count, sampled at start/stop |
 
-Still **not** emitted: `publish_total` (a differently-named alias of
-`published_total`) and `publish_failures_total` (failures are a `status`
-label on `published_total` instead). Don't alert on those two names.
+`publish_total` and `publish_failures_total` were **removed in 0.14**. Both
+were declared on `MetricsConfig` but never emitted anywhere, and
+`publish_total` resolved to a different default name than `published_total`
+(`rabbitkit_publish_total` vs `rabbitkit_messages_published_total`), so a
+dashboard built on it was always scraping a series that did not exist. Use
+`published_total` and its `status` label instead — a publish failure is
+`rabbitkit_messages_published_total{status="failure"}`.
 
 ## Bulk operations, settlement & retry handoff (0.12)
 

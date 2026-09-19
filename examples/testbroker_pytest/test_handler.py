@@ -9,8 +9,6 @@ Requirements:
 
 import json
 
-import pytest
-
 from rabbitkit.testing import TestBroker
 
 # ── Application code under test ───────────────────────────────────────────────

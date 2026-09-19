@@ -1188,9 +1188,27 @@ class AsyncBroker:
             self._pipeline.clear_caches()
 
     def _wire_reconnect_metric(self) -> None:
-        """Async mirror of ``SyncBroker._wire_reconnect_metric`` — count
-        transport reconnects (connection churn) via the first route
-        ``MetricsMiddleware``'s collector, if any. No-op without metrics."""
+        """Wire the channel-churn counters via the first route
+        ``MetricsMiddleware``'s collector, if any. No-op without metrics.
+
+        Deliberately does NOT wire ``reconnects_total``, unlike the sync
+        broker. It is driven by ``on_reconnect``, which on async depends on
+        aio-pika telling us a reconnect happened — and 9.6 does not: when the
+        BROKER closes the connection it recovers underneath the same
+        ``RobustConnection`` object without firing ``reconnect_callbacks``,
+        ``close_callbacks`` or advancing ``connection_attempt`` (verified
+        against a live broker). Registering the counter anyway would publish a
+        series that is permanently 0 while connections really are flapping,
+        which is worse than no series at all: a dashboard panel and an alert
+        would both look healthy. ``channel_rebuilds_total`` IS driven by
+        rabbitkit's own observations and is the churn signal to use on async —
+        see ``docs/observability.md``.
+
+        ``on_reconnect`` itself still works and still fires whenever rabbitkit
+        REPLACES a connection (a rebuilt publisher connection, a lazy
+        re-create), so wiring your own callback to it remains useful; it is
+        only unsuitable as the sole basis for a churn metric.
+        """
         if self._transport is None:
             return
         from rabbitkit.middleware.metrics import MetricsMiddleware
@@ -1207,11 +1225,16 @@ class AsyncBroker:
         if metrics_mw is None or metrics_mw.collector is None:
             return
         collector = metrics_mw.collector
-        metric_name = metrics_mw.config.reconnects_total
-        self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
+        logger.info(
+            "Async broker: not emitting %s — aio-pika does not report a broker-initiated "
+            "reconnect, so the series would be permanently 0 while connections flap. "
+            "Alert on %s instead (see docs/observability.md).",
+            metrics_mw.config.reconnects_total,
+            metrics_mw.config.channel_rebuilds_total,
+        )
 
         # Item 3: channel open/rebuild counters — same collector, same
-        # no-route-metrics no-op behavior as the reconnect hook above.
+        # no-route-metrics no-op behavior.
         opened_name = metrics_mw.config.channels_opened_total
         rebuilt_name = metrics_mw.config.channel_rebuilds_total
         self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))

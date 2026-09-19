@@ -156,21 +156,32 @@ class PrometheusCollector:
 
     def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None:
         """Increment a Prometheus counter."""
-        label_names = tuple(sorted(labels.keys()))
-        counter = self._get_counter(name, label_names)
-        counter.labels(**labels).inc(value)
+        counter = self._get_counter(name, tuple(sorted(labels.keys())))
+        self._child(counter, labels).inc(value)
 
     def observe_histogram(self, name: str, labels: dict[str, str], value: float) -> None:
         """Observe a value on a Prometheus histogram."""
-        label_names = tuple(sorted(labels.keys()))
-        histogram = self._get_histogram(name, label_names)
-        histogram.labels(**labels).observe(value)
+        histogram = self._get_histogram(name, tuple(sorted(labels.keys())))
+        self._child(histogram, labels).observe(value)
 
     def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
         """Set a Prometheus gauge to an absolute value."""
-        label_names = tuple(sorted(labels.keys()))
-        gauge = self._get_gauge(name, label_names)
-        gauge.labels(**labels).set(value)
+        gauge = self._get_gauge(name, tuple(sorted(labels.keys())))
+        self._child(gauge, labels).set(value)
+
+    @staticmethod
+    def _child(metric: Any, labels: dict[str, str]) -> Any:
+        """The labelled child, or the metric itself when there are no labels.
+
+        ``prometheus_client`` raises ``ValueError: No label names were set``
+        if you call ``.labels()`` on a metric constructed without label names,
+        so an UNLABELLED metric must be used directly. Every unlabelled metric
+        rabbitkit emits — ``reconnects_total``, ``channels_opened_total``,
+        ``channel_rebuilds_total``, the broker/consumer lifecycle gauges, the
+        settlement gauges and the health gauge — used to raise here, which
+        took down the caller (e.g. ``broker.start()``) the first time it fired.
+        """
+        return metric.labels(**labels) if labels else metric
 
 
 # ── Middleware ────────────────────────────────────────────────────────────

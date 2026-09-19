@@ -695,14 +695,6 @@ class MetricsConfig:
         return self.published_counter or f"{self.namespace}_messages_published_total"
 
     @property
-    def publish_total(self) -> str:
-        return self.published_counter or f"{self.namespace}_publish_total"
-
-    @property
-    def publish_failures_total(self) -> str:
-        return f"{self.namespace}_publish_failures_total"
-
-    @property
     def publish_confirm_latency_seconds(self) -> str:
         return f"{self.namespace}_publish_confirm_latency_seconds"
 

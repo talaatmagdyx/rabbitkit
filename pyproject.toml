@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.13.1"
+version = "0.14.0"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -146,6 +146,12 @@ filterwarnings = [
     # bypasses these filters). Real users still see them.
     "ignore:Starting a single-worker sync consumer:RuntimeWarning",
     "ignore:SigningMiddleware is using the default in-memory:RuntimeWarning",
+    # The unmarshalled-interval-timer guard. Legitimately fires for the batch
+    # helpers' own tests, which drive them with plain callables and no
+    # transport owner; tests/unit/highload/test_coalescing_marshal.py asserts
+    # it DOES fire (pytest.warns bypasses these filters). Real users still
+    # see it.
+    "ignore:.*flush_interval_ms > 0 but no marshal=:RuntimeWarning",
     # third-party: testcontainers' own deprecated decorator
     "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
     # M13 security guardrail, asserted by test_cert_none_warns; SSL tests

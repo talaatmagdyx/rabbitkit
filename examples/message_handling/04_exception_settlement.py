@@ -32,7 +32,7 @@ async def handle_with_control(body: bytes) -> None:
         data = json.loads(body)
     except json.JSONDecodeError:
         # Malformed JSON — reject immediately, don't requeue
-        raise RejectMessage(requeue=False)
+        raise RejectMessage(requeue=False) from None
 
     action = data.get("action")
 
@@ -89,11 +89,11 @@ async def handle_business_event(body: bytes) -> None:
 
     except InvalidPayloadError as exc:
         print(f"[business] invalid payload: {exc} → rejecting")
-        raise RejectMessage(requeue=False)
+        raise RejectMessage(requeue=False) from exc
 
     except TemporaryOutageError as exc:
         print(f"[business] temporary outage: {exc} → nack+requeue")
-        raise NackMessage(requeue=True)
+        raise NackMessage(requeue=True) from exc
 
 
 async def main() -> None:

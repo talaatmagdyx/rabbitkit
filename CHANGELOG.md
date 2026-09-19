@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-09-19
+
+Observability correctness, and the lint/coverage gates tightened so the
+classes of bug fixed here cannot come back silently.
+
+### Fixed
+
+- **`PrometheusCollector` crashed on every UNLABELLED metric.** `inc_counter`
+  / `observe_histogram` / `set_gauge` called `metric.labels(**labels)`
+  unconditionally, and `prometheus_client` raises
+  `ValueError: No label names were set` when you call `.labels()` on a metric
+  declared without label names. Every unlabelled series rabbitkit emits was
+  affected — `channels_opened_total`, `channel_rebuilds_total`,
+  `broker_connected`, `consumer_active`, `worker_pool_pending`, the whole
+  `settlement_*` gauge family and `settlement_coalesced_total` — and the
+  exception propagated to the caller, so `broker.start()` raised on its very
+  first lifecycle gauge. The collector now uses the metric itself when there
+  are no labels. This was invisible because every existing metrics test used
+  a `MagicMock` collector, which accepts any call; there is now a suite that
+  runs against the real `prometheus_client` with a scoped `CollectorRegistry`.
+- **Example ports no longer collide.** Three examples bound `:8080`, so a
+  still-running example silently blocked the next one. The Kubernetes worker
+  now uses `:8081` and the production pipeline `:8082` / `:9102`.
+- **The examples smoke runner now always shows why a run failed** instead of
+  swallowing the output when its error pattern did not match.
+- **`examples/highload/04_backpressure.py` referenced a class that does not
+  exist** (`BlockedConnectionError`) in a commented-out block. The real name
+  is `BackpressureError`, and the demo now actually runs. Found by putting
+  `examples/` under the lint gate.
+- **`examples/dependency_injection/02_generator_deps.py` interpolated message
+  bytes straight into a SQL string.** The fake session is a demo, but the
+  pattern gets copied; it is parameterised now.
+
+### Added
+
+- **`marshal=` on `BatchPublisher` and `BatchAcker`**, matching the parameter
+  `CoalescingAcker` gained in 0.13.1. All three interval-driven batch helpers
+  now run their timer flush on the transport owner thread the same way, and
+  all three warn when `flush_interval_ms > 0` is set without one.
+
+### Changed
+
+- **`examples/` is now part of the lint gate**
+  (`ruff check src/ tests/ benchmarks/ examples/`), in CI, the Makefile,
+  pre-commit, `CONTRIBUTING.md` and the PR template. Examples are executable
+  documentation and had drifted to 39 findings, including the two real bugs
+  above.
+- **The CI coverage floor moved from 85% to 99%.** Actual unit coverage is
+  99%; the floor was 14 points of slack in which a regression could hide.
+- **The async broker no longer wires `reconnects_total`.** Verified against a
+  live broker: when the BROKER closes a connection, aio-pika 9.6 recovers
+  underneath the same `RobustConnection` without re-running its counted
+  connect path, so `reconnect_callbacks` never fires and the counter would
+  read a permanent 0 while connections really were flapping — worse than no
+  series at all. `channel_rebuilds_total` is the async reconnect signal; the
+  broker now logs that at startup. Sync is unaffected. See
+  `docs/observability.md`.
+
+### Removed
+
+- **`MetricsConfig.publish_total` and `MetricsConfig.publish_failures_total`.**
+  Neither ever had an emission site, and `publish_total` resolved to a
+  *different* default name than `published_total`
+  (`rabbitkit_publish_total` vs `rabbitkit_messages_published_total`), so any
+  dashboard built on it was scraping a series that never existed. Use
+  `published_total` and its `status` label: a publish failure is
+  `rabbitkit_messages_published_total{status="failure"}`.
+
 ## [0.13.1] — 2026-09-19
 
 Fixes the two things 0.13.0 only documented or scoped around.

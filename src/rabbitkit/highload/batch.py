@@ -210,11 +210,14 @@ class BatchPublisher:
         config: BatchPublishConfig | None = None,
         confirm_fn: Callable[[], Any] | None = None,
         *,
+        marshal: Callable[[Callable[[], None]], None] | None = None,
         on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self._config = config or BatchPublishConfig()
         self._publish_fn = publish_fn
         self._confirm_fn = confirm_fn
+        self._marshal = marshal
+        self._warned_unmarshalled = False
         self._on_error = on_error
         self._buffer: list[MessageEnvelope] = []
         self._lock = threading.Lock()
@@ -258,16 +261,34 @@ class BatchPublisher:
 
     # ── Timer helpers ────────────────────────────────────────────────────
 
+    def _warn_unmarshalled_timer(self) -> None:
+        """One warning per instance: an interval timer without ``marshal``
+        runs the transport callable off the owner thread, which fails
+        silently (see :class:`CoalescingAcker` for the full explanation)."""
+        if self._warned_unmarshalled:
+            return
+        self._warned_unmarshalled = True
+        warnings.warn(
+            f"{type(self).__name__} has flush_interval_ms > 0 but no marshal=. The interval "
+            "timer fires on a threading.Timer thread, so the transport callable will run "
+            "off the owner — asyncio only raises for that in debug mode, so work can be "
+            "queued without ever reaching the broker. Pass marshal=loop.call_soon_threadsafe "
+            "(asyncio) or marshal=connection.add_callback_threadsafe (pika), or set "
+            "flush_interval_ms=0 and flush yourself.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
     def _schedule_timer(self) -> None:
+        if self._config.flush_interval_ms > 0 and self._marshal is None:
+            self._warn_unmarshalled_timer()
         if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
             interval = self._config.flush_interval_ms / 1000.0
             self._timer = threading.Timer(interval, self._timer_callback)
             self._timer.daemon = True
             self._timer.start()
 
-    def _timer_callback(self) -> None:
-        with self._lock:
-            self._timer = None
+    def _interval_flush(self) -> None:
         try:
             self.flush()
         except BaseException as exc:
@@ -275,6 +296,18 @@ class BatchPublisher:
             # helper usable (unsent tail is in last_flush.unsent).
             self._record_error(exc)
             logger.error("BatchPublisher interval flush failed: %s", exc, exc_info=True)
+
+    def _timer_callback(self) -> None:
+        with self._lock:
+            self._timer = None
+        if self._marshal is None:
+            self._interval_flush()
+        else:
+            try:
+                self._marshal(self._interval_flush)
+            except BaseException as exc:
+                self._record_error(exc)
+                logger.error("BatchPublisher could not marshal its interval flush: %s", exc, exc_info=True)
         with self._lock:
             if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
                 self._schedule_timer()
@@ -527,10 +560,13 @@ class BatchAcker:
         ack_fn: Callable[..., Any],
         config: BatchAckConfig | None = None,
         *,
+        marshal: Callable[[Callable[[], None]], None] | None = None,
         on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self._config = config or BatchAckConfig()
         self._ack_fn = ack_fn
+        self._marshal = marshal
+        self._warned_unmarshalled = False
         self._on_error = on_error
         self._tags: list[int] = []
         self._seen: set[int] = set()
@@ -582,21 +618,51 @@ class BatchAcker:
 
     # ── Timer helpers ────────────────────────────────────────────────────
 
+    def _warn_unmarshalled_timer(self) -> None:
+        """One warning per instance: an interval timer without ``marshal``
+        runs the transport callable off the owner thread, which fails
+        silently (see :class:`CoalescingAcker` for the full explanation)."""
+        if self._warned_unmarshalled:
+            return
+        self._warned_unmarshalled = True
+        warnings.warn(
+            f"{type(self).__name__} has flush_interval_ms > 0 but no marshal=. The interval "
+            "timer fires on a threading.Timer thread, so the transport callable will run "
+            "off the owner — asyncio only raises for that in debug mode, so work can be "
+            "queued without ever reaching the broker. Pass marshal=loop.call_soon_threadsafe "
+            "(asyncio) or marshal=connection.add_callback_threadsafe (pika), or set "
+            "flush_interval_ms=0 and flush yourself.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
     def _schedule_timer(self) -> None:
+        if self._config.flush_interval_ms > 0 and self._marshal is None:
+            self._warn_unmarshalled_timer()
         if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
             interval = self._config.flush_interval_ms / 1000.0
             self._timer = threading.Timer(interval, self._timer_callback)
             self._timer.daemon = True
             self._timer.start()
 
-    def _timer_callback(self) -> None:
-        with self._lock:
-            self._timer = None
+    def _interval_flush(self) -> None:
         try:
             self.flush()
         except BaseException as exc:
             self._record_error(exc)
             logger.error("BatchAcker interval flush failed: %s", exc, exc_info=True)
+
+    def _timer_callback(self) -> None:
+        with self._lock:
+            self._timer = None
+        if self._marshal is None:
+            self._interval_flush()
+        else:
+            try:
+                self._marshal(self._interval_flush)
+            except BaseException as exc:
+                self._record_error(exc)
+                logger.error("BatchAcker could not marshal its interval flush: %s", exc, exc_info=True)
         with self._lock:
             if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
                 self._schedule_timer()

@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: Ruff
-        run: .venv/bin/ruff check src/ tests/ benchmarks/
+        run: .venv/bin/ruff check src/ tests/ benchmarks/ examples/
       - name: mypy
         run: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 
@@ -50,7 +50,7 @@ jobs:
       # Do NOT raise this to 100 — it would break the pipeline. Raise it
       # incrementally as new tests close the gap.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as

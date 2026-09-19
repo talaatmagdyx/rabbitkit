@@ -27,7 +27,6 @@ from rabbitkit.health import broker_health_check_async
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import JSONResponse
 except ImportError as exc:
     raise SystemExit("Install fastapi: pip install 'rabbitkit[fastapi]'") from exc
 

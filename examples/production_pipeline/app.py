@@ -12,8 +12,8 @@ What this wires up (each marked [P#] and explained inline):
        ack-after-confirmed (a lost result publish nack-requeues the source)
   [P4] Pydantic validation of message bodies (bad payload -> PERMANENT -> DLQ)
   [P5] Idempotent-handler design + optional Redis deduplication middleware
-  [P6] Prometheus metrics (incl. reconnect/channel-churn counters) on :9100
-  [P7] Kubernetes-correct liveness/readiness split on :8080
+  [P6] Prometheus metrics (incl. reconnect/channel-churn counters) on :9102
+  [P7] Kubernetes-correct liveness/readiness split on :8082
   [P8] Graceful SIGTERM drain + auto-reconnect via broker.run()
   [P9] Env-driven config; credentials never logged (safe_url); connection
        identified in the management UI (connection_name + client_properties)
@@ -270,9 +270,9 @@ def main() -> None:
 
         # Loopback by default; bind 0.0.0.0 explicitly for k8s scrapers and
         # gate it with a NetworkPolicy (the endpoint is unauthenticated).
-        start_metrics_server(port=int(os.environ.get("METRICS_PORT", "9100")))
+        start_metrics_server(port=int(os.environ.get("METRICS_PORT", "9102")))
 
-    start_health_server(int(os.environ.get("HEALTH_PORT", "8080")))
+    start_health_server(int(os.environ.get("HEALTH_PORT", "8082")))
 
     # [P8]+[P10] run() blocks: start + consume + reconnect-on-drop + SIGTERM
     # drain. worker_count > 1 moves handlers OFF the connection's I/O thread:

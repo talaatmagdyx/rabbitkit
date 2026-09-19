@@ -102,8 +102,9 @@ async def main() -> None:
     print("=== RabbitApp Lifecycle Demo ===")
     print(f"Initial state: {app.state.name}")  # IDLE
 
-    # Run state monitor and lifecycle together
-    asyncio.create_task(check_state_during_lifecycle())
+    # Run state monitor and lifecycle together. Hold the reference: a bare
+    # create_task() may be garbage-collected mid-flight.
+    monitor = asyncio.create_task(check_state_during_lifecycle())
 
     # start the app's hook lifecycle, then the broker, and wait for the
     # state monitor above to request shutdown
@@ -113,6 +114,7 @@ async def main() -> None:
         await asyncio.sleep(0.1)
     await broker.stop()
     await app.stop_async()
+    await monitor  # the monitor has already requested shutdown; reap it
 
     print(f"\nFinal state: {app.state.name}")  # STOPPED
 

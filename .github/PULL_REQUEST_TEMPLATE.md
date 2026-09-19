@@ -4,7 +4,7 @@
 
 ## Checklist
 
-- [ ] `ruff check src/ tests/ benchmarks/` passes
+- [ ] `ruff check src/ tests/ benchmarks/ examples/` passes
 - [ ] `mypy src/rabbitkit/ --strict --ignore-missing-imports` passes
 - [ ] `pytest tests/unit/ --cov=src/rabbitkit --cov-report=term-missing` passes
 - [ ] Tests added/updated in `tests/unit/<package>/test_<module>.py`

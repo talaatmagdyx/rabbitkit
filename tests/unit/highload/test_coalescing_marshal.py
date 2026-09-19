@@ -26,9 +26,9 @@ from typing import Any
 
 import pytest
 
-from rabbitkit.core.config import BatchAckConfig
-from rabbitkit.core.types import FlushReason
-from rabbitkit.highload.batch import CoalescingAcker
+from rabbitkit.core.config import BatchAckConfig, BatchPublishConfig
+from rabbitkit.core.types import FlushReason, MessageEnvelope
+from rabbitkit.highload.batch import BatchAcker, BatchPublisher, CoalescingAcker
 
 
 @contextlib.contextmanager
@@ -296,3 +296,81 @@ class TestEmitFailuresAreLogged:
             acker.flush(FlushReason.MANUAL)
         assert [r for r in caplog.records if "failed to emit" in r.getMessage()] == []
         assert acker.last_error is None
+
+
+# ── the same rule holds for the sibling helpers ───────────────────────────
+
+
+class TestSiblingHelpersShareTheRule:
+    """BatchAcker and BatchPublisher call user code from the same
+    ``threading.Timer`` thread, so they take the same ``marshal``."""
+
+    def _acker(self, **kw: Any) -> BatchAcker:
+        return BatchAcker(ack_fn=lambda t, multiple=False: None, **kw)
+
+    def _publisher(self, **kw: Any) -> BatchPublisher:
+        return BatchPublisher(publish_fn=lambda e: None, **kw)
+
+    def test_batch_acker_warns_without_marshal(self) -> None:
+        acker = self._acker(config=BatchAckConfig(batch_size=1000, flush_interval_ms=50))
+        with pytest.warns(RuntimeWarning, match="BatchAcker has flush_interval_ms"):
+            acker.add(1)
+        acker._closed = True
+        if acker._timer is not None:
+            acker._timer.cancel()
+
+    def test_batch_publisher_warns_without_marshal(self) -> None:
+        publisher = self._publisher(config=BatchPublishConfig(batch_size=1000, flush_interval_ms=50))
+        with pytest.warns(RuntimeWarning, match="BatchPublisher has flush_interval_ms"):
+            publisher.add(MessageEnvelope(routing_key="q", body=b"x"))
+        publisher._closed = True
+        if publisher._timer is not None:
+            publisher._timer.cancel()
+
+    def test_batch_acker_interval_flush_is_marshalled(self) -> None:
+        acked: list[int] = []
+        marshalled: list[str] = []
+
+        def marshal(fn: Any) -> None:
+            marshalled.append(threading.current_thread().name)
+            fn()
+
+        acker = self._acker(config=BatchAckConfig(batch_size=1000, flush_interval_ms=20), marshal=marshal)
+        acker._ack_fn = lambda tag, multiple=False: acked.append(tag)
+        acker.add(1)
+        deadline = time.monotonic() + 3
+        while not acked and time.monotonic() < deadline:
+            time.sleep(0.01)
+        acker.close()
+        assert acked == [1]
+        assert marshalled, "the interval flush bypassed marshal"
+
+    def test_batch_publisher_interval_flush_is_marshalled(self) -> None:
+        published: list[Any] = []
+        marshalled: list[str] = []
+
+        def marshal(fn: Any) -> None:
+            marshalled.append(threading.current_thread().name)
+            fn()
+
+        publisher = BatchPublisher(
+            publish_fn=published.append,
+            config=BatchPublishConfig(batch_size=1000, flush_interval_ms=20),
+            marshal=marshal,
+        )
+        publisher.add(MessageEnvelope(routing_key="q", body=b"x"))
+        deadline = time.monotonic() + 3
+        while not published and time.monotonic() < deadline:
+            time.sleep(0.01)
+        publisher.close()
+        assert len(published) == 1
+        assert marshalled, "the interval flush bypassed marshal"
+
+    @pytest.mark.parametrize("interval", [0])
+    def test_no_warning_without_a_timer(self, interval: int) -> None:
+        with warnings_recorded() as caught:
+            self._acker(config=BatchAckConfig(batch_size=1000, flush_interval_ms=interval)).add(1)
+            self._publisher(config=BatchPublishConfig(batch_size=1000, flush_interval_ms=interval)).add(
+                MessageEnvelope(routing_key="q", body=b"x")
+            )
+        assert [w for w in caught if "no marshal=" in str(w.message)] == []

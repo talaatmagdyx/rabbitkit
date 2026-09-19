@@ -13,6 +13,7 @@ Requirements:
 """
 
 import asyncio
+import json
 import uuid
 
 from rabbitkit import MessageEnvelope, RabbitConfig
@@ -61,9 +62,6 @@ async def handle_unique_content(body: bytes) -> None:
 
 
 # ── Custom key function ───────────────────────────────────────────────────────
-import json
-
-
 def extract_order_id(msg: "object") -> str:
     """Extract order_id from body as the dedup key."""
     try:

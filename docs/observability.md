@@ -69,7 +69,7 @@ these are a no-op if no route has one. No labels on any of these three.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `rabbitkit_reconnects_total` | Counter | Every re-connection *after* the first successful connect. Reconnects were previously logged but never counted, so a flapping broker/network was invisible to metrics-based alerting. |
+| `rabbitkit_reconnects_total` | Counter | **Sync broker only since 0.14.** Every re-connection *after* the first successful connect. The async broker deliberately does not emit it — see [below](#async-does-not-emit-reconnects_total). |
 | `rabbitkit_channels_opened_total` | Counter | Every new low-level channel either transport creates — the publisher/topology channel, a per-queue consumer channel, an async channel-pool slot, or a dedicated fast/mandatory/reply-to channel. A steady climb with no matching traffic growth signals a channel leak. |
 | `rabbitkit_channel_rebuilds_total` | Counter | The subset of `channels_opened_total` that **replaces** a channel lost to a reconnect, a 406 topology-drift close, or a mandatory/fast-channel recycle — as opposed to an ordinary first-ever open or async channel-pool growth. Isolates "something upstream actually failed" from routine churn. |
 
@@ -179,28 +179,39 @@ Alerting guidance:
   cumulative-ack prefix. Safe (nothing is acked early), but unacked messages
   accumulate; alert before `max_pending` is reached.
 
-## Known gap: `reconnects_total` undercounts on AsyncBroker
+## Async does not emit `reconnects_total`
 
-`rabbitkit_reconnects_total` (and anything else wired to
-`transport.on_reconnect`) is driven by aio-pika's `reconnect_callbacks`.
-Verified against a live broker on aio-pika 9.6: when the **broker** closes the
-connection, aio-pika recovers underneath the *same* `RobustConnection` object
-without re-running its counted connect path, so `connection_attempt` never
-advances and the callbacks never fire — even though consumers are restored and
-traffic resumes. The counter stays at zero for that (very common) case.
+**Since 0.14 `AsyncBroker` does not wire `rabbitkit_reconnects_total` at
+all.** This is a deliberate removal, not an oversight. Use
+`rabbitkit_channel_rebuilds_total` as the async reconnect signal; the broker
+logs a line saying so at startup.
 
-What still works:
+The counter is driven by `transport.on_reconnect`, which on async depends on
+aio-pika reporting a reconnect. Verified against a live broker on aio-pika
+9.6, it does not: when the **broker** closes the connection, aio-pika recovers
+underneath the *same* `RobustConnection` object without re-running its counted
+connect path. `connection_attempt` never advances, and
+`reconnect_callbacks`, `close_callbacks` and the channel callbacks all stay
+silent — even though consumers are restored and traffic resumes.
 
-- The **sync** transport fires its own reconnect hook and is unaffected.
-- On async, a connection rabbitkit *replaces* itself (a rebuilt publisher
-  connection, or a lazy re-create after close) does fire the hook — the pool
-  attaches the callbacks to every connection it creates, and a connection
-  created after `connect()` counts as a reconnect.
+That is the common case, so the series would have read a permanent `0` while
+connections really were flapping. A panel pinned at zero and an alert that can
+never fire are worse than no series at all: both read as "healthy". Removing
+it makes the gap visible instead of silent.
 
-Until this is resolved upstream, alert on connection churn using
-`rabbitkit_channel_rebuilds_total`, `rabbitkit_settlement_items_total{status="stale"}`
-and the broker's own `connection_closed` metrics rather than
-`reconnects_total` alone. Do not hang correctness-critical wiring off
+What is unaffected:
+
+- The **sync** transport fires its own reconnect hook and still emits the
+  counter.
+- The async pool still attaches `reconnect_callbacks`, `connection_blocked`
+  and `connection_unblocked` to *every* connection it creates, and a
+  connection created after `connect()` finished still counts as a reconnect
+  for any hook you register yourself via `transport.on_reconnect`. Only the
+  built-in metric wiring is gone.
+
+For async connection-churn alerting use `rabbitkit_channel_rebuilds_total`,
+`rabbitkit_settlement_items_total{status="stale"}` and the broker's own
+`connection_closed` metrics. Do not hang correctness-critical wiring off
 `on_reconnect` on async: `CoalescingAcker` does not need it, because a
 rebuilt channel is a new object and therefore gets a fresh ledger.
 

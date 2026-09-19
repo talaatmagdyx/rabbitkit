@@ -151,7 +151,14 @@ jobs:
       - name: Chaos gate (all scenarios)
         timeout-minutes: 15
         env:
-          RK_CHAOS_PORT: "32778"
+          # 5699/5698 are deliberately OUTSIDE Docker's ephemeral range
+          # (32768-60999). The old 32778/32777 sat inside it, so a
+          # testcontainer in the previous step could randomly publish on
+          # exactly that port and the chaos broker then failed to bind:
+          # "address already in use". Disabling the Ryuk reaper (needed to
+          # stop it wedging) means leaked containers linger long enough to
+          # collide, so the ports have to move out of the range.
+          RK_CHAOS_PORT: "5699"
           # Every benchmark module documents this invocation. The runner is
           # ephemeral, so the testcontainers reaper buys nothing here and is a
           # known source of hangs when a second suite starts its own stack.
@@ -167,7 +174,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 12
         env:
-          RK_CHAOS_PORT: "32777"
+          RK_CHAOS_PORT: "5698"
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
           .venv/bin/python -m benchmarks || echo "benchmark suite skipped/failed (best-effort)"

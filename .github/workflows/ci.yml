@@ -141,6 +141,10 @@ jobs:
         timeout-minutes: 10
         env:
           RK_CHAOS_PORT: "32778"
+          # Every benchmark module documents this invocation. The runner is
+          # ephemeral, so the testcontainers reaper buys nothing here and is a
+          # known source of hangs when a second suite starts its own stack.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
       # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
       # without breaking the pipeline (`continue-on-error: true` on this step).
@@ -152,5 +156,6 @@ jobs:
         timeout-minutes: 12
         env:
           RK_CHAOS_PORT: "32777"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
           .venv/bin/python -m benchmarks || echo "chaos suite skipped/failed (best-effort)"

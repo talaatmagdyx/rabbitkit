@@ -25,6 +25,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
@@ -118,6 +119,10 @@ jobs:
   #     so it reports results without failing the pipeline.
   integration:
     runs-on: ubuntu-latest
+    # A healthy run of this whole job is ~7 minutes. Without a ceiling a hung
+    # step inherits GitHub's 6-hour default and blocks the PR that long — which
+    # is exactly what happened when the best-effort benchmark suite wedged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -133,13 +138,18 @@ jobs:
       # must pass — a reconnect/redelivery regression should break the build,
       # not merge green. Exit code is checked (no continue-on-error).
       - name: Chaos gate (restart mid-consume)
+        timeout-minutes: 10
         env:
           RK_CHAOS_PORT: "32778"
         run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
       # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
       # without breaking the pipeline (`continue-on-error: true` on this step).
+      # `continue-on-error` does NOT bound runtime: a wedged step still holds
+      # the job open. The timeout is what makes "best-effort" actually
+      # best-effort.
       - name: Chaos suite (best-effort)
         continue-on-error: true
+        timeout-minutes: 12
         env:
           RK_CHAOS_PORT: "32777"
         run: |

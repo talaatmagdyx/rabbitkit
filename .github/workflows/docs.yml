@@ -9,10 +9,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege, per job. These were at WORKFLOW level, so the `build` job
+# inherited `pages: write` and `id-token: write` while installing ~200
+# unpinned packages (`uv pip install -e ".[dev]"` runs arbitrary setup code).
+# A single compromised dev dependency could then mint an OIDC token and
+# overwrite the published site. `build` needs neither; only `deploy` does.
+# `release.yml` already scopes per job — this follows it.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deploy at a time, queued serially. cancel-in-progress must stay
 # false: cancelling (or superseding) an in-flight Pages deployment makes
@@ -25,6 +29,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -33,16 +39,19 @@ jobs:
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: Build site
         run: .venv/bin/mkdocs build --strict
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
         with:
           path: site
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

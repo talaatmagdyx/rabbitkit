@@ -473,6 +473,10 @@ class TestInstrumentation:
             "coalescing_ratio",
             "invalidations",
             "dropped_on_invalidate",
+            "reserved",
+            "unresolved",
+            "frames_failed",
+            "frames_not_attempted",
             "oldest_pending_age",
         }
         assert stats["registered"] == 3 and stats["ack_ready"] == 2 and stats["frontier"] == 1

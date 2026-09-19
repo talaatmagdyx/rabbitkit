@@ -418,6 +418,76 @@ order, so the lower frames land first):
 A *blocking* delivery is different: once one is reached, nothing above it
 may be coalesced in that plan.
 
+That plan shape is only safe because the frames go out **in order and all of
+them land**. See the next section for what happens when one does not.
+
+### Plan, emit, commit
+
+`basic_ack(tag, multiple=True)` acknowledges every delivery still
+unacknowledged up to `tag`. In the plan above, `ack(105, multiple=True)` is
+correct *only* because `nack(103)` already removed 103 from the broker's
+unacknowledged set. If that nack never reached the broker and the cumulative
+ack went out anyway, the broker would acknowledge 103 as well — turning an
+intended requeue into an ack and losing the message.
+
+Since 0.15 the coordinator therefore never settles anything on a promise:
+
+```python
+from rabbitkit.core.settlement import emit_batch
+
+batch = coordinator.prepare()          # reserves tags, settles nothing
+report = emit_batch(                   # emit -> observe -> commit, in order
+    batch, coordinator,
+    ack=channel.basic_ack, nack=channel.basic_nack, reject=channel.basic_reject,
+)
+if not report.ok:
+    ...  # report.failed, report.not_attempted, report.invalidated
+```
+
+`emit_batch` stops at the first failure. Three rules follow:
+
+| Situation | What happens |
+|---|---|
+| A frame lands | Its tags are committed and leave the ledger |
+| A frame fails | Emission stops. Its tags become **unresolved**: they leave the ledger and are never re-sent, because re-sending a settlement whose first attempt may have landed turns an ambiguity into a protocol error. Unacknowledged is always safe — the broker redelivers |
+| Commands after the failure | **Not attempted.** Their tags return to the ledger and are planned again next flush |
+
+A failed **nack or reject also invalidates the generation**: that tag may
+still be unacknowledged, so no later cumulative ack on the channel can be
+trusted. A failed **ack** does not, because a later cumulative ack sweeping
+it up produces the outcome that was intended anyway.
+
+`CoalescingAcker` and `AsyncCoalescingAcker` do all of this for you. Reach
+for `prepare()` / `emit_batch()` directly only when you drive the wire
+yourself. `plan()` still exists as a pure-planning primitive that settles
+immediately; it assumes every command is emitted, in order, successfully, so
+it suits `TestBroker` and unit tests rather than a real channel.
+
+### Async: `AsyncCoalescingAcker`
+
+On aio-pika, settlement is a coroutine. A synchronous emit callable can only
+*schedule* it and return, so it never learns whether the frame landed — which
+means the commit protocol cannot be implemented that way at all. Use the
+async acker, which owns the event-loop boundary end to end:
+
+```python
+from rabbitkit.highload import AsyncCoalescingAcker
+
+acker = AsyncCoalescingAcker(
+    ack_fn=lambda tag, multiple: channel.basic_ack(tag, multiple),
+    nack_fn=lambda tag, requeue: channel.basic_nack(tag, requeue=requeue),
+    reject_fn=lambda tag, requeue: channel.basic_reject(tag, requeue=requeue),
+    config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
+)
+await acker.start()
+...
+await acker.close()
+```
+
+Its interval flush is an `asyncio.Task` on your loop, not a
+`threading.Timer`, so there is no `marshal=` parameter and no way to schedule
+settlement onto a loop that never wakes to run it.
+
 ### Duplicate and contradictory settlement
 
 Repeating the same decision is an idempotent no-op. Changing it is refused:

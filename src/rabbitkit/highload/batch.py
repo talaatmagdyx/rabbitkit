@@ -58,7 +58,7 @@ from rabbitkit.core.config import BatchAckConfig, BatchPublishConfig
 from rabbitkit.core.settlement import (
     SettlementCommand,
     SettlementCoordinator,
-    apply_commands,
+    emit_batch,
 )
 from rabbitkit.core.types import (
     BulkPublishStatus,
@@ -834,9 +834,20 @@ class BatchAcker:
 
 @dataclass(frozen=True, slots=True)
 class CoalescingFlushReport:
+    """What a flush PLANNED versus what actually reached the broker.
+
+    ``commands`` is the plan. ``emitted`` is the subset whose frames the
+    transport accepted; only those tags are settled. ``not_attempted`` were
+    deliberately withheld after a failure, because a cumulative ack must
+    never follow a settlement that did not land.
+    """
+
     reason: FlushReason
     commands: tuple[SettlementCommand, ...] = ()
     errors: tuple[tuple[SettlementCommand, BaseException], ...] = field(default_factory=tuple)
+    emitted: tuple[SettlementCommand, ...] | None = None
+    not_attempted: tuple[SettlementCommand, ...] = ()
+    invalidated: bool = False
 
     @property
     def settled_tags(self) -> int:
@@ -848,6 +859,14 @@ class CoalescingFlushReport:
 
     @property
     def ok_commands(self) -> tuple[tuple[SettlementCommand, None], ...]:
+        """Commands that reached the broker.
+
+        When ``emitted`` is set (every flush through :func:`emit_batch`) it is
+        authoritative. The fallback covers reports built by hand and treats
+        anything not in ``errors`` as sent.
+        """
+        if self.emitted is not None:
+            return tuple((c, None) for c in self.emitted)
         failed = {id(c) for c, _ in self.errors}
         return tuple((c, None) for c in self.commands if id(c) not in failed)
 
@@ -986,6 +1005,15 @@ class CoalescingAcker:
         return self._coordinator.pending
 
     @property
+    def generation(self) -> int:
+        """The current channel generation.
+
+        It advances on :meth:`on_reconnect`, and also when a failed
+        nack/reject forces the acker to abandon coalescing on this channel.
+        """
+        return self._coordinator.generation
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
@@ -1120,10 +1148,25 @@ class CoalescingAcker:
         with self._flush_lock:
             with self._lock:
                 self._approved_since_flush = 0
-            commands = self._coordinator.drain_plan() if reason is FlushReason.CLOSE else self._coordinator.plan()
-            results = apply_commands(commands, ack=self._ack_fn, nack=self._nack_fn, reject=self._reject_fn)
-            errors = tuple((c, e) for c, e in results if e is not None)
-            report = CoalescingFlushReport(reason=reason, commands=tuple(commands), errors=errors)
+            batch = (
+                self._coordinator.prepare_drain() if reason is FlushReason.CLOSE else self._coordinator.prepare()
+            )
+            # plan -> emit -> commit. The ledger only advances for frames the
+            # transport actually accepted, and emission stops at the first
+            # failure so a cumulative ack can never follow a nack that never
+            # left the process.
+            emission = emit_batch(
+                batch, self._coordinator, ack=self._ack_fn, nack=self._nack_fn, reject=self._reject_fn
+            )
+            errors = ((emission.failed, emission.error),) if emission.failed is not None and emission.error else ()
+            report = CoalescingFlushReport(
+                reason=reason,
+                commands=batch.commands,
+                errors=errors,
+                emitted=emission.emitted,
+                not_attempted=emission.not_attempted,
+                invalidated=emission.invalidated,
+            )
             self.settled_total += report.settled_tags
             self.coalesced_total += report.coalesced_tags
             if errors:
@@ -1141,6 +1184,20 @@ class CoalescingAcker:
                         command.generation,
                         exc,
                         exc_info=exc,
+                    )
+                if report.not_attempted:
+                    logger.warning(
+                        "CoalescingAcker withheld %d command(s) covering %d tag(s) after that failure: "
+                        "emitting them could settle deliveries the failed command was meant to handle. "
+                        "The broker will redeliver anything left unacknowledged.",
+                        len(report.not_attempted),
+                        sum(len(c.covers) for c in report.not_attempted),
+                    )
+                if report.invalidated:
+                    logger.warning(
+                        "CoalescingAcker invalidated generation %d: a failed nack/reject may still be "
+                        "unacknowledged at the broker, so no later cumulative ack on this channel is safe.",
+                        batch.generation,
                     )
             if self._collector is not None:
                 inc = getattr(self._collector, "inc_counter", None)

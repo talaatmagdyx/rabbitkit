@@ -20,49 +20,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
-import time
 import uuid
 from typing import Any
 
 import pytest
 
 from rabbitkit.core.settlement import CoordinatorError
+from tests.integration.conftest import await_consumers, await_counts, live_counts
 
 try:
     from rabbitkit.core.message import RabbitMessage as _RabbitMessage
 except ImportError:  # pragma: no cover
     pass
 
-try:
-    from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
-
-    _TESTCONTAINERS_AVAILABLE = True
-except ImportError:
-    _TESTCONTAINERS_AVAILABLE = False
-
 pytestmark = pytest.mark.integration
 
 
-def _skip_no_docker() -> None:
-    if not _TESTCONTAINERS_AVAILABLE:
-        pytest.skip("testcontainers not installed — run: pip install testcontainers[rabbitmq]")
-    try:
-        import docker  # type: ignore[import-untyped]
-
-        docker.from_env().ping()
-    except Exception:
-        pytest.skip("Docker daemon not reachable — skip real-RabbitMQ integration tests")
-
-
 @pytest.fixture(scope="module")
-def rabbit() -> Any:  # type: ignore[return]
-    _skip_no_docker()
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine").with_exposed_ports(15672) as container:
-        host = container.get_container_host_ip()
-        yield {
-            "url": f"amqp://guest:guest@{host}:{container.get_exposed_port(5672)}/",
-            "mgmt": f"http://{host}:{container.get_exposed_port(15672)}",
-        }
+def rabbit(rabbit_container: dict[str, Any]) -> dict[str, Any]:
+    """The suite-wide broker (see ``conftest.py``): ``url`` / ``mgmt`` / ``container``.
+
+    ``_kill_connections`` below is node-wide, which is one of the reasons this
+    suite must stay serial.
+    """
+    return rabbit_container
 
 
 def _config(url: str, **kw: Any) -> Any:
@@ -73,18 +54,14 @@ def _config(url: str, **kw: Any) -> Any:
 
 
 def _counts(rabbit: dict[str, str], queue: str, *, retries: int = 40) -> tuple[int, int]:
-    from rabbitkit.management import ManagementConfig, RabbitManagementClient
+    """``(ready, unacked)`` straight off the node; polls until the queue exists.
 
-    client = RabbitManagementClient(ManagementConfig(url=rabbit["mgmt"], username="guest", password="guest"))
-    last: Exception | None = None
-    for _ in range(retries):
-        try:
-            info = client.get_queue(queue)
-            return int(info.get("messages_ready", 0)), int(info.get("messages_unacknowledged", 0))
-        except Exception as exc:
-            last = exc
-            time.sleep(0.25)
-    raise AssertionError(f"queue {queue} not visible via management API: {last}")
+    Was the management API, whose statistics snapshot refreshes on a ~5s
+    interval — so every convergence check below paid 5s before it could see a
+    settlement that had already happened. ``rabbitmqctl`` reads the queue
+    process itself: ~0.3s, and never stale.
+    """
+    return live_counts(rabbit, queue, retries=retries)
 
 
 def _kill_connections(rabbit: dict[str, str]) -> int:
@@ -107,22 +84,30 @@ def _kill_connections(rabbit: dict[str, str]) -> int:
 async def _await_counts(rabbit: dict[str, str], queue: str, expected: tuple[int, int], timeout: float = 60.0) -> None:
     """Poll until the broker reports *expected* ``(ready, unacked)``.
 
-    The management API refreshes queue stats on an interval, so a single
-    read right after a settlement can be stale — always poll.
+    Two-stage (see ``conftest.wait_for_counts``): a passive ``queue_declare``
+    gates on the ready count at ~10ms, and only a match pays for the
+    ``rabbitmqctl`` read that can also see unacked. Same assertion, same
+    failure message — just not five seconds behind reality.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    seen: tuple[int, int] = (-1, -1)
-    while loop.time() < deadline:
-        seen = await loop.run_in_executor(None, lambda: _counts(rabbit, queue))
-        if seen == expected:
-            return
-        await asyncio.sleep(0.3)
-    raise AssertionError(f"{queue}: expected ready/unacked {expected}, last saw {seen}")
+    await await_counts(rabbit, queue, expected, timeout=timeout)
 
 
 async def _await_drained(rabbit: dict[str, str], queue: str, timeout: float = 60.0) -> None:
     await _await_counts(rabbit, queue, (0, 0), timeout)
+
+
+async def _await_settled(ledger: Ledger, expected_acks: int, timeout: float = 10.0) -> None:
+    """Wait for the ledger to observe the frames a flush/close just emitted.
+
+    ``flush()``/``close()`` can marshal the final emission onto the event
+    loop, so the ledger's view lags the call by a loop tick or two. This
+    replaces a fixed sleep and asserts NOTHING — the assertions that follow
+    each call site are still the test's, and still have to hold.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline and len(ledger.acked) < expected_acks:
+        await asyncio.sleep(0.01)
 
 
 class Ledger:
@@ -156,7 +141,17 @@ class Ledger:
                     self.acked.add(self.done[tag])
 
 
-def _make_acker(channel: Any, ledger: Ledger, loop: asyncio.AbstractEventLoop) -> Any:
+def _make_acker(
+    channel: Any, ledger: Ledger, loop: asyncio.AbstractEventLoop, *, flush_interval_ms: int = 100
+) -> Any:
+    """A real ``CoalescingAcker`` wired to a real channel.
+
+    *flush_interval_ms* is a knob because ``batch_size=32`` can only trip when
+    more than 32 deliveries are in flight. At ``prefetch_count=1`` there is
+    never more than one, so EVERY message waits out a full interval tick —
+    120 messages x 100ms. The coalescing behaviour under test is unchanged by
+    a shorter tick; only the dead waiting is.
+    """
     from rabbitkit.core.config import BatchAckConfig
     from rabbitkit.highload.batch import CoalescingAcker
 
@@ -166,7 +161,7 @@ def _make_acker(channel: Any, ledger: Ledger, loop: asyncio.AbstractEventLoop) -
         ack_fn=lambda t, m: loop.create_task(channel.basic_ack(delivery_tag=t, multiple=m)),
         nack_fn=lambda t, r: loop.create_task(channel.basic_nack(delivery_tag=t, requeue=r)),
         reject_fn=lambda t, r: loop.create_task(channel.basic_reject(delivery_tag=t, requeue=r)),
-        config=BatchAckConfig(batch_size=32, flush_interval_ms=100),
+        config=BatchAckConfig(batch_size=32, flush_interval_ms=flush_interval_ms),
         channel_key=channel,
         max_hold=2,
         marshal=loop.call_soon_threadsafe,
@@ -194,7 +189,10 @@ async def test_coalescing_across_prefetch_settings(rabbit: dict[str, str], prefe
     broker = AsyncBroker(config=_config(rabbit["url"], consumer=ConsumerConfig(prefetch_count=prefetch)))
     loop = asyncio.get_running_loop()
     ledger = Ledger()
-    group = CoalescingAckerGroup(factory=lambda ch: _make_acker(ch, ledger, loop))
+    # prefetch=1 can never fill batch_size, so a 100ms tick would be paid per
+    # message (120 of them). A 10ms tick exercises the identical code path.
+    interval_ms = 10 if prefetch == 1 else 100
+    group = CoalescingAckerGroup(factory=lambda ch: _make_acker(ch, ledger, loop, flush_interval_ms=interval_ms))
     processed = 0
     done = asyncio.Event()
 
@@ -215,7 +213,7 @@ async def test_coalescing_across_prefetch_settings(rabbit: dict[str, str], prefe
             done.set()
 
     await broker.start(worker_config=WorkerConfig(worker_count=8))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [
         MessageEnvelope(routing_key=queue, body=json.dumps({"id": f"m{i}"}).encode(), message_id=f"m{i}")
         for i in range(total)
@@ -223,7 +221,7 @@ async def test_coalescing_across_prefetch_settings(rabbit: dict[str, str], prefe
     (await broker.publish_many(envelopes)).raise_for_status()
     await asyncio.wait_for(done.wait(), timeout=120)
     group.flush()
-    await asyncio.sleep(0.5)
+    await _await_settled(ledger, total)
 
     assert ledger.violations == [], ledger.violations[:3]
     assert len(ledger.acked) == total
@@ -308,7 +306,7 @@ async def test_chaos_failures_and_redelivery_converge(rabbit: dict[str, str]) ->
             done.set()
 
     await broker.start(worker_config=WorkerConfig(worker_count=8))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [
         MessageEnvelope(routing_key=queue, body=json.dumps({"id": f"m{i}"}).encode(), message_id=f"m{i}")
         for i in range(total)
@@ -318,7 +316,7 @@ async def test_chaos_failures_and_redelivery_converge(rabbit: dict[str, str]) ->
         await asyncio.wait_for(done.wait(), timeout=180)
     finally:
         group.flush()
-        await asyncio.sleep(1.0)
+        await _await_settled(ledger, total)
 
     assert ledger.violations == [], f"{len(ledger.violations)} unsafe acks, first 3: {ledger.violations[:3]}"
     assert succeeded == {f"m{i}" for i in range(total)}, "a message was lost"
@@ -379,7 +377,7 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
     await broker.start(worker_config=WorkerConfig(worker_count=8))
     reconnects: list[int] = []
     broker._transport.on_reconnect(lambda: reconnects.append(group.reset()))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [
         MessageEnvelope(routing_key=queue, body=json.dumps({"id": f"m{i}"}).encode(), message_id=f"m{i}")
         for i in range(total)
@@ -399,7 +397,7 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
     # unacked delivery, so the redeliveries have to finish the job.
     await asyncio.wait_for(done.wait(), timeout=180)
     group.flush()
-    await asyncio.sleep(1.0)
+    await _await_settled(ledger, total)
 
     assert killed["done"]
     assert len(succeeded) > before, "nothing was processed after the kill — recovery never happened"
@@ -454,7 +452,7 @@ async def test_shutdown_leaves_unfinished_work_unacked(rabbit: dict[str, str]) -
             arrived.set()
 
     await broker.start(worker_config=WorkerConfig(worker_count=8))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [
         MessageEnvelope(routing_key=queue, body=json.dumps({"id": f"m{i}"}).encode(), message_id=f"m{i}")
         for i in range(total)
@@ -463,7 +461,7 @@ async def test_shutdown_leaves_unfinished_work_unacked(rabbit: dict[str, str]) -
     await asyncio.wait_for(arrived.wait(), timeout=60)
 
     report = group.close()  # graceful shutdown of the settlement layer
-    await asyncio.sleep(0.5)
+    await _await_settled(ledger, total - 1)
 
     assert ledger.violations == []
     assert report.settled_tags == total - 1, "the stuck delivery must not be settled"

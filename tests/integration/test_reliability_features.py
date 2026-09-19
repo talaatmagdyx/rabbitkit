@@ -23,41 +23,20 @@ from typing import Any
 
 import pytest
 
+from tests.integration.conftest import await_consumers, live_counts
+
 try:
     from rabbitkit.core.message import RabbitMessage as _RabbitMessage
 except ImportError:  # pragma: no cover
     pass
 
-try:
-    from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
-
-    _TESTCONTAINERS_AVAILABLE = True
-except ImportError:
-    _TESTCONTAINERS_AVAILABLE = False
-
 pytestmark = pytest.mark.integration
 
 
-def _skip_no_docker() -> None:
-    if not _TESTCONTAINERS_AVAILABLE:
-        pytest.skip("testcontainers not installed — run: pip install testcontainers[rabbitmq]")
-    try:
-        import docker  # type: ignore[import-untyped]
-
-        docker.from_env().ping()
-    except Exception:
-        pytest.skip("Docker daemon not reachable — skip real-RabbitMQ integration tests")
-
-
 @pytest.fixture(scope="module")
-def rabbit() -> Any:  # type: ignore[return]
-    _skip_no_docker()
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine").with_exposed_ports(15672) as container:
-        host = container.get_container_host_ip()
-        yield {
-            "url": f"amqp://guest:guest@{host}:{container.get_exposed_port(5672)}/",
-            "mgmt": f"http://{host}:{container.get_exposed_port(15672)}",
-        }
+def rabbit(rabbit_container: dict[str, Any]) -> dict[str, Any]:
+    """The suite-wide broker (see ``conftest.py``): ``url`` / ``mgmt`` / ``container``."""
+    return rabbit_container
 
 
 def _config(url: str, **kw: Any) -> Any:
@@ -74,6 +53,13 @@ def _mgmt(rabbit: dict[str, str]) -> Any:
 
 
 def _queue_info(rabbit: dict[str, str], queue: str, *, retries: int = 40) -> dict[str, Any]:
+    """Full management-API record for *queue* — the only source for the
+    static fields asserted below (``type``, ``effective_policy_definition``).
+
+    Those fields are not stats, so they are not subject to the ~5s statistics
+    refresh; only the poll interval needed tightening. MESSAGE COUNTS must
+    NOT be read from here — see ``_counts``.
+    """
     client = _mgmt(rabbit)
     last: Exception | None = None
     for _ in range(retries):
@@ -81,13 +67,19 @@ def _queue_info(rabbit: dict[str, str], queue: str, *, retries: int = 40) -> dic
             return dict(client.get_queue(queue))
         except Exception as exc:
             last = exc
-            time.sleep(0.25)
+            time.sleep(0.05)
     raise AssertionError(f"queue {queue} not visible via management API: {last}")
 
 
 def _counts(rabbit: dict[str, str], queue: str) -> tuple[int, int]:
-    info = _queue_info(rabbit, queue)
-    return int(info.get("messages_ready", 0)), int(info.get("messages_unacknowledged", 0))
+    """``(ready, unacked)`` straight off the node.
+
+    Deliberately NOT ``_queue_info``: the management API serves a statistics
+    snapshot refreshed on a ~5s interval, so every wait below used to pay 5s
+    before it could see a settlement that had already happened.
+    ``rabbitmqctl`` reads the queue process itself: ~0.3s, never stale.
+    """
+    return live_counts(rabbit, queue)
 
 
 async def _await_until(pred: Any, timeout: float = 20.0) -> None:
@@ -96,7 +88,7 @@ async def _await_until(pred: Any, timeout: float = 20.0) -> None:
     while loop.time() < deadline:
         if await loop.run_in_executor(None, pred):
             return
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.05)
     raise AssertionError("condition not met in time")
 
 
@@ -126,7 +118,7 @@ async def test_async_iter_publish_streams_a_generator(rabbit: dict[str, str]) ->
             )
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     seen: list[int] = []
     async for item in broker.iter_publish(rows(), BulkPublishOptions(max_in_flight=8, overall_timeout=60)):
         assert item.ok, (item.status, item.reason)
@@ -154,7 +146,7 @@ async def test_publish_many_without_confirms_reports_unknown(rabbit: dict[str, s
         pass
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     result = await broker.publish_many(
         [MessageEnvelope(routing_key=queue, body=b"{}", mandatory=False) for _ in range(5)]
     )
@@ -209,7 +201,7 @@ async def test_retry_envelope_headers_are_sanitized_on_the_wire(rabbit: dict[str
         raise ConnectionError(f"amqp://svc:{secret}@db.internal/ refused; token={secret}")  # transient
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     (await broker.publish_many([MessageEnvelope(routing_key=queue, body=b"{}", mandatory=True)])).raise_for_status()
     await asyncio.wait_for(failed.wait(), timeout=30)
 
@@ -252,7 +244,7 @@ async def test_retry_handoff_failure_nacks_and_recovers(rabbit: dict[str, str]) 
         recovered.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: _mgmt(rabbit).delete_queue(f"{queue}.retry.1"))
 
@@ -297,7 +289,7 @@ def test_policy_templates_applied_make_critical_preflight_fully_verified(rabbit:
                 info = _queue_info(rabbit, queue)
                 if (info.get("effective_policy_definition") or {}).get("dead-letter-strategy") == "at-least-once":
                     break
-                time.sleep(0.25)
+                time.sleep(0.05)
             report = broker.preflight("critical", management_client=mgmt)
             assert report.fully_verified, [(c.name, c.status.value, c.detail) for c in report.checks]
             assert all(c.status is PreflightStatus.VERIFIED for c in report.checks)
@@ -357,7 +349,7 @@ async def test_coalescing_acker_settles_out_of_order_completions(rabbit: dict[st
             done.set()
 
     await broker.start(worker_config=WorkerConfig(worker_count=4))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [MessageEnvelope(routing_key=queue, body=b"{}") for _ in range(total)]
     (await broker.publish_many(envelopes)).raise_for_status()
     await asyncio.wait_for(done.wait(), timeout=30)
@@ -440,7 +432,7 @@ async def test_coalescing_acker_group_isolates_two_queues(rabbit: dict[str, str]
         await handle(msg, queue_b)
 
     await broker.start(worker_config=WorkerConfig(worker_count=4))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     envelopes = [MessageEnvelope(routing_key=q, body=b"{}") for q in (queue_a, queue_b) for _ in range(per_queue)]
     (await broker.publish_many(envelopes)).raise_for_status()
     await asyncio.wait_for(done.wait(), timeout=60)

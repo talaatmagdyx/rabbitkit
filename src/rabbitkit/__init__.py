@@ -115,6 +115,7 @@ from rabbitkit.health import (
     broker_readiness,
     broker_readiness_async,
 )
+from rabbitkit.highload.async_acker import AsyncCoalescingAcker
 from rabbitkit.highload.backpressure import FlowController
 from rabbitkit.highload.batch import (
     BatchAcker,
@@ -163,6 +164,7 @@ __all__ = [
     "AsyncAPIGeneratorConfig",
     "AsyncBatchPublisher",
     "AsyncBroker",
+    "AsyncCoalescingAcker",
     "AsyncHealthWatcher",
     "AsyncWorkerPool",
     "BackpressureConfig",

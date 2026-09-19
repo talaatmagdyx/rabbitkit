@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-09-19
+
+Settlement correctness. A coalesced plan could turn an intended
+**NACK+requeue into an ACK**, losing the message. If you use
+`CoalescingAcker`, upgrade.
+
+### Fixed
+
+- **A cumulative ack could follow a settlement that never reached the
+  broker.** `SettlementCoordinator.plan()` removed deliveries from the ledger
+  at *planning* time, and the executor carried on after a failed frame. Those
+  two combine into loss. For
+
+      101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
+
+  the planner correctly emits `ack(102, multiple=True)`, `nack(103)`,
+  `ack(105, multiple=True)`. If the nack failed and the last frame still went
+  out, `basic_ack(105, multiple=True)` acknowledged **everything still
+  unacknowledged up to 105 — including 103**, the delivery that was supposed
+  to be requeued. The work was silently dropped instead of retried.
+
+  The code already knew the rule it was breaking: `plan()` documented that its
+  commands "MUST be emitted in that order", while `apply_commands()`
+  documented that the first error "does NOT stop later commands". Two
+  docstrings, opposite contracts, nothing enforcing either.
+
+- **`examples/pydantic_validation/worker.py` never decoded its model.** It
+  used `from __future__ import annotations`, which makes every annotation a
+  lazy string, so the pipeline's `inspect.signature()` read saw `"Order"`
+  rather than the class and handed the handler raw bytes
+  (`'bytes' object has no attribute 'id'`). It was also missing the
+  `serializer=` the other Pydantic examples pass. The bug was invisible while
+  the queue happened to be empty: with nothing to consume, the handler never
+  ran and the example reported healthy.
+
+### Added
+
+- **The plan/emit/commit protocol.** `SettlementCoordinator.prepare()` returns
+  a `SettlementBatch` and *reserves* its tags instead of consuming them;
+  `emit_batch()` (and `emit_batch_async()`) emits in order, commits each
+  command only after its frame lands, and stops at the first failure. The
+  ledger now moves forward only on evidence. `commit_command()`,
+  `fail_command()` and `release_commands()` are available for hand-rolled
+  drivers.
+  - A failed frame's tags become **unresolved**: they leave the ledger and are
+    never re-emitted, because re-sending a settlement whose first attempt may
+    have landed turns an ambiguity into a protocol error. Unacknowledged is
+    always safe — the broker redelivers.
+  - A failed **nack or reject invalidates the generation**. That tag may still
+    be unacknowledged, so no later cumulative ack on the channel can be
+    trusted. A failed **ack** does not: a later cumulative ack sweeping it up
+    produces the intended outcome anyway.
+- **`AsyncCoalescingAcker`** (`rabbitkit.highload`), an async-native acker that
+  owns the event-loop boundary. No timer thread, so no `marshal=` and no
+  silently-dropped cross-thread work. It also exists because the commit
+  protocol is *not implementable* synchronously on aio-pika: settlement there
+  is a coroutine, so a sync callable can only schedule it and never learns
+  whether the frame landed. Awaiting is what supplies the evidence.
+- **Failure-injection coverage**: a regression test asserting the exact wire
+  calls for the scenario above, plus a sweep injecting a failure at every
+  position of a five-command plan and checking that no tag is ever settled by
+  a frame that did not go out.
+
+### Changed
+
+- **`apply_commands()` now stops at the first failure** instead of continuing.
+  For a coalesced plan, continuing is never correct. Use `settle_many_sync` /
+  `settle_many_async` when tags really are independent.
+- **`CoalescingFlushReport` separates planned from settled.** New `emitted`,
+  `not_attempted` and `invalidated` fields; `settled_tags` counts only frames
+  that reached the broker. New coordinator stats: `reserved`, `unresolved`,
+  `frames_failed`, `frames_not_attempted`.
+- **The integration gate can no longer pass without a broker.** Every module
+  skips when Docker is missing, and **pytest exits 0 when every test skips** —
+  exit 5 only means "nothing collected", and a skipped test *is* collected. So
+  a runner with no Docker reported a green real-broker gate that executed
+  nothing. `RK_REQUIRE_BROKER=1` (set in CI) now turns a structural skip into a
+  failure. Environment-bound skips inside tests that did reach a broker stay
+  legal.
+- **All six chaos scenarios are gating**, not just restart-mid-consume. Each
+  asserts a message-safety property, which is deterministic correctness rather
+  than a benchmark. The remaining best-effort step is the throughput benchmark
+  suite, renamed to say so.
+- **The integration suite is roughly three times faster** with no assertion
+  weakened: one shared session container instead of eleven, live queue counts
+  instead of a management API that is structurally ~5s stale, and consumer
+  readiness polled instead of slept on.
+
 ## [0.14.0] — 2026-09-19
 
 Observability correctness, and the lint/coverage gates tightened so the

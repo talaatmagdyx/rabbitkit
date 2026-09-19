@@ -130,27 +130,44 @@ class CompressionMiddleware(BaseMiddleware):
         ``unconsumed_tail`` each iteration; the running total is checked every
         chunk — a zip bomb raises before a huge allocation is materialised.
         """
-        decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
         out = bytearray()
-        tail: bytes = data
-        while True:
-            chunk = decomp.decompress(tail, _CHUNK)
-            out += chunk
+        remaining: bytes = data
+        # gzip permits CONCATENATED members and the stdlib joins them. Decode
+        # each member in turn; stopping after the first silently discarded
+        # everything after it, which is a body-smuggling primitive against
+        # anything that inspects the decompressed body separately.
+        while remaining:
+            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            tail: bytes = remaining
+            while True:
+                chunk = decomp.decompress(tail, _CHUNK)
+                out += chunk
+                if len(out) > self._max_decompressed_size:
+                    raise ValueError(
+                        f"Decompressed size ({len(out)}) exceeds "
+                        f"max_decompressed_size ({self._max_decompressed_size})"
+                    )
+                tail = decomp.unconsumed_tail
+                if decomp.eof:
+                    break
+                if not chunk and not tail:
+                    # Input exhausted without reaching the end of the member.
+                    # The gzip trailer (CRC32 + ISIZE) is the payload's only
+                    # integrity check, so accepting here would hand the
+                    # handler a truncated or spliced body as if it were
+                    # complete. The stdlib raises EOFError; so do we.
+                    raise ValueError(
+                        "Truncated gzip stream: input exhausted before the end of a member "
+                        "(CRC/length trailer never verified)"
+                    )
+            out += decomp.flush()
             if len(out) > self._max_decompressed_size:
                 raise ValueError(
-                    f"Decompressed size ({len(out)}) exceeds max_decompressed_size ({self._max_decompressed_size})"
+                    f"Decompressed size ({len(out)}) exceeds "
+                    f"max_decompressed_size ({self._max_decompressed_size})"
                 )
-            tail = decomp.unconsumed_tail
-            if decomp.eof:
-                break
-            if not chunk and not tail:
-                # No output and no input left to feed — avoid spinning.
-                break
-        out += decomp.flush()
-        if len(out) > self._max_decompressed_size:
-            raise ValueError(
-                f"Decompressed size ({len(out)}) exceeds max_decompressed_size ({self._max_decompressed_size})"
-            )
+            # unused_data is whatever followed this member's trailer.
+            remaining = decomp.unused_data
         return bytes(out)
 
     def _decompress_zstd_streaming(self, data: bytes) -> bytes:
@@ -198,7 +215,12 @@ class CompressionMiddleware(BaseMiddleware):
         elif content_encoding == "zstd":
             return self._decompress_zstd_streaming(data)
         else:
-            logger.warning("Unknown content_encoding: %s, returning raw data", content_encoding)
+            # content_encoding is an AMQP property the PUBLISHER sets, so it
+            # is attacker-controlled, unbounded, and may contain newlines.
+            # Logging it verbatim lets an attacker forge whole log lines
+            # attributed to a real logger. Collapse whitespace and bound it.
+            safe_encoding = " ".join(str(content_encoding).split())[:64]
+            logger.warning("Unknown content_encoding: %r, returning raw data", safe_encoding)
             return data
 
     def on_receive(self, message: RabbitMessage) -> None:

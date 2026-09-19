@@ -35,7 +35,13 @@ _DEFAULT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # scheme://user:password@host  → scheme://***:***@host
     # password is greedy up to the LAST "@" before the host so an unescaped
     # "@" inside the secret cannot leak its tail
-    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s]+)@"),
+    # The scheme run is bounded ({0,31}) on purpose. With an unbounded `*`
+    # this pattern is QUADRATIC: a long run of scheme-legal characters that
+    # never reaches "://" makes the engine retry from every offset. Measured
+    # before the bound: 8 KiB 0.06s, 16 KiB 0.25s, 32 KiB 0.96s, 64 KiB 3.8s
+    # — 4x per doubling, i.e. ~16 minutes for 1 MiB, on the event loop.
+    # Real URI schemes are a handful of characters (RFC 3986).
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,31}://)([^/\s:@]{1,256}):([^/\s]{1,512})@"),
     # Authorization: Bearer <token> / Basic <blob>
     re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9\-._~+/]+=*"),
     # key=value / key: value / "key": "value" for secret-bearing key names
@@ -52,6 +58,9 @@ _DEFAULT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_.]")
+
+#: How much more than the kept summary to redact over. See summary_for().
+_REDACT_WINDOW_FACTOR = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +151,20 @@ class ErrorSanitizer:
         # Collapse whitespace/newlines: a header is one line; a stack-trace-
         # shaped message must not smuggle formatting into log pipelines.
         text = " ".join(text.split())
-        return self.redact(text)[: self._max_summary]
+        # Bound the input BEFORE redacting. redact() runs six regexes over
+        # whatever it is given, and `str(exc)` is attacker-influenced whenever
+        # a handler echoes the body (json.JSONDecodeError, pydantic's
+        # ValidationError, ValueError(f"bad: {body}")). Redacting a 16 MiB
+        # message to keep 256 characters is pure waste, and on the async path
+        # it blocks the event loop, which costs heartbeats and wedges the
+        # consumer into a redelivery loop.
+        #
+        # The window is a MULTIPLE of the kept length, not the kept length:
+        # truncating to exactly _max_summary could slice a secret that starts
+        # just inside the kept region, leaving its prefix unredacted. With 8x
+        # slack, any secret beginning within the kept 256 characters is still
+        # seen whole by the patterns.
+        return self.redact(text[: self._max_summary * _REDACT_WINDOW_FACTOR])[: self._max_summary]
 
     def sanitize(self, exc: BaseException, severity: ErrorSeverity | None = None) -> SanitizedError:
         category = severity.value if severity is not None else "unknown"

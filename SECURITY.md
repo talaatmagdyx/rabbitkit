@@ -2,14 +2,19 @@
 
 ## Supported Versions
 
-rabbitkit follows [SemVer](https://semver.org/). Security fixes are backported
-to the latest minor release on the current major version; older majors are
-not supported.
+rabbitkit follows [SemVer](https://semver.org/). Security fixes land on the
+latest released minor; older minors are not backported.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.x     | :white_check_mark: |
-| < 1.0   | :x:                |
+| 0.15.x  | :white_check_mark: |
+| < 0.15  | :x:                |
+
+rabbitkit is in public beta (`0.x`). Until `1.0`, "supported" means the
+latest released minor only — upgrade before reporting, and expect the fix in
+a new minor rather than a backport. This table previously claimed `1.x` was
+supported and everything below `1.0` was not, which described no released
+version and may have discouraged reports.
 
 ## Reporting a Vulnerability
 

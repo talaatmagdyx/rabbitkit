@@ -52,8 +52,13 @@ classes of bug fixed here cannot come back silently.
   pre-commit, `CONTRIBUTING.md` and the PR template. Examples are executable
   documentation and had drifted to 39 findings, including the two real bugs
   above.
-- **The CI coverage floor moved from 85% to 99%.** Actual unit coverage is
-  99%; the floor was 14 points of slack in which a regression could hide.
+- **The CI coverage floor moved from 85% to 99%** on the 3.12 leg, and to
+  95% on the others. Actual unit coverage is 99.1%; the old floor was 14
+  points of slack in which a regression could hide. The per-leg split is
+  deliberate: coverage tracks which OPTIONAL dependencies have wheels for a
+  given interpreter, not test quality — 3.14 has no opentelemetry wheel, so
+  `middleware/otel.py` reports 24% and the total ~98.4% from the very same
+  suite. 3.12 resolves the full `[dev]` set, so it carries the ratchet.
 - **The async broker no longer wires `reconnects_total`.** Verified against a
   live broker: when the BROKER closes a connection, aio-pika 9.6 recovers
   underneath the same `RobustConnection` without re-running its counted

@@ -64,11 +64,16 @@ All of these must pass:
 - `ruff check` — zero warnings.
 - `mypy --strict --ignore-missing-imports` — zero errors.
 - `pytest tests/unit/` — all unit tests pass. The project targets 100%
-  coverage and actually sits at 99%, so since 0.14 CI's floor is 99%
-  (`--cov-fail-under=99`) — a ratchet, not a target. New code should aim
-  for full coverage, with `# pragma: no cover` reserved for genuinely
-  unreachable defensive guards. If you need to lower the floor to land a
-  change, don't: add the test instead.
+  coverage and actually sits at 99%, so since 0.14 CI gates on it: the
+  **3.12 leg** carries the ratchet at 99% (`--cov-fail-under=99`), and the
+  other matrix legs get 95%. The split is deliberate — coverage varies with
+  which OPTIONAL dependencies have wheels for a given interpreter, not with
+  test quality. 3.14 has no opentelemetry wheel, so `middleware/otel.py`
+  falls to 24% and the total to ~98.4% from an identical suite. 3.12
+  resolves the full `[dev]` set, so its number is the honest one. New code
+  should aim for full coverage, with `# pragma: no cover` reserved for
+  genuinely unreachable defensive guards. If you need to lower a floor to
+  land a change, don't: add the test instead.
 - `pytest tests/security/ tests/property/` — security regression scenarios
   (signing replay, decompression bombs) and hypothesis property-based
   round-trip tests; all must pass.

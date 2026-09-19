@@ -29,6 +29,9 @@ safety invariants.
 ::: rabbitkit.core.types.DeliveryState
 ::: rabbitkit.highload.batch.CoalescingAcker
 ::: rabbitkit.highload.batch.CoalescingFlushReport
+::: rabbitkit.highload.batch.CoalescingAckerGroup
+::: rabbitkit.highload.batch.GroupFlushReport
+::: rabbitkit.highload.batch.ChannelMismatchError
 
 ## Reliability profiles & preflight
 

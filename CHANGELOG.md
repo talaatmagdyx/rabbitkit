@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-09-19
+
+Per-channel ack isolation. Purely additive — no behavior changes to existing
+code, no queue is re-declared.
+
+### Added
+
+- **`CoalescingAckerGroup`** — one `CoalescingAcker` per channel, created on
+  demand from a factory you supply. Delivery tags are a PER-CHANNEL counter
+  (tag 7 on channel A and tag 7 on channel B are different messages) and
+  rabbitkit gives every subscriber queue its own channel, so a multi-queue
+  consumer needs one ledger per channel:
+
+  ```
+  Channel A → CoalescingAcker A → SettlementCoordinator A
+  Channel B → CoalescingAcker B → SettlementCoordinator B
+  ```
+
+  The group keeps that isolation without hand-rolled bookkeeping:
+  `for_channel(ch)` builds/caches the acker, the per-delivery calls
+  (`register` / `complete` / `fail` / `retry_pending` / `release`) take the
+  channel and route to its ledger, and `flush()` / `close()` fan out and
+  return a `GroupFlushReport` aggregating every channel.
+  `on_reconnect(channel)` drops one rebuilt channel's ledger (old tags are
+  never replayed) and `reset()` drops all of them; `settled_total` /
+  `coalesced_total` survive a channel being retired so a reconnect does not
+  reset your metrics.
+
+- **`CoalescingAcker(channel_key=...)` and
+  `register(tag, channel_key=...)`** — turns "one acker per channel" from a
+  documented convention into an enforced invariant. A bound acker raises the
+  new **`ChannelMismatchError`** when handed a delivery from any other
+  channel, at registration time, before it can corrupt the ledger; an unbound
+  acker binds to the first key it is given. Without this, feeding two
+  channels into one acker let a cumulative ack computed from channel A's
+  completed prefix settle channel B's messages. Omitting `channel_key` keeps
+  the previous, unchecked behavior, so this is backward compatible.
+
+- **`examples/bulk_operations/08_two_channels_ack_isolation.py`** — two
+  queues carrying the same delivery tags, completed out of order, showing
+  each channel's frames covering only its own tags plus the guard firing on
+  a cross-channel mistake. Verified against a real broker: 40 deliveries
+  settled in 9 frames (39 tags coalesced), both queues drained.
+
+- Tests: `tests/unit/highload/test_ack_isolation.py` (31 cases — binding,
+  mismatch rejection, ledger separation, cumulative acks never crossing
+  channels, per-channel hold/fallback, reconnect/reset/close lifecycle,
+  retained stats, concurrent `for_channel`), and a live-broker
+  `test_coalescing_acker_group_isolates_two_queues` proving two subscriber
+  queues get two channels and both drain to 0/0.
+
 ## [0.12.0] — 2026-09-18
 
 Reliability and bulk operations release. Implements the "Reliability and Bulk

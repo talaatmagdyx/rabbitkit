@@ -1,3 +1,3 @@
 """rabbitkit version — single source of truth."""
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"

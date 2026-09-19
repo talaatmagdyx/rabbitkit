@@ -26,11 +26,14 @@ NEW_SYMBOLS = [
     # highload
     "BatchClosedError",
     "BatchFlushError",
+    "ChannelMismatchError",
     "CoalescingAcker",
+    "CoalescingAckerGroup",
     "CoalescingFlushReport",
     "FlushItem",
     "FlushReason",
     "FlushReport",
+    "GroupFlushReport",
     # profiles / preflight
     "ReliabilityProfile",
     "PreflightStatus",
@@ -72,13 +75,14 @@ def test_top_level_and_canonical_are_same_objects() -> None:
     from rabbitkit.core.bulk import BulkPublishOptions
     from rabbitkit.core.settlement import SettlementCoordinator
     from rabbitkit.core.types import BulkPublishStatus, SettlementItemStatus
-    from rabbitkit.highload.batch import CoalescingAcker
+    from rabbitkit.highload.batch import CoalescingAcker, CoalescingAckerGroup
 
     assert rabbitkit.BulkPublishOptions is BulkPublishOptions
     assert rabbitkit.SettlementCoordinator is SettlementCoordinator
     assert rabbitkit.BulkPublishStatus is BulkPublishStatus
     assert rabbitkit.SettlementItemStatus is SettlementItemStatus
     assert rabbitkit.CoalescingAcker is CoalescingAcker
+    assert rabbitkit.CoalescingAckerGroup is CoalescingAckerGroup
 
 
 def test_highload_package_exports() -> None:
@@ -87,8 +91,11 @@ def test_highload_package_exports() -> None:
     for name in (
         "BatchAcker",
         "BatchPublisher",
+        "ChannelMismatchError",
         "CoalescingAcker",
+        "CoalescingAckerGroup",
         "FlushReport",
+        "GroupFlushReport",
         "BatchFlushError",
         "BatchClosedError",
     ):

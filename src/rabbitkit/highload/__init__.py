@@ -6,10 +6,13 @@ from rabbitkit.highload.batch import (
     BatchClosedError,
     BatchFlushError,
     BatchPublisher,
+    ChannelMismatchError,
     CoalescingAcker,
+    CoalescingAckerGroup,
     CoalescingFlushReport,
     FlushItem,
     FlushReport,
+    GroupFlushReport,
 )
 
 __all__ = [
@@ -17,9 +20,12 @@ __all__ = [
     "BatchClosedError",
     "BatchFlushError",
     "BatchPublisher",
+    "ChannelMismatchError",
     "CoalescingAcker",
+    "CoalescingAckerGroup",
     "CoalescingFlushReport",
     "FlowController",
     "FlushItem",
     "FlushReport",
+    "GroupFlushReport",
 ]

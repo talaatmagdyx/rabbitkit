@@ -33,7 +33,7 @@ test-file:
 
 # Linting
 lint:
-	uv run ruff check src/ tests/
+	uv run ruff check src/ tests/ benchmarks/ examples/
 	uv run ruff format --check src/ tests/
 
 # Type checking

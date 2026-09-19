@@ -5,7 +5,7 @@ argument-hint: "[unit|full]  (default: unit)"
 
 Run rabbitkit's quality gates in order and report a single pass/fail summary. Stop at the first hard failure and show its output.
 
-1. `.venv/bin/ruff check src/ tests/ benchmarks/` — must be 0 warnings.
+1. `.venv/bin/ruff check src/ tests/ benchmarks/ examples/` — must be 0 warnings.
 2. `.venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports` — must be 0 errors.
 3. `.venv/bin/pytest tests/unit/ -q --tb=short` — all must pass.
 4. `.venv/bin/pytest tests/security/ tests/property/ -q --tb=short` — security regression scenarios and hypothesis property-based tests; all must pass.

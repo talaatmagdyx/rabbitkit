@@ -15,11 +15,10 @@ Requirements:
 import asyncio
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from rabbitkit import MessageEnvelope, RabbitApp, RabbitConfig
+from rabbitkit import RabbitApp
 from rabbitkit.testing import TestApp, TestBroker
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +147,7 @@ def test_with_testapp():
     def shutdown_hook() -> None:
         hook_calls.append("shutdown")
 
-    with TestApp(rabbit_app, broker) as ta:
+    with TestApp(rabbit_app, broker):
         # Startup hooks ran
         assert "startup" in hook_calls
 

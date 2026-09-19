@@ -18,6 +18,7 @@ import time
 
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
+from rabbitkit.core.errors import BackpressureError
 from rabbitkit.highload.backpressure import BackpressureConfig, FlowController
 
 broker = AsyncBroker(RabbitConfig())
@@ -83,22 +84,21 @@ async def main() -> None:
     # ── 3. connection.blocked handling ───────────────────────────────────────
     print("=== connection.blocked handling ===")
     fc3 = FlowController(BackpressureConfig(
-        on_blocked="raise",   # raise BlockedConnectionError immediately
+        on_blocked="raise",   # raise BackpressureError immediately
     ))
 
-    # Simulate broker sending connection.blocked
-    # In production this is wired to the transport:
-    # transport.on_blocked(fc3.on_blocked)
-    # transport.on_unblocked(fc3.on_unblocked)
-    #
-    # fc3.on_blocked()   # simulate blocked
-    # try:
-    #     await fc3.acquire_async()
-    # except BlockedConnectionError:
-    #     print("Broker is blocking — backing off")
-    # fc3.on_unblocked()
-
-    print("connection.blocked demo: wire fc.on_blocked/on_unblocked to transport signals")
+    # In production these two are wired to the transport's blocked signals:
+    #     transport.on_blocked(fc3.on_blocked)
+    #     transport.on_unblocked(fc3.on_unblocked)
+    # Here we drive them by hand to show the effect.
+    fc3.on_blocked()
+    try:
+        await fc3.acquire_async()
+        print("acquired (unexpected while blocked)")
+    except BackpressureError as exc:
+        print(f"broker is blocking — backing off: {exc}")
+    fc3.on_unblocked()
+    print(f"after unblock, acquire_async() -> {await fc3.acquire_async()}")
 
     await broker.stop()
 

@@ -55,7 +55,7 @@ pip install -e ".[integration]"
 All of these must pass:
 
 ```bash
-.venv/bin/ruff check src/ tests/ benchmarks/
+.venv/bin/ruff check src/ tests/ benchmarks/ examples/
 .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 .venv/bin/pytest tests/unit/ -q --tb=short --cov=src/rabbitkit --cov-report=term-missing
 .venv/bin/pytest tests/security/ tests/property/ -q --tb=short
@@ -63,11 +63,19 @@ All of these must pass:
 
 - `ruff check` — zero warnings.
 - `mypy --strict --ignore-missing-imports` — zero errors.
-- `pytest tests/unit/` — all unit tests pass. The project targets ~100%
-  coverage; CI's floor is 85% (`--cov-fail-under=85`) so it stays green
-  while a few defensive/transport-shim paths are brought under test — new
-  code should still aim for full coverage, with `# pragma: no cover`
-  reserved for genuinely unreachable defensive guards.
+- `pytest tests/unit/` — all unit tests pass. The project targets 100%
+  coverage and actually sits at 99.1%, so since 0.14 CI's floor is 99%
+  (`--cov-fail-under=99`, raised from 85) — a ratchet, not a target. New
+  code should aim for full coverage, with `# pragma: no cover` reserved for
+  genuinely unreachable defensive guards. If you need to lower the floor to
+  land a change, don't: add the test instead.
+  - If your local coverage is higher than CI's, suspect a **test-only
+    dependency you happen to have installed**. Several test modules start
+    with `pytest.importorskip(...)`; when the import fails the whole file
+    skips silently and its module's coverage collapses, with no failure to
+    read. That is how `middleware/otel.py` sat at 24% in CI while showing
+    100% locally — `test_otel.py` needs `opentelemetry.sdk`, but the `[otel]`
+    extra only ships the API. Compare the skip counts before the numbers.
 - `pytest tests/security/ tests/property/` — security regression scenarios
   (signing replay, decompression bombs) and hypothesis property-based
   round-trip tests; all must pass.

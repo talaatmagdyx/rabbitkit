@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.13.1"
+version = "0.14.0"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -51,6 +51,11 @@ dev         = [
     "httpx>=0.27,<1.0",  # starlette TestClient (dashboard tests)
     "httpx2>=0.1",  # starlette 1.x TestClient backend (silences its httpx deprecation)
     "prometheus-client>=0.20,<2.0",  # PrometheusCollector tests
+    # tests/unit/middleware/test_otel.py does importorskip("opentelemetry.sdk").
+    # The [otel] extra only ships the API (all the middleware needs at runtime),
+    # so without this the ENTIRE otel test module skipped silently in CI and
+    # middleware/otel.py sat at 24% coverage. Test-only dependency.
+    "opentelemetry-sdk>=1.20,<2",
     "psutil>=5.9",  # bench_resources (memory/FD tracking)
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
@@ -146,6 +151,12 @@ filterwarnings = [
     # bypasses these filters). Real users still see them.
     "ignore:Starting a single-worker sync consumer:RuntimeWarning",
     "ignore:SigningMiddleware is using the default in-memory:RuntimeWarning",
+    # The unmarshalled-interval-timer guard. Legitimately fires for the batch
+    # helpers' own tests, which drive them with plain callables and no
+    # transport owner; tests/unit/highload/test_coalescing_marshal.py asserts
+    # it DOES fire (pytest.warns bypasses these filters). Real users still
+    # see it.
+    "ignore:.*flush_interval_ms > 0 but no marshal=:RuntimeWarning",
     # third-party: testcontainers' own deprecated decorator
     "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
     # M13 security guardrail, asserted by test_cert_none_warns; SSL tests

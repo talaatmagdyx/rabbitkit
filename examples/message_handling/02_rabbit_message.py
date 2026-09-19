@@ -72,7 +72,6 @@ async def main() -> None:
     await broker.start()
 
     import uuid
-    from datetime import datetime, timezone
 
     await broker.publish(
         MessageEnvelope(

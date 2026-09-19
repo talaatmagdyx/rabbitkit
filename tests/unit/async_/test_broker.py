@@ -103,9 +103,7 @@ class TestLifecycle:
         mock_transport.declare_queue = AsyncMock()
         mock_transport.consume = AsyncMock(return_value="tag")
 
-        with patch(
-            "rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport
-        ) as transport_cls:
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport) as transport_cls:
             await broker.start()
 
         assert transport_cls.call_args.kwargs["pool_config"] is pool
@@ -301,9 +299,9 @@ class TestLifecycle:
             with _warnings.catch_warnings(record=True) as caught:
                 _warnings.simplefilter("always")
                 await broker.start()
-        assert not any(
-            "confirm_delivery=False" in str(w.message) for w in caught
-        ), "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        assert not any("confirm_delivery=False" in str(w.message) for w in caught), (
+            "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        )
 
     @pytest.mark.asyncio
     async def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
@@ -1686,8 +1684,7 @@ class TestBatchPublisherAutoCap:
 
         runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
         assert any(
-            "flush_workers" in str(w.message) and "channel_pool_size" in str(w.message)
-            for w in runtime_warnings
+            "flush_workers" in str(w.message) and "channel_pool_size" in str(w.message) for w in runtime_warnings
         ), f"Expected flush_workers/channel_pool_size RuntimeWarning, got: {[str(w.message) for w in runtime_warnings]}"
 
     @pytest.mark.asyncio
@@ -1726,9 +1723,7 @@ class TestBatchPublisherAutoCap:
                     await broker.stop()
 
         flush_worker_warnings = [
-            w
-            for w in caught
-            if issubclass(w.category, RuntimeWarning) and "flush_workers" in str(w.message)
+            w for w in caught if issubclass(w.category, RuntimeWarning) and "flush_workers" in str(w.message)
         ]
         assert flush_worker_warnings == []
 
@@ -2032,9 +2027,7 @@ class TestAsyncWaitInFlightCancelsAndNacksStragglers:
         with patch("rabbitkit.async_.broker.logger") as mock_logger:
             await broker._wait_in_flight(deadline)  # must NOT raise
 
-        assert any(
-            "nack on abandoned handler" in c.args[0] for c in mock_logger.warning.call_args_list
-        )
+        assert any("nack on abandoned handler" in c.args[0] for c in mock_logger.warning.call_args_list)
 
 
 # ── async publish() kwargs form ───────────────────────────────────────────
@@ -2054,9 +2047,7 @@ class TestAsyncPublishKwargsForm:
         mock_transport.connect = AsyncMock()
         mock_transport.declare_queue = AsyncMock()
         mock_transport.consume = AsyncMock(return_value="tag")
-        mock_transport.publish = AsyncMock(
-            return_value=PublishOutcome(status=PublishStatus.CONFIRMED)
-        )
+        mock_transport.publish = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
 
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=mock_transport):
             await broker.start()
@@ -2273,13 +2264,14 @@ class TestPublishSizeGuardAsync:
 
 
 class TestWireReconnectMetricAsync:
-    """Async mirror of the sync TestWireReconnectMetric -- connection-churn
-    counter wiring via the first route MetricsMiddleware's collector."""
+    """Channel-churn counter wiring via the first route MetricsMiddleware's
+    collector. Unlike sync, ``reconnects_total`` is deliberately NOT wired:
+    aio-pika does not report a broker-initiated reconnect, so the series
+    would be permanently 0 while connections really are flapping."""
 
-    def test_registers_callback_when_metrics_middleware_present(self) -> None:
+    def _wired(self, collector: MagicMock) -> AsyncBroker:
         from rabbitkit.middleware.metrics import MetricsMiddleware
 
-        collector = MagicMock()
         broker = AsyncBroker()
 
         @broker.subscriber(queue="orders", middlewares=[MetricsMiddleware(collector)])
@@ -2288,12 +2280,25 @@ class TestWireReconnectMetricAsync:
 
         broker._transport = MagicMock()
         broker._wire_reconnect_metric()
+        return broker
 
-        broker._transport.on_reconnect.assert_called_once()
-        registered_cb = broker._transport.on_reconnect.call_args.args[0]
-        registered_cb()
-        collector.inc_counter.assert_called_once()
-        assert collector.inc_counter.call_args.args[0].endswith("_reconnects_total")
+    def test_does_not_wire_a_reconnect_counter(self) -> None:
+        collector = MagicMock()
+        broker = self._wired(collector)
+        broker._transport.on_reconnect.assert_not_called()
+
+    def test_wires_the_channel_churn_counters(self) -> None:
+        collector = MagicMock()
+        broker = self._wired(collector)
+
+        broker._transport.on_channel_opened.assert_called_once()
+        broker._transport.on_channel_rebuilt.assert_called_once()
+        broker._transport.on_channel_opened.call_args.args[0]()
+        broker._transport.on_channel_rebuilt.call_args.args[0]()
+        emitted = [c.args[0] for c in collector.inc_counter.call_args_list]
+        assert any(n.endswith("_channels_opened_total") for n in emitted)
+        assert any(n.endswith("_channel_rebuilds_total") for n in emitted)
+        assert not any(n.endswith("_reconnects_total") for n in emitted)
 
     def test_noop_without_metrics_middleware(self) -> None:
         broker = AsyncBroker()
@@ -2431,9 +2436,7 @@ class TestFlowControlledInternalPublishAsync:
         broker._transport = MagicMock()
         broker._wire_retry_middleware()
 
-        retry_mw = next(
-            mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware)
-        )
+        retry_mw = next(mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware))
         assert retry_mw._publish_async_fn == broker._flow_controlled_internal_publish
 
 

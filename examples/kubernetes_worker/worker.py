@@ -73,7 +73,11 @@ async def handle_order(body: dict) -> None:
 
 
 async def health_server() -> None:
-    """Minimal HTTP health server for Kubernetes probes on port 8080."""
+    """Minimal HTTP health server for Kubernetes probes on port 8081.
+
+    Examples each use a distinct port so the smoke suite can run them
+    back to back without waiting on a sibling's socket.
+    """
     from aiohttp import web  # type: ignore[import-untyped]
 
     async def liveness(request: web.Request) -> web.Response:
@@ -92,9 +96,11 @@ async def health_server() -> None:
     app.router.add_get("/healthz/ready", readiness)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+
+    # health server must bind every interface inside the container.
+    site = web.TCPSite(runner, "0.0.0.0", 8081)  # noqa: S104
     await site.start()
-    print("health server listening on :8080")
+    print("health server listening on :8081")
 
 
 async def main() -> None:

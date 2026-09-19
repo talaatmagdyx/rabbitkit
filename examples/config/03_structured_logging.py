@@ -14,9 +14,11 @@ Requirements:
 
 import asyncio
 
+import structlog
+
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.core.logging import LoggingConfig, configure_structlog
+from rabbitkit.core.logging import LoggingConfig
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mode 1: Development — coloured console output
@@ -54,8 +56,6 @@ dev_broker = AsyncBroker(
 
 
 # ── Register handlers ─────────────────────────────────────────────────────────
-import structlog
-
 logger = structlog.stdlib.get_logger(__name__)
 
 

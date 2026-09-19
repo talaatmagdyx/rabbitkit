@@ -18,6 +18,7 @@ import json
 
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
+from rabbitkit.core.config import RetryConfig
 from rabbitkit.locking import LockMiddleware, RedisLock
 
 try:
@@ -66,8 +67,6 @@ async def handle_order(body: bytes) -> None:
 # ── 3. When lock is unavailable ───────────────────────────────────────────────
 # If another instance holds the lock, the message is nacked with requeue=True.
 # With retry configured, this becomes a natural wait-and-retry loop.
-
-from rabbitkit.core.config import RetryConfig
 
 broker_with_retry = AsyncBroker(RabbitConfig(
     retry=RetryConfig(max_retries=5, delays=(1, 2, 4, 8, 16))

@@ -19,12 +19,13 @@ jobs:
           python-version: "3.12"
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: Ruff
-        run: .venv/bin/ruff check src/ tests/ benchmarks/
+        run: .venv/bin/ruff check src/ tests/ benchmarks/ examples/
       - name: mypy
         run: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
@@ -44,13 +45,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
-      # NOTE(coverage): the project aims for ~100% coverage, but the floor is
-      # intentionally kept at 85 here so CI stays green while unreachable
-      # defensive guards and transport-shim paths are brought under test.
-      # Do NOT raise this to 100 — it would break the pipeline. Raise it
-      # incrementally as new tests close the gap.
+      # NOTE(coverage): the floor is 99% (actual 99.1%) on every leg. It was
+      # 85% before 0.14, which was 14 points of slack a regression could hide
+      # in. Raise it as new tests land; never lower it to make a change go
+      # green — add the test instead.
+      #
+      # If a leg reports ~98.4%, the cause is almost certainly a test-only
+      # dependency that failed to resolve rather than a missing test: an
+      # `importorskip` module drops out and takes its whole file's coverage
+      # with it. That is exactly how middleware/otel.py sat at 24% in CI
+      # until `opentelemetry-sdk` was added to the `[dev]` extra. Check the
+      # skip count and the install log before touching this number.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as
@@ -112,6 +119,10 @@ jobs:
   #     so it reports results without failing the pipeline.
   integration:
     runs-on: ubuntu-latest
+    # A healthy run of this whole job is ~7 minutes. Without a ceiling a hung
+    # step inherits GitHub's 6-hour default and blocks the PR that long — which
+    # is exactly what happened when the best-effort benchmark suite wedged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -127,14 +138,24 @@ jobs:
       # must pass — a reconnect/redelivery regression should break the build,
       # not merge green. Exit code is checked (no continue-on-error).
       - name: Chaos gate (restart mid-consume)
+        timeout-minutes: 10
         env:
           RK_CHAOS_PORT: "32778"
+          # Every benchmark module documents this invocation. The runner is
+          # ephemeral, so the testcontainers reaper buys nothing here and is a
+          # known source of hangs when a second suite starts its own stack.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
       # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
       # without breaking the pipeline (`continue-on-error: true` on this step).
+      # `continue-on-error` does NOT bound runtime: a wedged step still holds
+      # the job open. The timeout is what makes "best-effort" actually
+      # best-effort.
       - name: Chaos suite (best-effort)
         continue-on-error: true
+        timeout-minutes: 12
         env:
           RK_CHAOS_PORT: "32777"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
           .venv/bin/python -m benchmarks || echo "chaos suite skipped/failed (best-effort)"

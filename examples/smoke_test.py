@@ -134,11 +134,16 @@ def main() -> None:
         print(f"{verdict:<16} {rel}", flush=True)
         if not ok:
             fails.append(rel)
-            # surface the first error line to make CI logs actionable
+            # Always surface WHY. Previously only a _REAL_ERROR regex match was
+            # echoed, so a plain non-zero exit (e.g. a port already in use)
+            # printed nothing and every diagnosis meant digging through the raw
+            # CI log. Prefer the matched signature, else the tail of the output.
             m = _REAL_ERROR.search(out)
-            if m:
-                snippet = out[m.start():].splitlines()[:6]
+            snippet = out[m.start() :].splitlines()[:6] if m else out.strip().splitlines()[-8:]
+            if snippet:
                 print("    " + "\n    ".join(snippet), flush=True)
+            else:
+                print("    (no output captured)", flush=True)
         elif verdict == "PASS":
             passes += 1
         else:

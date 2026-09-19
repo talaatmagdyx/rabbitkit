@@ -15,7 +15,7 @@ import asyncio
 
 from rabbitkit import MessageEnvelope, RabbitConfig, RetryConfig
 from rabbitkit.async_ import AsyncBroker
-from rabbitkit.middleware.timeout import HandlerTimeoutError, TimeoutConfig, TimeoutMiddleware
+from rabbitkit.middleware.timeout import TimeoutConfig, TimeoutMiddleware
 
 broker = AsyncBroker(RabbitConfig(
     retry=RetryConfig(max_retries=2, delays=(1, 3)),  # retry on timeout

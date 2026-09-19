@@ -58,9 +58,11 @@ distinction should check for the same sentinel.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -484,10 +486,18 @@ class DeduplicationMiddleware(BaseMiddleware):
             return
         # "nack_requeue" (default): the copy comes back and retries, so it is
         # NOT lost if the claiming consumer dies mid-handler.
-        # ponytail: immediate requeue — the duplicate redelivers in a tight
-        # loop until the claim resolves, bounded by prefetch and the
-        # handler's duration; add a delay queue if that churn ever matters.
-        logger.debug("Duplicate of in-flight message (key=%s); nack-requeueing", key)
+        # Throttle before requeueing. An immediate nack(requeue=True) is
+        # redelivered at once and spins until the claim resolves: measured at
+        # ~3,160 redeliveries/second from a SINGLE duplicate, for up to
+        # processing_timeout (default 300s). That burns a prefetch slot and
+        # broker bandwidth, and an attacker who can publish a colliding id
+        # alongside a slow payload gets the amplification for free.
+        delay = self._config.in_flight_requeue_delay
+        logger.debug(
+            "Duplicate of in-flight message (key=%s); nack-requeueing after %.2fs", key, delay
+        )
+        if delay > 0:
+            time.sleep(delay)
         if not message.is_settled:
             message.nack(requeue=True)
 
@@ -578,7 +588,13 @@ class DeduplicationMiddleware(BaseMiddleware):
             if not message.is_settled:
                 await message.ack_async()
             return
-        logger.debug("Duplicate of in-flight message (key=%s); nack-requeueing", key)
+        delay = self._config.in_flight_requeue_delay
+        logger.debug(
+            "Duplicate of in-flight message (key=%s); nack-requeueing after %.2fs", key, delay
+        )
+        if delay > 0:
+            # asyncio.sleep, not time.sleep: this runs on the event loop.
+            await asyncio.sleep(delay)
         if not message.is_settled:
             await message.nack_async(requeue=True)
 

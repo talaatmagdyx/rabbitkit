@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import logging
 import queue
 import threading
@@ -112,7 +113,18 @@ class _DaemonWorkerPool:
             fut, fn, args, kwargs = item
             if fut.set_running_or_notify_cancel():
                 try:
-                    fut.set_result(fn(*args, **kwargs))
+                    # Run in a FRESH context per message.
+                    #
+                    # A pooled thread is long-lived and carries ONE
+                    # contextvars.Context for its entire life, so calling the
+                    # handler directly let message A's ContextVar writes leak
+                    # into message B on the same thread. With DI's
+                    # `set_local`, tenant B could read tenant A's scope --
+                    # which contradicts the isolation the DI context class
+                    # advertises. The async path is safe because each message
+                    # is its own Task (and a Task already copies the context);
+                    # this gives the sync pool the same guarantee.
+                    fut.set_result(contextvars.copy_context().run(fn, *args, **kwargs))
                 except BaseException as exc:
                     fut.set_exception(exc)
             # loop back: re-mark idle at the top of the next iteration
@@ -272,8 +284,12 @@ class SyncWorkerPool:
         Otherwise, submits to the thread pool.
         """
         if self._executor is None:
-            # Single worker mode -- run directly
-            callback(message)
+            # Single worker mode -- run directly, but still in a FRESH
+            # context. This runs on the transport's owner thread, which lives
+            # for the whole process, so without the copy every message's
+            # ContextVar writes would accumulate on it and leak into the next
+            # message exactly as they did on the pooled path.
+            contextvars.copy_context().run(callback, message)
             return
 
         future = self._executor.submit(callback, message)

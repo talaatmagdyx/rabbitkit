@@ -380,6 +380,28 @@ _ACK_STRATEGIES_ASYNC: dict[AckPolicy, _AsyncAckStrategy] = {
 }
 
 
+#: RabbitMQ's private direct-reply-to pseudo-queue. A reply here can only
+#: reach the channel that issued the request, so it is safe by construction.
+_DIRECT_REPLY_PREFIX = "amq.rabbitmq.reply-to"
+
+
+def _reply_to_permitted(reply_to: str, allow: tuple[str, ...] | None) -> bool:
+    """Is *reply_to* an acceptable destination for a handler result?
+
+    ``allow=None`` permits everything (the historical behaviour). Entries
+    ending in ``*`` match as prefixes.
+    """
+    if allow is None:
+        return True
+    for pattern in allow:
+        if pattern.endswith("*"):
+            if reply_to.startswith(pattern[:-1]):
+                return True
+        elif reply_to == pattern:
+            return True
+    return reply_to.startswith(_DIRECT_REPLY_PREFIX)
+
+
 class HandlerPipeline:
     """Executes the full message processing pipeline.
 
@@ -1267,6 +1289,18 @@ class HandlerPipeline:
 
         # Determine destination (Contract 5)
         if message.reply_to:
+            # `reply_to` comes from the PUBLISHER. Publishing a handler result
+            # to it unchecked is a one-hop write into any queue in the vhost.
+            if not _reply_to_permitted(message.reply_to, route.reply_to_allow):
+                logger.warning(
+                    "Route %r refused to publish its result to reply_to=%r: not in reply_to_allow. "
+                    "Result dropped.",
+                    route.name,
+                    message.reply_to,
+                )
+                return None
+            if route.reply_to_allow is None and not message.reply_to.startswith(_DIRECT_REPLY_PREFIX):
+                route.runtime_state.warn_unbounded_reply_to(route.name, message.reply_to)
             # RPC reply takes precedence
             if user_envelope is not None:
                 # Preserve user-provided fields (headers, message_id,

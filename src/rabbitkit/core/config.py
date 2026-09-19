@@ -902,6 +902,15 @@ class DeduplicationConfig:
     store_results: bool = False
     max_result_bytes: int = 65536
     on_in_flight: str = "nack_requeue"  # claim only: "nack_requeue" (retry-safe) | "ack_skip"
+    #: Seconds to wait before nack-requeueing a duplicate of an IN-FLIGHT
+    #: message. Without it the requeue is immediate, the broker redelivers at
+    #: once, and the message spins until the claim resolves — measured at
+    #: ~3,160 redeliveries/second from ONE duplicate, for up to
+    #: ``processing_timeout`` (default 300s). That burns a prefetch slot and
+    #: broker bandwidth, and an attacker who can publish a colliding id plus a
+    #: slow payload gets the amplification for free. 0 restores the old
+    #: behaviour.
+    in_flight_requeue_delay: float = 0.5
 
     def __post_init__(self) -> None:
         if self.store_results and self.mark_policy != "claim":

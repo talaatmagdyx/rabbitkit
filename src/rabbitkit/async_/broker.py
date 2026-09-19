@@ -285,6 +285,7 @@ class AsyncBroker:
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
+        reply_to_allow: tuple[str, ...] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -301,6 +302,7 @@ class AsyncBroker:
             prefetch_count=prefetch_count,
             filter_fn=filter_fn,
             reject_without_dlx=reject_without_dlx,
+            reply_to_allow=reply_to_allow,
         )
 
     def publisher(

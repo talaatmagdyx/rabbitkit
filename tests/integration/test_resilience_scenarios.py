@@ -36,6 +36,8 @@ from typing import Any
 
 import pytest
 
+from tests.integration.conftest import await_consumers
+
 pytestmark = pytest.mark.integration
 
 try:
@@ -121,59 +123,64 @@ def _restart_container(container: Any, timeout: float = 90.0) -> None:
 # ── 1. Async reconnect-resume after a hard broker restart ───────────────────
 
 
-async def test_async_reconnect_resume_after_connection_drop() -> None:
+async def test_async_reconnect_resume_after_connection_drop(rabbit_container: dict[str, Any]) -> None:
     """Drop the broker connection mid-drain via the management API (fast,
     simulates a network partition / broker restart) — the robust connection
     must reconnect and the consumer resume with no message loss.
     """
-    _skip_no_docker()
-
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.core.types import MessageEnvelope
 
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        url = _amqp_url(container)
-        config = RabbitConfig(connection=ConnectionConfig.from_url(url))
-        broker = AsyncBroker(config=config)
+    container = rabbit_container["container"]
+    url = _amqp_url(container)
+    config = RabbitConfig(connection=ConnectionConfig.from_url(url))
+    broker = AsyncBroker(config=config)
 
-        total = 20
-        processed: list[bytes] = []
-        lock = threading.Lock()
+    total = 20
+    processed: list[bytes] = []
+    lock = threading.Lock()
 
-        @broker.subscriber(queue="sre-reconnect-q")
-        async def handle(body: bytes) -> None:
-            await asyncio.sleep(0.05)
-            with lock:
-                processed.append(body)
+    @broker.subscriber(queue="sre-reconnect-q")
+    async def handle(body: bytes) -> None:
+        await asyncio.sleep(0.05)
+        with lock:
+            processed.append(body)
 
-        await broker.start()
-        await asyncio.sleep(0.5)
+    await broker.start()
+    await await_consumers(url, broker)
 
-        for i in range(total):
-            await broker.publish(
-                MessageEnvelope(routing_key="sre-reconnect-q", body=f"m{i}".encode())
-            )
+    for i in range(total):
+        await broker.publish(
+            MessageEnvelope(routing_key="sre-reconnect-q", body=f"m{i}".encode())
+        )
+    # The kill has to land mid-drain, so wait for delivery to actually start
+    # rather than guessing at 0.3s.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        with lock:
+            if processed:
+                break
+        await asyncio.sleep(0.02)
+
+    # Drop all AMQP connections via rabbitmqctl (fast, ~1s, no management port
+    # needed) — simulates a broker restart / network partition.
+    result = _exec(container, ["rabbitmqctl", "close_all_connections", "test"])
+    exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
+    if exit_code != 0:
+        pytest.skip("rabbitmqctl close_all_connections failed in this env")
+
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        with lock:
+            if len(set(processed)) >= total:
+                break
         await asyncio.sleep(0.3)
 
-        # Drop all AMQP connections via rabbitmqctl (fast, ~1s, no management port
-        # needed) — simulates a broker restart / network partition.
-        result = _exec(container, ["rabbitmqctl", "close_all_connections", "test"])
-        exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
-        if exit_code != 0:
-            pytest.skip("rabbitmqctl close_all_connections failed in this env")
-
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            with lock:
-                if len(set(processed)) >= total:
-                    break
-            await asyncio.sleep(0.3)
-
-        try:
-            await broker.stop(timeout=10.0)
-        except Exception:
-            pass
+    try:
+        await broker.stop(timeout=10.0)
+    except Exception:
+        pass
 
     with lock:
         unique = set(processed)
@@ -226,8 +233,11 @@ async def test_blocked_connection_watchdog_closes_on_alarm() -> None:
         except Exception:
             pass  # publish may fail/timeout — the blocked frame is what matters
 
-        # The watchdog should close the connection within ~blocked_connection_timeout (+ grace).
-        deadline = time.monotonic() + 20.0
+        # The watchdog should close the connection within ~blocked_connection_timeout
+        # (+ grace). blocked_connection_timeout=3 above, so a real blocked frame
+        # closes this by ~4s; the rest of a 20s deadline was only ever a slower
+        # route to the skip below.
+        deadline = time.monotonic() + 7.0
         closed = False
         while time.monotonic() < deadline:
             if not transport.is_connected():
@@ -255,112 +265,117 @@ async def test_blocked_connection_watchdog_closes_on_alarm() -> None:
 # ── 3. Heartbeat wedge detection ──────────────────────────────────────────────
 
 
-async def test_heartbeat_wedge_detection() -> None:
+async def test_heartbeat_wedge_detection(rabbit_container: dict[str, Any]) -> None:
     """broker_liveness is True while messages flow (heartbeat fresh), and flips
     False when the heartbeat goes stale past wedged_timeout — proving the I-4
     wiring is real against a live broker, not just a unit-test mock.
     """
-    _skip_no_docker()
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.core.types import MessageEnvelope
     from rabbitkit.health import broker_liveness
 
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        url = _amqp_url(container)
-        config = RabbitConfig(connection=ConnectionConfig.from_url(url))
-        broker = AsyncBroker(config=config)
+    container = rabbit_container["container"]
+    url = _amqp_url(container)
+    config = RabbitConfig(connection=ConnectionConfig.from_url(url))
+    broker = AsyncBroker(config=config)
 
-        received: list[bytes] = []
-        done = asyncio.Event()
+    received: list[bytes] = []
+    done = asyncio.Event()
 
-        @broker.subscriber(queue="sre-heartbeat-q")
-        async def handle(body: bytes) -> None:
-            received.append(body)
-            done.set()
+    @broker.subscriber(queue="sre-heartbeat-q")
+    async def handle(body: bytes) -> None:
+        received.append(body)
+        done.set()
 
-        await broker.start()
-        await asyncio.sleep(0.3)
+    await broker.start()
+    await await_consumers(url, broker)
 
-        await broker.publish(MessageEnvelope(routing_key="sre-heartbeat-q", body=b"beat"))
-        await asyncio.wait_for(done.wait(), timeout=10.0)
-        assert received  # message delivered → heartbeat should be fresh
+    await broker.publish(MessageEnvelope(routing_key="sre-heartbeat-q", body=b"beat"))
+    await asyncio.wait_for(done.wait(), timeout=10.0)
+    assert received  # message delivered → heartbeat should be fresh
 
-        # Liveness with the real (fresh) heartbeat must be True.
-        assert broker_liveness(broker) is True
+    # Liveness with the real (fresh) heartbeat must be True.
+    assert broker_liveness(broker) is True
 
-        # Now forge a stale heartbeat (simulate a wedged I/O loop) and assert
-        # liveness flips False within a short wedged_timeout.
-        import time as _time
+    # Now forge a stale heartbeat (simulate a wedged I/O loop) and assert
+    # liveness flips False within a short wedged_timeout.
+    import time as _time
 
-        broker.last_heartbeat = _time.monotonic() - 120.0  # 120s stale
-        assert broker_liveness(broker, wedged_timeout=60.0) is False
+    broker.last_heartbeat = _time.monotonic() - 120.0  # 120s stale
+    assert broker_liveness(broker, wedged_timeout=60.0) is False
 
-        try:
-            await broker.stop(timeout=10.0)
-        except Exception:
-            pass
+    try:
+        await broker.stop(timeout=10.0)
+    except Exception:
+        pass
 
 
 # ── 4. Sync SIGTERM graceful drain ────────────────────────────────────────────
 
 
-def test_sync_sigterm_graceful_drain() -> None:
+def test_sync_sigterm_graceful_drain(rabbit_container: dict[str, Any]) -> None:
     """A sync consumer sent SIGTERM mid-drain must stop the consume loop and
     drain in-flight work within graceful_timeout — not hang until SIGKILL.
     In-flight unacked messages are redelivered (at-least-once).
     """
-    _skip_no_docker()
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
     from rabbitkit.core.types import MessageEnvelope
     from rabbitkit.sync.broker import SyncBroker
 
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        url = _amqp_url(container)
-        config = RabbitConfig(connection=ConnectionConfig.from_url(url))
-        broker = SyncBroker(config=config)
+    container = rabbit_container["container"]
+    url = _amqp_url(container)
+    config = RabbitConfig(connection=ConnectionConfig.from_url(url))
+    broker = SyncBroker(config=config)
 
-        processed: list[bytes] = []
-        lock = threading.Lock()
+    processed: list[bytes] = []
+    lock = threading.Lock()
 
-        @broker.subscriber(queue="sre-sigterm-q")
-        def handle(body: bytes) -> None:
-            time.sleep(0.02)
-            with lock:
-                processed.append(body)
-
-        broker.start()
-
-        for i in range(10):
-            broker.publish(MessageEnvelope(routing_key="sre-sigterm-q", body=f"m{i}".encode()))
-
-        # Drive the consume loop on a background thread.
-        assert broker._transport is not None
-        consume_thread = threading.Thread(target=broker._transport.start_consuming, daemon=True)
-        consume_thread.start()
-        time.sleep(0.3)  # let some messages flow
-
-        # Simulate SIGTERM (the handler is signal-safe: offloads to a daemon thread).
-        t0 = time.monotonic()
-        broker._on_sigterm(signal.SIGTERM, None)
-
-        # The consume loop should exit within graceful_timeout + margin.
-        consume_thread.join(timeout=15.0)
-        elapsed = time.monotonic() - t0
-        assert not consume_thread.is_alive(), "consume loop did not exit after SIGTERM"
-
-        broker.stop(timeout=10.0)
-
-        # At least some messages were processed (graceful drain, not a hard kill).
+    @broker.subscriber(queue="sre-sigterm-q")
+    def handle(body: bytes) -> None:
+        time.sleep(0.02)
         with lock:
-            n = len(processed)
-        assert n > 0, f"no messages processed before SIGTERM drain (elapsed={elapsed:.1f}s)"
+            processed.append(body)
+
+    broker.start()
+
+    for i in range(10):
+        broker.publish(MessageEnvelope(routing_key="sre-sigterm-q", body=f"m{i}".encode()))
+
+    # Drive the consume loop on a background thread.
+    assert broker._transport is not None
+    consume_thread = threading.Thread(target=broker._transport.start_consuming, daemon=True)
+    consume_thread.start()
+    # SIGTERM must arrive mid-drain: wait for a message to actually land
+    # rather than guessing at 0.3s.
+    _deadline = time.monotonic() + 15.0
+    while time.monotonic() < _deadline:
+        with lock:
+            if processed:
+                break
+        time.sleep(0.01)
+
+    # Simulate SIGTERM (the handler is signal-safe: offloads to a daemon thread).
+    t0 = time.monotonic()
+    broker._on_sigterm(signal.SIGTERM, None)
+
+    # The consume loop should exit within graceful_timeout + margin.
+    consume_thread.join(timeout=15.0)
+    elapsed = time.monotonic() - t0
+    assert not consume_thread.is_alive(), "consume loop did not exit after SIGTERM"
+
+    broker.stop(timeout=10.0)
+
+    # At least some messages were processed (graceful drain, not a hard kill).
+    with lock:
+        n = len(processed)
+    assert n > 0, f"no messages processed before SIGTERM drain (elapsed={elapsed:.1f}s)"
 
 
 # ── 5. Async publish retry-once-on-connection-error (item 6) ────────────────
 
 
-async def test_async_publish_retries_once_after_mid_publish_connection_kill() -> None:
+async def test_async_publish_retries_once_after_mid_publish_connection_kill(rabbit_container: dict[str, Any]) -> None:
     """Killing the connection while a confirmed publish is in flight must be
     recovered by exactly one retry (item 6): the message lands on the queue
     exactly once (no double-confirm/duplicate), and the outcome the caller
@@ -372,76 +387,75 @@ async def test_async_publish_retries_once_after_mid_publish_connection_kill() ->
     skip rather than fail — the retry-once mechanism itself is proven
     deterministically by the unit tests in test_transport.py.
     """
-    _skip_no_docker()
     from rabbitkit.async_.transport import AsyncTransportImpl
     from rabbitkit.core.config import ConnectionConfig
     from rabbitkit.core.topology import RabbitQueue
     from rabbitkit.core.types import MessageEnvelope, PublishStatus
 
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        url = _amqp_url(container)
-        transport = AsyncTransportImpl(connection_config=ConnectionConfig.from_url(url))
-        await transport.connect()
+    container = rabbit_container["container"]
+    url = _amqp_url(container)
+    transport = AsyncTransportImpl(connection_config=ConnectionConfig.from_url(url))
+    await transport.connect()
 
-        queue_name = "sre-publish-retry-q"
-        await transport.declare_queue(RabbitQueue(name=queue_name, durable=True))
+    queue_name = "sre-publish-retry-q"
+    await transport.declare_queue(RabbitQueue(name=queue_name, durable=True))
 
-        async def _kill_mid_publish() -> None:
-            await asyncio.sleep(0.02)
-            _exec(container, ["rabbitmqctl", "close_all_connections", "test"])
+    async def _kill_mid_publish() -> None:
+        await asyncio.sleep(0.02)
+        _exec(container, ["rabbitmqctl", "close_all_connections", "test"])
 
-        kill_task = asyncio.create_task(_kill_mid_publish())
-        outcome = await transport.publish(
-            MessageEnvelope(routing_key=queue_name, body=b"retry-me", exchange="")
-        )
-        await kill_task
+    kill_task = asyncio.create_task(_kill_mid_publish())
+    outcome = await transport.publish(
+        MessageEnvelope(routing_key=queue_name, body=b"retry-me", exchange="")
+    )
+    await kill_task
 
-        if outcome.status != PublishStatus.CONFIRMED:
-            try:
-                await transport.disconnect()
-            except Exception:
-                pass
-            pytest.skip(
-                f"connection kill did not land inside the publish window in this env "
-                f"(outcome={outcome.status}, error={outcome.error}) — retry-once logic "
-                "is unit-tested deterministically in test_transport.py"
-            )
-
-        from rabbitkit.core.message import RabbitMessage
-
-        received: list[bytes] = []
-        done = asyncio.Event()
-
-        async def handle(message: RabbitMessage) -> None:
-            received.append(message.body)
-            await message.ack_async()
-            done.set()
-
-        # The publisher connection recovering (proven by outcome==CONFIRMED
-        # above) doesn't guarantee the SEPARATE consumer connection has
-        # finished its own connect_robust restore yet -- retry with backoff
-        # rather than a single fixed sleep.
-        consume_deadline = time.monotonic() + 15.0
-        while True:
-            try:
-                await transport.consume(queue_name, handle)
-                break
-            except Exception:
-                if time.monotonic() >= consume_deadline:
-                    raise
-                await asyncio.sleep(0.5)
-        try:
-            await asyncio.wait_for(done.wait(), timeout=10.0)
-        except TimeoutError:
-            pytest.fail("published message never arrived on the queue after a CONFIRMED outcome")
-        await asyncio.sleep(1.5)  # window for a hypothetical duplicate to also arrive
-
+    if outcome.status != PublishStatus.CONFIRMED:
         try:
             await transport.disconnect()
         except Exception:
             pass
+        pytest.skip(
+            f"connection kill did not land inside the publish window in this env "
+            f"(outcome={outcome.status}, error={outcome.error}) — retry-once logic "
+            "is unit-tested deterministically in test_transport.py"
+        )
 
-        assert received == [b"retry-me"], f"expected exactly one delivery (no duplicate), got {received}"
+    from rabbitkit.core.message import RabbitMessage
+
+    received: list[bytes] = []
+    done = asyncio.Event()
+
+    async def handle(message: RabbitMessage) -> None:
+        received.append(message.body)
+        await message.ack_async()
+        done.set()
+
+    # The publisher connection recovering (proven by outcome==CONFIRMED
+    # above) doesn't guarantee the SEPARATE consumer connection has
+    # finished its own connect_robust restore yet -- retry with backoff
+    # rather than a single fixed sleep.
+    consume_deadline = time.monotonic() + 15.0
+    while True:
+        try:
+            await transport.consume(queue_name, handle)
+            break
+        except Exception:
+            if time.monotonic() >= consume_deadline:
+                raise
+            await asyncio.sleep(0.5)
+    try:
+        await asyncio.wait_for(done.wait(), timeout=10.0)
+    except TimeoutError:
+        pytest.fail("published message never arrived on the queue after a CONFIRMED outcome")
+    await asyncio.sleep(0.5)  # window for a hypothetical duplicate to also arrive
+
+    try:
+        await transport.disconnect()
+    except Exception:
+        pass
+
+    assert received == [b"retry-me"], f"expected exactly one delivery (no duplicate), got {received}"
 
 
 # ── 6. Channel-count stability (item 9) ──────────────────────────────────────
@@ -463,50 +477,49 @@ class _CountingCollector:
         pass
 
 
-async def test_channel_count_stays_bounded_across_many_publishes() -> None:
+async def test_channel_count_stays_bounded_across_many_publishes(rabbit_container: dict[str, Any]) -> None:
     """Item 9: N publishes through the confirmed (pooled-channel) path must
     not grow channels_opened_total unboundedly -- a regression guard
     against a channel-pool leak (e.g. a release() bug that never returns a
     channel to the pool, forcing a fresh channel per publish instead of
     reusing the pool)."""
-    _skip_no_docker()
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import ConnectionConfig, PoolConfig, RabbitConfig
     from rabbitkit.core.types import MessageEnvelope
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        url = _amqp_url(container)
-        pool_size = 5
-        config = RabbitConfig(
-            connection=ConnectionConfig.from_url(url),
-            pool=PoolConfig(channel_pool_size=pool_size),
+    container = rabbit_container["container"]
+    url = _amqp_url(container)
+    pool_size = 5
+    config = RabbitConfig(
+        connection=ConnectionConfig.from_url(url),
+        pool=PoolConfig(channel_pool_size=pool_size),
+    )
+    broker = AsyncBroker(config=config)
+    collector = _CountingCollector()
+
+    @broker.subscriber(
+        queue="sre-channel-count-q",
+        middlewares=[MetricsMiddleware(collector)],
+    )
+    async def handle(body: bytes) -> None:
+        pass
+
+    await broker.start()
+
+    n_publishes = 50
+    for i in range(n_publishes):
+        outcome = await broker.publish(
+            MessageEnvelope(routing_key="sre-channel-count-q", body=f"m{i}".encode())
         )
-        broker = AsyncBroker(config=config)
-        collector = _CountingCollector()
+        assert outcome.ok, f"publish {i} failed: {outcome.status} {outcome.error}"
 
-        @broker.subscriber(
-            queue="sre-channel-count-q",
-            middlewares=[MetricsMiddleware(collector)],
-        )
-        async def handle(body: bytes) -> None:
-            pass
+    opened = collector.counters.get("rabbitkit_channels_opened_total", 0.0)
 
-        await broker.start()
-
-        n_publishes = 50
-        for i in range(n_publishes):
-            outcome = await broker.publish(
-                MessageEnvelope(routing_key="sre-channel-count-q", body=f"m{i}".encode())
-            )
-            assert outcome.ok, f"publish {i} failed: {outcome.status} {outcome.error}"
-
-        opened = collector.counters.get("rabbitkit_channels_opened_total", 0.0)
-
-        try:
-            await broker.stop(timeout=10.0)
-        except Exception:
-            pass
+    try:
+        await broker.stop(timeout=10.0)
+    except Exception:
+        pass
 
     assert opened < n_publishes, (
         f"channels_opened_total ({opened}) grew with publish count "

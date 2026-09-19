@@ -25,43 +25,20 @@ from typing import Any
 
 import pytest
 
+from tests.integration.conftest import await_consumers, live_counts
+
 try:
     from rabbitkit.core.message import RabbitMessage as _RabbitMessage  # noqa: F401
 except ImportError:  # pragma: no cover
     pass
 
-try:
-    from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
-
-    _TESTCONTAINERS_AVAILABLE = True
-except ImportError:
-    _TESTCONTAINERS_AVAILABLE = False
-
 pytestmark = pytest.mark.integration
 
 
-def _skip_no_docker() -> None:
-    if not _TESTCONTAINERS_AVAILABLE:
-        pytest.skip("testcontainers not installed — run: pip install testcontainers[rabbitmq]")
-    try:
-        import docker  # type: ignore[import-untyped]
-
-        docker.from_env().ping()
-    except Exception:
-        pytest.skip("Docker daemon not reachable — skip real-RabbitMQ integration tests")
-
-
 @pytest.fixture(scope="module")
-def rabbit() -> Any:  # type: ignore[return]
-    _skip_no_docker()
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine").with_exposed_ports(15672) as container:
-        host = container.get_container_host_ip()
-        port = container.get_exposed_port(5672)
-        mgmt_port = container.get_exposed_port(15672)
-        yield {
-            "url": f"amqp://guest:guest@{host}:{port}/",
-            "mgmt": f"http://{host}:{mgmt_port}",
-        }
+def rabbit(rabbit_container: dict[str, Any]) -> dict[str, Any]:
+    """The suite-wide broker (see ``conftest.py``): ``url`` / ``mgmt`` / ``container``."""
+    return rabbit_container
 
 
 def _config(url: str, **kw: Any) -> Any:
@@ -78,17 +55,14 @@ def _mgmt(rabbit: dict[str, str]) -> Any:
 
 
 def _queue_counts(rabbit: dict[str, str], queue: str, *, retries: int = 40) -> tuple[int, int]:
-    """``(ready, unacked)`` from the management API; polls until the queue exists."""
-    client = _mgmt(rabbit)
-    last: Exception | None = None
-    for _ in range(retries):
-        try:
-            info = client.get_queue(queue)
-            return int(info.get("messages_ready", 0)), int(info.get("messages_unacknowledged", 0))
-        except Exception as exc:  # 404 until declared / stats lag
-            last = exc
-            time.sleep(0.25)
-    raise AssertionError(f"queue {queue} not visible via management API: {last}")
+    """``(ready, unacked)`` straight off the node; polls until the queue exists.
+
+    Was the management API, which serves a statistics snapshot refreshed on a
+    ~5s interval — so every wait below paid 5s before it could see a
+    settlement that had already happened. ``rabbitmqctl`` reads the queue
+    process itself: ~0.3s, and never stale.
+    """
+    return live_counts(rabbit, queue, retries=retries)
 
 
 def _wait_until(pred: Any, timeout: float = 15.0) -> None:
@@ -96,7 +70,7 @@ def _wait_until(pred: Any, timeout: float = 15.0) -> None:
     while time.monotonic() < deadline:
         if pred():
             return
-        time.sleep(0.1)
+        time.sleep(0.05)
     raise AssertionError("condition not met in time")
 
 
@@ -131,7 +105,7 @@ async def test_async_publish_many_confirmed_and_consumed(rabbit: dict[str, str])
             done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
 
     envelopes = _envs(queue, 50)
     # one unroutable (no such queue, mandatory) + one oversized
@@ -168,7 +142,7 @@ async def test_async_ack_many_subset_leaves_sibling_unacked(rabbit: dict[str, st
             got3.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     result = await broker.publish_many(_envs(queue, 3))
     assert result.all_confirmed
     await asyncio.wait_for(got3.wait(), timeout=30.0)
@@ -208,7 +182,7 @@ async def test_async_nack_many_dead_letters(rabbit: dict[str, str]) -> None:
             got.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbit["url"], broker)
     assert (await broker.publish_many(_envs(queue, 2))).all_confirmed
     await asyncio.wait_for(got.wait(), timeout=30.0)
 

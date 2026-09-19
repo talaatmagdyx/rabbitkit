@@ -114,9 +114,12 @@ jobs:
   # Gating vs best-effort split:
   #   - The `Integration tests` step is GATING: a real regression in a marked
   #     integration test fails the job. Do NOT swallow its exit code.
-  #   - The `Chaos suite` step is best-effort (`continue-on-error: true` on the
-  #     step only): the chaos/benchmark suite may be flaky or environment-bound,
-  #     so it reports results without failing the pipeline.
+  #   - The `Chaos gate` runs ALL SIX chaos scenarios and is GATING. Each one
+  #     asserts a message-safety property (no loss across a restart, retry
+  #     exhaustion reaching the DLQ, unconfirmed publishes resent), which is
+  #     deterministic correctness, not a benchmark.
+  #   - The `Benchmark suite` step is best-effort: throughput numbers depend on
+  #     the runner hardware, so it reports without failing the pipeline.
   integration:
     runs-on: ubuntu-latest
     # A healthy run of this whole job is ~7 minutes. Without a ceiling a hung
@@ -132,30 +135,39 @@ jobs:
       # GATING: real integration regressions fail the job. `-m integration`
       # selects only marked tests; if none are marked pytest exits 5 (no tests
       # ran), which is treated as a failure so missing tests surface loudly.
+      # RK_REQUIRE_BROKER=1 makes tests/integration/conftest.py refuse to report
+      # a green gate that never reached a broker. Without it, a host with no
+      # Docker skips every test and pytest still exits 0 — exit 5 only covers
+      # "nothing collected", and a skipped test IS collected.
       - name: Integration tests
+        timeout-minutes: 15
+        env:
+          RK_REQUIRE_BROKER: "1"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short
       # GATING (M15): the critical restart-mid-consume scenarios (sync+async)
       # must pass — a reconnect/redelivery regression should break the build,
       # not merge green. Exit code is checked (no continue-on-error).
-      - name: Chaos gate (restart mid-consume)
-        timeout-minutes: 10
+      - name: Chaos gate (all scenarios)
+        timeout-minutes: 15
         env:
           RK_CHAOS_PORT: "32778"
           # Every benchmark module documents this invocation. The runner is
           # ephemeral, so the testcontainers reaper buys nothing here and is a
           # known source of hangs when a second suite starts its own stack.
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
-      # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
-      # without breaking the pipeline (`continue-on-error: true` on this step).
+        run: .venv/bin/python -m benchmarks.chaos_suite
+      # BEST-EFFORT, and genuinely so: this is the THROUGHPUT benchmark suite,
+      # whose numbers depend on the runner's CPU and disk. Correctness lives in
+      # the gate above.
       # `continue-on-error` does NOT bound runtime: a wedged step still holds
       # the job open. The timeout is what makes "best-effort" actually
       # best-effort.
-      - name: Chaos suite (best-effort)
+      - name: Benchmark suite (best-effort)
         continue-on-error: true
         timeout-minutes: 12
         env:
           RK_CHAOS_PORT: "32777"
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
-          .venv/bin/python -m benchmarks || echo "chaos suite skipped/failed (best-effort)"
+          .venv/bin/python -m benchmarks || echo "benchmark suite skipped/failed (best-effort)"

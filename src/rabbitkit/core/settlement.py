@@ -26,10 +26,11 @@ Safety invariants enforced here (see the plan, §3):
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -303,6 +304,73 @@ class SettlementCommand:
     generation: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class SettlementBatch:
+    """Commands PREPARED for the wire but not yet settled in the ledger.
+
+    This is the unit of the plan/emit/commit protocol. A batch is produced by
+    :meth:`SettlementCoordinator.prepare`, which reserves the covered tags
+    without consuming them, and is resolved one command at a time by
+    :meth:`SettlementCoordinator.commit_command` (the frame reached the
+    broker) or :meth:`SettlementCoordinator.fail_command` (it did not).
+
+    Why this exists: a cumulative ``basic_ack(tag, multiple=True)`` settles
+    every delivery still unacknowledged up to ``tag``. A plan that mixes a
+    nack with a later cumulative ack is therefore only correct if the nack
+    actually reached the broker first. Consuming the ledger at planning time
+    made the coordinator believe a settlement happened that may never have
+    left the process.
+    """
+
+    commands: tuple[SettlementCommand, ...]
+    generation: int
+    batch_id: int
+
+    def __len__(self) -> int:
+        return len(self.commands)
+
+    def __bool__(self) -> bool:
+        return bool(self.commands)
+
+    @property
+    def covered_tags(self) -> tuple[int, ...]:
+        """Every delivery tag this batch would settle, ascending."""
+        return tuple(sorted(t for c in self.commands for t in c.covers))
+
+
+@dataclass(frozen=True, slots=True)
+class EmissionReport:
+    """Outcome of driving a :class:`SettlementBatch` onto the wire.
+
+    ``emitted`` reached the broker and are settled. ``failed`` raised.
+    ``not_attempted`` were deliberately NOT sent, because a command whose
+    safety depends on an earlier frame must never follow a failure.
+    """
+
+    batch_id: int
+    generation: int
+    emitted: tuple[SettlementCommand, ...] = ()
+    failed: SettlementCommand | None = None
+    error: BaseException | None = None
+    not_attempted: tuple[SettlementCommand, ...] = ()
+    invalidated: bool = False
+    unresolved_tags: tuple[int, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """True when every command in the batch reached the broker."""
+        return self.failed is None and not self.not_attempted
+
+    @property
+    def settled_tags(self) -> int:
+        return sum(len(c.covers) for c in self.emitted)
+
+    @property
+    def coalesced_tags(self) -> int:
+        """Tags settled by a cumulative ack beyond the frame's own tag."""
+        return sum(len(c.covers) - 1 for c in self.emitted if c.multiple and len(c.covers) > 1)
+
+
 class CoordinatorError(RuntimeError):
     """Invalid use of :class:`SettlementCoordinator`. Base class for the
     specific errors below; catching it catches all of them."""
@@ -431,6 +499,15 @@ class SettlementCoordinator:
         self._frames_sent = 0
         self._invalidations = 0
         self._dropped_on_invalidate = 0
+        # plan/emit/commit protocol: tags reserved by an in-flight batch.
+        # They are NOT settled yet, so they stay in the ledger, but a second
+        # prepare() must not re-plan them AND nothing above them may be
+        # cumulatively acked while their wire outcome is unknown.
+        self._reserved: dict[int, int] = {}  # tag -> batch_id
+        self._next_batch_id = 1
+        self._unresolved_count = 0
+        self._frames_failed = 0
+        self._frames_not_attempted = 0
 
     # ── inspection ────────────────────────────────────────────────────────
 
@@ -519,6 +596,10 @@ class SettlementCoordinator:
                 "coalescing_ratio": (self._settled_count / self._frames_sent) if self._frames_sent else 0.0,
                 "invalidations": self._invalidations,
                 "dropped_on_invalidate": self._dropped_on_invalidate,
+                "reserved": len(self._reserved),
+                "unresolved": self._unresolved_count,
+                "frames_failed": self._frames_failed,
+                "frames_not_attempted": self._frames_not_attempted,
                 "oldest_pending_age": (
                     max(0.0, self._clock() - min(self._registered_at.values())) if self._registered_at else 0.0
                 ),
@@ -646,8 +727,12 @@ class SettlementCoordinator:
 
     # ── planning ─────────────────────────────────────────────────────────
 
-    def plan(self, *, force_individual: bool = False) -> list[SettlementCommand]:
-        """Compute and CONSUME the commands that are safe to emit now.
+    def _plan_locked(self, *, force_individual: bool) -> tuple[list[SettlementCommand], set[int]]:
+        """The planning walk. Caller must hold ``self._lock``.
+
+        Returns the commands and the set of tags they cover. Nothing is
+        removed from the ledger here — consuming is the caller's decision,
+        which is what makes the plan/emit/commit protocol possible.
 
         Walks the ledger in ascending tag order and coalesces each contiguous
         run of ack-safe deliveries. A nack/reject in the middle is emitted
@@ -655,103 +740,217 @@ class SettlementCoordinator:
         run AFTER it can form a new cumulative range::
 
             101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
-            → ack(102, multiple=True), nack(103), ack(105, multiple=True)
+            -> ack(102, multiple=True), nack(103), ack(105, multiple=True)
 
         The moment a BLOCKING delivery is reached (still outstanding, retry-
-        pending, failed or cancelled) no cumulative ack may reach past it
-        ever again in this plan: everything above is acked individually,
-        optionally after a bounded hold. Commands are returned in ascending
-        tag order and MUST be emitted in that order — a cumulative ack is
-        only safe because the frames below it went out first.
+        pending, failed, cancelled, or RESERVED by an in-flight batch) no
+        cumulative ack may reach past it again in this plan: everything above
+        is acked individually, optionally after a bounded hold.
 
-        Every returned tag is removed from the ledger, so a tag is planned at
-        most once. Blocking entries stay.
+        Commands come back in ascending tag order and MUST be emitted in that
+        order. A cumulative ack is only correct because the frames below it
+        went out first -- see :func:`emit_batch`, which is the only supported
+        way to put a plan on the wire.
+        """
+        commands: list[SettlementCommand] = []
+        covered: set[int] = set()
+        run: list[int] = []  # current contiguous ack-safe run
+        blocked = False  # a blocking delivery has been passed
+
+        def flush_run() -> None:
+            if not run:
+                return
+            if self._coalesce and not force_individual and len(run) >= 2:
+                commands.append(
+                    SettlementCommand(
+                        kind=SettlementAction.ACK,
+                        delivery_tag=run[-1],
+                        multiple=True,
+                        covers=tuple(run),
+                        generation=self._generation,
+                    )
+                )
+            else:
+                commands.extend(
+                    SettlementCommand(
+                        kind=SettlementAction.ACK,
+                        delivery_tag=t,
+                        multiple=False,
+                        covers=(t,),
+                        generation=self._generation,
+                    )
+                    for t in run
+                )
+            covered.update(run)
+            run.clear()
+
+        for tag in sorted(self._ledger):
+            # A reserved tag is on the wire with an UNKNOWN outcome. It may
+            # still be unacknowledged at the broker, so no cumulative ack may
+            # sweep past it and it must not be planned twice.
+            if tag in self._reserved:
+                flush_run()
+                blocked = True
+                continue
+            state = self._ledger[tag]
+            if state.is_ack_safe:
+                if not blocked:
+                    run.append(tag)
+                    continue
+                # Stranded behind a blocker: hold briefly hoping the blocker
+                # resolves, then fall back to an individual ack so one slow
+                # handler cannot pin its siblings forever.
+                if self._coalesce and not force_individual and self._hold.get(tag, 0) < self._max_hold:
+                    self._hold[tag] = self._hold.get(tag, 0) + 1
+                    continue
+                commands.append(
+                    SettlementCommand(
+                        kind=SettlementAction.ACK,
+                        delivery_tag=tag,
+                        multiple=False,
+                        covers=(tag,),
+                        generation=self._generation,
+                    )
+                )
+                covered.add(tag)
+            elif state is DeliveryState.NACK or state is DeliveryState.REJECT:
+                # Settles this tag on the wire before anything above it, so it
+                # does NOT block a later cumulative range -- PROVIDED it
+                # actually reaches the broker. emit_batch enforces that.
+                flush_run()
+                commands.append(
+                    SettlementCommand(
+                        kind=SettlementAction.NACK if state is DeliveryState.NACK else SettlementAction.REJECT,
+                        delivery_tag=tag,
+                        requeue=self._requeue.get(tag, state is DeliveryState.NACK),
+                        covers=(tag,),
+                        generation=self._generation,
+                    )
+                )
+                covered.add(tag)
+            else:  # OUTSTANDING / RETRY_PENDING / FAILED / CANCELLED
+                flush_run()
+                blocked = True
+        flush_run()
+        commands.sort(key=lambda c: c.delivery_tag)
+        return commands, covered
+
+    def _settle_tags_locked(self, tags: Iterable[int]) -> None:
+        """Drop tags from the ledger for good. Caller holds ``self._lock``."""
+        for tag in tags:
+            self._ledger.pop(tag, None)
+            self._hold.pop(tag, None)
+            self._requeue.pop(tag, None)
+            self._registered_at.pop(tag, None)
+            self._reserved.pop(tag, None)
+
+    def prepare(self, *, force_individual: bool = False) -> SettlementBatch:
+        """Plan the commands that are safe to emit now, WITHOUT settling them.
+
+        The covered tags are *reserved*: they stay in the ledger, a second
+        ``prepare()`` will not re-plan them, and nothing above them may be
+        cumulatively acked while their wire outcome is unknown. Resolve the
+        batch with :func:`emit_batch`, or by hand via
+        :meth:`commit_command` / :meth:`fail_command` / :meth:`release_commands`.
+
+        Every command MUST be emitted in the order given, and a command must
+        never be emitted after an earlier one failed.
+        """
+        with self._lock:
+            if not self._ledger:
+                return SettlementBatch(commands=(), generation=self._generation, batch_id=0)
+            commands, covered = self._plan_locked(force_individual=force_individual)
+            batch_id = self._next_batch_id
+            self._next_batch_id += 1
+            for tag in covered:
+                self._reserved[tag] = batch_id
+            return SettlementBatch(
+                commands=tuple(commands),
+                generation=self._generation,
+                batch_id=batch_id,
+            )
+
+    def commit_command(self, batch: SettlementBatch, command: SettlementCommand) -> None:
+        """The frame reached the broker: settle its tags for good.
+
+        A no-op when the generation moved on under us (the channel was rebuilt
+        mid-batch), because those tags are already gone and the broker will
+        redeliver them.
+        """
+        with self._lock:
+            if batch.generation != self._generation:
+                return
+            self._settle_tags_locked(command.covers)
+            self._settled_count += len(command.covers)
+            self._frames_sent += 1
+            if command.multiple and len(command.covers) > 1:
+                self._coalesced_count += len(command.covers)
+
+    def fail_command(self, batch: SettlementBatch, command: SettlementCommand, error: BaseException) -> bool:
+        """The frame did NOT reach the broker, or we cannot tell.
+
+        The covered tags become UNRESOLVED: they leave the ledger and are
+        never re-emitted, because re-sending a settlement whose first attempt
+        may have landed is how you turn an ambiguity into a protocol error.
+        Leaving them unacknowledged is always safe -- the broker redelivers
+        them when the channel goes away.
+
+        Returns True when the generation was invalidated, which the caller
+        must treat as "this channel can no longer be used for coalescing".
+        That happens for a failed NACK or REJECT: the tag may still be
+        unacknowledged at the broker, so ANY later cumulative ack above it
+        would silently acknowledge the very delivery we meant to requeue.
+        An ACK that fails is not dangerous in the same way -- a later
+        cumulative ack sweeping it up produces exactly the intended outcome.
+        """
+        with self._lock:
+            if batch.generation != self._generation:
+                return False
+            self._settle_tags_locked(command.covers)
+            self._unresolved_count += len(command.covers)
+            self._frames_failed += 1
+            must_invalidate = command.kind in (SettlementAction.NACK, SettlementAction.REJECT)
+        if must_invalidate:
+            self.invalidate()
+            return True
+        return False
+
+    def release_commands(self, batch: SettlementBatch, commands: Sequence[SettlementCommand]) -> None:
+        """These commands were never attempted: un-reserve their tags.
+
+        They go back to being ordinary ledger entries and will be planned
+        again on the next :meth:`prepare`. Nothing reached the wire, so this
+        is always safe.
+        """
+        with self._lock:
+            if batch.generation != self._generation:
+                return
+            for command in commands:
+                for tag in command.covers:
+                    if self._reserved.get(tag) == batch.batch_id:
+                        del self._reserved[tag]
+                self._frames_not_attempted += 1
+
+    def plan(self, *, force_individual: bool = False) -> list[SettlementCommand]:
+        """Plan AND immediately settle every command in the ledger.
+
+        This is the pure-planning primitive. It assumes the caller emits every
+        returned command, in order, and that they all succeed -- so it is only
+        appropriate for tests, for ``TestBroker``, and for callers that supply
+        their own ordering and failure guarantees.
+
+        For anything that touches a real channel use :meth:`prepare` plus
+        :func:`emit_batch`, which stops on the first failure instead of
+        letting a cumulative ack follow a nack that never landed.
         """
         with self._lock:
             if not self._ledger:
                 return []
-            commands: list[SettlementCommand] = []
-            consumed: set[int] = set()
-            run: list[int] = []  # current contiguous ack-safe run
-            blocked = False  # a blocking delivery has been passed
-
-            def flush_run() -> None:
-                if not run:
-                    return
-                if self._coalesce and not force_individual and len(run) >= 2:
-                    commands.append(
-                        SettlementCommand(
-                            kind=SettlementAction.ACK,
-                            delivery_tag=run[-1],
-                            multiple=True,
-                            covers=tuple(run),
-                            generation=self._generation,
-                        )
-                    )
-                    self._coalesced_count += len(run)
-                else:
-                    commands.extend(
-                        SettlementCommand(
-                            kind=SettlementAction.ACK,
-                            delivery_tag=t,
-                            multiple=False,
-                            covers=(t,),
-                            generation=self._generation,
-                        )
-                        for t in run
-                    )
-                consumed.update(run)
-                run.clear()
-
-            for tag in sorted(self._ledger):
-                state = self._ledger[tag]
-                if state.is_ack_safe:
-                    if not blocked:
-                        run.append(tag)
-                        continue
-                    # Stranded behind a blocker: hold briefly hoping the
-                    # blocker resolves, then fall back to an individual ack so
-                    # one slow handler cannot pin its siblings forever.
-                    if self._coalesce and not force_individual and self._hold.get(tag, 0) < self._max_hold:
-                        self._hold[tag] = self._hold.get(tag, 0) + 1
-                        continue
-                    commands.append(
-                        SettlementCommand(
-                            kind=SettlementAction.ACK,
-                            delivery_tag=tag,
-                            multiple=False,
-                            covers=(tag,),
-                            generation=self._generation,
-                        )
-                    )
-                    consumed.add(tag)
-                elif state is DeliveryState.NACK or state is DeliveryState.REJECT:
-                    # Settles this tag on the wire before anything above it,
-                    # so it does NOT block a later cumulative range.
-                    flush_run()
-                    commands.append(
-                        SettlementCommand(
-                            kind=SettlementAction.NACK if state is DeliveryState.NACK else SettlementAction.REJECT,
-                            delivery_tag=tag,
-                            requeue=self._requeue.get(tag, state is DeliveryState.NACK),
-                            covers=(tag,),
-                            generation=self._generation,
-                        )
-                    )
-                    consumed.add(tag)
-                else:  # OUTSTANDING / RETRY_PENDING / FAILED / CANCELLED
-                    flush_run()
-                    blocked = True
-            flush_run()
-
-            for tag in consumed:
-                self._ledger.pop(tag, None)
-                self._hold.pop(tag, None)
-                self._requeue.pop(tag, None)
-                self._registered_at.pop(tag, None)
-            self._settled_count += len(consumed)
+            commands, covered = self._plan_locked(force_individual=force_individual)
+            self._settle_tags_locked(covered)
+            self._settled_count += len(covered)
             self._frames_sent += len(commands)
-            commands.sort(key=lambda c: c.delivery_tag)
+            self._coalesced_count += sum(len(c.covers) for c in commands if c.multiple and len(c.covers) > 1)
             return commands
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -768,6 +967,9 @@ class SettlementCoordinator:
             self._hold.clear()
             self._requeue.clear()
             self._registered_at.clear()
+            # Any in-flight batch is void: its generation no longer matches,
+            # so commit/fail/release for it become no-ops.
+            self._reserved.clear()
             self._last_registered = 0
             self._generation += 1
             self._invalidations += 1
@@ -775,11 +977,33 @@ class SettlementCoordinator:
             return dropped
 
     def drain_plan(self) -> list[SettlementCommand]:
-        """Shutdown: emit everything already approved (individually — there is
-        no reason to wait for a prefix), and leave every blocking delivery
-        UNACKED for redelivery. Never acks merely to empty the ledger
-        (invariant I6)."""
+        """Shutdown: plan AND settle everything already approved.
+
+        Individual frames only — at shutdown there is no reason to wait for a
+        prefix. Every blocking delivery is left UNACKED for redelivery; this
+        never acks merely to empty the ledger (invariant I6). Same caveat as
+        :meth:`plan`: use :meth:`prepare_drain` for a real channel.
+        """
         return self.plan(force_individual=True)
+
+    def prepare_drain(self) -> SettlementBatch:
+        """Shutdown equivalent of :meth:`prepare`: individual frames only."""
+        return self.prepare(force_individual=True)
+
+
+def _emit_one(
+    command: SettlementCommand,
+    *,
+    ack: Callable[[int, bool], Any],
+    nack: Callable[[int, bool], Any],
+    reject: Callable[[int, bool], Any],
+) -> None:
+    if command.kind is SettlementAction.ACK:
+        ack(command.delivery_tag, command.multiple)
+    elif command.kind is SettlementAction.NACK:
+        nack(command.delivery_tag, command.requeue)
+    else:
+        reject(command.delivery_tag, command.requeue)
 
 
 def apply_commands(
@@ -789,26 +1013,156 @@ def apply_commands(
     nack: Callable[[int, bool], Any],
     reject: Callable[[int, bool], Any],
 ) -> list[tuple[SettlementCommand, BaseException | None]]:
-    """Emit *commands* through three callables (``(tag, multiple)`` for ack,
-    ``(tag, requeue)`` for nack/reject). Returns ``(command, error)`` per
-    command — the first transport error does NOT stop later commands on
-    other tags, but every failure is visible to the caller."""
+    """Emit *commands* in order, STOPPING at the first failure.
+
+    Three callables: ``(tag, multiple)`` for ack, ``(tag, requeue)`` for
+    nack/reject. Returns ``(command, error)`` for every command that was
+    attempted; commands after a failure are simply absent from the result,
+    because they were deliberately not sent.
+
+    Stopping is not a convenience, it is the correctness rule. A coalesced
+    plan can read ``ack(102, multiple=True)``, ``nack(103)``,
+    ``ack(105, multiple=True)``. If the nack fails and the last frame still
+    goes out, the broker acknowledges everything unacknowledged up to 105 --
+    including tag 103, the delivery that was supposed to be requeued. The
+    message is then lost rather than retried.
+
+    Prefer :func:`emit_batch`, which additionally keeps the coordinator's
+    ledger in step with what actually reached the broker.
+    """
     results: list[tuple[SettlementCommand, BaseException | None]] = []
     for cmd in commands:
         try:
-            if cmd.kind is SettlementAction.ACK:
-                ack(cmd.delivery_tag, cmd.multiple)
-            elif cmd.kind is SettlementAction.NACK:
-                nack(cmd.delivery_tag, cmd.requeue)
-            else:
-                reject(cmd.delivery_tag, cmd.requeue)
-            results.append((cmd, None))
+            _emit_one(cmd, ack=ack, nack=nack, reject=reject)
         except Exception as exc:
             results.append((cmd, exc))
+            break
+        results.append((cmd, None))
     return results
 
 
+def emit_batch(
+    batch: SettlementBatch,
+    coordinator: SettlementCoordinator,
+    *,
+    ack: Callable[[int, bool], Any],
+    nack: Callable[[int, bool], Any],
+    reject: Callable[[int, bool], Any],
+) -> EmissionReport:
+    """Drive a prepared batch onto the wire: emit, observe, then commit.
+
+    This is the only supported way to settle a coalesced plan against a real
+    channel. For each command in order:
+
+    * emit it;
+    * on success, commit its tags in the coordinator;
+    * on failure, stop. The failed command's tags become UNRESOLVED (never
+      re-emitted, left for the broker to redeliver), every later command is
+      reported as ``not_attempted`` and its tags are released back to the
+      ledger, and a failed nack/reject invalidates the generation.
+
+    The ledger therefore only ever moves forward on evidence that a frame
+    actually reached the broker, and a cumulative ack can never follow a
+    settlement that did not land.
+    """
+    emitted: list[SettlementCommand] = []
+    for index, cmd in enumerate(batch.commands):
+        try:
+            _emit_one(cmd, ack=ack, nack=nack, reject=reject)
+        except Exception as exc:
+            rest = batch.commands[index + 1 :]
+            invalidated = coordinator.fail_command(batch, cmd, exc)
+            if not invalidated:
+                coordinator.release_commands(batch, rest)
+            return EmissionReport(
+                batch_id=batch.batch_id,
+                generation=batch.generation,
+                emitted=tuple(emitted),
+                failed=cmd,
+                error=exc,
+                not_attempted=tuple(rest),
+                invalidated=invalidated,
+                unresolved_tags=cmd.covers,
+            )
+        coordinator.commit_command(batch, cmd)
+        emitted.append(cmd)
+    return EmissionReport(
+        batch_id=batch.batch_id,
+        generation=batch.generation,
+        emitted=tuple(emitted),
+    )
+
+
 # ── Selected settlement runners (used by both brokers + TestBroker) ────────
+
+
+async def _emit_one_async(
+    command: SettlementCommand,
+    *,
+    ack: Callable[[int, bool], Awaitable[Any]],
+    nack: Callable[[int, bool], Awaitable[Any]],
+    reject: Callable[[int, bool], Awaitable[Any]],
+) -> None:
+    if command.kind is SettlementAction.ACK:
+        await ack(command.delivery_tag, command.multiple)
+    elif command.kind is SettlementAction.NACK:
+        await nack(command.delivery_tag, command.requeue)
+    else:
+        await reject(command.delivery_tag, command.requeue)
+
+
+async def emit_batch_async(
+    batch: SettlementBatch,
+    coordinator: SettlementCoordinator,
+    *,
+    ack: Callable[[int, bool], Awaitable[Any]],
+    nack: Callable[[int, bool], Awaitable[Any]],
+    reject: Callable[[int, bool], Awaitable[Any]],
+) -> EmissionReport:
+    """Awaitable twin of :func:`emit_batch`, with identical guarantees.
+
+    This is what makes the protocol implementable on aio-pika at all. A
+    synchronous driver can only call something that schedules the settlement
+    and returns, so it learns nothing about whether the frame landed and
+    cannot decide whether the next one is safe. Awaiting each command gives
+    the emit/observe/commit loop the evidence it needs.
+
+    Cancellation is treated as a failure of the command in flight, because
+    its outcome is genuinely unknown: the frame may or may not have been
+    written. The tags become unresolved rather than settled, and the
+    remaining commands are withheld.
+    """
+    emitted: list[SettlementCommand] = []
+    for index, cmd in enumerate(batch.commands):
+        try:
+            await _emit_one_async(cmd, ack=ack, nack=nack, reject=reject)
+        except (Exception, asyncio.CancelledError) as exc:
+            rest = batch.commands[index + 1 :]
+            invalidated = coordinator.fail_command(batch, cmd, exc)
+            if not invalidated:
+                coordinator.release_commands(batch, rest)
+            report = EmissionReport(
+                batch_id=batch.batch_id,
+                generation=batch.generation,
+                emitted=tuple(emitted),
+                failed=cmd,
+                error=exc,
+                not_attempted=tuple(rest),
+                invalidated=invalidated,
+                unresolved_tags=cmd.covers,
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                # Never swallow cancellation: the ledger is consistent now,
+                # so let the task actually die.
+                raise
+            return report
+        coordinator.commit_command(batch, cmd)
+        emitted.append(cmd)
+    return EmissionReport(
+        batch_id=batch.batch_id,
+        generation=batch.generation,
+        emitted=tuple(emitted),
+    )
 
 
 def settle_many_sync(

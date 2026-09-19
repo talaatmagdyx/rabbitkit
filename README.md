@@ -342,9 +342,14 @@ management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
 cap, quorum queues and a quorum retry chain — and report anything they cannot
 verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
 default, and a failing delay-queue handoff backs off instead of hot-looping.
-`CoalescingAcker` is the only place a cumulative `basic.ack(multiple=True)`
-may originate: it knows every delivery on the channel and coalesces only
-through a completed prefix, so a still-running sibling is never acked early.
+`CoalescingAcker` (and `AsyncCoalescingAcker`) is the only place a cumulative
+`basic.ack(multiple=True)` may originate: it knows every delivery on the
+channel and coalesces only through a completed prefix, so a still-running
+sibling is never acked early. Settlement follows a **plan / emit / commit**
+protocol — the ledger advances only for frames the broker actually accepted,
+and emission stops at the first failure, because a cumulative ack that
+follows a nack which never landed would acknowledge the very delivery meant
+to be requeued.
 Every bulk path emits bounded-label metrics
 (`rabbitkit_bulk_publish_items_total{status,reason}`,
 `rabbitkit_settlement_items_total{action,status}`,

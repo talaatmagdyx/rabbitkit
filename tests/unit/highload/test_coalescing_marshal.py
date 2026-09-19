@@ -251,8 +251,18 @@ class TestEmitFailuresAreLogged:
         assert any("delivery_tag=2" in m for m in messages), messages
         assert any("covering 2 tag(s)" in m for m in messages), messages
 
-    def test_every_failing_command_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        def boom(*_: Any) -> None:
+    def test_emission_stops_at_the_first_failure(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A failure ends the flush; later commands are withheld, not sent.
+
+        Before the commit protocol every command was attempted, so all three
+        failed and all three were logged. That is precisely the unsafe
+        behaviour: a frame whose correctness depends on an earlier one must
+        never follow it onto the wire once that earlier one failed.
+        """
+        attempted: list[tuple[str, int]] = []
+
+        def boom(tag: int, _flag: bool) -> None:
+            attempted.append(("emit", tag))
             raise RuntimeError("down")
 
         acker = CoalescingAcker(
@@ -270,11 +280,13 @@ class TestEmitFailuresAreLogged:
         with caplog.at_level(logging.ERROR):
             report = acker.flush()
 
-        assert len(report.errors) == 3
+        assert len(attempted) == 1, f"only the first command may be tried, got {attempted}"
+        assert len(report.errors) == 1
+        assert report.emitted == ()
+        assert len(report.not_attempted) == 2, "the two later commands were withheld"
+        assert report.settled_tags == 0, "nothing reached the broker, so nothing is settled"
         logged = [r.getMessage() for r in caplog.records if "failed to emit" in r.getMessage()]
-        assert len(logged) == 3
-        assert any("emit nack" in m for m in logged)
-        assert any("emit reject" in m for m in logged)
+        assert len(logged) == 1
 
     def test_the_generation_is_in_the_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
         def boom(*_: Any) -> None:
@@ -374,3 +386,40 @@ class TestSiblingHelpersShareTheRule:
                 MessageEnvelope(routing_key="q", body=b"x")
             )
         assert [w for w in caught if "no marshal=" in str(w.message)] == []
+
+
+class TestInvalidationIsLogged:
+    def test_a_failed_nack_invalidates_and_says_so(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A failed nack may still be unacknowledged at the broker, so every
+        later cumulative ack on the channel is untrustworthy. The acker burns
+        the generation and the log has to say why."""
+
+        def ack_ok(_tag: int, _multiple: bool) -> None:
+            return None
+
+        def nack_boom(_tag: int, _requeue: bool) -> None:
+            raise ConnectionError("channel gone")
+
+        acker = CoalescingAcker(
+            ack_fn=ack_ok,
+            nack_fn=nack_boom,
+            reject_fn=ack_ok,
+            config=BatchAckConfig(batch_size=1000, flush_interval_ms=0),
+        )
+        for tag in (101, 102, 103, 104, 105):
+            acker.register(tag)
+        acker.complete(101)
+        acker.complete(102)
+        acker.fail(103, requeue=True)
+        acker.complete(104)
+        acker.complete(105)
+        gen = acker.generation
+
+        with caplog.at_level(logging.WARNING):
+            report = acker.flush()
+
+        assert report.invalidated is True
+        assert acker.generation == gen + 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("withheld 1 command" in m for m in messages), messages
+        assert any("invalidated generation" in m for m in messages), messages

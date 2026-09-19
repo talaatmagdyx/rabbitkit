@@ -509,7 +509,9 @@ class TestApplyCommands:
             SettlementCommand(kind=SettlementAction.REJECT, delivery_tag=5, requeue=False, covers=(5,)),
         ]
         results = apply_commands(cmds, ack=ack, nack=nack, reject=reject)
-        assert log == [("ack", 3, True), ("reject", 5, False)]
+        # The reject MUST NOT be emitted: it follows a nack that failed, and
+        # anything after a failed settlement may settle the wrong delivery.
+        assert log == [("ack", 3, True)]
+        assert len(results) == 2, "emission stops at the first failure"
         assert results[0][1] is None
         assert isinstance(results[1][1], RuntimeError)
-        assert results[2][1] is None

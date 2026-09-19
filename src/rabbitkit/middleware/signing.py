@@ -177,7 +177,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.message import RabbitMessage
@@ -357,13 +357,27 @@ class SigningConfig:
     secret_key: str | bytes
     algorithm: str = "hmac-sha256"
     header_name: str = "x-rabbitkit-signature"
-    reject_unsigned: bool = False
+    # 0.16: BOTH default to True — signing now fails CLOSED.
+    # reject_unsigned=False meant a message with the signature header simply
+    # DELETED was accepted, silently and without logging. An attacker forged
+    # nothing; they removed a header. The canonical example in
+    # docs/security.md used the plain constructor, so anyone following the
+    # documentation had signing that enforced nothing.
+    reject_unsigned: bool = True
     reject_invalid: bool = True
     # Replay protection. H4: default tightened from 300s to 60s — shrink
     # further for payments/high-value traffic.
     max_skew: float = 60.0
     require_freshness: bool = True
     nonce_cache: NonceCache | None = None
+    #: Additional keys ACCEPTED on verify but never used to sign. This is what
+    #: makes rotation possible: publish with the new `secret_key` while old
+    #: keys stay verifiable until in-flight messages drain, then drop them.
+    #: Without it, rotating required every publisher and consumer to flip
+    #: atomically, and every message signed with the old key that was still in
+    #: flight failed verification and was dead-lettered PERMANENTLY. The
+    #: documented advice to "rotate periodically" was unfollowable in practice.
+    previous_keys: tuple[str | bytes, ...] = ()
 
     def __repr__(self) -> str:
         """Mask the shared secret.
@@ -379,7 +393,32 @@ class SigningConfig:
 
         return _masked_repr(self, secret_fields=("secret_key",))
 
+    #: Shortest key accepted. HMAC's security rests on key entropy; the docs
+    #: have always said "at least 32 bytes" but nothing enforced it, so
+    #: `secret_key=os.environ.get("SIGNING_KEY", "")` with the variable unset
+    #: produced a deployment where signing appeared to work end to end while
+    #: every message was forgeable by anyone who read the source.
+    MIN_KEY_BYTES: ClassVar[int] = 32
+
     def __post_init__(self) -> None:
+        key = self.secret_key.encode() if isinstance(self.secret_key, str) else self.secret_key
+        if not key:
+            raise ValueError(
+                "SigningConfig.secret_key is empty. An empty key still produces a valid-looking "
+                "HMAC, so signing would appear to work while every message was forgeable."
+            )
+        if len(key) < self.MIN_KEY_BYTES:
+            raise ValueError(
+                f"SigningConfig.secret_key is {len(key)} bytes; at least {self.MIN_KEY_BYTES} are "
+                "required. Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        for i, prev in enumerate(self.previous_keys):
+            pk = prev.encode() if isinstance(prev, str) else prev
+            if len(pk) < self.MIN_KEY_BYTES:
+                raise ValueError(
+                    f"SigningConfig.previous_keys[{i}] is {len(pk)} bytes; "
+                    f"at least {self.MIN_KEY_BYTES} are required."
+                )
         if self.algorithm not in ("hmac-sha256", "hmac-sha512"):
             raise ValueError(f"Unsupported algorithm: {self.algorithm}. Use 'hmac-sha256' or 'hmac-sha512'.")
         if self.max_skew <= 0:
@@ -407,6 +446,11 @@ class SigningMiddleware(BaseMiddleware):
     def __init__(self, config: SigningConfig) -> None:
         self._config = config
         self._key = config.secret_key.encode("utf-8") if isinstance(config.secret_key, str) else config.secret_key
+        # Signing always uses self._key; verification accepts any of these.
+        self._accepted_keys: tuple[bytes, ...] = (
+            self._key,
+            *(k.encode("utf-8") if isinstance(k, str) else k for k in config.previous_keys),
+        )
         self._hash_name = "sha256" if config.algorithm == "hmac-sha256" else "sha512"
         # Default to the in-memory cache so replay protection is functional
         # out of the box for a single process; callers may inject a shared
@@ -493,9 +537,16 @@ class SigningMiddleware(BaseMiddleware):
         return hmac.new(self._key, signed, getattr(hashlib, self._hash_name)).hexdigest()
 
     def _verify_signature(self, body: bytes, signature: str | bytes) -> bool:
-        """Verify HMAC signature using constant-time comparison."""
-        expected = self._compute_signature(body)
-        return _const_time_eq(expected, signature)
+        """Verify against every accepted key, constant-time throughout.
+
+        Every candidate is compared (no early exit) so the number of keys
+        tried is not observable in the response time.
+        """
+        ok = False
+        for key in self._accepted_keys:
+            expected = hmac.new(key, body, getattr(hashlib, self._hash_name)).hexdigest()
+            ok |= _const_time_eq(expected, signature)
+        return ok
 
     def _verify_fresh_signature(
         self,
@@ -509,18 +560,22 @@ class SigningMiddleware(BaseMiddleware):
         content_encoding: str | None = None,
         reply_to: str | None = None,
     ) -> bool:
-        """Verify replay-protected, route-bound signature (H3) using
-        constant-time comparison."""
-        expected = self._compute_fresh_signature(
-            timestamp,
-            nonce,
-            body,
-            exchange=exchange,
-            routing_key=routing_key,
-            content_encoding=content_encoding,
-            reply_to=reply_to,
-        )
-        return _const_time_eq(expected, signature)
+        """Verify the replay-protected, route-bound signature (H3) against
+        every accepted key, constant-time throughout.
+
+        This is the DEFAULT path (``require_freshness=True``), and it is
+        taken whenever the freshness headers are present — even if this
+        consumer has `require_freshness=False`. Rotation therefore has to be
+        implemented here, not only on the legacy path, or a key roll would
+        still dead-letter every in-flight message.
+        """
+        route = self._canonical_route(exchange, routing_key, content_encoding, reply_to)
+        signed = f"{timestamp}:{nonce}:".encode() + route + body
+        ok = False
+        for key in self._accepted_keys:
+            expected = hmac.new(key, signed, getattr(hashlib, self._hash_name)).hexdigest()
+            ok |= _const_time_eq(expected, signature)
+        return ok
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -619,7 +674,13 @@ class SigningMiddleware(BaseMiddleware):
                     f"Signature timestamp outside max_skew ({skew:.1f}s > {self._config.max_skew}s)"
                 )
 
-            if self._config.reject_invalid and not self._verify_fresh_signature(
+            # Monitoring mode (reject_invalid=False) does not COMPUTE the
+            # signature, so recording the nonce below would let an
+            # unauthenticated observer burn a captured nonce and get the
+            # genuine message rejected as a replay. Verify explicitly so the
+            # outcome is known either way, and only touch the nonce cache
+            # when the message is authentic.
+            verified = self._verify_fresh_signature(
                 timestamp,
                 str(nonce),
                 message.body,
@@ -628,12 +689,30 @@ class SigningMiddleware(BaseMiddleware):
                 routing_key=message.routing_key,
                 content_encoding=message.content_encoding,
                 reply_to=message.reply_to,
-            ):
-                raise InvalidSignatureError("Message signature verification failed")
+            )
+            if not verified:
+                if self._config.reject_invalid:
+                    raise InvalidSignatureError("Message signature verification failed")
+                # Monitoring mode: report and pass through, but do NOT record
+                # the nonce for a message we could not authenticate.
+                logger.warning(
+                    "Signature verification FAILED for a message on %r (monitoring mode: "
+                    "passing it through). Set reject_invalid=True to enforce.",
+                    message.routing_key,
+                )
+                return
 
             # Nonce replay check — mark after signature verifies so bogus
             # messages can't burn nonces. TTL covers the replay window.
-            if not self._nonce_cache.seen(str(nonce), self._config.max_skew):
+            # The acceptance window is `abs(now - ts) <= max_skew`, i.e. it is
+            # 2 * max_skew WIDE (max_skew into the past AND the future). The
+            # TTL is measured from FIRST RECEIPT, so recording for only
+            # max_skew let the nonce expire while the timestamp was still
+            # acceptable — one free replay per window for any message received
+            # early relative to its timestamp, which is exactly what the
+            # future half of the window exists for (publisher clock ahead,
+            # NTP drift, VM clock). Cover the whole window.
+            if not self._nonce_cache.seen(str(nonce), self._config.max_skew * 2):
                 # Duplicate nonce. H1: a BROKER REDELIVERY (redelivered=True) of
                 # an unacked message legitimately carries the same nonce — a
                 # transient handler failure → nack/requeue → redelivery must not

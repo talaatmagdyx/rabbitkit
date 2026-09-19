@@ -670,7 +670,7 @@ class TestPublishWithMiddlewares:
         every broker.publish() call — the primary producer API."""
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
 
         captured: list[MessageEnvelope] = []
@@ -745,7 +745,7 @@ class TestPublishWithMiddlewares:
         from rabbitkit.highload.backpressure import FlowController
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
         broker.flow_controller = FlowController()
 
@@ -768,7 +768,7 @@ class TestPublishWithMiddlewares:
         the raw transport — batching and signing are independent features."""
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker, _mock_transport = await self._start_broker(middlewares=[signing_mw])
 
         captured: list[MessageEnvelope] = []
@@ -793,7 +793,7 @@ class TestPublishWithMiddlewares:
         publish), matching the route-level publish chain's caching behavior."""
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker, mock_transport = await self._start_broker(middlewares=[signing_mw])
         mock_transport.publish = AsyncMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
 
@@ -2448,7 +2448,7 @@ class TestSigningRetryConflictAsync:
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
         broker = AsyncBroker()
-        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t-key" + "-padded-out-to-32-bytes!"))
 
         @broker.subscriber(queue="orders", retry=RetryConfig(max_retries=1, delays=(5,)), middlewares=[signing])
         async def handle(body: bytes) -> None:

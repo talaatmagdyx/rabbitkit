@@ -291,7 +291,7 @@ class TestSigningCompressionComposition:
     the fix are required together for the canonical order to actually work.
     """
 
-    SECRET = "h7-test-secret"
+    SECRET = "test-secret-key" + "-padded-to-32-bytes"
 
     def _make_middlewares(self) -> tuple[Any, Any]:
         from rabbitkit.core.config import CompressionConfig
@@ -387,7 +387,9 @@ def test_on_receive_exception_bypasses_retry_middleware() -> None:
     )
     # No signature header on the incoming message + reject_unsigned=True ->
     # on_receive raises InvalidSignatureError.
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="s3cr3t", reject_unsigned=True))
+    signing_mw = SigningMiddleware(
+        SigningConfig(secret_key="s3cr3t-key" + "-padded-out-to-32-bytes!", reject_unsigned=True)
+    )
 
     reg = SubscriberRegistry()
 

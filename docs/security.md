@@ -124,7 +124,24 @@ Do not let external callers control routing keys directly. A caller that control
 
 ## HMAC Signing
 
-`SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks. Configure it with a secret that is at least 32 bytes:
+`SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks.
+
+**Since 0.16 signing fails closed.** `reject_unsigned` and `reject_invalid` both
+default to `True`. Previously `reject_unsigned` defaulted to `False`, so a
+message whose signature header was simply *deleted* was accepted silently and
+without logging — an attacker forged nothing, they removed a header. The example
+below used the plain constructor, so anyone following this page had signing that
+enforced nothing.
+
+A key shorter than 32 bytes is now **refused at construction**. The page always
+said "at least 32 bytes"; nothing enforced it, so
+`secret_key=os.environ.get("SIGNING_KEY", "")` with the variable unset produced a
+deployment where signing appeared to work end to end while every message was
+forgeable by anyone who read the source. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 ```python
 from rabbitkit.experimental import SigningConfig
@@ -132,6 +149,27 @@ from rabbitkit.middleware.signing import SigningMiddleware
 
 mw = SigningMiddleware(config=SigningConfig(secret_key="a-long-random-secret-at-least-32-bytes"))
 ```
+
+### Rotating the key
+
+`previous_keys` holds keys that are **accepted on verify but never used to
+sign**, which is what makes rotation possible:
+
+```python
+SigningConfig(
+    secret_key=NEW_KEY,            # everything is signed with this
+    previous_keys=(OLD_KEY,),      # still verifies while messages drain
+)
+```
+
+Publish with the new key, keep the old one accepted until in-flight messages
+drain, then drop it. Before 0.16 there was only one key, so rotating required
+every publisher and consumer to flip atomically — and any message signed with
+the old key that was still in flight failed verification and was dead-lettered
+permanently. The advice to rotate was unfollowable in practice.
+
+Every accepted key is compared without an early exit, so the number of keys
+configured is not observable in the response time.
 
 The default (`require_freshness=True`) signature covers `timestamp`, `nonce`,
 `exchange`, `routing_key`, `content_encoding`, and `reply_to`, in addition to

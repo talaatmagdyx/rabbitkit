@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.2] — 2026-09-20
+
+Supply-chain and CI hardening. No code changes to the package itself.
+
+### Security
+
+- **Release authorization.** The `pypi` environment had zero protection
+  rules and the default branch was unprotected, so any credential with write
+  access could tag and publish a wheel with no review. Trusted Publishing
+  removes the *token* to steal, not the *authorization* question. The
+  environment now requires a reviewer and restricts deployments to `v*` tags;
+  `main` requires a pull request with passing checks and refuses force pushes.
+- **Actions holding elevated tokens are pinned to commit hashes.** The PyPI
+  publish step tracked `release/v1`, a mutable *branch*, while holding the
+  OIDC token — a compromise of that branch changes what runs in the release
+  job on the next tag. Same treatment for the code-scanning and Pages-deploy
+  actions, which hold `security-events: write` and `id-token: write`.
+- **Docs workflow permissions are now per job.** `pages: write` and
+  `id-token: write` sat at workflow level, so the build job inherited them
+  while installing the full unpinned toolchain. One compromised dev
+  dependency could mint an OIDC token. Only the deploy job needs them.
+- **Template injection in the soak workflow.** Two `workflow_dispatch` inputs
+  were interpolated straight into a `run:` block, where the Actions templater
+  substitutes before the shell parses. Moved to `env:` and quoted.
+- **The dependency audit now covers the dev toolchain.** It audited `[all]`
+  only, so pytest, mkdocs, ruff, mypy, testcontainers and docker — the
+  packages that actually execute in CI against checked-out code — were never
+  scanned.
+- **Three dependency floors permitted known-vulnerable resolutions.** CI
+  could not see this because it always resolves the newest version in range.
+  Floors verified against OSV per version:
+
+  | Package | Was | Advisories at the old floor | Now |
+  |---|---|---|---|
+  | `aiohttp` | `>=3.9.0` | 76 | `>=3.14.3` |
+  | `starlette` | `>=0.37.0` | 14 | `>=1.4.0` |
+  | `pydantic` | `>=2.0.0` | 2 | `>=2.4.0` |
+
+  All three are optional extras. The upper bounds are unchanged, and CI was
+  already testing above every new floor.
+
+### Fixed
+
+- **The chaos gate could fail on a port collision.** `RK_CHAOS_PORT` used
+  32778/32777, inside Docker's ephemeral range (32768-60999), so a
+  testcontainer from the preceding step could randomly publish on exactly
+  that port. Reachable since 0.15.0 disabled the Ryuk reaper (needed to stop
+  it wedging the job), which lets leaked containers linger. Moved to
+  5699/5698, and a bind failure now names the container holding the port.
+
 ## [0.15.1] — 2026-09-20
 
 Security hardening from a full review of the package. No API changes.

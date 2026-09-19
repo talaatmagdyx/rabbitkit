@@ -64,3 +64,17 @@ class TestPolicies:
         client, req = _client()
         client.delete_policy("p", "prod")
         req.assert_called_with("DELETE", "/policies/prod/p")
+
+
+class TestCloseConnection:
+    def test_close_connection(self) -> None:
+        client, req = _client()
+        client.close_connection("rabbit@host-1.2.3.4:5672 -> 5.6.7.8:9")
+        method, path = req.call_args[0][:2]
+        assert method == "DELETE"
+        assert path == "/connections/rabbit%40host-1.2.3.4%3A5672%20-%3E%205.6.7.8%3A9"
+
+    def test_close_connection_encodes_the_name(self) -> None:
+        client, req = _client()
+        client.close_connection("a/b c")
+        assert req.call_args[0][1] == "/connections/a%2Fb%20c"

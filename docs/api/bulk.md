@@ -27,6 +27,11 @@ safety invariants.
 ::: rabbitkit.core.settlement.SettlementCoordinator
 ::: rabbitkit.core.settlement.SettlementCommand
 ::: rabbitkit.core.types.DeliveryState
+::: rabbitkit.core.settlement.CoordinatorError
+::: rabbitkit.core.settlement.UnknownDeliveryError
+::: rabbitkit.core.settlement.StaleGenerationError
+::: rabbitkit.core.settlement.ContradictorySettlementError
+::: rabbitkit.core.settlement.LedgerFullError
 ::: rabbitkit.highload.batch.CoalescingAcker
 ::: rabbitkit.highload.batch.CoalescingFlushReport
 ::: rabbitkit.highload.batch.CoalescingAckerGroup

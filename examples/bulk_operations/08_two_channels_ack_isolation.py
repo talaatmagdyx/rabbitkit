@@ -61,6 +61,8 @@ def make_acker(channel: Any) -> CoalescingAcker:
     loop = loop_ref["loop"]
 
     def emit(coro: Any) -> None:
+        # Safe on the owner thread: marshal= below moves the interval flush
+        # off the threading.Timer thread and onto the event loop.
         loop.create_task(coro)
 
     def ack_fn(tag: int, multiple: bool) -> None:
@@ -74,6 +76,7 @@ def make_acker(channel: Any) -> CoalescingAcker:
         reject_fn=lambda t, r: emit(channel.basic_reject(delivery_tag=t, requeue=r)),
         config=BatchAckConfig(batch_size=1000, flush_interval_ms=200),
         channel_key=channel,  # ← turns "one acker per channel" into an invariant
+        marshal=loop.call_soon_threadsafe,  # ← required whenever the timer is on
     )
 
 

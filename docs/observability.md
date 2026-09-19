@@ -175,6 +175,31 @@ Alerting guidance:
   cumulative-ack prefix. Safe (nothing is acked early), but unacked messages
   accumulate; alert before `max_pending` is reached.
 
+## Known gap: `reconnects_total` undercounts on AsyncBroker
+
+`rabbitkit_reconnects_total` (and anything else wired to
+`transport.on_reconnect`) is driven by aio-pika's `reconnect_callbacks`.
+Verified against a live broker on aio-pika 9.6: when the **broker** closes the
+connection, aio-pika recovers underneath the *same* `RobustConnection` object
+without re-running its counted connect path, so `connection_attempt` never
+advances and the callbacks never fire — even though consumers are restored and
+traffic resumes. The counter stays at zero for that (very common) case.
+
+What still works:
+
+- The **sync** transport fires its own reconnect hook and is unaffected.
+- On async, a connection rabbitkit *replaces* itself (a rebuilt publisher
+  connection, or a lazy re-create after close) does fire the hook — the pool
+  attaches the callbacks to every connection it creates, and a connection
+  created after `connect()` counts as a reconnect.
+
+Until this is resolved upstream, alert on connection churn using
+`rabbitkit_channel_rebuilds_total`, `rabbitkit_settlement_items_total{status="stale"}`
+and the broker's own `connection_closed` metrics rather than
+`reconnects_total` alone. Do not hang correctness-critical wiring off
+`on_reconnect` on async: `CoalescingAcker` does not need it, because a
+rebuilt channel is a new object and therefore gets a fresh ledger.
+
 ## High-cardinality routing keys / queue names
 
 Every `queue` label above uses the bound queue name specifically to avoid

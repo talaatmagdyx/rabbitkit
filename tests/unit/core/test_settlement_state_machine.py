@@ -555,7 +555,10 @@ class TestConcurrentMutation:
             thread.join()
         stop.set()
         planner_thread.join()
-        emitted.extend(coord.plan())
+        # drain_plan() forces individual acks, so it never leaves work behind
+        # in the max_hold buffer the way a single plan() can when the planner
+        # thread happened to exit before its second pass.
+        emitted.extend(coord.drain_plan())
 
         covered = [tag for c in emitted for tag in c.covers]
         assert straggler not in covered, "the unfinished delivery was acked"

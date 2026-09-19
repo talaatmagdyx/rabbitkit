@@ -181,6 +181,62 @@ A cumulative ack through tag *T* is emitted only when every still-outstanding
 lower tag is approved for success. If your process cannot guarantee that it
 registers every delivery on the channel, construct with `coalesce=False`.
 
+### One acker per channel
+
+Delivery tags are a **per-channel counter**: tag 7 on channel A and tag 7 on
+channel B are different messages. rabbitkit gives every subscriber queue its
+own channel, so a consumer with several queues needs several ledgers:
+
+```
+Channel A → CoalescingAcker A → SettlementCoordinator A
+Channel B → CoalescingAcker B → SettlementCoordinator B
+```
+
+Feeding two channels into one acker would let a cumulative ack computed from
+A's completed prefix settle B's messages. Pass `channel_key=` and that
+convention becomes an enforced invariant: a delivery from any other channel
+raises `ChannelMismatchError` at `register()` time, before it can corrupt the
+ledger. An unbound acker binds to the first key it is given.
+
+`CoalescingAckerGroup` does the bookkeeping for you — one acker per channel,
+created on demand from your factory:
+
+```python
+from rabbitkit import BatchAckConfig, CoalescingAcker, CoalescingAckerGroup
+
+def build(channel):                     # only you know how to reach your transport
+    return CoalescingAcker(
+        ack_fn=lambda t, m: emit(channel.basic_ack(delivery_tag=t, multiple=m)),
+        nack_fn=lambda t, r: emit(channel.basic_nack(delivery_tag=t, requeue=r)),
+        reject_fn=lambda t, r: emit(channel.basic_reject(delivery_tag=t, requeue=r)),
+        config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
+        channel_key=channel,
+    )
+
+group = CoalescingAckerGroup(factory=build)
+
+@broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+async def handle(body: bytes, msg: RabbitMessage) -> None:
+    channel = msg.raw_message.channel
+    group.register(channel, msg.delivery_tag)   # BEFORE the work
+    ...
+    group.complete(channel, msg.delivery_tag)
+```
+
+| Call | Effect |
+|---|---|
+| `group.for_channel(ch)` | The acker owning that channel, built on first use |
+| `group.register/complete/fail/retry_pending/release(ch, tag)` | Routed to that channel's ledger, channel-checked |
+| `group.flush()` | Fans out; returns a `GroupFlushReport` aggregating every channel |
+| `group.on_reconnect(ch)` | One channel rebuilt: drop its ledger, retire its acker, return the dropped tags |
+| `group.reset()` | Whole connection rebuilt: drop every ledger |
+| `group.close()` | Drain approved work on every channel, then reject further use |
+
+Channels are dict keys (pika and aio-pika channels are identity-hashable) and
+the group holds a strong reference to each, so call `on_reconnect` or `reset`
+when they are rebuilt. Totals (`settled_total`, `coalesced_total`) survive a
+channel being retired, so a reconnect does not reset your metrics.
+
 The legacy `BatchAcker` now defaults to `mode="individual"`. The old
 `ack(max_tag, multiple=True)` behaviour is `mode="cumulative"` and requires
 `ordered_exclusive_owner=True` as an explicit attestation.
@@ -362,7 +418,8 @@ Runnable, CI-smoke-tested against a real broker:
 — async and sync `publish_many`, streaming `iter_publish`, batch-commit
 `ack_many`, `CoalescingAcker` with out-of-order completion, critical-profile
 preflight against the management API, sanitized headers and handoff backoff
-(no broker needed), and the transactional outbox/inbox.
+(no broker needed), the transactional outbox/inbox, and two-queue
+per-channel ack isolation.
 
 ## Migration notes
 

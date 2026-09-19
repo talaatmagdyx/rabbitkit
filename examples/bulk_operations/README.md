@@ -13,6 +13,7 @@ management plugin on `15672`); `06` needs no broker at all.
 | `05_reliability_profile_preflight.py` | `critical_config`, contradiction detection, `validate_profile`, `policy_templates`, `broker.preflight` against the management API |
 | `06_retry_handoff_and_sanitizer.py` | Sanitized DLQ triage headers (`error_detail`) and bounded retry-handoff backoff / EXHAUSTED hook — no broker needed |
 | `07_transactional_outbox_inbox.py` | Outbox → `publish_many` → inbox with SQLite: stable ids, mark-only-confirmed, duplicate absorbed, ack after commit |
+| `08_two_channels_ack_isolation.py` | Two queues → two channels → two ledgers; `CoalescingAckerGroup` keeps them isolated and `ChannelMismatchError` catches a cross-channel mistake |
 
 ```bash
 docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
@@ -26,6 +27,7 @@ python examples/bulk_operations/01_publish_many_async.py
 - Wire-level ack coalescing without ever acking a still-running sibling: `04`.
 - Proving a critical deployment meets the profile (and seeing what cannot be proven): `05`.
 - Understanding what lands on your DLQ headers and what happens when the retry queue is gone: `06`.
+- Coalescing across **several queues** without one channel's ack touching another's messages: `08`.
 
 There is no "publish by id" or "fetch by id" example because RabbitMQ has no
 such operation: queues are not queryable stores. The selection ("pluck")

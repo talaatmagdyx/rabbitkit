@@ -1078,6 +1078,18 @@ A cumulative `ack(tag, multiple=True)` is emitted only through the longest
 prefix of completed tags; anything behind a still-running or retry-pending
 delivery is acked individually after a bounded hold.
 
+**One acker per channel.** Delivery tags are a per-channel counter, and each
+subscriber queue gets its own channel. `channel_key=` makes that an enforced
+invariant (`ChannelMismatchError` on a foreign delivery), and
+`CoalescingAckerGroup` keeps one acker per channel for you:
+
+```python
+group = CoalescingAckerGroup(factory=build_acker_for)   # build_acker_for(channel)
+group.register(msg.raw_message.channel, msg.delivery_tag)
+group.complete(msg.raw_message.channel, msg.delivery_tag)
+group.on_reconnect(channel)    # that channel was rebuilt; group.reset() for all
+```
+
 See [Bulk Operations & Reliability Profiles](../bulk-operations.md) for the
 full contract and safety invariants.
 

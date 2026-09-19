@@ -112,6 +112,7 @@ python examples/quickstart/01_sync_broker.py
 | `bulk_operations/05_reliability_profile_preflight.py` | `critical_config`, `validate_profile`, `policy_templates`, `broker.preflight` via the management API |
 | `bulk_operations/06_retry_handoff_and_sanitizer.py` | Sanitized DLQ headers + bounded retry-handoff backoff (no broker needed) |
 | `bulk_operations/07_transactional_outbox_inbox.py` | Outbox → `publish_many` → inbox with SQLite; duplicate absorbed; ack after commit |
+| `bulk_operations/08_two_channels_ack_isolation.py` | Per-channel ack isolation: two queues, two ledgers, `CoalescingAckerGroup` + `ChannelMismatchError` guard |
 
 ### Configuration
 | File | Description |

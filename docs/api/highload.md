@@ -25,6 +25,15 @@ coalescing under arbitrary completion order see
 ::: rabbitkit.highload.batch.BatchFlushError
 ::: rabbitkit.highload.batch.BatchClosedError
 
+## Per-channel ack isolation
+
+One acker per channel — delivery tags are a per-channel counter. See
+[Bulk Operations](bulk.md#safe-coalescing) for the contract.
+
+::: rabbitkit.highload.batch.CoalescingAckerGroup
+::: rabbitkit.highload.batch.GroupFlushReport
+::: rabbitkit.highload.batch.ChannelMismatchError
+
 ## Worker Pools
 
 ::: rabbitkit.concurrency.SyncWorkerPool

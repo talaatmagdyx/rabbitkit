@@ -369,3 +369,98 @@ async def test_coalescing_acker_settles_out_of_order_completions(rabbit: dict[st
     assert acker.pending == 0
     await _await_until(lambda: _counts(rabbit, queue) == (0, 0))
     await broker.stop()
+
+
+# ── per-channel ack isolation across two queues ─────────────────────────────
+
+
+async def test_coalescing_acker_group_isolates_two_queues(rabbit: dict[str, str]) -> None:
+    """rabbitkit gives each subscriber queue its own channel, so two queues
+    means two ledgers::
+
+        Channel A → CoalescingAcker A → SettlementCoordinator A
+        Channel B → CoalescingAcker B → SettlementCoordinator B
+
+    Both queues carry the SAME delivery tags (1..N on each channel). Proves
+    every frame emitted on a channel covers only that channel's own tags, a
+    cumulative ack never leaks across, and both queues drain to 0/0.
+    """
+    import random
+
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import BatchAckConfig, ConsumerConfig, WorkerConfig
+    from rabbitkit.core.types import AckPolicy, MessageEnvelope
+    from rabbitkit.highload.batch import CoalescingAcker, CoalescingAckerGroup
+
+    suffix = uuid.uuid4().hex[:8]
+    queue_a, queue_b = f"rel-iso-a-{suffix}", f"rel-iso-b-{suffix}"
+    per_queue = 25
+    broker = AsyncBroker(config=_config(rabbit["url"], consumer=ConsumerConfig(prefetch_count=64)))
+    loop = asyncio.get_running_loop()
+    frames: dict[Any, list[tuple[int, bool]]] = {}
+    tags_seen: dict[str, set[int]] = {queue_a: set(), queue_b: set()}
+    settled = 0
+    done = asyncio.Event()
+
+    def make_acker(channel: Any) -> CoalescingAcker:
+        frames.setdefault(channel, [])
+
+        def ack_fn(tag: int, multiple: bool) -> None:
+            frames[channel].append((tag, multiple))
+            loop.create_task(channel.basic_ack(delivery_tag=tag, multiple=multiple))
+
+        return CoalescingAcker(
+            ack_fn=ack_fn,
+            nack_fn=lambda t, r: loop.create_task(channel.basic_nack(delivery_tag=t, requeue=r)),
+            reject_fn=lambda t, r: loop.create_task(channel.basic_reject(delivery_tag=t, requeue=r)),
+            config=BatchAckConfig(batch_size=1000, flush_interval_ms=0),
+            channel_key=channel,
+        )
+
+    group = CoalescingAckerGroup(factory=make_acker)
+
+    async def handle(msg: _RabbitMessage, queue: str) -> None:
+        nonlocal settled
+        assert msg.delivery_tag is not None
+        channel = msg.raw_message.channel
+        group.register(channel, msg.delivery_tag)  # raises if this channel is not its own
+        tags_seen[queue].add(msg.delivery_tag)
+        await asyncio.sleep(random.uniform(0, 0.05))  # out-of-order completion
+        group.complete(channel, msg.delivery_tag)
+        settled += 1
+        if settled >= 2 * per_queue:
+            done.set()
+
+    @broker.subscriber(queue=queue_a, ack_policy=AckPolicy.MANUAL)
+    async def handle_a(body: bytes, msg: _RabbitMessage) -> None:
+        await handle(msg, queue_a)
+
+    @broker.subscriber(queue=queue_b, ack_policy=AckPolicy.MANUAL)
+    async def handle_b(body: bytes, msg: _RabbitMessage) -> None:
+        await handle(msg, queue_b)
+
+    await broker.start(worker_config=WorkerConfig(worker_count=4))
+    await asyncio.sleep(0.3)
+    envelopes = [MessageEnvelope(routing_key=q, body=b"{}") for q in (queue_a, queue_b) for _ in range(per_queue)]
+    (await broker.publish_many(envelopes)).raise_for_status()
+    await asyncio.wait_for(done.wait(), timeout=60)
+
+    report = group.flush()
+    assert group.channels == 2, "each subscriber queue must get its own channel"
+    assert report.channels == 2
+    assert report.settled_tags == 2 * per_queue
+    assert report.coalesced_tags >= 2  # cumulative acks did happen
+    assert group.pending == 0
+
+    # Both queues saw the same tag numbers — they are different messages.
+    assert tags_seen[queue_a] == tags_seen[queue_b] == set(range(1, per_queue + 1))
+
+    # Every frame on a channel covers only tags that channel actually received.
+    assert len(frames) == 2
+    for emitted in frames.values():
+        assert emitted, "each channel emitted its own frames"
+        assert max(tag for tag, _ in emitted) <= per_queue
+
+    for queue in (queue_a, queue_b):
+        await _await_until(lambda q=queue: _counts(rabbit, q) == (0, 0))
+    await broker.stop()

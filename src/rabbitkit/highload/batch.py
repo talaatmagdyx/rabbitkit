@@ -15,7 +15,15 @@ requires an explicit ordered/exclusive-ownership attestation.
 arbitrary completion order: it wraps a channel-wide
 :class:`~rabbitkit.core.settlement.SettlementCoordinator` that knows every
 outstanding delivery and only emits ``multiple=True`` through a tag when
-every lower outstanding tag is approved.
+every lower outstanding tag is approved. ONE acker per channel — pass
+``channel_key=`` so that is enforced rather than merely intended.
+
+``CoalescingAckerGroup`` owns one acker per channel for you (rabbitkit gives
+each subscriber queue its own channel), so a multi-queue consumer keeps the
+ledgers isolated without hand-rolling the bookkeeping::
+
+    Channel A → CoalescingAcker A → SettlementCoordinator A
+    Channel B → CoalescingAcker B → SettlementCoordinator B
 
 All three are channel-scoped — never cross channels.
 
@@ -64,6 +72,19 @@ logger = logging.getLogger(__name__)
 
 class BatchClosedError(RuntimeError):
     """``add()`` after ``close()`` — the buffer no longer accepts work."""
+
+
+class ChannelMismatchError(RuntimeError):
+    """A delivery from a different channel was handed to a bound
+    :class:`CoalescingAcker`.
+
+    Delivery tags are a PER-CHANNEL counter: tag 7 on channel A and tag 7 on
+    channel B are different messages. Mixing two channels in one ledger makes
+    a cumulative ack computed from channel A's prefix settle channel B's
+    messages — silent, wrong, and unrecoverable. Bind the acker (constructor
+    ``channel_key=`` or the first ``register(..., channel_key=...)``) and this
+    is caught at registration instead.
+    """
 
 
 # ── Flush accounting ─────────────────────────────────────────────────────
@@ -776,6 +797,16 @@ class CoalescingAcker:
     ``reject_fn(tag, requeue)`` — which must marshal onto the transport
     owner (see :class:`BatchAcker`'s notes on pika thread safety).
 
+    **One acker per channel.** The emit callables are bound to one channel
+    and delivery tags are a per-channel counter, so feeding two channels'
+    tags into one acker would ack the wrong messages. Pass ``channel_key``
+    (the channel object itself is the natural key — all pika/aio-pika
+    channels are identity-hashable) and that convention becomes an enforced
+    invariant: a delivery from any other channel raises
+    :class:`ChannelMismatchError` at :meth:`register` time, before it can
+    corrupt the ledger. An unbound acker binds to the first ``channel_key``
+    it is given. :class:`CoalescingAckerGroup` does this for you.
+
     ``on_reconnect()`` invalidates the ledger; old tags are never replayed.
     Sync-only by design: the emit callables are what cross into the
     transport, so an aio-pika user passes ``lambda t, m:
@@ -791,9 +822,11 @@ class CoalescingAcker:
         config: BatchAckConfig | None = None,
         max_hold: int = 2,
         coalesce: bool = True,
+        channel_key: Any = None,
         on_flush: Callable[[CoalescingFlushReport], None] | None = None,
     ) -> None:
         self._config = config or BatchAckConfig()
+        self._channel_key = channel_key
         self._ack_fn = ack_fn
         self._nack_fn = nack_fn
         self._reject_fn = reject_fn
@@ -813,6 +846,11 @@ class CoalescingAcker:
         return self._coordinator
 
     @property
+    def channel_key(self) -> Any:
+        """The channel this acker is bound to, or ``None`` while unbound."""
+        return self._channel_key
+
+    @property
     def pending(self) -> int:
         return self._coordinator.pending
 
@@ -822,10 +860,29 @@ class CoalescingAcker:
 
     # ── ledger API ───────────────────────────────────────────────────────
 
-    def register(self, delivery_tag: int) -> None:
+    def register(self, delivery_tag: int, *, channel_key: Any = None) -> None:
+        """Register a delivery BEFORE its handler runs.
+
+        Pass ``channel_key`` (normally the channel object the delivery
+        arrived on) to have the one-acker-per-channel rule enforced: an
+        unbound acker binds to it, a bound acker raises
+        :class:`ChannelMismatchError` on anything else. Omitting it keeps the
+        legacy, unchecked behavior.
+        """
         with self._lock:
             if self._closed:
                 raise BatchClosedError("CoalescingAcker is closed; register() rejected")
+            if channel_key is not None:
+                bound = self._channel_key
+                if bound is None:
+                    self._channel_key = channel_key  # first registration binds
+                elif bound is not channel_key and bound != channel_key:
+                    raise ChannelMismatchError(
+                        f"delivery_tag {delivery_tag} arrived on {channel_key!r} but this "
+                        f"CoalescingAcker is bound to {bound!r}. Delivery tags are a "
+                        "per-channel counter — use one acker per channel "
+                        "(CoalescingAckerGroup does this for you)."
+                    )
         self._coordinator.register(delivery_tag)
         self._arm_timer()
 
@@ -914,6 +971,213 @@ class CoalescingAcker:
         return self.flush(FlushReason.CLOSE)
 
 
+# ── CoalescingAckerGroup ─────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class GroupFlushReport:
+    """Aggregate of one :meth:`CoalescingAckerGroup.flush` across channels."""
+
+    reason: FlushReason
+    reports: tuple[CoalescingFlushReport, ...] = ()
+
+    @property
+    def channels(self) -> int:
+        return len(self.reports)
+
+    @property
+    def settled_tags(self) -> int:
+        return sum(r.settled_tags for r in self.reports)
+
+    @property
+    def coalesced_tags(self) -> int:
+        return sum(r.coalesced_tags for r in self.reports)
+
+    @property
+    def errors(self) -> tuple[tuple[SettlementCommand, BaseException], ...]:
+        return tuple(err for r in self.reports for err in r.errors)
+
+
+class CoalescingAckerGroup:
+    """One :class:`CoalescingAcker` per channel, created on demand.
+
+    rabbitkit gives every subscriber queue its own channel, and delivery tags
+    are a PER-CHANNEL counter — so a consumer with several queues needs
+    several ledgers::
+
+        Channel A → CoalescingAcker A → SettlementCoordinator A
+        Channel B → CoalescingAcker B → SettlementCoordinator B
+
+    This group keeps that isolation for you: ``factory(channel)`` builds a
+    fully wired acker (its ``ack_fn``/``nack_fn``/``reject_fn`` bound to THAT
+    channel — only you know how to reach your transport), the group caches it
+    per channel, and every per-delivery call carries the channel so a
+    cross-channel mistake raises :class:`ChannelMismatchError` instead of
+    acking the wrong messages.
+
+    Channels are used as dict keys (all pika/aio-pika channel objects are
+    identity-hashable). The group holds a strong reference to each channel it
+    settles on, so call :meth:`on_reconnect` when one is rebuilt (or
+    :meth:`reset` when the whole connection is) to drop it.
+
+    Usage::
+
+        def build(channel: Any) -> CoalescingAcker:
+            return CoalescingAcker(
+                ack_fn=lambda t, m: emit(channel.basic_ack(t, multiple=m)),
+                nack_fn=lambda t, r: emit(channel.basic_nack(t, requeue=r)),
+                reject_fn=lambda t, r: emit(channel.basic_reject(t, requeue=r)),
+                config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
+                channel_key=channel,
+            )
+
+        group = CoalescingAckerGroup(factory=build)
+
+        @broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+        async def handle(body: bytes, msg: RabbitMessage) -> None:
+            channel = msg.raw_message.channel
+            group.register(channel, msg.delivery_tag)
+            ...
+            group.complete(channel, msg.delivery_tag)
+    """
+
+    def __init__(self, factory: Callable[[Any], CoalescingAcker]) -> None:
+        self._factory = factory
+        self._ackers: dict[Any, CoalescingAcker] = {}
+        self._lock = threading.Lock()
+        self._closed = False
+        # Totals survive a channel being retired on reconnect/close, so a
+        # reconnect does not silently reset the metrics.
+        self._retired_settled = 0
+        self._retired_coalesced = 0
+
+    # ── inspection ───────────────────────────────────────────────────────
+
+    @property
+    def channels(self) -> int:
+        """Number of channels with a live acker."""
+        with self._lock:
+            return len(self._ackers)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def pending(self) -> int:
+        """Registered-but-unsettled deliveries across every channel."""
+        return sum(a.pending for a in self._snapshot())
+
+    @property
+    def settled_total(self) -> int:
+        return self._retired_settled + sum(a.settled_total for a in self._snapshot())
+
+    @property
+    def coalesced_total(self) -> int:
+        return self._retired_coalesced + sum(a.coalesced_total for a in self._snapshot())
+
+    @property
+    def last_error(self) -> BaseException | None:
+        for acker in self._snapshot():
+            if acker.last_error is not None:
+                return acker.last_error
+        return None
+
+    def _snapshot(self) -> tuple[CoalescingAcker, ...]:
+        with self._lock:
+            return tuple(self._ackers.values())
+
+    def _retire(self, acker: CoalescingAcker) -> None:
+        self._retired_settled += acker.settled_total
+        self._retired_coalesced += acker.coalesced_total
+
+    # ── per-channel access ───────────────────────────────────────────────
+
+    def for_channel(self, channel: Any) -> CoalescingAcker:
+        """Return (creating on first use) the acker that owns *channel*."""
+        with self._lock:
+            if self._closed:
+                raise BatchClosedError("CoalescingAckerGroup is closed; for_channel() rejected")
+            acker = self._ackers.get(channel)
+            if acker is not None:
+                return acker
+        # Build outside the lock: the factory touches the transport and must
+        # not serialize every other channel behind it.
+        acker = self._factory(channel)
+        with self._lock:
+            existing = self._ackers.get(channel)
+            if existing is not None:  # another thread won the race
+                return existing
+            self._ackers[channel] = acker
+            return acker
+
+    # ── per-delivery API (channel-checked) ───────────────────────────────
+
+    def register(self, channel: Any, delivery_tag: int) -> None:
+        """Register a delivery BEFORE its handler runs, on *channel*'s ledger."""
+        self.for_channel(channel).register(delivery_tag, channel_key=channel)
+
+    def complete(self, channel: Any, delivery_tag: int) -> None:
+        self.for_channel(channel).complete(delivery_tag)
+
+    def fail(self, channel: Any, delivery_tag: int, *, requeue: bool = True, reject: bool = False) -> None:
+        self.for_channel(channel).fail(delivery_tag, requeue=requeue, reject=reject)
+
+    def retry_pending(self, channel: Any, delivery_tag: int) -> None:
+        self.for_channel(channel).retry_pending(delivery_tag)
+
+    def release(self, channel: Any, delivery_tag: int) -> None:
+        self.for_channel(channel).release(delivery_tag)
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    def flush(self, reason: FlushReason = FlushReason.MANUAL) -> GroupFlushReport:
+        """Flush every channel's acker; never let one channel's failure skip
+        the others (each acker records its own errors in its report)."""
+        return GroupFlushReport(reason=reason, reports=tuple(a.flush(reason) for a in self._snapshot()))
+
+    def on_reconnect(self, channel: Any) -> tuple[int, ...]:
+        """One channel was rebuilt: drop its ledger and retire its acker.
+
+        Returns the dropped delivery tags (the broker redelivers them). The
+        replacement channel is a different object, so the next
+        :meth:`for_channel` builds a fresh acker for it. Unknown channels are
+        a no-op, so this is safe to call from a reconnect hook that does not
+        track which channels were in use.
+        """
+        with self._lock:
+            acker = self._ackers.pop(channel, None)
+        if acker is None:
+            return ()
+        dropped = acker.on_reconnect()
+        self._retire(acker)
+        return dropped
+
+    def reset(self) -> int:
+        """The whole connection was rebuilt: drop every ledger. Returns the
+        total number of dropped tags."""
+        with self._lock:
+            ackers = tuple(self._ackers.values())
+            self._ackers.clear()
+        dropped = 0
+        for acker in ackers:
+            dropped += len(acker.on_reconnect())
+            self._retire(acker)
+        return dropped
+
+    def close(self) -> GroupFlushReport:
+        """Close every acker (draining what is approved) and clear the group."""
+        with self._lock:
+            self._closed = True
+            ackers = tuple(self._ackers.values())
+            self._ackers.clear()
+        reports = []
+        for acker in ackers:
+            reports.append(acker.close())
+            self._retire(acker)
+        return GroupFlushReport(reason=FlushReason.CLOSE, reports=tuple(reports))
+
+
 __all__ = [
     "REASON_CANCELLED",
     "REASON_NOT_STARTED",
@@ -922,10 +1186,13 @@ __all__ = [
     "BatchClosedError",
     "BatchFlushError",
     "BatchPublisher",
+    "ChannelMismatchError",
     "CoalescingAcker",
+    "CoalescingAckerGroup",
     "CoalescingFlushReport",
     "FlushItem",
     "FlushReason",
     "FlushReport",
+    "GroupFlushReport",
     "SettlementAction",
 ]

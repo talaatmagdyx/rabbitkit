@@ -532,7 +532,14 @@ class TestCoalescingAcker:
 
     def test_interval_timer_flushes(self) -> None:
         wire = _Wire()
-        ca = _coalescer(wire, config=BatchAckConfig(batch_size=100, flush_interval_ms=5))
+        # marshal=inline: this _Wire has no transport owner, so running the
+        # flush on the timer thread is correct here (and silences the guard
+        # warning that real transports need).
+        ca = _coalescer(
+            wire,
+            config=BatchAckConfig(batch_size=100, flush_interval_ms=5),
+            marshal=lambda fn: fn(),
+        )
         ca.register(1)
         ca.complete(1)
         deadline = time.monotonic() + 2

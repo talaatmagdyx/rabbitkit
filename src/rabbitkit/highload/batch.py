@@ -42,6 +42,7 @@ import asyncio
 import logging
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -809,30 +810,33 @@ class CoalescingAcker:
 
     ``on_reconnect()`` invalidates the ledger; old tags are never replayed.
 
-    **The emit callables must be thread-safe.** ``flush_interval_ms`` fires
-    them from a background ``threading.Timer`` thread, NOT the transport
-    owner — the same hazard :class:`BatchAcker` documents. A bare
-    ``loop.create_task(...)`` is silently never scheduled from that thread,
-    so acks simply stop (most visible at ``prefetch=1``, where the broker
-    then waits forever for an ack that never leaves). Marshal explicitly::
+    **Pass ``marshal`` whenever ``flush_interval_ms > 0``.** The interval
+    timer is a ``threading.Timer``, so without it the emit callables run on
+    a background thread instead of the transport owner. That is not merely
+    unsupported, it fails SILENTLY: ``loop.create_task()`` from a foreign
+    thread only raises under asyncio debug mode, so in production the task
+    is queued without waking the loop — a busy loop happens to pick it up, an
+    idle one never does. At ``prefetch=1`` the loop goes idle waiting for the
+    next delivery that the un-emitted ack would have unlocked, and the
+    consumer deadlocks.
 
-        # aio-pika / asyncio
-        def emit(coro):
-            loop.call_soon_threadsafe(lambda: loop.create_task(coro))
+    ``marshal`` takes a zero-argument callable and runs it on the transport
+    owner; both standard entry points match that signature directly, so it is
+    one argument, not a wrapper around each callable::
 
-        acker = CoalescingAcker(
-            ack_fn=lambda t, m: emit(channel.basic_ack(delivery_tag=t, multiple=m)),
-            ...
-        )
+        # asyncio / aio-pika
+        acker = CoalescingAcker(..., marshal=loop.call_soon_threadsafe)
 
         # pika
-        def safe_ack(tag, multiple):
-            connection.add_callback_threadsafe(
-                lambda: channel.basic_ack(delivery_tag=tag, multiple=multiple)
-            )
+        acker = CoalescingAcker(..., marshal=connection.add_callback_threadsafe)
 
-    Set ``flush_interval_ms=0`` and flush yourself if you would rather not
-    deal with the timer thread at all.
+    With ``marshal`` set, the whole interval flush — planning and emission —
+    runs on the owner, so ordinary ``channel.basic_ack(...)`` /
+    ``loop.create_task(...)`` callables are safe. Size-triggered and manual
+    flushes already run on the caller's thread and are unaffected.
+
+    ``flush_interval_ms=0`` disables the timer entirely; then no marshalling
+    is needed because every flush is one you drive yourself.
     """
 
     def __init__(
@@ -846,6 +850,7 @@ class CoalescingAcker:
         coalesce: bool = True,
         channel_key: Any = None,
         max_pending: int = 0,
+        marshal: Callable[[Callable[[], None]], None] | None = None,
         collector: Any = None,
         metrics_config: Any = None,
         on_flush: Callable[[CoalescingFlushReport], None] | None = None,
@@ -856,6 +861,7 @@ class CoalescingAcker:
         self._nack_fn = nack_fn
         self._reject_fn = reject_fn
         self._on_flush = on_flush
+        self._marshal = marshal
         self._collector = collector
         self._metrics_config = metrics_config
         self._coordinator = SettlementCoordinator(coalesce=coalesce, max_hold=max_hold, max_pending=max_pending)
@@ -864,6 +870,7 @@ class CoalescingAcker:
         self._timer: threading.Timer | None = None
         self._closed = False
         self._approved_since_flush = 0
+        self._warned_unmarshalled = False
         self.last_error: BaseException | None = None
         self.settled_total = 0
         self.coalesced_total = 0
@@ -989,21 +996,55 @@ class CoalescingAcker:
 
     # ── timer ────────────────────────────────────────────────────────────
 
+    def _warn_unmarshalled_timer(self) -> None:
+        """One warning per acker: an interval timer without ``marshal`` runs
+        the emit callables off the transport owner, which fails silently."""
+        if self._warned_unmarshalled:
+            return
+        self._warned_unmarshalled = True
+        warnings.warn(
+            "CoalescingAcker has flush_interval_ms > 0 but no marshal=. The interval "
+            "timer fires on a threading.Timer thread, so the emit callables will run "
+            "off the transport owner — asyncio only raises for that in debug mode, so "
+            "acks can be queued without ever reaching the broker (a consumer at "
+            "prefetch=1 then deadlocks). Pass marshal=loop.call_soon_threadsafe "
+            "(asyncio) or marshal=connection.add_callback_threadsafe (pika), or set "
+            "flush_interval_ms=0 and flush yourself.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
     def _arm_timer(self) -> None:
+        if self._config.flush_interval_ms > 0 and self._marshal is None:
+            self._warn_unmarshalled_timer()
         with self._lock:
             if self._timer is None and self._config.flush_interval_ms > 0 and not self._closed:
                 self._timer = threading.Timer(self._config.flush_interval_ms / 1000.0, self._timer_callback)
                 self._timer.daemon = True
                 self._timer.start()
 
-    def _timer_callback(self) -> None:
-        with self._lock:
-            self._timer = None
+    def _interval_flush(self) -> None:
+        """The interval flush body. Runs on the transport owner when
+        ``marshal`` was supplied, otherwise on the timer thread."""
         try:
             self.flush(FlushReason.INTERVAL)
         except BaseException as exc:
             self.last_error = exc
             logger.error("CoalescingAcker interval flush failed: %s", exc, exc_info=True)
+
+    def _timer_callback(self) -> None:
+        with self._lock:
+            self._timer = None
+        if self._marshal is None:
+            self._interval_flush()
+        else:
+            # Hand the WHOLE flush — planning and emission — to the transport
+            # owner, so the emit callables never run on this timer thread.
+            try:
+                self._marshal(self._interval_flush)
+            except BaseException as exc:
+                self.last_error = exc
+                logger.error("CoalescingAcker could not marshal its interval flush: %s", exc, exc_info=True)
         if self._coordinator.pending:
             self._arm_timer()
 
@@ -1021,6 +1062,20 @@ class CoalescingAcker:
             self.coalesced_total += report.coalesced_tags
             if errors:
                 self.last_error = errors[0][1]
+                # Previously these were recorded on last_error and nothing
+                # else — a failing ack_fn was invisible in the logs.
+                for command, exc in errors:
+                    logger.error(
+                        "CoalescingAcker failed to emit %s(delivery_tag=%d, multiple=%s) "
+                        "covering %d tag(s) on generation %d: %s",
+                        command.kind.value,
+                        command.delivery_tag,
+                        command.multiple,
+                        len(command.covers),
+                        command.generation,
+                        exc,
+                        exc_info=exc,
+                    )
             if self._collector is not None:
                 inc = getattr(self._collector, "inc_counter", None)
                 if inc is not None and self._metrics_config is not None and report.coalesced_tags:
@@ -1100,17 +1155,30 @@ class CoalescingAckerGroup:
     settles on, so call :meth:`on_reconnect` when one is rebuilt (or
     :meth:`reset` when the whole connection is) to drop it.
 
+    Correctness does NOT depend on you making that call: a rebuilt channel is
+    a different object, so the next :meth:`for_channel` builds a fresh acker
+    with an empty ledger and the stale one is never consulted again. Calling
+    it releases the retired acker (and its channel reference) promptly and
+    keeps the metrics honest. Note that on ``AsyncBroker`` the transport's
+    ``on_reconnect`` hook does not fire for a broker-closed connection — see
+    the known gap in ``docs/observability.md`` — so do not rely on it as the
+    only trigger.
+
+    Do NOT call :meth:`reset` on a live channel: dropping a ledger while its
+    channel is still open leaves those deliveries unacked on a connection the
+    broker still considers healthy, so they are not redelivered until it goes
+    away.
+
     Usage::
 
         def build(channel: Any) -> CoalescingAcker:
-            # `emit` MUST be thread-safe — the flush timer runs off-loop.
-            # See CoalescingAcker's docstring.
             return CoalescingAcker(
-                ack_fn=lambda t, m: emit(channel.basic_ack(t, multiple=m)),
-                nack_fn=lambda t, r: emit(channel.basic_nack(t, requeue=r)),
-                reject_fn=lambda t, r: emit(channel.basic_reject(t, requeue=r)),
+                ack_fn=lambda t, m: loop.create_task(channel.basic_ack(t, multiple=m)),
+                nack_fn=lambda t, r: loop.create_task(channel.basic_nack(t, requeue=r)),
+                reject_fn=lambda t, r: loop.create_task(channel.basic_reject(t, requeue=r)),
                 config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
                 channel_key=channel,
+                marshal=loop.call_soon_threadsafe,   # required with an interval timer
             )
 
         group = CoalescingAckerGroup(factory=build)

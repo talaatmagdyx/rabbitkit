@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-09-19
+
+Fixes the two things 0.13.0 only documented or scoped around.
+
+### Fixed
+
+- **`CoalescingAcker` no longer fails silently when an interval timer is
+  used.** `flush_interval_ms` fires on a `threading.Timer` thread, so the
+  emit callables ran off the transport owner. That is not merely unsupported,
+  it is *invisible*: asyncio's cross-thread guard only runs under debug mode
+  (`BaseEventLoop.call_soon` checks the thread only `if self._debug`), so in
+  production a `loop.create_task()` from the timer thread is queued without
+  waking the loop — a busy loop happens to pick it up, an idle one never
+  does. At `prefetch=1` the loop goes idle waiting for the delivery that the
+  un-emitted ack would have unlocked, and the consumer deadlocks.
+  0.13.0 only documented the hazard; it is now fixed by construction:
+
+  - New **`marshal=`** parameter takes a zero-argument callable and runs the
+    WHOLE interval flush on the transport owner, so ordinary
+    `channel.basic_ack(...)` / `loop.create_task(...)` callables are safe.
+    Both standard entry points match the signature directly:
+    `marshal=loop.call_soon_threadsafe` (asyncio) or
+    `marshal=connection.add_callback_threadsafe` (pika).
+  - Arming an interval timer **without** `marshal` now emits a
+    `RuntimeWarning` (once per acker) instead of failing later and silently.
+  - Size-triggered, manual and close flushes already run on the caller's
+    thread and are unchanged.
+
+- **Emit failures are logged.** A failing `ack_fn`/`nack_fn`/`reject_fn` was
+  recorded on `last_error` and in the flush report but never logged, so a
+  broken callable was invisible in the logs. Each failing command is now
+  logged at ERROR with its kind, delivery tag, `multiple` flag, covered-tag
+  count and generation.
+
+- **Reconnect/blocked callbacks now follow every connection the pool
+  creates.** `AsyncTransportImpl.connect()` registered them once on the
+  initial publisher/consumer pair, so a connection rabbitkit replaced later
+  (a rebuilt publisher connection, or a lazy re-create) carried no callbacks
+  at all and `on_reconnect` never fired for it. `AsyncConnectionPool` now
+  takes an `on_connection_created` hook fired for every connection it builds,
+  and a connection created after `connect()` completed is treated as a
+  reconnect.
+
+- **A flaky concurrency test** introduced in 0.13.0: it drained with a single
+  `plan()`, which with `max_hold=1` holds every stranded delivery for one
+  round and can legitimately return nothing if the planner thread exited
+  first. It now drains with `drain_plan()`. The coordinator itself was never
+  at fault.
+
+### Changed
+
+- The connection-kill integration test now **requires convergence**: after
+  force-closing every connection mid-run it waits for all 150 messages to be
+  processed and the queue to drain to 0/0, rather than only asserting the
+  safety properties. 0.13.0 deliberately stopped short of that.
+
+### Known limitation (newly documented)
+
+`rabbitkit_reconnects_total` undercounts on `AsyncBroker`. Verified against a
+live broker on aio-pika 9.6: when the **broker** closes the connection,
+aio-pika recovers underneath the same `RobustConnection` object without
+re-running its counted connect path (`connection_attempt` never advances), so
+it never fires `reconnect_callbacks` — even though consumers are restored and
+traffic resumes. The sync transport is unaffected. See
+`docs/observability.md`; settlement correctness does not depend on the hook,
+because a rebuilt channel is a new object and therefore gets a fresh ledger.
+
 ## [0.13.0] — 2026-09-19
 
 Settlement hardening. `SettlementCoordinator` is now an explicit,

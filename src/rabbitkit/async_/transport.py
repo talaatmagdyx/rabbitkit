@@ -92,6 +92,7 @@ class AsyncTransportImpl:
             publisher_confirms=self._confirm_delivery,
             on_channel_opened=self._fire_channel_opened,
             on_channel_rebuilt=self._fire_channel_rebuilt,
+            on_connection_created=self._attach_connection_callbacks,
         )
         self._connected = False
 
@@ -198,6 +199,45 @@ class AsyncTransportImpl:
                 cb()
             except Exception:  # pragma: no cover — never break the event loop
                 logger.exception("channel_rebuilt callback raised")
+
+    def _attach_connection_callbacks(self, connection: Any) -> None:
+        """Register the reconnect/blocked hooks on a freshly created connection.
+
+        Called by the pool for EVERY connection it builds. Registering only
+        the initial pair (as connect() used to) meant a rebuilt or lazily
+        re-created connection carried no callbacks, so ``on_reconnect`` never
+        fired again — ``reconnects_total`` stopped counting and any
+        ledger-invalidation wiring hung off it silently stopped running.
+        ``CallbackCollection`` is set-like and bound methods compare equal, so
+        re-registering the same connection is harmless.
+
+        A connection created AFTER :meth:`connect` finished is a REPLACEMENT
+        for one we were already using, so it fires the reconnect callbacks
+        itself. aio-pika only fires ``reconnect_callbacks`` when a
+        ``RobustConnection`` reconnects IN PLACE; when rabbitkit swaps the
+        connection object instead (``_rebuild_publisher_connection``, or a
+        lazy re-create after a close) the new object's first connect is not a
+        "reconnect" to aio-pika — so without this, ``on_reconnect`` never
+        fired for that very common path and ``reconnects_total`` undercounted
+        to zero.
+        """
+        for collection, callback in (
+            ("reconnect_callbacks", self._aio_reconnected),
+            ("connection_blocked", self._aio_blocked),
+            ("connection_unblocked", self._aio_unblocked),
+        ):
+            target = getattr(connection, collection, None)
+            if target is None:  # pragma: no cover — older aio-pika may differ
+                continue
+            try:
+                adder = getattr(target, "add", None) or getattr(target, "add_callback", None)
+                if adder is not None:
+                    adder(callback)
+            except Exception:  # pragma: no cover — never fail a connect on a hook
+                logger.debug("Could not register %s on a new connection", collection)
+        if self._connected:
+            logger.info("Replacement AMQP connection created — treating it as a reconnect")
+            self._aio_reconnected()
 
     def _aio_reconnected(self, *_args: Any) -> None:
         for cb in list(self._reconnect_callbacks):

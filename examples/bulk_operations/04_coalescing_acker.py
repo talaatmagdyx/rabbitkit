@@ -43,10 +43,10 @@ completed = 0
 
 
 def _emit(coro_factory):
-    """The acker's timer fires on a helper thread; aio-pika channel calls must
-    run on the event loop, so hand the coroutine over thread-safely."""
+    """Plain create_task: ``marshal=`` below guarantees the acker's interval
+    flush already runs on the event loop, so these are on the owner thread."""
     loop = loop_ref["loop"]
-    loop.call_soon_threadsafe(lambda: loop.create_task(coro_factory()))
+    loop.create_task(coro_factory())
 
 
 def ack_fn(tag: int, multiple: bool) -> None:
@@ -68,6 +68,9 @@ acker = CoalescingAcker(
     nack_fn=nack_fn,
     reject_fn=reject_fn,
     config=BatchAckConfig(batch_size=6, flush_interval_ms=150),
+    # REQUIRED with an interval timer: it fires on a threading.Timer thread,
+    # so the whole flush is handed to the event loop instead.
+    marshal=lambda fn: loop_ref["loop"].call_soon_threadsafe(fn),
     max_hold=2,  # a completed tag stranded behind a slow sibling waits <= 2 rounds, then acks alone
 )
 

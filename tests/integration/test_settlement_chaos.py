@@ -160,19 +160,16 @@ def _make_acker(channel: Any, ledger: Ledger, loop: asyncio.AbstractEventLoop) -
     from rabbitkit.core.config import BatchAckConfig
     from rabbitkit.highload.batch import CoalescingAcker
 
-    def emit(coro: Any) -> None:
-        # The flush INTERVAL timer fires on a threading.Timer thread, so a
-        # bare loop.create_task() would never be scheduled. Marshal onto the
-        # loop the documented way.
-        loop.call_soon_threadsafe(lambda: loop.create_task(coro))
-
+    # marshal= hands the whole interval flush to the event loop, so these
+    # plain create_task callables always run on the owner thread.
     return CoalescingAcker(
-        ack_fn=lambda t, m: emit(channel.basic_ack(delivery_tag=t, multiple=m)),
-        nack_fn=lambda t, r: emit(channel.basic_nack(delivery_tag=t, requeue=r)),
-        reject_fn=lambda t, r: emit(channel.basic_reject(delivery_tag=t, requeue=r)),
+        ack_fn=lambda t, m: loop.create_task(channel.basic_ack(delivery_tag=t, multiple=m)),
+        nack_fn=lambda t, r: loop.create_task(channel.basic_nack(delivery_tag=t, requeue=r)),
+        reject_fn=lambda t, r: loop.create_task(channel.basic_reject(delivery_tag=t, requeue=r)),
         config=BatchAckConfig(batch_size=32, flush_interval_ms=100),
         channel_key=channel,
         max_hold=2,
+        marshal=loop.call_soon_threadsafe,
         on_flush=ledger.on_flush,
     )
 
@@ -333,15 +330,12 @@ async def test_chaos_failures_and_redelivery_converge(rabbit: dict[str, str]) ->
 
 
 async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]) -> None:
-    """Real failure injection: force-close every AMQP connection mid-run.
-
-    Convergence is aio-pika's job (and is gated separately by the chaos
-    suite); what MUST hold here regardless of how recovery goes is the
-    settlement contract:
+    """Real failure injection: force-close every AMQP connection mid-run,
+    then require the run to CONVERGE.
 
     * no ACK ever covered a delivery whose handler had not completed;
     * no delivery tag was settled twice;
-    * nothing was lost — every id is either acked or still on the broker.
+    * every message is processed after recovery, and the queue drains to 0/0.
     """
     import json
 
@@ -358,6 +352,7 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
     group = CoalescingAckerGroup(factory=lambda ch: _make_acker(ch, ledger, loop))
     succeeded: set[str] = set()
     killed = {"done": False}
+    done = asyncio.Event()
 
     @broker.subscriber(queue=queue, ack_policy=AckPolicy.MANUAL)
     async def handle(body: bytes, msg: _RabbitMessage) -> None:
@@ -377,6 +372,8 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
             del ledger.done[msg.delivery_tag]
             return
         succeeded.add(message_id)
+        if len(succeeded) >= total:
+            done.set()
 
     # A reconnect must invalidate every ledger — the production wiring.
     await broker.start(worker_config=WorkerConfig(worker_count=8))
@@ -393,21 +390,29 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
     deadline = loop.time() + 30
     while loop.time() < deadline and len(succeeded) < total // 4:
         await asyncio.sleep(0.1)
-    assert succeeded, "nothing was processed before the kill"
+    before = len(succeeded)
+    assert before, "nothing was processed before the kill"
     await loop.run_in_executor(None, lambda: _kill_connections(rabbit))
     killed["done"] = True
-    await asyncio.sleep(8.0)  # let whatever recovery happens, happen
+
+    # Recovery must carry the run to completion: the kill requeued every
+    # unacked delivery, so the redeliveries have to finish the job.
+    await asyncio.wait_for(done.wait(), timeout=180)
     group.flush()
     await asyncio.sleep(1.0)
 
     assert killed["done"]
+    assert len(succeeded) > before, "nothing was processed after the kill — recovery never happened"
     assert ledger.violations == [], f"{len(ledger.violations)} unsafe acks, first 3: {ledger.violations[:3]}"
-    assert len(ledger.acked) == len(succeeded), "an ack covered a delivery that never completed"
-    # Nothing lost: every id is either acked, or still held by the broker.
-    ready, unacked = await loop.run_in_executor(None, lambda: _counts(rabbit, queue))
-    assert len(ledger.acked) + ready + unacked >= total, (
-        f"messages vanished: acked={len(ledger.acked)} ready={ready} unacked={unacked} of {total}"
-    )
+    assert succeeded == {f"m{i}" for i in range(total)}, "a message was lost across the connection kill"
+    # NOTE: `reconnects` is deliberately not asserted. aio-pika 9.6 recovers a
+    # broker-closed connection underneath the same RobustConnection object
+    # without re-running its counted connect path, so it never fires
+    # reconnect_callbacks — see docs/observability.md. Settlement stays safe
+    # regardless: the replacement channels are new objects, so the group
+    # builds fresh ledgers and the stale ones are never consulted again.
+    assert group.channels >= 1
+    await _await_drained(rabbit, queue, timeout=120)
     await broker.stop()
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
 from typing import Any, cast
 
 import typer
@@ -13,6 +14,24 @@ from rabbitkit.cli.commands.migrate import migrate_command
 topology_app = typer.Typer(help="Topology inspection and management commands.")
 
 topology_app.command("migrate")(migrate_command)
+
+
+def _safe_url(management_url: str) -> str:
+    """The URL with any embedded credentials removed, for display.
+
+    ``--url`` accepts ``http://user:pass@host:15672`` (the form ``migrate``
+    documents), and these commands echo the URL back on failure. Printing it
+    verbatim puts the password into terminal scrollback and, in CI, into the
+    build log.
+    """
+    try:
+        parsed = urllib.parse.urlparse(management_url)
+        if not parsed.hostname:
+            return "<redacted url>"
+        netloc = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
+        return f"{parsed.scheme}://{netloc}{parsed.path.rstrip('/')}"
+    except Exception:
+        return "<redacted url>"
 
 
 @topology_app.command("list")
@@ -143,7 +162,7 @@ def topology_validate(
     try:
         live = _live_resources(management_url, vhost)
     except Exception as exc:
-        typer.echo(f"ERROR: could not reach management API at {management_url}: {exc}", err=True)
+        typer.echo(f"ERROR: could not reach management API at {_safe_url(management_url)}: {exc}", err=True)
         raise typer.Exit(1) from None
 
     issues: list[str] = []
@@ -203,7 +222,7 @@ def topology_diff(
     try:
         live = _live_resources(management_url, vhost)
     except Exception as exc:
-        typer.echo(f"ERROR: could not reach management API at {management_url}: {exc}", err=True)
+        typer.echo(f"ERROR: could not reach management API at {_safe_url(management_url)}: {exc}", err=True)
         raise typer.Exit(1) from None
 
     diff: dict[str, Any] = {

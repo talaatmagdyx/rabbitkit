@@ -620,9 +620,14 @@ class TestZstdDctxTypeErrorFallback:
 
 
 class TestGzipStreamingEmptyChunk:
-    def test_empty_chunk_and_tail_breaks_loop(self) -> None:
-        """Line 131: when decompress() returns b'' and unconsumed_tail is b''
-        and eof is False, the loop breaks to avoid spinning."""
+    def test_input_exhausted_before_eof_is_rejected(self) -> None:
+        """Input exhausted with eof still False means a TRUNCATED member.
+
+        This used to `break` and return the partial data. The gzip trailer
+        (CRC32 + ISIZE) is the payload's only integrity check, so accepting
+        here handed the handler a truncated or spliced body as though it were
+        complete. It now raises, matching the stdlib's EOFError.
+        """
 
         class _StubDecomp:
             """Fake decompressobj that returns empty on first decompress, then eof."""
@@ -643,9 +648,8 @@ class TestGzipStreamingEmptyChunk:
         stub = _StubDecomp()
         mw = CompressionMiddleware()
         with patch("zlib.decompressobj", return_value=stub):
-            result = mw._decompress_gzip_streaming(b"dummy")
-
-        assert result == b""
+            with pytest.raises(ValueError, match="Truncated gzip stream"):
+                mw._decompress_gzip_streaming(b"dummy")
 
     def test_flush_over_cap_raises(self) -> None:
         """Line 134: when flush() returns data that pushes len(out) over the cap,
@@ -656,11 +660,13 @@ class TestGzipStreamingEmptyChunk:
             """Fake decompressobj where flush returns data exceeding the cap."""
 
             def __init__(self) -> None:
-                self.eof = False
+                # eof=True so the member ends cleanly and we reach flush();
+                # the truncation guard must not fire for a complete member.
+                self.eof = True
                 self.unconsumed_tail: bytes = b""
+                self.unused_data: bytes = b""
 
             def decompress(self, data: bytes, max_length: int) -> bytes:
-                # Return empty immediately so loop breaks via line 131
                 return b""
 
             def flush(self) -> bytes:

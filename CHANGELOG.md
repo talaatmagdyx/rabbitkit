@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] — 2026-09-20
+
+Security hardening from a full review of the package. No API changes.
+
+### Security
+
+- **Regular-expression denial of service in `ErrorSanitizer`.** The
+  URL-credential pattern had an unbounded scheme run (`[a-z0-9+.-]*` before
+  `://`), making it quadratic, and `summary_for` redacted the *entire*
+  exception text before truncating to 256 characters. Measured on 0.15.0:
+  8 KiB 0.06s, 16 KiB 0.25s, 32 KiB 0.96s, 64 KiB 3.8s — 4x per doubling,
+  extrapolating to roughly 16 minutes for 1 MiB. A handler echoing the body
+  into an exception is routine (`json.JSONDecodeError`, `ValidationError`,
+  `ValueError(f"bad: {body}")`), so one crafted message stalled the event
+  loop, missed heartbeats and wedged the consumer into a redelivery loop.
+  The scheme run is now bounded and the input is capped before redacting.
+  1 MiB now takes ~0.002s. The cap is a *multiple* of the kept length so a
+  secret starting inside the kept region is still matched whole.
+- **`SigningConfig.secret_key` appeared in `repr()`.** The dataclass-generated
+  repr printed every field, so the HMAC key reached any traceback, any
+  `logger.debug("cfg=%s", config)` and any pytest assertion diff. Possession
+  of that key is total compromise — an attacker can sign any body for any
+  route. Now masked with the same `_masked_repr` helper `ConnectionConfig` and
+  `ManagementConfig` already used.
+- **Truncated gzip bodies were accepted.** `_decompress_gzip_streaming`
+  returned partial data when the input ran out mid-member, skipping the gzip
+  trailer (CRC32 + ISIZE) — the payload's only integrity check. The stdlib
+  raises `EOFError`; so do we now.
+- **Concatenated gzip members were silently dropped.** Only the first member
+  was decoded, discarding the rest without error — a body-smuggling primitive
+  against anything that inspects the decompressed body separately. All
+  members are now decoded, matching `gzip.decompress`.
+- **Log injection via `content_encoding`.** That AMQP property is set by the
+  publisher and was logged verbatim, so an embedded newline forged whole log
+  lines attributed to a real logger. Now whitespace-collapsed and bounded.
+- **The CLI echoed credentials.** `topology`'s two failure paths printed the
+  `--url` verbatim, and that flag documents `http://user:pass@host:15672` as
+  its input form, so a password reached terminal scrollback and CI logs.
+  Userinfo is now stripped; the host is kept because it is the diagnostic.
+
+### Fixed
+
+- `SECURITY.md` claimed `1.x` was supported and `< 1.0` was not, which
+  described no released version and may have discouraged reports. It now
+  names the actually-supported line.
+
 ## [0.15.0] — 2026-09-19
 
 Settlement correctness. A coalesced plan could turn an intended

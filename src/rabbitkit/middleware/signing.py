@@ -365,6 +365,20 @@ class SigningConfig:
     require_freshness: bool = True
     nonce_cache: NonceCache | None = None
 
+    def __repr__(self) -> str:
+        """Mask the shared secret.
+
+        The dataclass-generated repr prints every field, so the HMAC key
+        landed in any traceback, any ``logger.debug("cfg=%s", config)`` and
+        any pytest assertion diff. Possession of that key is total
+        compromise: an attacker can sign any body for any route. The same
+        masking is already applied to ConnectionConfig and ManagementConfig;
+        this class had simply never opted in.
+        """
+        from rabbitkit.core.config import _masked_repr
+
+        return _masked_repr(self, secret_fields=("secret_key",))
+
     def __post_init__(self) -> None:
         if self.algorithm not in ("hmac-sha256", "hmac-sha512"):
             raise ValueError(f"Unsupported algorithm: {self.algorithm}. Use 'hmac-sha256' or 'hmac-sha512'.")

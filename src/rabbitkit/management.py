@@ -405,6 +405,18 @@ class RabbitManagementClient:
     def list_connections(self) -> list[ConnectionInfo]:
         return cast("list[ConnectionInfo]", self._request("GET", "/connections"))
 
+    def close_connection(self, name: str, reason: str = "closed via rabbitkit management API") -> None:
+        """Force-close one connection via ``DELETE /api/connections/{name}``.
+
+        The client sees the socket drop and (with ``connect_robust``, which
+        both rabbitkit transports use) reconnects. Intended for operator
+        tooling and failure-injection tests — every delivery unacked on that
+        connection is requeued by the broker, so consumers must be
+        idempotent. ``name`` comes from :meth:`list_connections`.
+        """
+        name_encoded = urllib.parse.quote(name, safe="")
+        self._request("DELETE", f"/connections/{name_encoded}")
+
     def list_channels(self) -> list[ChannelInfo]:
         return cast("list[ChannelInfo]", self._request("GET", "/channels"))
 

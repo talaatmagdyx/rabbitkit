@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-09-19
+
+Settlement hardening. `SettlementCoordinator` is now an explicit,
+correctness-critical state machine with eight documented invariants enforced
+in code and pinned by deterministic, property-based, concurrency and
+real-broker failure-injection tests. See
+[the settlement safety model](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/bulk-operations.md#the-settlement-safety-model).
+
+### Added
+
+- **Explicit delivery states.** `DeliveryState` gains `FAILED` and
+  `CANCELLED` alongside `OUTSTANDING` / `SUCCESS` / `RETRY_PENDING` / `NACK`
+  / `REJECT`, plus the predicates `is_ack_safe`, `is_emittable` and
+  `blocks_frontier`. A delivery being *finished* is not the same as being
+  *safe to ack*: `SUCCESS` is reachable only from `OUTSTANDING` or
+  `RETRY_PENDING`, so a handler that failed or was cancelled can never be
+  acked (invariant I3). New `CoalescingAcker.abandon(tag)` /
+  `cancel(tag)` (and the `CoalescingAckerGroup` proxies) record those states
+  — they block the frontier, are never emitted, and leave the delivery
+  unacked for redelivery.
+- **Typed coordinator errors**, all subclassing `CoordinatorError`:
+  `UnknownDeliveryError` (never registered), `StaleGenerationError` (tag
+  from a dropped channel generation), `ContradictorySettlementError`
+  (changing a decision, or settling an already-emitted tag) and
+  `LedgerFullError`. A caller bug can no longer corrupt the frontier
+  silently.
+- **Ledger bounds.** `CoalescingAcker(max_pending=N)` /
+  `SettlementCoordinator(max_pending=N)` cap the ledger; exceeding it raises
+  `LedgerFullError` from `register()` so the caller applies backpressure.
+  Reaching a bound never relaxes the ack rules (I7). Default 0 = unbounded,
+  unchanged.
+- **Instrumentation.** `SettlementCoordinator` exposes `frontier`,
+  `ack_ready`, `gap_count`, `oldest_pending_age` and a `stats` dict with
+  `registered`, `frames_sent`, `coalescing_ratio`, `invalidations` and more;
+  `CoalescingAcker.metrics` / `CoalescingAckerGroup.metrics` surface them.
+  Pass `collector=`/`metrics_config=` to emit the new
+  `rabbitkit_settlement_{pending,ack_ready,frontier,gap_count,oldest_pending_age_seconds,coalescing_ratio}`
+  gauges on every flush.
+- **`RabbitManagementClient.close_connection(name)`** — force-close one
+  connection via the management API, for operator tooling and
+  failure-injection tests.
+- Tests: `tests/unit/core/test_settlement_state_machine.py` (114 cases, one
+  class per invariant); the Hypothesis machine now also drives
+  `FAILED`/`CANCELLED`, idempotent repeats, contradictions and unknown tags
+  across ~18k random operations per run, asserting the frontier and
+  ack-safety invariants after every step; concurrency tests for racing
+  completion against planning, invalidation and contradictory decisions; and
+  `tests/integration/test_settlement_chaos.py` — a prefetch matrix (1/10/100),
+  a convergence run with random nack+requeue redelivery, a graceful-shutdown
+  contract check, and real connection-kill failure injection asserting no ACK
+  ever covered an unfinished delivery and nothing was lost.
+
+### Changed
+
+- **Repeating a settlement decision is now an idempotent no-op** instead of
+  raising. `complete(t)` twice, or `fail(t, requeue=True)` twice, is
+  accepted; *changing* the decision (including flipping `requeue`) still
+  raises `ContradictorySettlementError`. Code that relied on the second
+  identical call raising will no longer see an exception.
+- **Multi-segment coalescing.** A nack or reject in the middle of a run
+  settles its own tag on the wire, so the deliveries after it can now form a
+  new cumulative range instead of degrading to individual acks:
+  `101 ✓ 102 ✓ 103 nack 104 ✓ 105 ✓` emits `ack(102, multiple)`,
+  `nack(103)`, `ack(105, multiple)` — three frames where 0.12 emitted four.
+  Commands are still returned in ascending tag order and must be emitted in
+  that order.
+- `SettlementCoordinator.stats` values are now `float` (it carries
+  `coalescing_ratio` and `oldest_pending_age` alongside the counters).
+
+### Fixed
+
+- **Documented the `CoalescingAcker` timer-thread hazard.** `flush_interval_ms`
+  fires the emit callables from a background `threading.Timer` thread, so a
+  bare `loop.create_task(...)` is silently never scheduled and acks simply
+  stop — most visibly at `prefetch=1`, where the broker then waits forever
+  for an ack that never leaves. The class docstring now shows the
+  `loop.call_soon_threadsafe` and `connection.add_callback_threadsafe`
+  recipes, matching the warning `BatchAcker` already carried. Found while
+  writing the prefetch-matrix test, which hit exactly this.
+
 ## [0.12.1] — 2026-09-19
 
 Per-channel ack isolation. Purely additive — no behavior changes to existing

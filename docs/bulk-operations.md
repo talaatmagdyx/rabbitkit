@@ -358,6 +358,110 @@ correctness API (one frame per delivery by design), not a throughput one;
 **`CoalescingAcker`** is the wire optimisation — 100× fewer ack frames when
 completions arrive in order, never across an unfinished sibling.
 
+## The settlement safety model
+
+Coalescing is a correctness-critical state machine, not just a performance
+optimization, so these eight invariants are enforced in code and pinned by
+tests (`tests/unit/core/test_settlement_state_machine.py`, the Hypothesis
+machine in `tests/property/`, and real-broker runs in
+`tests/integration/test_settlement_chaos.py`).
+
+| | Invariant | Enforced by |
+|---|---|---|
+| **I1** | Never cumulative-ack across an unsafe gap | `plan()` coalesces only contiguous ack-safe runs |
+| **I2** | Never settle a delivery from another channel/generation | `channel_key` binding + per-generation ledger |
+| **I3** | Never ack a delivery that did not reach ACK_READY | `SUCCESS` reachable only from `OUTSTANDING`/`RETRY_PENDING` |
+| **I4** | A contradictory settlement is never silently accepted | transition table + `ContradictorySettlementError` |
+| **I5** | Channel loss invalidates every pending settlement | `invalidate()` / `on_reconnect()` drop the whole ledger |
+| **I6** | Shutdown may leave messages unacked, never acks to flush | `drain_plan()` emits only approved work |
+| **I7** | Optimization failure costs throughput, never semantics | `max_pending` raises; it never relaxes the ack rules |
+| **I8** | Coalescing changes frame count, not settlement semantics | same tags, same kinds, with `coalesce` on or off |
+
+The last one is the design principle: **turning coalescing on or off changes
+performance and wire traffic, never which messages your application considers
+processed.**
+
+### The delivery state machine
+
+A delivery being *finished* is not the same as being *safe to ack*:
+
+```
+OUTSTANDING ──┬─> SUCCESS         ack-safe; advances the frontier
+              ├─> NACK            emitted individually, then settled
+              ├─> REJECT          emitted individually, then settled
+              ├─> RETRY_PENDING ─┐  owned by the retry path; blocks
+              ├─> FAILED         │  blocks the frontier, never emitted
+              └─> CANCELLED      │  blocks the frontier, never emitted
+                                 └─> SUCCESS / NACK / REJECT
+```
+
+`FAILED` (`acker.abandon(tag)`) and `CANCELLED` (`acker.cancel(tag)`) are
+finished but never acked — the delivery stays unacked so the broker
+redelivers it. Neither can ever become `SUCCESS`; both may still be settled
+explicitly with a nack or reject.
+
+The **frontier** is the end of the leading ack-safe run, *not* the highest
+completed tag. Given 101 done, 102 done, 103 running, 104 done, 105 done,
+the maximum safe cumulative ack is `ack(102, multiple=True)` — never 105.
+
+### Nack in the middle
+
+A nack or reject settles its own tag on the wire, so the run *after* it can
+form a new cumulative range (commands are always emitted in ascending tag
+order, so the lower frames land first):
+
+```
+101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
+→ ack(102, multiple=True), nack(103), ack(105, multiple=True)
+```
+
+A *blocking* delivery is different: once one is reached, nothing above it
+may be coalesced in that plan.
+
+### Duplicate and contradictory settlement
+
+Repeating the same decision is an idempotent no-op. Changing it is refused:
+
+| Call | Result |
+|---|---|
+| `complete(t)` twice | no-op |
+| `fail(t, requeue=True)` twice | no-op |
+| `fail(t, requeue=True)` then `fail(t, requeue=False)` | `ContradictorySettlementError` |
+| `complete(t)` then `fail(t)` | `ContradictorySettlementError` |
+| settling a tag already emitted | `ContradictorySettlementError` |
+| settling a tag that was never registered | `UnknownDeliveryError` |
+| settling a tag from a dropped generation | `StaleGenerationError` |
+
+All four subclass `CoordinatorError`, so one `except` catches them.
+
+### Requeue and redelivery
+
+A nacked-with-requeue message comes back with a **new, higher** delivery tag.
+Registration is strictly increasing, so the old tag can never be reused and
+the redelivery is simply a new delivery.
+
+### Bounds
+
+`CoalescingAcker(max_pending=N)` caps the ledger. Exceeding it raises
+`LedgerFullError` from `register()`, so you apply backpressure (stop
+consuming, lower prefetch); the delivery stays unacked and the broker
+redelivers it. A full ledger **never** relaxes the ack rules.
+
+Watch `oldest_pending_age` and `gap_count` to see a straggler holding the
+frontier back before the ceiling is reached.
+
+### Instrumentation
+
+`acker.metrics` (and `group.metrics`, summed) exposes `registered`,
+`pending`, `outstanding`, `ack_ready`, `frontier`, `gap_count`,
+`oldest_pending_age`, `settled`, `coalesced`, `frames_sent`,
+`coalescing_ratio`, `invalidations` and `dropped_on_invalidate`. Pass
+`collector=` and `metrics_config=` to have the gauges emitted on every flush
+(see [Observability](observability.md)).
+
+`coalescing_ratio` is deliveries settled per frame sent — the benchmark's
+2,000 deliveries in 20 frames is a ratio of 100.
+
 ## Transactional outbox and inbox
 
 The end-to-end at-least-once recipe. `examples/bulk_operations/07_transactional_outbox_inbox.py`

@@ -808,9 +808,31 @@ class CoalescingAcker:
     it is given. :class:`CoalescingAckerGroup` does this for you.
 
     ``on_reconnect()`` invalidates the ledger; old tags are never replayed.
-    Sync-only by design: the emit callables are what cross into the
-    transport, so an aio-pika user passes ``lambda t, m:
-    loop.create_task(channel.basic_ack(t, multiple=m))``-style adapters.
+
+    **The emit callables must be thread-safe.** ``flush_interval_ms`` fires
+    them from a background ``threading.Timer`` thread, NOT the transport
+    owner — the same hazard :class:`BatchAcker` documents. A bare
+    ``loop.create_task(...)`` is silently never scheduled from that thread,
+    so acks simply stop (most visible at ``prefetch=1``, where the broker
+    then waits forever for an ack that never leaves). Marshal explicitly::
+
+        # aio-pika / asyncio
+        def emit(coro):
+            loop.call_soon_threadsafe(lambda: loop.create_task(coro))
+
+        acker = CoalescingAcker(
+            ack_fn=lambda t, m: emit(channel.basic_ack(delivery_tag=t, multiple=m)),
+            ...
+        )
+
+        # pika
+        def safe_ack(tag, multiple):
+            connection.add_callback_threadsafe(
+                lambda: channel.basic_ack(delivery_tag=tag, multiple=multiple)
+            )
+
+    Set ``flush_interval_ms=0`` and flush yourself if you would rather not
+    deal with the timer thread at all.
     """
 
     def __init__(
@@ -823,6 +845,9 @@ class CoalescingAcker:
         max_hold: int = 2,
         coalesce: bool = True,
         channel_key: Any = None,
+        max_pending: int = 0,
+        collector: Any = None,
+        metrics_config: Any = None,
         on_flush: Callable[[CoalescingFlushReport], None] | None = None,
     ) -> None:
         self._config = config or BatchAckConfig()
@@ -831,7 +856,9 @@ class CoalescingAcker:
         self._nack_fn = nack_fn
         self._reject_fn = reject_fn
         self._on_flush = on_flush
-        self._coordinator = SettlementCoordinator(coalesce=coalesce, max_hold=max_hold)
+        self._collector = collector
+        self._metrics_config = metrics_config
+        self._coordinator = SettlementCoordinator(coalesce=coalesce, max_hold=max_hold, max_pending=max_pending)
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._timer: threading.Timer | None = None
@@ -849,6 +876,37 @@ class CoalescingAcker:
     def channel_key(self) -> Any:
         """The channel this acker is bound to, or ``None`` while unbound."""
         return self._channel_key
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Coordinator instrumentation for this channel: ``registered``,
+        ``pending``, ``outstanding``, ``ack_ready``, ``frontier``,
+        ``settled``, ``coalesced``, ``frames_sent``, ``coalescing_ratio``,
+        ``gap_count``, ``oldest_pending_age``, ``invalidations``,
+        ``dropped_on_invalidate``."""
+        stats = self._coordinator.stats
+        stats["gap_count"] = self._coordinator.gap_count
+        return stats
+
+    def _emit_metrics(self) -> None:
+        """Push :attr:`metrics` into a ``MetricsCollector`` when one was
+        supplied. Labels are bounded (none) — this is per-channel state, so
+        wire one collector per process, not per delivery."""
+        if self._collector is None or self._metrics_config is None:
+            return
+        cfg, stats = self._metrics_config, self.metrics
+        set_gauge = getattr(self._collector, "set_gauge", None)
+        if set_gauge is None:
+            return
+        for name, key in (
+            (cfg.settlement_pending, "pending"),
+            (cfg.settlement_ack_ready, "ack_ready"),
+            (cfg.settlement_frontier, "frontier"),
+            (cfg.settlement_gap_count, "gap_count"),
+            (cfg.settlement_oldest_pending_age_seconds, "oldest_pending_age"),
+            (cfg.settlement_coalescing_ratio, "coalescing_ratio"),
+        ):
+            set_gauge(name, {}, float(stats[key]))
 
     @property
     def pending(self) -> int:
@@ -902,6 +960,23 @@ class CoalescingAcker:
         above it until :meth:`release`."""
         self._coordinator.mark_retry_pending(delivery_tag)
 
+    def abandon(self, delivery_tag: int) -> None:
+        """The handler failed with no settlement decision (``FAILED``).
+
+        Blocks the frontier and is NEVER acked — the delivery stays unacked
+        so the broker redelivers it when the channel closes. Use this instead
+        of leaving the tag ``OUTSTANDING`` so the ledger records that nobody
+        is still working on it.
+        """
+        self._coordinator.mark_failed(delivery_tag)
+
+    def cancel(self, delivery_tag: int) -> None:
+        """The handler was cancelled (shutdown, timeout) — ``CANCELLED``.
+
+        Same treatment as :meth:`abandon`: blocks the frontier, never acked.
+        """
+        self._coordinator.mark_cancelled(delivery_tag)
+
     def release(self, delivery_tag: int) -> None:
         self._coordinator.release(delivery_tag)
 
@@ -946,6 +1021,11 @@ class CoalescingAcker:
             self.coalesced_total += report.coalesced_tags
             if errors:
                 self.last_error = errors[0][1]
+            if self._collector is not None:
+                inc = getattr(self._collector, "inc_counter", None)
+                if inc is not None and self._metrics_config is not None and report.coalesced_tags:
+                    inc(self._metrics_config.settlement_coalesced_total, {}, float(report.coalesced_tags))
+                self._emit_metrics()
             if self._on_flush is not None:
                 try:
                     self._on_flush(report)
@@ -1023,6 +1103,8 @@ class CoalescingAckerGroup:
     Usage::
 
         def build(channel: Any) -> CoalescingAcker:
+            # `emit` MUST be thread-safe — the flush timer runs off-loop.
+            # See CoalescingAcker's docstring.
             return CoalescingAcker(
                 ack_fn=lambda t, m: emit(channel.basic_ack(t, multiple=m)),
                 nack_fn=lambda t, r: emit(channel.basic_nack(t, requeue=r)),
@@ -1083,6 +1165,23 @@ class CoalescingAckerGroup:
                 return acker.last_error
         return None
 
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Per-channel metrics summed across the group (``coalescing_ratio``
+        is recomputed from the totals, not averaged)."""
+        total: dict[str, float] = {}
+        for acker in self._snapshot():
+            for key, value in acker.metrics.items():
+                if key == "coalescing_ratio":
+                    continue
+                total[key] = total.get(key, 0.0) + value
+        total["channels"] = float(self.channels)
+        total["settled"] = float(self.settled_total)
+        total["coalesced"] = float(self.coalesced_total)
+        frames = total.get("frames_sent", 0.0)
+        total["coalescing_ratio"] = (total["settled"] / frames) if frames else 0.0
+        return total
+
     def _snapshot(self) -> tuple[CoalescingAcker, ...]:
         with self._lock:
             return tuple(self._ackers.values())
@@ -1125,6 +1224,14 @@ class CoalescingAckerGroup:
 
     def retry_pending(self, channel: Any, delivery_tag: int) -> None:
         self.for_channel(channel).retry_pending(delivery_tag)
+
+    def abandon(self, channel: Any, delivery_tag: int) -> None:
+        """Handler failed with no settlement decision — never acked."""
+        self.for_channel(channel).abandon(delivery_tag)
+
+    def cancel(self, channel: Any, delivery_tag: int) -> None:
+        """Handler was cancelled — never acked."""
+        self.for_channel(channel).cancel(delivery_tag)
 
     def release(self, channel: Any, delivery_tag: int) -> None:
         self.for_channel(channel).release(delivery_tag)

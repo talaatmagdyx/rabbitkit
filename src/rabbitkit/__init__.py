@@ -66,11 +66,16 @@ from rabbitkit.core.retry_handoff import RetryHandoffTracker
 from rabbitkit.core.router import RabbitRouter
 from rabbitkit.core.sanitizer import ErrorSanitizer, SanitizedError
 from rabbitkit.core.settlement import (
+    ContradictorySettlementError,
+    CoordinatorError,
+    LedgerFullError,
     SettlementCommand,
     SettlementCoordinator,
     SettlementItem,
     SettlementReport,
     SettlementReportError,
+    StaleGenerationError,
+    UnknownDeliveryError,
 )
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
@@ -189,6 +194,8 @@ __all__ = [
     "ConsumerConfig",
     "Context",
     "ContextRepo",
+    "ContradictorySettlementError",
+    "CoordinatorError",
     "DIResolver",
     "DLQInspector",
     "DataclassDecoder",
@@ -212,6 +219,7 @@ __all__ = [
     "HealthStatus",
     "HealthWatcher",
     "JsonParser",
+    "LedgerFullError",
     "LoggingConfig",
     "ManagementConfig",
     "MessageDecoder",
@@ -271,11 +279,13 @@ __all__ = [
     "SettlementReport",
     "SettlementReportError",
     "SocketConfig",
+    "StaleGenerationError",
     "SyncBatchPublisher",
     "SyncBroker",
     "SyncWorkerPool",
     "TopologyMode",
     "TopologyValidationError",
+    "UnknownDeliveryError",
     "UnsafeTopologyError",
     "WorkerConfig",
     "__version__",

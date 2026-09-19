@@ -754,6 +754,42 @@ class MetricsConfig:
         return f"{self.namespace}_settlement_items_total"
 
     @property
+    def settlement_pending(self) -> str:
+        """Gauge: deliveries registered with a ``SettlementCoordinator`` but
+        not yet settled. Unbounded growth means a stuck handler is holding
+        the ack frontier back."""
+        return f"{self.namespace}_settlement_pending"
+
+    @property
+    def settlement_ack_ready(self) -> str:
+        """Gauge: deliveries approved for an ack but not yet emitted."""
+        return f"{self.namespace}_settlement_ack_ready"
+
+    @property
+    def settlement_frontier(self) -> str:
+        """Gauge: highest delivery tag a cumulative ack could currently cover.
+        Flat while ``settlement_ack_ready`` climbs = a straggler is blocking."""
+        return f"{self.namespace}_settlement_frontier"
+
+    @property
+    def settlement_gap_count(self) -> str:
+        """Gauge: blocking deliveries sitting below an ack-ready one — the
+        stragglers stranding otherwise-settleable work."""
+        return f"{self.namespace}_settlement_gap_count"
+
+    @property
+    def settlement_oldest_pending_age_seconds(self) -> str:
+        """Gauge: age of the oldest unsettled delivery. The clearest
+        "a handler is stuck" signal; alert on it."""
+        return f"{self.namespace}_settlement_oldest_pending_age_seconds"
+
+    @property
+    def settlement_coalescing_ratio(self) -> str:
+        """Gauge: deliveries settled per AMQP frame sent. 1.0 = no coalescing
+        happening (often because the frontier is blocked)."""
+        return f"{self.namespace}_settlement_coalescing_ratio"
+
+    @property
     def settlement_coalesced_total(self) -> str:
         """Tags settled through a cumulative (multiple=True) ack by a
         ``CoalescingAcker`` — the coalescing-ratio numerator."""

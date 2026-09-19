@@ -27,11 +27,12 @@ Safety invariants enforced here (see the plan, §3):
 from __future__ import annotations
 
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import DeliveryState, SettlementAction, SettlementItemStatus
@@ -303,8 +304,45 @@ class SettlementCommand:
 
 
 class CoordinatorError(RuntimeError):
-    """Invalid use of :class:`SettlementCoordinator` (unregistered tag,
-    non-monotonic registration, double intent)."""
+    """Invalid use of :class:`SettlementCoordinator`. Base class for the
+    specific errors below; catching it catches all of them."""
+
+
+class UnknownDeliveryError(CoordinatorError):
+    """A delivery tag that was never registered on this generation.
+
+    Silently ignoring it would let a caller bug corrupt the frontier, so it
+    is always loud. A tag from an OLDER generation (the channel was rebuilt
+    under you) raises :class:`StaleGenerationError` instead.
+    """
+
+
+class StaleGenerationError(CoordinatorError):
+    """A delivery tag from a previous channel generation.
+
+    The channel it arrived on is gone; the broker will redeliver the message
+    on the new one with a NEW tag. Emitting anything for the old tag would
+    settle an unrelated message (invariants I2, I5).
+    """
+
+
+class ContradictorySettlementError(CoordinatorError):
+    """A settlement decision that contradicts one already recorded.
+
+    Repeating the SAME decision is an idempotent no-op; changing it (ack →
+    nack, nack → ack, acking something that FAILED) is never silently
+    accepted (invariant I4).
+    """
+
+
+class LedgerFullError(CoordinatorError):
+    """``max_pending`` reached — the ledger refuses to grow further.
+
+    Raised by :meth:`SettlementCoordinator.register`, so the caller applies
+    backpressure (stop consuming / lower prefetch). The delivery stays
+    unacked and the broker redelivers it. Bounds NEVER cause an unsafe ack
+    (invariant I7).
+    """
 
 
 class SettlementCoordinator:
@@ -329,26 +367,69 @@ class SettlementCoordinator:
     thread / event loop).
     """
 
+    #: Which state transitions are legal. Repeating the SAME state is an
+    #: idempotent no-op (handled before this table); anything not listed is a
+    #: contradiction. SUCCESS is reachable ONLY from OUTSTANDING/RETRY_PENDING
+    #: — a delivery that FAILED or was CANCELLED can never be acked (I3).
+    _TRANSITIONS: ClassVar[dict[DeliveryState, frozenset[DeliveryState]]] = {
+        DeliveryState.OUTSTANDING: frozenset(
+            {
+                DeliveryState.SUCCESS,
+                DeliveryState.NACK,
+                DeliveryState.REJECT,
+                DeliveryState.RETRY_PENDING,
+                DeliveryState.FAILED,
+                DeliveryState.CANCELLED,
+            }
+        ),
+        DeliveryState.RETRY_PENDING: frozenset(
+            {
+                DeliveryState.SUCCESS,
+                DeliveryState.NACK,
+                DeliveryState.REJECT,
+                DeliveryState.FAILED,
+                DeliveryState.CANCELLED,
+            }
+        ),
+        DeliveryState.FAILED: frozenset({DeliveryState.NACK, DeliveryState.REJECT}),
+        DeliveryState.CANCELLED: frozenset({DeliveryState.NACK, DeliveryState.REJECT}),
+        DeliveryState.SUCCESS: frozenset(),
+        DeliveryState.NACK: frozenset(),
+        DeliveryState.REJECT: frozenset(),
+    }
+
     def __init__(
         self,
         *,
         generation: int = 0,
         coalesce: bool = True,
         max_hold: int = 0,
+        max_pending: int = 0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._generation = generation
         self._coalesce = coalesce
         # max_hold: how many planning rounds a SUCCESS entry stranded behind
-        # an outstanding tag may wait for a cumulative ack before being
-        # acked individually. 0 = never hold (always individual fallback).
+        # a blocking tag may wait for a cumulative ack before being acked
+        # individually. 0 = never hold (always individual fallback).
         self._max_hold = max(0, max_hold)
+        # max_pending: hard ceiling on ledger size. 0 = unbounded (default).
+        # Exceeding it raises LedgerFullError from register() so the caller
+        # applies backpressure — it NEVER relaxes the ack rules (I7).
+        self._max_pending = max(0, max_pending)
+        self._clock = clock
         self._lock = threading.Lock()
         self._ledger: dict[int, DeliveryState] = {}  # insertion == ascending tag order
         self._hold: dict[int, int] = {}
         self._requeue: dict[int, bool] = {}
+        self._registered_at: dict[int, float] = {}
         self._last_registered = 0
+        self._prev_high_water = 0  # highest tag of any dropped generation
+        self._registered_count = 0
         self._settled_count = 0
         self._coalesced_count = 0
+        self._frames_sent = 0
+        self._invalidations = 0
         self._dropped_on_invalidate = 0
 
     # ── inspection ────────────────────────────────────────────────────────
@@ -362,6 +443,10 @@ class SettlementCoordinator:
         return self._coalesce
 
     @property
+    def max_pending(self) -> int:
+        return self._max_pending
+
+    @property
     def outstanding(self) -> int:
         with self._lock:
             return sum(1 for s in self._ledger.values() if s is DeliveryState.OUTSTANDING)
@@ -373,13 +458,70 @@ class SettlementCoordinator:
             return len(self._ledger)
 
     @property
-    def stats(self) -> dict[str, int]:
+    def ack_ready(self) -> int:
+        """Deliveries approved for an ack but not yet emitted."""
+        with self._lock:
+            return sum(1 for s in self._ledger.values() if s.is_ack_safe)
+
+    @property
+    def frontier(self) -> int:
+        """Highest tag a cumulative ack could cover right now (0 = none).
+
+        This is the end of the leading all-SUCCESS run, NOT the highest
+        completed tag — that difference is the whole point of the
+        coordinator (invariant I1).
+        """
+        with self._lock:
+            return self._frontier_locked()
+
+    def _frontier_locked(self) -> int:
+        frontier = 0
+        for tag in sorted(self._ledger):
+            if self._ledger[tag].is_ack_safe:
+                frontier = tag
+            else:
+                break
+        return frontier
+
+    @property
+    def gap_count(self) -> int:
+        """Blocking deliveries sitting below an ack-ready one — i.e. how many
+        stragglers are stranding otherwise-settleable work."""
+        with self._lock:
+            tags = sorted(self._ledger)
+            highest_ready = max((t for t in tags if self._ledger[t].is_ack_safe), default=0)
+            return sum(1 for t in tags if t < highest_ready and self._ledger[t].blocks_frontier)
+
+    @property
+    def oldest_pending_age(self) -> float:
+        """Seconds since the oldest still-unsettled delivery was registered
+        (0.0 when the ledger is empty). The signal for a stuck handler
+        holding the frontier back."""
+        with self._lock:
+            if not self._registered_at:
+                return 0.0
+            return max(0.0, self._clock() - min(self._registered_at.values()))
+
+    @property
+    def stats(self) -> dict[str, float]:
+        """Snapshot for metrics/debugging. ``coalescing_ratio`` is
+        deliveries settled per AMQP frame sent — 1.0 means no coalescing."""
         with self._lock:
             return {
+                "registered": self._registered_count,
                 "pending": len(self._ledger),
+                "outstanding": sum(1 for s in self._ledger.values() if s is DeliveryState.OUTSTANDING),
+                "ack_ready": sum(1 for s in self._ledger.values() if s.is_ack_safe),
+                "frontier": self._frontier_locked(),
                 "settled": self._settled_count,
                 "coalesced": self._coalesced_count,
+                "frames_sent": self._frames_sent,
+                "coalescing_ratio": (self._settled_count / self._frames_sent) if self._frames_sent else 0.0,
+                "invalidations": self._invalidations,
                 "dropped_on_invalidate": self._dropped_on_invalidate,
+                "oldest_pending_age": (
+                    max(0.0, self._clock() - min(self._registered_at.values())) if self._registered_at else 0.0
+                ),
             }
 
     def state_of(self, delivery_tag: int) -> DeliveryState | None:
@@ -390,7 +532,12 @@ class SettlementCoordinator:
 
     def register(self, delivery_tag: int) -> None:
         """Register a delivery BEFORE its handler runs. Tags must be strictly
-        increasing within a generation (AMQP guarantees this per channel)."""
+        increasing within a generation (AMQP guarantees this per channel), so
+        a redelivered message — which always arrives with a NEW, higher tag —
+        registers cleanly while the old tag can never be re-registered.
+
+        Raises :class:`LedgerFullError` when ``max_pending`` is reached.
+        """
         with self._lock:
             if delivery_tag <= 0:
                 raise CoordinatorError(f"delivery_tag must be positive, got {delivery_tag}")
@@ -400,18 +547,60 @@ class SettlementCoordinator:
                     f"{self._last_registered} (stale or duplicate delivery on generation "
                     f"{self._generation})"
                 )
+            if self._max_pending and len(self._ledger) >= self._max_pending:
+                raise LedgerFullError(
+                    f"ledger holds {len(self._ledger)} unsettled deliveries (max_pending="
+                    f"{self._max_pending}) on generation {self._generation}; apply backpressure "
+                    "(stop consuming / lower prefetch) — the delivery stays unacked and the "
+                    "broker will redeliver it."
+                )
             self._ledger[delivery_tag] = DeliveryState.OUTSTANDING
+            self._registered_at[delivery_tag] = self._clock()
             self._last_registered = delivery_tag
+            self._registered_count += 1
 
-    def _set_intent(self, delivery_tag: int, state: DeliveryState) -> None:
+    def _missing(self, delivery_tag: int) -> CoordinatorError:
+        """Classify a tag that is not in the ledger (best effort — all three
+        are CoordinatorError and none of them ever emits a frame)."""
+        if delivery_tag <= self._last_registered:
+            return ContradictorySettlementError(
+                f"delivery_tag {delivery_tag} was already settled or released on generation {self._generation}"
+            )
+        if delivery_tag <= self._prev_high_water:
+            return StaleGenerationError(
+                f"delivery_tag {delivery_tag} belongs to a previous generation (current is "
+                f"{self._generation}); that channel is gone and the broker will redeliver "
+                "the message with a new tag"
+            )
+        return UnknownDeliveryError(
+            f"delivery_tag {delivery_tag} was never registered on generation {self._generation}"
+        )
+
+    def _set_intent(self, delivery_tag: int, state: DeliveryState, requeue: bool | None = None) -> None:
         current = self._ledger.get(delivery_tag)
         if current is None:
-            raise CoordinatorError(f"delivery_tag {delivery_tag} is not registered on generation {self._generation}")
-        if current is not DeliveryState.OUTSTANDING and current is not DeliveryState.RETRY_PENDING:
-            raise CoordinatorError(f"delivery_tag {delivery_tag} already has intent {current.value}")
+            raise self._missing(delivery_tag)
+        if current is state:
+            # Idempotent repeat — but a nack/reject that flips requeue is a
+            # different decision, not a repeat.
+            if requeue is not None and self._requeue.get(delivery_tag) != requeue:
+                raise ContradictorySettlementError(
+                    f"delivery_tag {delivery_tag} is already {state.value} with "
+                    f"requeue={self._requeue.get(delivery_tag)}; cannot change it to requeue={requeue}"
+                )
+            return
+        if state not in self._TRANSITIONS[current]:
+            raise ContradictorySettlementError(
+                f"delivery_tag {delivery_tag} is {current.value}; refusing to change it to "
+                f"{state.value} (legal next states: "
+                f"{sorted(x.value for x in self._TRANSITIONS[current]) or 'none — terminal'})"
+            )
         self._ledger[delivery_tag] = state
+        if requeue is not None:
+            self._requeue[delivery_tag] = requeue
 
     def mark_success(self, delivery_tag: int) -> None:
+        """Handler succeeded: the delivery is ack-safe. Idempotent."""
         with self._lock:
             self._set_intent(delivery_tag, DeliveryState.SUCCESS)
 
@@ -422,15 +611,28 @@ class SettlementCoordinator:
         with self._lock:
             self._set_intent(delivery_tag, DeliveryState.RETRY_PENDING)
 
+    def mark_failed(self, delivery_tag: int) -> None:
+        """Handler failed with no settlement decision: block the frontier and
+        never emit anything. The delivery stays unacked, so the broker
+        redelivers it when the channel closes. It can still be settled
+        explicitly with :meth:`mark_nack` / :meth:`mark_reject`, but never
+        acked."""
+        with self._lock:
+            self._set_intent(delivery_tag, DeliveryState.FAILED)
+
+    def mark_cancelled(self, delivery_tag: int) -> None:
+        """Handler was cancelled (shutdown, timeout): same treatment as
+        :meth:`mark_failed` — blocks the frontier, never acked."""
+        with self._lock:
+            self._set_intent(delivery_tag, DeliveryState.CANCELLED)
+
     def mark_nack(self, delivery_tag: int, *, requeue: bool = True) -> None:
         with self._lock:
-            self._set_intent(delivery_tag, DeliveryState.NACK)
-            self._requeue[delivery_tag] = requeue
+            self._set_intent(delivery_tag, DeliveryState.NACK, requeue=requeue)
 
     def mark_reject(self, delivery_tag: int, *, requeue: bool = False) -> None:
         with self._lock:
-            self._set_intent(delivery_tag, DeliveryState.REJECT)
-            self._requeue[delivery_tag] = requeue
+            self._set_intent(delivery_tag, DeliveryState.REJECT, requeue=requeue)
 
     def release(self, delivery_tag: int) -> None:
         """Remove a delivery that was settled OUTSIDE the coordinator (e.g. by
@@ -440,72 +642,55 @@ class SettlementCoordinator:
             self._ledger.pop(delivery_tag, None)
             self._hold.pop(delivery_tag, None)
             self._requeue.pop(delivery_tag, None)
+            self._registered_at.pop(delivery_tag, None)
 
     # ── planning ─────────────────────────────────────────────────────────
 
     def plan(self, *, force_individual: bool = False) -> list[SettlementCommand]:
         """Compute and CONSUME the commands that are safe to emit now.
 
-        Every returned command's tags are removed from the ledger, so a tag
-        is planned at most once. Entries still OUTSTANDING / RETRY_PENDING
-        stay. Emission order is ascending by the highest tag each command
-        settles, which keeps individual nacks below a cumulative ack ahead
-        of it.
+        Walks the ledger in ascending tag order and coalesces each contiguous
+        run of ack-safe deliveries. A nack/reject in the middle is emitted
+        individually and, because it settles that tag on the wire first, the
+        run AFTER it can form a new cumulative range::
+
+            101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
+            → ack(102, multiple=True), nack(103), ack(105, multiple=True)
+
+        The moment a BLOCKING delivery is reached (still outstanding, retry-
+        pending, failed or cancelled) no cumulative ack may reach past it
+        ever again in this plan: everything above is acked individually,
+        optionally after a bounded hold. Commands are returned in ascending
+        tag order and MUST be emitted in that order — a cumulative ack is
+        only safe because the frames below it went out first.
+
+        Every returned tag is removed from the ledger, so a tag is planned at
+        most once. Blocking entries stay.
         """
         with self._lock:
             if not self._ledger:
                 return []
             commands: list[SettlementCommand] = []
-            tags = sorted(self._ledger)  # ascending, defensive (dict is insertion-ordered anyway)
-
-            # 1. Longest all-SUCCESS prefix → cumulative ack (if allowed).
-            prefix: list[int] = []
-            for t in tags:
-                if self._ledger[t] is DeliveryState.SUCCESS:
-                    prefix.append(t)
-                else:
-                    break
-            use_multiple = self._coalesce and not force_individual and len(prefix) >= 2
             consumed: set[int] = set()
-            if use_multiple:
-                commands.append(
-                    SettlementCommand(
-                        kind=SettlementAction.ACK,
-                        delivery_tag=prefix[-1],
-                        multiple=True,
-                        covers=tuple(prefix),
-                        generation=self._generation,
-                    )
-                )
-                consumed.update(prefix)
-                self._coalesced_count += len(prefix)
-                prefix_boundary = prefix[-1]
-            else:
-                prefix_boundary = 0
+            run: list[int] = []  # current contiguous ack-safe run
+            blocked = False  # a blocking delivery has been passed
 
-            # 2. Everything else: individual, in tag order.
-            blocked = False  # True once we pass an OUTSTANDING/RETRY_PENDING entry
-            for t in tags:
-                if t in consumed:
-                    continue
-                state = self._ledger[t]
-                if state is DeliveryState.OUTSTANDING or state is DeliveryState.RETRY_PENDING:
-                    blocked = True
-                    continue
-                if state is DeliveryState.SUCCESS:
-                    # Behind an unfinished sibling: optionally hold a few rounds
-                    # hoping for a cumulative ack; never hold when coalescing
-                    # is off or the prefix already advanced past us.
-                    if (
-                        self._coalesce
-                        and not force_individual
-                        and blocked
-                        and t > prefix_boundary
-                        and self._hold.get(t, 0) < self._max_hold
-                    ):
-                        self._hold[t] = self._hold.get(t, 0) + 1
-                        continue
+            def flush_run() -> None:
+                if not run:
+                    return
+                if self._coalesce and not force_individual and len(run) >= 2:
                     commands.append(
+                        SettlementCommand(
+                            kind=SettlementAction.ACK,
+                            delivery_tag=run[-1],
+                            multiple=True,
+                            covers=tuple(run),
+                            generation=self._generation,
+                        )
+                    )
+                    self._coalesced_count += len(run)
+                else:
+                    commands.extend(
                         SettlementCommand(
                             kind=SettlementAction.ACK,
                             delivery_tag=t,
@@ -513,36 +698,59 @@ class SettlementCoordinator:
                             covers=(t,),
                             generation=self._generation,
                         )
+                        for t in run
                     )
-                    consumed.add(t)
-                elif state is DeliveryState.NACK:
-                    commands.append(
-                        SettlementCommand(
-                            kind=SettlementAction.NACK,
-                            delivery_tag=t,
-                            requeue=self._requeue.get(t, True),
-                            covers=(t,),
-                            generation=self._generation,
-                        )
-                    )
-                    consumed.add(t)
-                elif state is DeliveryState.REJECT:
-                    commands.append(
-                        SettlementCommand(
-                            kind=SettlementAction.REJECT,
-                            delivery_tag=t,
-                            requeue=self._requeue.get(t, False),
-                            covers=(t,),
-                            generation=self._generation,
-                        )
-                    )
-                    consumed.add(t)
+                consumed.update(run)
+                run.clear()
 
-            for t in consumed:
-                self._ledger.pop(t, None)
-                self._hold.pop(t, None)
-                self._requeue.pop(t, None)
+            for tag in sorted(self._ledger):
+                state = self._ledger[tag]
+                if state.is_ack_safe:
+                    if not blocked:
+                        run.append(tag)
+                        continue
+                    # Stranded behind a blocker: hold briefly hoping the
+                    # blocker resolves, then fall back to an individual ack so
+                    # one slow handler cannot pin its siblings forever.
+                    if self._coalesce and not force_individual and self._hold.get(tag, 0) < self._max_hold:
+                        self._hold[tag] = self._hold.get(tag, 0) + 1
+                        continue
+                    commands.append(
+                        SettlementCommand(
+                            kind=SettlementAction.ACK,
+                            delivery_tag=tag,
+                            multiple=False,
+                            covers=(tag,),
+                            generation=self._generation,
+                        )
+                    )
+                    consumed.add(tag)
+                elif state is DeliveryState.NACK or state is DeliveryState.REJECT:
+                    # Settles this tag on the wire before anything above it,
+                    # so it does NOT block a later cumulative range.
+                    flush_run()
+                    commands.append(
+                        SettlementCommand(
+                            kind=SettlementAction.NACK if state is DeliveryState.NACK else SettlementAction.REJECT,
+                            delivery_tag=tag,
+                            requeue=self._requeue.get(tag, state is DeliveryState.NACK),
+                            covers=(tag,),
+                            generation=self._generation,
+                        )
+                    )
+                    consumed.add(tag)
+                else:  # OUTSTANDING / RETRY_PENDING / FAILED / CANCELLED
+                    flush_run()
+                    blocked = True
+            flush_run()
+
+            for tag in consumed:
+                self._ledger.pop(tag, None)
+                self._hold.pop(tag, None)
+                self._requeue.pop(tag, None)
+                self._registered_at.pop(tag, None)
             self._settled_count += len(consumed)
+            self._frames_sent += len(commands)
             commands.sort(key=lambda c: c.delivery_tag)
             return commands
 
@@ -552,20 +760,25 @@ class SettlementCoordinator:
         """Reconnect / channel rebuild: drop the WHOLE ledger and bump the
         generation. Returns the dropped tags for logging. Old tags must never
         be replayed onto the replacement channel — the broker will redeliver
-        every unacked message on it anyway."""
+        every unacked message on it anyway (invariants I2, I5)."""
         with self._lock:
             dropped = tuple(sorted(self._ledger))
+            self._prev_high_water = max(self._prev_high_water, self._last_registered)
             self._ledger.clear()
             self._hold.clear()
             self._requeue.clear()
+            self._registered_at.clear()
             self._last_registered = 0
             self._generation += 1
+            self._invalidations += 1
             self._dropped_on_invalidate += len(dropped)
             return dropped
 
     def drain_plan(self) -> list[SettlementCommand]:
-        """Shutdown: emit everything approved (individually — no reason to
-        wait for a prefix), leave OUTSTANDING/RETRY_PENDING unacked."""
+        """Shutdown: emit everything already approved (individually — there is
+        no reason to wait for a prefix), and leave every blocking delivery
+        UNACKED for redelivery. Never acks merely to empty the ledger
+        (invariant I6)."""
         return self.plan(force_individual=True)
 
 

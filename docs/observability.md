@@ -146,6 +146,12 @@ exception text or tenant id.
 | `rabbitkit_bulk_publish_batch_size` | histogram | — | `publish_many` input sizes |
 | `rabbitkit_settlement_items_total` | counter | `action`, `status` | One per `ack_many` / `nack_many` item. `status` ∈ dispatched/already_settled/duplicate/invalid/stale/not_attempted/failed. |
 | `rabbitkit_settlement_coalesced_total` | counter | — | Tags settled through a cumulative ack by a `CoalescingAcker` (`CoalescingAcker.coalesced_total` exposes the same number in-process) |
+| `rabbitkit_settlement_pending` | gauge | — | Deliveries registered with a coordinator but not yet settled |
+| `rabbitkit_settlement_ack_ready` | gauge | — | Approved for an ack but not yet emitted |
+| `rabbitkit_settlement_frontier` | gauge | — | Highest tag a cumulative ack could cover; flat while `ack_ready` climbs = a straggler is blocking |
+| `rabbitkit_settlement_gap_count` | gauge | — | Blocking deliveries sitting below an ack-ready one |
+| `rabbitkit_settlement_oldest_pending_age_seconds` | gauge | — | Age of the oldest unsettled delivery — the clearest "a handler is stuck" signal |
+| `rabbitkit_settlement_coalescing_ratio` | gauge | — | Deliveries settled per frame sent; 1.0 = no coalescing happening |
 | `rabbitkit_retry_handoff_failures_total` | counter | `queue` | The RETRY PUBLISH to the delay queue failed (returned / nacked / timed out / raised). Distinct from `messages_retried_total`, which counts handler attempts. |
 | `rabbitkit_retry_handoff_paused` | gauge | `queue` | 1 while a route's handoff tracker is degraded/exhausted, 0 once a handoff succeeds again |
 
@@ -164,6 +170,10 @@ Alerting guidance:
 - **`settlement_items_total{status="stale"}`** — deferred acks are
   outliving their channel (reconnects under MANUAL/batch-commit consumers).
   Shorten the batch window or ack sooner.
+- **`settlement_oldest_pending_age_seconds` rising with a flat
+  `settlement_frontier`** — one slow handler is stranding the whole
+  cumulative-ack prefix. Safe (nothing is acked early), but unacked messages
+  accumulate; alert before `max_pending` is reached.
 
 ## High-cardinality routing keys / queue names
 

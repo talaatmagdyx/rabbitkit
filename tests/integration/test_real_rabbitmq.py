@@ -361,7 +361,7 @@ async def test_async_broker_publish_applies_signing_middleware(rabbitmq_url: str
     received_headers: dict[str, Any] = {}
     done = asyncio.Event()
 
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-integration-tests-pad!"))
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config, middlewares=[signing_mw])
 
@@ -1167,7 +1167,7 @@ async def test_async_signing_and_compression_compose_correctly(rabbitmq_url: str
     from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
     compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="h7-integ-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-h7-integration-tests!"))
 
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config, middlewares=[compression_mw, signing_mw])
@@ -1946,7 +1946,7 @@ def test_sync_broker_publish_applies_signing_middleware(rabbitmq_url: str) -> No
 
     received_headers: list[dict[str, Any]] = []
 
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-integration-tests-pad!"))
     config = _make_sync_config(rabbitmq_url)
     broker = SyncBroker(config=config, middlewares=[signing_mw])
 

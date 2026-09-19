@@ -19,7 +19,7 @@ from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import MessageEnvelope
 from rabbitkit.middleware.signing import InvalidSignatureError, SigningConfig, SigningMiddleware
 
-SECRET = "attacker-does-not-know-this"
+SECRET = "attacker-does-not-know-this" + "-32-bytes"
 
 
 def _envelope_after_wire(envelope: MessageEnvelope) -> RabbitMessage:

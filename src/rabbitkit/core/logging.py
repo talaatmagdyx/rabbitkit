@@ -79,8 +79,11 @@ of (or in addition to) the defaults.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from rabbitkit.core.sanitizer import ErrorSanitizer
 
 if TYPE_CHECKING:
     import structlog
@@ -206,6 +209,119 @@ def _redact_processor(keys: frozenset[str]) -> Any:
     return processor
 
 
+
+# ── Value-level redaction for STDLIB logging (0.16) ───────────────────────
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Redact credential-shaped VALUES from rendered log records.
+
+    ``_redact_processor`` above scrubs by key NAME and only under structlog.
+    Two gaps followed from that, both of which leaked plaintext:
+
+    1. Only four rabbitkit modules use structlog; **thirty-four use
+       :mod:`logging` directly** and bypassed the processor entirely.
+    2. Key-name matching cannot catch a secret in the VALUE of an innocently
+       named field. ``logger.warning("connection lost", error=str(exc))`` has
+       the key ``error``, so an exception carrying
+       ``amqp://svc:pw@host`` sailed through.
+
+    ``ErrorSanitizer`` already knew how to redact these, but it had exactly
+    one call site in the whole package — the dead-letter header — so
+    ``error_detail="sanitized"`` protected the header while the log line,
+    right next to it, printed the password.
+
+    This filter closes both by redacting the *formatted* message. Attach it
+    to the ``rabbitkit`` logger and it covers every module regardless of
+    which logging API they use.
+
+    It does NOT redact tracebacks: those are rendered by the Formatter, not
+    the record. Use :class:`SecretRedactingFormatter` for that.
+    """
+
+    def __init__(self, sanitizer: ErrorSanitizer | None = None, name: str = "") -> None:
+        super().__init__(name)
+        self._sanitizer = sanitizer or ErrorSanitizer()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:  # pragma: no cover - a broken record must still log
+            return True
+        redacted = self._sanitizer.redact(rendered)
+        if redacted != rendered:
+            # Replace msg wholesale and drop args: the substitution already
+            # happened, and re-applying args would raise or re-introduce the
+            # secret.
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+class SecretRedactingFormatter(logging.Formatter):
+    """A Formatter that also redacts the rendered TRACEBACK.
+
+    The last line of a traceback is ``str(exc)``, so any handler raising
+    ``SQLAlchemyError("could not connect: postgres://svc:pw@db/app")`` put
+    the password into every ``logger.exception(...)`` and every
+    ``exc_info=True`` call — of which rabbitkit has roughly forty.
+    """
+
+    def __init__(self, *args: Any, sanitizer: ErrorSanitizer | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._sanitizer = sanitizer or ErrorSanitizer()
+
+    def formatException(self, ei: Any) -> str:  # noqa: N802 — stdlib signature
+        return self._sanitizer.redact(super().formatException(ei))
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self._sanitizer.redact(super().format(record))
+
+
+def install_log_redaction(
+    logger_name: str = "rabbitkit",
+    *,
+    sanitizer: ErrorSanitizer | None = None,
+) -> SecretRedactingFilter:
+    """Attach :class:`SecretRedactingFilter` to *logger_name*, idempotently.
+
+    Called automatically by :func:`configure_structlog`. Call it directly if
+    you do not use rabbitkit's logging setup but still want its log lines
+    scrubbed.
+    """
+    root = logging.getLogger(logger_name)
+    for existing in root.filters:
+        if isinstance(existing, SecretRedactingFilter):
+            return existing
+    filt = SecretRedactingFilter(sanitizer)
+
+    # A Filter on a Logger runs only for records logged DIRECTLY on it.
+    # Records from child loggers propagate to ancestor HANDLERS and skip
+    # ancestor filters entirely, so attaching to "rabbitkit" alone would
+    # miss every `logging.getLogger(__name__)` in the package — which is 34
+    # of the 38 modules. Attach to each logger in the namespace instead.
+    root.addFilter(filt)
+    prefix = f"{logger_name}."
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if not name.startswith(prefix) or not isinstance(logger, logging.Logger):
+            continue
+        if not any(isinstance(f, SecretRedactingFilter) for f in logger.filters):
+            logger.addFilter(filt)
+
+    # Any handler already attached under this namespace gets it too, which
+    # also covers loggers created AFTER this call whose records reach one of
+    # those handlers.
+    for logger in (root, *(
+        lg
+        for name, lg in logging.Logger.manager.loggerDict.items()
+        if name.startswith(prefix) and isinstance(lg, logging.Logger)
+    )):
+        for handler in logger.handlers:
+            if not any(isinstance(f, SecretRedactingFilter) for f in handler.filters):
+                handler.addFilter(filt)
+    return filt
+
+
 def configure_structlog(config: LoggingConfig | None = None) -> None:
     """One-time structlog configuration.
 
@@ -232,6 +348,10 @@ def configure_structlog(config: LoggingConfig | None = None) -> None:
 
     if config.redact_keys:
         processors.append(_redact_processor(config.redact_keys))
+        # Key-name redaction only reaches structlog callers (4 of 38 modules)
+        # and cannot see a secret in the VALUE of an innocently named field.
+        # This covers every rabbitkit logger regardless of logging API.
+        install_log_redaction()
 
     if config.add_log_level:
         processors.append(structlog.stdlib.add_log_level)

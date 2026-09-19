@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-09-20
+
+Signing now fails **closed**, and rabbitkit's own log lines are scrubbed.
+Both are breaking if you relied on the previous defaults.
+
+### Security
+
+- **BREAKING: `reject_unsigned` now defaults to `True`.** It was `False`, so a
+  message whose signature header was simply *deleted* was accepted silently
+  and without logging. An attacker forged nothing; they removed a header. The
+  canonical example in `docs/security.md` used the plain constructor, so
+  anyone following the documentation had signing that enforced nothing. Pass
+  `reject_unsigned=False` explicitly if you genuinely mix signed and unsigned
+  traffic.
+- **BREAKING: keys shorter than 32 bytes are refused at construction.** The
+  docs always said "at least 32 bytes"; nothing enforced it, so
+  `secret_key=os.environ.get("SIGNING_KEY", "")` with the variable unset gave
+  a deployment where signing appeared to work end to end while every message
+  was forgeable by anyone who read the source. Empty keys are refused too.
+- **One free replay per window.** The acceptance window is
+  `abs(now - ts) <= max_skew`, i.e. `2 * max_skew` wide, but the nonce was
+  recorded for only `max_skew` and measured from *first receipt*. A message
+  received early relative to its timestamp — which is exactly what the future
+  half of the window is for — had its nonce expire while the timestamp was
+  still acceptable. Now recorded for the full window.
+- **Monitoring mode could be used to destroy genuine messages.** With
+  `reject_invalid=False` the signature was never computed, yet the nonce was
+  still recorded and a duplicate still raised. An observer who sniffed one
+  nonce could get the real message rejected as a replay. Verification now
+  always runs; the nonce is recorded only for an authentic message. That path
+  also had no log statement at all, so "monitoring mode" monitored nothing.
+- **rabbitkit's own logs leaked credentials.** `ErrorSanitizer` had exactly
+  one call site in the package — the dead-letter header — so
+  `error_detail="sanitized"` scrubbed the header while the log line next to
+  it printed the password. The structlog key-redaction processor did not help:
+  it matches key NAMES, and only 4 of 38 modules use structlog while 34 use
+  `logging` directly. New `SecretRedactingFilter` and
+  `SecretRedactingFormatter` redact credential-shaped *values* from rendered
+  records and tracebacks; `configure_structlog()` installs the filter across
+  the whole `rabbitkit` logger namespace automatically.
+
+### Added
+
+- **`SigningConfig.previous_keys`** — keys accepted on verify but never used
+  to sign, which is what makes rotation possible. Previously there was one
+  key, so rotating required every publisher and consumer to flip atomically
+  and any in-flight message signed with the old key was dead-lettered
+  permanently; the documented advice to rotate was unfollowable. Every
+  accepted key is compared without an early exit, so the number configured is
+  not observable in the response time. Rotation works on the default
+  freshness path, not just the legacy one.
+- `install_log_redaction()` for applications that do not use rabbitkit's
+  logging setup but still want its output scrubbed.
+
 ## [0.15.2] — 2026-09-20
 
 Supply-chain and CI hardening. No code changes to the package itself.

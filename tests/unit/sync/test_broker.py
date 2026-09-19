@@ -1836,7 +1836,7 @@ class TestPublishWithMiddlewares:
         from rabbitkit.core.types import PublishOutcome, PublishStatus
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker = self._start_broker(middlewares=[signing_mw])
 
         captured: list[MessageEnvelope] = []
@@ -1912,7 +1912,7 @@ class TestPublishWithMiddlewares:
         from rabbitkit.highload.backpressure import FlowController
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker = self._start_broker(middlewares=[signing_mw])
         broker.flow_controller = FlowController()
 
@@ -1935,7 +1935,7 @@ class TestPublishWithMiddlewares:
         from rabbitkit.core.types import PublishOutcome, PublishStatus
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
-        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret"))
+        signing_mw = SigningMiddleware(SigningConfig(secret_key="test-secret-key" + "-padded-to-32-bytes"))
         broker = self._start_broker(middlewares=[signing_mw])
         broker._transport.publish = MagicMock(  # type: ignore[union-attr]
             return_value=PublishOutcome(status=PublishStatus.CONFIRMED)
@@ -2453,7 +2453,7 @@ class TestSigningRetryConflict:
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
         broker = SyncBroker()
-        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t-key" + "-padded-out-to-32-bytes!"))
 
         @broker.subscriber(queue="orders", retry=RetryConfig(max_retries=1, delays=(5,)), middlewares=[signing])
         def handle(body: bytes) -> None:
@@ -2467,7 +2467,7 @@ class TestSigningRetryConflict:
         from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
         broker = SyncBroker()
-        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t"))
+        signing = SigningMiddleware(SigningConfig(secret_key="s3cr3t-key" + "-padded-out-to-32-bytes!"))
 
         @broker.subscriber(queue="orders", retry=RETRY_DISABLED, middlewares=[signing])
         def handle(body: bytes) -> None:

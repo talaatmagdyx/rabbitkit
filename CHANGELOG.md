@@ -25,6 +25,16 @@ classes of bug fixed here cannot come back silently.
   are no labels. This was invisible because every existing metrics test used
   a `MagicMock` collector, which accepts any call; there is now a suite that
   runs against the real `prometheus_client` with a scoped `CollectorRegistry`.
+- **CI was never running the OpenTelemetry tests.**
+  `tests/unit/middleware/test_otel.py` opens with
+  `pytest.importorskip("opentelemetry.sdk")`, but the `[otel]` extra ships
+  only `opentelemetry-api` — all the middleware needs at runtime — and no
+  extra declared the SDK. So the entire module skipped silently on every CI
+  leg and `middleware/otel.py` sat at 24% coverage, while developers who
+  happened to have the SDK installed saw 100% locally. `opentelemetry-sdk`
+  is now a test-only `[dev]` dependency. A skipped `importorskip` module is
+  invisible: it reports as a skip, not a failure, and takes its whole file's
+  coverage with it.
 - **Example ports no longer collide.** Three examples bound `:8080`, so a
   still-running example silently blocked the next one. The Kubernetes worker
   now uses `:8081` and the production pipeline `:8082` / `:9102`.
@@ -52,13 +62,9 @@ classes of bug fixed here cannot come back silently.
   pre-commit, `CONTRIBUTING.md` and the PR template. Examples are executable
   documentation and had drifted to 39 findings, including the two real bugs
   above.
-- **The CI coverage floor moved from 85% to 99%** on the 3.12 leg, and to
-  95% on the others. Actual unit coverage is 99.1%; the old floor was 14
-  points of slack in which a regression could hide. The per-leg split is
-  deliberate: coverage tracks which OPTIONAL dependencies have wheels for a
-  given interpreter, not test quality — 3.14 has no opentelemetry wheel, so
-  `middleware/otel.py` reports 24% and the total ~98.4% from the very same
-  suite. 3.12 resolves the full `[dev]` set, so it carries the ratchet.
+- **The CI coverage floor moved from 85% to 99%.** Actual unit coverage is
+  99.1%; the old floor was 14 points of slack in which a regression could
+  hide.
 - **The async broker no longer wires `reconnects_total`.** Verified against a
   live broker: when the BROKER closes a connection, aio-pika 9.6 recovers
   underneath the same `RobustConnection` without re-running its counted

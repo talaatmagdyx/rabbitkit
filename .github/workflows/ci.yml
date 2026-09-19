@@ -44,19 +44,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
-      # NOTE(coverage): the floor is per-leg on purpose, because coverage is
-      # a function of which OPTIONAL dependencies have wheels for that
-      # interpreter — not of test quality. On 3.14 there is no opentelemetry
-      # wheel, so middleware/otel.py drops to 24% and the total falls to
-      # ~98.4% with an identical test suite.
+      # NOTE(coverage): the floor is 99% (actual 99.1%) on every leg. It was
+      # 85% before 0.14, which was 14 points of slack a regression could hide
+      # in. Raise it as new tests land; never lower it to make a change go
+      # green — add the test instead.
       #
-      # 3.12 is the reference leg: it resolves the full `[dev]` set, so its
-      # number reflects real coverage and carries the ratchet (99%, actual
-      # 99.1%). Every other leg gets a floor that only catches a collapse.
-      # Raise the reference floor as new tests land; never lower it to make
-      # a change go green — add the test instead.
+      # If a leg reports ~98.4%, the cause is almost certainly a test-only
+      # dependency that failed to resolve rather than a missing test: an
+      # `importorskip` module drops out and takes its whole file's coverage
+      # with it. That is exactly how middleware/otel.py sat at 24% in CI
+      # until `opentelemetry-sdk` was added to the `[dev]` extra. Check the
+      # skip count and the install log before touching this number.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=${{ matrix.python-version == '3.12' && 99 || 95 }}
+        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as

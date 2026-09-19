@@ -45,7 +45,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
-      # NOTE(coverage): the floor is 99% (actual 99.1%) on every leg. It was
+      # NOTE(coverage): security/ and property/ are INSIDE the coverage run.
+      # They were measured separately, so the adversarial regressions —
+      # which are the only tests exercising several hardening paths — did
+      # not count toward the floor, and those paths looked uncovered.
+      #
+      # The floor is 99% (actual 99.1%) on every leg. It was
       # 85% before 0.14, which was 14 points of slack a regression could hide
       # in. Raise it as new tests land; never lower it to make a change go
       # green — add the test instead.
@@ -57,7 +62,7 @@ jobs:
       # until `opentelemetry-sdk` was added to the `[dev]` extra. Check the
       # skip count and the install log before touching this number.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
+        run: .venv/bin/pytest tests/unit/ tests/security/ tests/property/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as

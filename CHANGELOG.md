@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-09-20
+
+Stop treating publisher-set identifiers as capabilities. Four findings shared
+one root cause: `message_id`, `correlation_id` and `reply_to` are all chosen
+by the PUBLISHER, and each was used as a trust-bearing key into a shared
+store or as a routing destination.
+
+### Security
+
+- **`reply_to` was a one-hop write into any queue in the vhost.** A handler's
+  return value was published to `message.reply_to` verbatim, as a routing key
+  on the default exchange, with no check. A publisher who could reach ONE
+  queue could have that route's handler output delivered into a queue they
+  have no publish rights to — and, with a dedup result store, could replay a
+  victim's `message_id` with their own `reply_to` and receive the victim's
+  stored result. New `reply_to_allow` on `@subscriber` restricts the
+  destination; entries ending in `*` match as prefixes, and the broker's
+  private `amq.rabbitmq.reply-to` pseudo-queue is always permitted because it
+  can only reach the channel that issued the request. Leaving it unset keeps
+  the previous behaviour and warns **once per route**.
+- **One duplicate could drive ~3,160 redeliveries per second.** With
+  `mark_policy="claim"`, a duplicate of an in-flight message was
+  `nack(requeue=True)`-ed with no delay, so the broker redelivered it
+  immediately and it spun until the claim resolved — up to
+  `processing_timeout`, default 300 seconds. That burns a prefetch slot and
+  broker bandwidth, and an attacker who publishes a colliding id alongside a
+  slow payload gets the amplification for free. New
+  `DeduplicationConfig.in_flight_requeue_delay` (default 0.5s) bounds it to
+  single digits per second; set 0 for the old behaviour.
+- **Messages could read each other's context on the sync path.** A pooled
+  worker thread carries ONE `contextvars.Context` for its entire life, and
+  the handler was called directly rather than through a copied context — so
+  message A's `ContextVar` writes leaked into message B on the same thread.
+  With DI's `set_local`, tenant B could read tenant A's scope, contradicting
+  the isolation `ContextRepo` advertises. Both paths are fixed: the pooled
+  one and `worker_count=1`, which bypasses the pool and runs inline on the
+  transport's owner thread — a thread that lives for the whole process, so it
+  accumulated context just as badly.
+
+### Changed
+
+- **`security/` and `property/` are inside the coverage run.** They were
+  measured separately, so the adversarial regressions — the only tests
+  exercising several hardening paths — did not count toward the floor, and
+  those paths looked uncovered when they were not.
+
 ## [0.16.0] — 2026-09-20
 
 Signing now fails **closed**, and rabbitkit's own log lines are scrubbed.

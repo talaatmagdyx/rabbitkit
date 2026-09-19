@@ -136,6 +136,7 @@ class TestBroker:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reply_to_allow: tuple[str, ...] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber — same API as real broker."""
         decorator = self._registry.subscriber(
@@ -143,6 +144,7 @@ class TestBroker:
             exchange=exchange,
             routing_key=routing_key,
             ack_policy=ack_policy,
+            reply_to_allow=reply_to_allow,
             middlewares=middlewares,
             serializer=serializer,
             retry=retry,

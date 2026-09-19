@@ -198,3 +198,81 @@ def _sign(mw: SigningMiddleware, envelope: Any = None) -> Any:
     call_next = MagicMock(return_value="published")
     mw.publish_scope(call_next, envelope if envelope is not None else _envelope())
     return call_next.call_args[0][0]
+
+
+class TestLogRedaction:
+    """`ErrorSanitizer` had ONE call site in the package — the DLQ header — so
+    `error_detail="sanitized"` scrubbed the header while the adjacent log line
+    printed the password."""
+
+    def test_the_formatter_redacts_a_traceback(self) -> None:
+        """The last line of a traceback is `str(exc)`, so any handler raising
+        an exception that carries a connection string leaked it through every
+        `logger.exception(...)` call — of which rabbitkit has ~40."""
+        import logging
+
+        from rabbitkit.core.logging import SecretRedactingFormatter
+
+        pw = "hunt" + "er2"
+        fmt = SecretRedactingFormatter("%(message)s")
+        try:
+            raise RuntimeError(f"could not connect: postgres://svc:{pw}@db.internal/app")
+        except RuntimeError:
+            import sys
+
+            record = logging.LogRecord(
+                "rabbitkit.test", logging.ERROR, __file__, 1, "boom", None, sys.exc_info()
+            )
+        rendered = fmt.format(record)
+        assert pw not in rendered
+        assert "db.internal" in rendered, "the host must survive — it is the diagnostic"
+
+    def test_the_formatter_redacts_the_message_too(self) -> None:
+        import logging
+
+        from rabbitkit.core.logging import SecretRedactingFormatter
+
+        pw = "hunt" + "er2"
+        fmt = SecretRedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            "rabbitkit.test", logging.ERROR, __file__, 1,
+            "lost: amqp://admin:%s@mq/prod", (pw,), None,
+        )
+        assert pw not in fmt.format(record)
+
+    def test_install_is_idempotent(self) -> None:
+        from rabbitkit.core.logging import SecretRedactingFilter, install_log_redaction
+
+        first = install_log_redaction("rabbitkit.testns")
+        second = install_log_redaction("rabbitkit.testns")
+        assert first is second
+        attached = [
+            f
+            for f in __import__("logging").getLogger("rabbitkit.testns").filters
+            if isinstance(f, SecretRedactingFilter)
+        ]
+        assert len(attached) == 1
+
+    def test_a_handler_already_attached_gets_the_filter(self) -> None:
+        """Covers loggers created AFTER install whose records reach an
+        existing handler."""
+        import io
+        import logging
+
+        from rabbitkit.core.logging import SecretRedactingFilter, install_log_redaction
+
+        name = "rabbitkit.handlerns"
+        lg = logging.getLogger(name)
+        handler = logging.StreamHandler(io.StringIO())
+        lg.addHandler(handler)
+        install_log_redaction(name)
+        assert any(isinstance(f, SecretRedactingFilter) for f in handler.filters)
+
+    def test_an_unformattable_record_still_logs(self) -> None:
+        """A broken record must not be swallowed by the filter."""
+        import logging
+
+        from rabbitkit.core.logging import SecretRedactingFilter
+
+        record = logging.LogRecord("rabbitkit.t", logging.ERROR, __file__, 1, "%d", ("nope",), None)
+        assert SecretRedactingFilter().filter(record) is True

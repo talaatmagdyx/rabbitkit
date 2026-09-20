@@ -114,6 +114,46 @@ to create it. `TopologyMode.MANUAL` goes further — it skips topology
 declaration/checking entirely, for callers that manage topology completely
 out-of-band (e.g. via `rabbitmqadmin`/Terraform).
 
+## Deduplication keys are publisher-controlled
+
+`DeduplicationConfig.key_source` defaults to `message_id`, which the
+**publisher** sets. On a key hit the message is acked and the handler is
+skipped, logged at debug level — no dead letter, no metric.
+
+That combination is a suppression primitive when an untrusted party can
+publish into a deduplicated queue. One junk message with
+`message_id="order-1001"` marks that key for `ttl` (24 hours by default);
+your genuine `order-1001` then arrives, is acknowledged, and is discarded
+silently. Business keys are the natural thing to put in `message_id`, which
+is exactly what makes them guessable.
+
+**This only matters if an untrusted publisher can reach the queue.** With a
+single publisher you control, or unguessable ids, it is theoretical.
+Deduplication is opt-in — nothing enables it for you.
+
+Two controls, both already available:
+
+```python
+# 1. Namespace: on by default since 0.18 (the consuming queue, taken from a
+#    header the broker overwrites, so a publisher cannot steer it).
+DeduplicationConfig(key_prefix="dedup:orders")
+
+# 2. Bind the key to an authenticated producer. RabbitMQ validates `user_id`
+#    against the connection's authenticated user when the publisher sets it,
+#    so it is the one identity on a message that cannot be forged.
+DeduplicationMiddleware(
+    redis,
+    key_fn=lambda m: f"{m.user_id}:{m.message_id}",
+)
+```
+
+`key_fn` replaces the identity only; the queue namespace is still applied.
+
+Requiring `user_id` is a deployment decision rabbitkit cannot make for you:
+it works only if every publisher sets it. If they do, it turns the key from
+"whatever the publisher claimed" into "this producer's claim", which is what
+closes the suppression path.
+
 ## Header Validation
 
 Headers are untrusted input. Validate and sanitize all routing headers before acting on them. Do not use header values as file paths, SQL queries, or shell arguments.

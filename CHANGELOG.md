@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-09-20
+
+### Changed
+
+- **BREAKING: dedup keys are namespaced by the consuming queue.** The key was
+  `{key_prefix}:{id}` with no queue component, so one `DeduplicationMiddleware`
+  instance shared across routes — which the project's own examples do — gave
+  every queue a single shared keyspace. Two queues each handling a message with
+  id `order-1001` deduplicated against each other and one was silently dropped.
+  That is wrong regardless of who is publishing. The key is now
+  `{key_prefix}:{queue}:{id}`, where the queue comes from
+  `x-rabbitkit-original-queue`, a header both brokers overwrite at consume time
+  so a publisher cannot steer it.
+
+  **Migration:** this changes every key, so on deploy there is one `ttl`
+  window (24h by default) in which previously-seen messages are not recognised
+  as duplicates. Harmless for most workloads. If a duplicate is unacceptable,
+  set `namespace_by_queue=False`, deploy, then flip it during a quiet period.
+
+  `key_fn` still replaces the identity only; the namespace is applied on top,
+  so custom key functions do not reintroduce the collision.
+
+### Added
+
+- `DeduplicationConfig.namespace_by_queue` (default `True`) to opt out during
+  migration.
+- **`docs/security.md` now documents that dedup keys are publisher-controlled.**
+  `key_source` defaults to `message_id`, and on a key hit the message is acked
+  and skipped at debug level with no dead letter and no metric. Where an
+  untrusted party can publish into a deduplicated queue, one junk message
+  suppresses a real one for `ttl`. The page states when that matters, when it
+  does not, and shows binding the key to `user_id` — the one identity on a
+  message RabbitMQ validates against the authenticated connection.
+
 ## [0.17.0] — 2026-09-20
 
 Stop treating publisher-set identifiers as capabilities. Four findings shared

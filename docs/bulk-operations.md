@@ -161,6 +161,7 @@ acker = CoalescingAcker(
     nack_fn=lambda tag, requeue: ...,
     reject_fn=lambda tag, requeue: ...,
     config=BatchAckConfig(batch_size=50, flush_interval_ms=200),
+    channel_key=channel,   # tags are channel-scoped; see "One acker per channel"
 )
 
 acker.register(tag)              # BEFORE the handler runs
@@ -425,12 +426,12 @@ them land**. See the next section for what happens when one does not.
 
 `basic_ack(tag, multiple=True)` acknowledges every delivery still
 unacknowledged up to `tag`. In the plan above, `ack(105, multiple=True)` is
-correct *only* because `nack(103)` already removed 103 from the broker's
-unacknowledged set. If that nack never reached the broker and the cumulative
-ack went out anyway, the broker would acknowledge 103 as well — turning an
+correct *only* because `nack(103)` already settled 103 separately, before
+any later frame could reach it. If that nack never took effect and the
+cumulative ack went out anyway, the ack can cover 103 as well — turning an
 intended requeue into an ack and losing the message.
 
-Since 0.15 the coordinator therefore never settles anything on a promise:
+Since 0.15.0 the coordinator therefore never settles anything on a promise:
 
 ```python
 from rabbitkit.core.settlement import emit_batch
@@ -449,7 +450,7 @@ if not report.ok:
 | Situation | What happens |
 |---|---|
 | A frame lands | Its tags are committed and leave the ledger |
-| A frame fails | Emission stops. Its tags become **unresolved**: they leave the ledger and are never re-sent, because re-sending a settlement whose first attempt may have landed turns an ambiguity into a protocol error. Unacknowledged is always safe — the broker redelivers |
+| A frame fails | Emission stops. Its tags become **unresolved**: they leave the ledger and are never re-sent, because re-sending a settlement whose first attempt may have landed turns an ambiguity into a protocol error. We deliberately leave them unacknowledged and recover the channel, preferring redelivery over another settlement decision on a generation we no longer trust |
 | Commands after the failure | **Not attempted.** Their tags return to the ledger and are planned again next flush |
 
 A failed **nack or reject also invalidates the generation**: that tag may
@@ -473,16 +474,26 @@ async acker, which owns the event-loop boundary end to end:
 ```python
 from rabbitkit.highload import AsyncCoalescingAcker
 
+# The settlement methods live on the RAW aiormq channel, not on
+# aio_pika.Channel. `msg.raw_message.channel` is the channel the delivery
+# arrived on, and its basic_* methods are coroutines — which is exactly why
+# the async acker exists.
+raw = msg.raw_message.channel
+
 acker = AsyncCoalescingAcker(
-    ack_fn=lambda tag, multiple: channel.basic_ack(tag, multiple),
-    nack_fn=lambda tag, requeue: channel.basic_nack(tag, requeue=requeue),
-    reject_fn=lambda tag, requeue: channel.basic_reject(tag, requeue=requeue),
+    ack_fn=lambda tag, multiple: raw.basic_ack(delivery_tag=tag, multiple=multiple),
+    nack_fn=lambda tag, requeue: raw.basic_nack(delivery_tag=tag, requeue=requeue),
+    reject_fn=lambda tag, requeue: raw.basic_reject(delivery_tag=tag, requeue=requeue),
     config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
+    channel_key=raw,       # tags are channel-scoped; see "One acker per channel"
 )
 await acker.start()
 ...
 await acker.close()
 ```
+
+A runnable version is
+[`examples/highload/06_async_coalescing_acker.py`](https://github.com/talaatmagdyx/rabbitkit/blob/main/examples/highload/06_async_coalescing_acker.py).
 
 Its interval flush is an `asyncio.Task` on your loop, not a
 `threading.Timer`, so there is no `marshal=` parameter and no way to schedule

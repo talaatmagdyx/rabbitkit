@@ -32,6 +32,12 @@ def _make_message(**kwargs: object) -> RabbitMessage:
     return RabbitMessage(**defaults)  # type: ignore[arg-type]
 
 
+#: Dedup keys are namespaced by the CONSUMING queue since 0.18, and
+#: _make_message defaults to routing_key="orders" with no
+#: x-rabbitkit-original-queue header, so that is the namespace here.
+_DEDUP_KEY = "rabbitkit:dedup:orders:m1"
+
+
 async def _noop_async_ack() -> None:
     """Async no-op settlement fn — RetryMiddleware acks the source message
     when it successfully routes a failure to a delay queue."""
@@ -135,7 +141,7 @@ class TestNewMessage:
 
         assert len(redis.set_calls) == 1
         call = redis.set_calls[0]
-        assert call["key"] == "dedup:unique-id"
+        assert call["key"] == "dedup:orders:unique-id"
         assert call["nx"] is True
         assert call["ex"] == 3600
 
@@ -205,7 +211,7 @@ class TestKeySource:
         msg = _make_message(message_id="mid-123")
         mw.consume_scope(MagicMock(), msg)
 
-        assert redis.set_calls[0]["key"] == "test:mid-123"
+        assert redis.set_calls[0]["key"] == "test:orders:mid-123"
 
     def test_key_source_correlation_id(self) -> None:
         """key_source='correlation_id' uses message.correlation_id."""
@@ -216,7 +222,7 @@ class TestKeySource:
         msg = _make_message(correlation_id="corr-456")
         mw.consume_scope(MagicMock(), msg)
 
-        assert redis.set_calls[0]["key"] == "test:corr-456"
+        assert redis.set_calls[0]["key"] == "test:orders:corr-456"
 
     def test_key_source_body_hash(self) -> None:
         """key_source='body_hash' uses SHA-256 of message body."""
@@ -231,7 +237,7 @@ class TestKeySource:
         mw.consume_scope(MagicMock(), msg)
 
         expected_hash = hashlib.sha256(body).hexdigest()
-        assert redis.set_calls[0]["key"] == f"hash:{expected_hash}"
+        assert redis.set_calls[0]["key"] == f"hash:orders:{expected_hash}"
 
     def test_unknown_key_source_falls_back_to_message_id(self) -> None:
         """Unknown key_source falls back to message_id."""
@@ -242,7 +248,7 @@ class TestKeySource:
         msg = _make_message(message_id="fallback-id")
         mw.consume_scope(MagicMock(), msg)
 
-        assert redis.set_calls[0]["key"] == "fb:fallback-id"
+        assert redis.set_calls[0]["key"] == "fb:orders:fallback-id"
 
     def test_none_message_id_falls_back_to_body_hash(self) -> None:
         """If message_id is None, key falls back to the body hash (not empty)."""
@@ -257,7 +263,7 @@ class TestKeySource:
         mw.consume_scope(MagicMock(), msg)
 
         expected_hash = hashlib.sha256(body).hexdigest()
-        assert redis.set_calls[0]["key"] == f"test:{expected_hash}"
+        assert redis.set_calls[0]["key"] == f"test:orders:{expected_hash}"
 
     def test_none_correlation_id_falls_back_to_body_hash(self) -> None:
         """If correlation_id is None, key falls back to the body hash."""
@@ -272,7 +278,7 @@ class TestKeySource:
         mw.consume_scope(MagicMock(), msg)
 
         expected_hash = hashlib.sha256(body).hexdigest()
-        assert redis.set_calls[0]["key"] == f"c:{expected_hash}"
+        assert redis.set_calls[0]["key"] == f"c:orders:{expected_hash}"
 
     def test_distinct_id_less_messages_are_not_deduped(self) -> None:
         """Two id-less messages with different bodies are NOT collapsed (L-S1)."""
@@ -311,7 +317,7 @@ class TestCustomKeyFn:
         msg = _make_message(routing_key="orders.created")
         mw.consume_scope(MagicMock(), msg)
 
-        assert redis.set_calls[0]["key"] == "pfx:custom-orders.created"
+        assert redis.set_calls[0]["key"] == "pfx:orders.created:custom-orders.created"
 
 
 # ── key prefix ───────────────────────────────────────────────────────────
@@ -327,7 +333,7 @@ class TestKeyPrefix:
         msg = _make_message(message_id="id-1")
         mw.consume_scope(MagicMock(), msg)
 
-        assert redis.set_calls[0]["key"] == "myapp:dedup:id-1"
+        assert redis.set_calls[0]["key"] == "myapp:dedup:orders:id-1"
 
 
 # ── TTL ──────────────────────────────────────────────────────────────────
@@ -1863,7 +1869,7 @@ class TestIdempotentReceiver:
         out = mw.consume_scope(lambda m: {"total": 42}, msg)
 
         assert out == {"total": 42}
-        stored = redis._store["rabbitkit:dedup:m1"]
+        stored = redis._store[_DEDUP_KEY]
         assert stored.startswith("{")
         assert '"r":{"total":42}' in stored.replace(" ", "")
 
@@ -1890,7 +1896,7 @@ class TestIdempotentReceiver:
         redis = _FakeRedis()
         mw = self._mw(redis)
         mw.consume_scope(lambda m: None, self._msg("m1"))
-        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+        assert redis._store[_DEDUP_KEY] == "completed"
         assert mw.consume_scope(lambda m: None, self._msg("m1")) is None
 
     def test_unserializable_result_degrades_to_plain_completed(self) -> None:
@@ -1900,31 +1906,31 @@ class TestIdempotentReceiver:
         mw = self._mw(redis)
         out = mw.consume_scope(lambda m: object(), self._msg("m1"))
         assert out is not None
-        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+        assert redis._store[_DEDUP_KEY] == "completed"
 
     def test_oversized_result_degrades_to_plain_completed(self) -> None:
         redis = _FakeRedis()
         mw = self._mw(redis, max_result_bytes=10)
         mw.consume_scope(lambda m: {"k": "x" * 100}, self._msg("m1"))
-        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+        assert redis._store[_DEDUP_KEY] == "completed"
 
     def test_legacy_value_reads_as_completed_without_replay(self) -> None:
         """Keys written by pre-F5 deployments ('1' / 'completed') skip
         exactly as before -- safe rolling upgrade."""
         redis = _FakeRedis()
-        redis._store["rabbitkit:dedup:m1"] = "1"
+        redis._store[_DEDUP_KEY] = "1"
         mw = self._mw(redis)
         assert mw.consume_scope(lambda m: {"new": 1}, self._msg("m1")) is None
 
     def test_schema_version_mismatch_skips_without_replay(self) -> None:
         redis = _FakeRedis()
-        redis._store["rabbitkit:dedup:m1"] = '{"s":"completed","v":999,"r":{"stale":1}}'
+        redis._store[_DEDUP_KEY] = '{"s":"completed","v":999,"r":{"stale":1}}'
         mw = self._mw(redis)
         assert mw.consume_scope(lambda m: {"x": 1}, self._msg("m1")) is None
 
     def test_malformed_envelope_skips_without_replay(self) -> None:
         redis = _FakeRedis()
-        redis._store["rabbitkit:dedup:m1"] = "{not json"
+        redis._store[_DEDUP_KEY] = "{not json"
         mw = self._mw(redis)
         assert mw.consume_scope(lambda m: 1, self._msg("m1")) is None
 
@@ -1932,7 +1938,7 @@ class TestIdempotentReceiver:
         redis = _FakeRedis()
         mw = self._mw(redis, store_results=False)
         mw.consume_scope(lambda m: {"total": 42}, self._msg("m1"))
-        assert redis._store["rabbitkit:dedup:m1"] == "completed"
+        assert redis._store[_DEDUP_KEY] == "completed"
 
     async def test_async_round_trip_replay(self) -> None:
         redis = _FakeAsyncRedis()
@@ -1957,3 +1963,73 @@ class TestIdempotentReceiver:
         assert _decode_stored_result(None) == (False, None)
         assert _decode_stored_result('{"s":"in-flight","v":1}') == (False, None)
         assert _decode_stored_result('["not","a","dict"]') == (False, None)
+
+
+class TestQueueNamespacing:
+    """Since 0.18 the dedup key includes the CONSUMING queue.
+
+    Without it, one middleware instance shared across routes — which the
+    project's own examples do — gives every queue a single shared keyspace.
+    Two queues each handling a message with id `order-1001` then deduplicate
+    against each other and one is silently dropped.
+    """
+
+    def test_the_queue_is_in_the_key_by_default(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis, DeduplicationConfig(key_prefix="k"))
+        mw.consume_scope(MagicMock(), _make_message(message_id="m", routing_key="orders"))
+        assert redis.set_calls[0]["key"] == "k:orders:m"
+
+    def test_two_queues_no_longer_collide_on_the_same_id(self) -> None:
+        """The headline: the same message_id on different queues is now two
+        distinct keys, so processing one does not suppress the other."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis, DeduplicationConfig(key_prefix="k"))
+        handled: list[str] = []
+
+        for queue in ("orders", "invoices"):
+            msg = _make_message(message_id="order-1001", routing_key=queue)
+            mw.consume_scope(lambda m, q=queue: handled.append(q), msg)
+
+        assert handled == ["orders", "invoices"], "the second queue must still run"
+        assert {c["key"] for c in redis.set_calls} == {"k:orders:order-1001", "k:invoices:order-1001"}
+
+    def test_the_broker_set_header_wins_over_the_routing_key(self) -> None:
+        """`x-rabbitkit-original-queue` is overwritten at consume time, so a
+        publisher cannot steer the namespace via the routing key."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis, DeduplicationConfig(key_prefix="k"))
+        msg = _make_message(
+            message_id="m",
+            routing_key="attacker-chosen",
+            headers={"x-rabbitkit-original-queue": "real-queue"},
+        )
+        mw.consume_scope(MagicMock(), msg)
+        assert redis.set_calls[0]["key"] == "k:real-queue:m"
+
+    def test_opting_out_restores_the_legacy_shape(self) -> None:
+        """The migration escape hatch: enabling namespacing invalidates every
+        existing key, so a workload that cannot take one TTL window of
+        reduced dedup can defer the change."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(
+            redis, DeduplicationConfig(key_prefix="k", namespace_by_queue=False)
+        )
+        mw.consume_scope(MagicMock(), _make_message(message_id="m", routing_key="orders"))
+        assert redis.set_calls[0]["key"] == "k:m"
+
+    def test_a_custom_key_fn_is_still_namespaced(self) -> None:
+        """key_fn replaces the IDENTITY, not the namespace — otherwise the
+        collision this fixes would come straight back for anyone using it."""
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(
+            redis, DeduplicationConfig(key_prefix="k"), key_fn=lambda m: "fixed"
+        )
+        mw.consume_scope(MagicMock(), _make_message(routing_key="orders"))
+        assert redis.set_calls[0]["key"] == "k:orders:fixed"
+
+    def test_a_message_with_no_queue_information_still_gets_a_namespace(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis, DeduplicationConfig(key_prefix="k"))
+        mw.consume_scope(MagicMock(), _make_message(message_id="m", routing_key=""))
+        assert redis.set_calls[0]["key"] == "k:unknown:m"

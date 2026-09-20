@@ -279,7 +279,16 @@ class DeduplicationMiddleware(BaseMiddleware):
             )
             raw = hashlib.sha256(message.body).hexdigest()
 
-        return f"{self._config.key_prefix}:{raw}"
+        if not self._config.namespace_by_queue:
+            return f"{self._config.key_prefix}:{raw}"
+
+        # Namespace by the CONSUMING queue. `x-rabbitkit-original-queue` is
+        # overwritten by both brokers at consume time (see the anti-spoofing
+        # note at sync/broker.py and async_/broker.py), so a publisher cannot
+        # steer this. Falling back to the routing key keeps a sensible
+        # namespace for a message that reached here some other way.
+        queue = message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown"
+        return f"{self._config.key_prefix}:{queue}:{raw}"
 
     def _mark_key(self, key: str, message: RabbitMessage) -> bool:
         """Attempt to mark key as processed (sync). Returns True if this is a new key.

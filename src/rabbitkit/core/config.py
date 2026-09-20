@@ -911,6 +911,24 @@ class DeduplicationConfig:
     #: slow payload gets the amplification for free. 0 restores the old
     #: behaviour.
     in_flight_requeue_delay: float = 0.5
+    #: Include the CONSUMING QUEUE in the dedup key. Default True since 0.18.
+    #:
+    #: Without it the key is just ``{key_prefix}:{id}``, so one middleware
+    #: instance shared across routes — which the project's own examples do —
+    #: gives every queue a single shared keyspace. Two different queues each
+    #: handling a message with id ``order-1001`` then deduplicate against each
+    #: other and one is silently dropped. That is wrong regardless of who is
+    #: publishing.
+    #:
+    #: The queue name comes from ``x-rabbitkit-original-queue``, which both
+    #: brokers overwrite at consume time, so a publisher cannot steer it.
+    #:
+    #: MIGRATION: enabling this changes every key, so on deploy there is one
+    #: ``ttl`` window (24h by default) in which previously-seen messages are
+    #: not recognised as duplicates. Harmless for most workloads; if a
+    #: duplicate is unacceptable, set False, deploy, then flip it during a
+    #: quiet period.
+    namespace_by_queue: bool = True
 
     def __post_init__(self) -> None:
         if self.store_results and self.mark_policy != "claim":

@@ -21,7 +21,7 @@ failed-publish → ``nack(requeue=True)`` branch is reachable in tests.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -32,18 +32,20 @@ from rabbitkit.core.path import extract_path
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.settlement import SettlementReport, settle_many_async, settle_many_sync
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.middleware.base import BaseMiddleware
-from rabbitkit.serialization.base import Serializer
-
-if TYPE_CHECKING:
-    from rabbitkit.core.router import RabbitRouter
 from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
+    SettlementAction,
 )
+from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.serialization.base import Serializer
+
+if TYPE_CHECKING:
+    from rabbitkit.core.router import RabbitRouter
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,7 @@ class TestBroker:
         name: str | None = None,
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
+        reply_to_allow: tuple[str, ...] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a subscriber — same API as real broker."""
         decorator = self._registry.subscriber(
@@ -141,6 +144,7 @@ class TestBroker:
             exchange=exchange,
             routing_key=routing_key,
             ack_policy=ack_policy,
+            reply_to_allow=reply_to_allow,
             middlewares=middlewares,
             serializer=serializer,
             retry=retry,
@@ -228,9 +232,7 @@ class TestBroker:
             # M2: mirror the real brokers -- wire in a route MetricsMiddleware
             # (if any) so messages_retried_total/dead_lettered_total are
             # observable through TestBroker too.
-            metrics_mw = next(
-                (mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None
-            )
+            metrics_mw = next((mw for mw in route.route_middlewares if isinstance(mw, MetricsMiddleware)), None)
             route.route_middlewares.insert(
                 index,
                 RetryMiddleware(
@@ -340,6 +342,30 @@ class TestBroker:
         message._ack_async_fn = async_ack
         message._nack_async_fn = async_nack
         message._reject_async_fn = async_reject
+
+    # ── Selected settlement (mirrors SyncBroker/AsyncBroker.ack_many) ────
+
+    def ack_many(self, messages: Iterable[RabbitMessage], *, fail_fast: bool = True) -> SettlementReport:
+        """Ack exactly the given deliveries, one frame each — same contract
+        and report shape as ``SyncBroker.ack_many``. Settlements are
+        recorded so ``assert_acked`` works on each message."""
+        return settle_many_sync(messages, SettlementAction.ACK, fail_fast=fail_fast)
+
+    def nack_many(
+        self, messages: Iterable[RabbitMessage], *, requeue: bool = True, fail_fast: bool = True
+    ) -> SettlementReport:
+        """Nack exactly the given deliveries — see ``SyncBroker.nack_many``."""
+        return settle_many_sync(messages, SettlementAction.NACK, requeue=requeue, fail_fast=fail_fast)
+
+    async def ack_many_async(self, messages: Iterable[RabbitMessage], *, fail_fast: bool = True) -> SettlementReport:
+        """Async twin of :meth:`ack_many` (``AsyncBroker.ack_many`` contract)."""
+        return await settle_many_async(messages, SettlementAction.ACK, fail_fast=fail_fast)
+
+    async def nack_many_async(
+        self, messages: Iterable[RabbitMessage], *, requeue: bool = True, fail_fast: bool = True
+    ) -> SettlementReport:
+        """Async twin of :meth:`nack_many`."""
+        return await settle_many_async(messages, SettlementAction.NACK, requeue=requeue, fail_fast=fail_fast)
 
     # ── Publish (test helper) ─────────────────────────────────────────────
 

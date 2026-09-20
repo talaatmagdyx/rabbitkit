@@ -6,7 +6,7 @@ Requires: pip install "rabbitkit[async,dashboard]"
 Run:
     python examples/advanced/07_monitoring_dashboard.py
 
-Then open: http://localhost:8080
+Then open: http://localhost:8083
 
 Requirements:
     pip install "rabbitkit[async,dashboard]"
@@ -15,7 +15,7 @@ Requirements:
 
 import asyncio
 
-from rabbitkit import MessageEnvelope, RabbitConfig
+from rabbitkit import RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 try:
@@ -65,8 +65,8 @@ async def main() -> None:
     # ))
     # dashboard_app = create_dashboard_app(broker, management_client=mgmt)
 
-    # ── Run standalone on port 8080 ───────────────────────────────────────────
-    print("\nDashboard available at: http://localhost:8080")
+    # ── Run standalone on port 8083 ───────────────────────────────────────────
+    print("\nDashboard available at: http://localhost:8083")
     print("  GET /         — HTML dashboard")
     print("  GET /api/health  — JSON health")
     print("  GET /api/routes  — JSON routes")
@@ -74,8 +74,8 @@ async def main() -> None:
 
     server = uvicorn.Server(uvicorn.Config(
         app=dashboard_app,
-        host="0.0.0.0",
-        port=8080,
+        host="127.0.0.1",   # a local demo; bind every interface only in a container
+        port=8083,
         log_level="warning",
     ))
 

@@ -359,6 +359,41 @@ class RabbitManagementClient:
         name_encoded = urllib.parse.quote(name, safe="")
         self._request("DELETE", f"/parameters/{component_encoded}/{vhost_encoded}/{name_encoded}")
 
+    # Policies (plan §5.1 / §9 — apply reviewed templates deliberately)
+    def list_policies(self, vhost: str | None = None) -> list[dict[str, Any]]:
+        """List policies via ``GET /api/policies`` (or ``/api/policies/{vhost}``)."""
+        if vhost is None:
+            return cast("list[dict[str, Any]]", self._request("GET", "/policies"))
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        return cast("list[dict[str, Any]]", self._request("GET", f"/policies/{vhost_encoded}"))
+
+    def get_policy(self, name: str, vhost: str = "/") -> dict[str, Any]:
+        """Fetch one policy via ``GET /api/policies/{vhost}/{name}``."""
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        return cast("dict[str, Any]", self._request("GET", f"/policies/{vhost_encoded}/{name_encoded}"))
+
+    def put_policy(self, name: str, definition: Any, vhost: str = "/") -> None:
+        """Create/update a policy via ``PUT /api/policies/{vhost}/{name}``.
+
+        *definition* is either the management-API body
+        (``{"pattern": ..., "definition": {...}, "apply-to": ..., "priority": ...}``)
+        or a :class:`rabbitkit.core.profiles.PolicyTemplate` (its
+        ``as_api_body()`` is used). rabbitkit never calls this on its own —
+        policies are cluster-owner decisions; this is the deliberate,
+        reviewed application step for ``policy_templates()`` output.
+        """
+        body_obj = definition.as_api_body() if hasattr(definition, "as_api_body") else definition
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        self._request("PUT", f"/policies/{vhost_encoded}/{name_encoded}", json.dumps(body_obj).encode())
+
+    def delete_policy(self, name: str, vhost: str = "/") -> None:
+        """Delete a policy via ``DELETE /api/policies/{vhost}/{name}``."""
+        vhost_encoded = urllib.parse.quote(vhost, safe="")
+        name_encoded = urllib.parse.quote(name, safe="")
+        self._request("DELETE", f"/policies/{vhost_encoded}/{name_encoded}")
+
     def list_shovel_statuses(self) -> list[dict[str, Any]]:
         """List shovel statuses via ``GET /api/shovels``.
 
@@ -369,6 +404,18 @@ class RabbitManagementClient:
     # Connection/Channel
     def list_connections(self) -> list[ConnectionInfo]:
         return cast("list[ConnectionInfo]", self._request("GET", "/connections"))
+
+    def close_connection(self, name: str, reason: str = "closed via rabbitkit management API") -> None:
+        """Force-close one connection via ``DELETE /api/connections/{name}``.
+
+        The client sees the socket drop and (with ``connect_robust``, which
+        both rabbitkit transports use) reconnects. Intended for operator
+        tooling and failure-injection tests — every delivery unacked on that
+        connection is requeued by the broker, so consumers must be
+        idempotent. ``name`` comes from :meth:`list_connections`.
+        """
+        name_encoded = urllib.parse.quote(name, safe="")
+        self._request("DELETE", f"/connections/{name_encoded}")
 
     def list_channels(self) -> list[ChannelInfo]:
         return cast("list[ChannelInfo]", self._request("GET", "/channels"))

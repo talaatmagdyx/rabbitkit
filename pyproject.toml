@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.11.0"
+version = "0.18.0"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -34,15 +34,24 @@ sync        = ["pika>=1.3.0,<2.0.0"]
 async       = ["aio-pika>=9.1.0,<10.0.0"]
 all-brokers = ["rabbitkit[sync,async]"]
 redis       = ["redis>=5.0.0,<9.0.0"]
-pydantic    = ["pydantic>=2.0.0,<3.0.0"]
+# Floor is the first release with no open advisory (verified against OSV):
+# 2.0.0-2.3.x carry GHSA-mr82-8j83-vxmv / PYSEC-2026-1812.
+pydantic    = ["pydantic>=2.4.0,<3.0.0"]
 msgspec     = ["msgspec>=0.18.0,<1.0.0"]
 fastapi     = ["fastapi>=0.111.0,<1.0.0"]
 compression = ["zstandard>=0.22.0,<1.0.0"]
-management = ["aiohttp>=3.9.0,<4.0.0"]
+# 3.14.3 is the first aiohttp with a clean advisory set (verified against
+# OSV: 3.14.0 -> 22, 3.14.1 -> 6, 3.14.2 -> 2, 3.14.3 -> 0). The old
+# >=3.9.0 floor permitted a resolution with 76 known advisories, and CI
+# could never see it because it always resolves the newest in range.
+management = ["aiohttp>=3.14.3,<4.0.0"]
 otel       = ["opentelemetry-api>=1.20,<2"]
 settings    = ["pydantic-settings>=2.0.0,<3.0.0"]
 cli         = ["typer>=0.12.0,<1.0.0"]
-dashboard   = ["starlette>=0.37.0,<2.0.0", "uvicorn>=0.29.0,<1.0.0"]
+# starlette 1.4.0 is the first clean release (1.0 -> 10 advisories,
+# 1.3 -> 2, 1.4 -> 0). The upper bound already allowed 1.x and CI has
+# been testing 1.6, so this only removes resolutions nothing tested.
+dashboard   = ["starlette>=1.4.0,<2.0.0", "uvicorn>=0.29.0,<1.0.0"]
 reload      = ["watchfiles>=0.21.0,<2.0.0"]
 all         = ["rabbitkit[all-brokers,otel,redis,pydantic,msgspec,fastapi,compression,settings,cli,dashboard,reload,management]"]
 dev         = [
@@ -51,6 +60,11 @@ dev         = [
     "httpx>=0.27,<1.0",  # starlette TestClient (dashboard tests)
     "httpx2>=0.1",  # starlette 1.x TestClient backend (silences its httpx deprecation)
     "prometheus-client>=0.20,<2.0",  # PrometheusCollector tests
+    # tests/unit/middleware/test_otel.py does importorskip("opentelemetry.sdk").
+    # The [otel] extra only ships the API (all the middleware needs at runtime),
+    # so without this the ENTIRE otel test module skipped silently in CI and
+    # middleware/otel.py sat at 24% coverage. Test-only dependency.
+    "opentelemetry-sdk>=1.20,<2",
     "psutil>=5.9",  # bench_resources (memory/FD tracking)
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
@@ -146,6 +160,12 @@ filterwarnings = [
     # bypasses these filters). Real users still see them.
     "ignore:Starting a single-worker sync consumer:RuntimeWarning",
     "ignore:SigningMiddleware is using the default in-memory:RuntimeWarning",
+    # The unmarshalled-interval-timer guard. Legitimately fires for the batch
+    # helpers' own tests, which drive them with plain callables and no
+    # transport owner; tests/unit/highload/test_coalescing_marshal.py asserts
+    # it DOES fire (pytest.warns bypasses these filters). Real users still
+    # see it.
+    "ignore:.*flush_interval_ms > 0 but no marshal=:RuntimeWarning",
     # third-party: testcontainers' own deprecated decorator
     "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
     # M13 security guardrail, asserted by test_cert_none_warns; SSL tests

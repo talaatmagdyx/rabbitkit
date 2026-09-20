@@ -121,7 +121,7 @@ async def main() -> None:
         for n in range(5, 50, 5)
     ]
     results = await asyncio.gather(*tasks)
-    for n, result in zip(range(5, 50, 5), results):
+    for n, result in zip(range(5, 50, 5), results, strict=True):
         if result:
             print(f"  fib({n:2d}) = {result['result']}")
 

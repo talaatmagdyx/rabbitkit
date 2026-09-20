@@ -40,12 +40,7 @@ from typing import Any
 
 import pytest
 
-try:
-    from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
-
-    _TESTCONTAINERS_AVAILABLE = True
-except ImportError:
-    _TESTCONTAINERS_AVAILABLE = False
+from tests.integration.conftest import await_consumers
 
 pytestmark = pytest.mark.integration
 
@@ -57,24 +52,10 @@ N_EVENTS = int(os.environ.get("RABBITKIT_PIPELINE_EVENTS", "5000"))
 PIPELINE_TIMEOUT = max(60.0, N_EVENTS / 500)
 
 
-def _skip_no_docker() -> None:
-    if not _TESTCONTAINERS_AVAILABLE:
-        pytest.skip("testcontainers not installed")
-    try:
-        import docker  # type: ignore[import-untyped]
-
-        docker.from_env().ping()
-    except Exception:
-        pytest.skip("Docker daemon not reachable")
-
-
 @pytest.fixture(scope="module")
-def rabbitmq_url() -> str:  # type: ignore[return]
-    _skip_no_docker()
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        host = container.get_container_host_ip()
-        port = container.get_exposed_port(5672)
-        yield f"amqp://guest:guest@{host}:{port}/"
+def rabbitmq_url(rabbit_container: dict[str, Any]) -> str:
+    """AMQP URL of the suite-wide container (see ``conftest.py``)."""
+    return str(rabbit_container["url"])
 
 
 # ── The pipeline's business logic — ONE pure function, shared by both
@@ -178,7 +159,7 @@ async def test_async_twitter_dm_pipeline_end_to_end(rabbitmq_url: str) -> None:
             done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     # Mock producer: N deterministic DM events, concurrent waves.
     t0 = time.monotonic()

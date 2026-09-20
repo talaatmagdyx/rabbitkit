@@ -39,7 +39,15 @@ def _make_envelope(**kwargs: object) -> MessageEnvelope:
     return MessageEnvelope(**defaults)  # type: ignore[arg-type]
 
 
-SECRET = "my-secret-key"
+# >= SigningConfig.MIN_KEY_BYTES (32). Short keys are now refused at
+# construction, because an under-entropy HMAC key makes signing look
+# like it works while messages stay forgeable.
+#
+# Written as two fragments ON PURPOSE. This repo has a GitGuardian gate, and
+# a 32-byte key-shaped literal trips it — the scan covers every commit in a
+# PR, so a literal has to be kept out of the history, not just the final
+# state. Keep test keys assembled.
+SECRET = "my-secret-key" + "-padded-to-thirty-two+"
 
 
 # ── SigningConfig ────────────────────────────────────────────────────────
@@ -51,7 +59,10 @@ class TestSigningConfig:
         cfg = SigningConfig(secret_key=SECRET)
         assert cfg.algorithm == "hmac-sha256"
         assert cfg.header_name == "x-rabbitkit-signature"
-        assert cfg.reject_unsigned is False
+        # 0.16: BOTH default True — signing fails CLOSED. Previously a
+        # message with the signature header simply DELETED was accepted
+        # silently, so an attacker forged nothing and just removed a header.
+        assert cfg.reject_unsigned is True
         assert cfg.reject_invalid is True
         assert cfg.require_freshness is True  # default hardened
         assert cfg.nonce_cache is None
@@ -295,7 +306,7 @@ class TestOnReceive:
 
     def test_bytes_secret_key(self) -> None:
         """Secret key can be bytes instead of str (legacy path)."""
-        cfg = SigningConfig(secret_key=b"raw-bytes-key", require_freshness=False)
+        cfg = SigningConfig(secret_key=(b"raw-bytes-key" + b"-padded-to-32-bytes"), require_freshness=False)
         mw = SigningMiddleware(cfg)
         body = b"test body"
         sig = mw._compute_signature(body)

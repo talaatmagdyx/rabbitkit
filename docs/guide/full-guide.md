@@ -1012,15 +1012,86 @@ def safe_ack(tag: int, multiple: bool = False) -> None:
 
 acker = BatchAcker(
     ack_fn=safe_ack,
-    config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
+    config=BatchAckConfig(batch_size=100, flush_interval_ms=200),  # mode="individual" (default)
 )
 
-# Add delivery tags (auto-acks in batches via multiple=True)
+acker.add(delivery_tag)   # buffered; flushed as ONE ack(tag, multiple=False) PER TAG
 acker.add(delivery_tag)
-acker.add(delivery_tag)
-# ...
 acker.close()
 ```
+
+Since 0.12 the default mode is **individual**: submitting tags 1 and 3 acks
+exactly 1 and 3, never a still-running tag 2. The legacy
+`ack(max_tag, multiple=True)` watermark is `BatchAckConfig(mode="cumulative",
+ordered_exclusive_owner=True)` — only safe when this acker is the channel's
+sole settler and completions arrive in tag order. For wire-level coalescing
+under arbitrary completion order use `CoalescingAcker` (below).
+
+### publish_many / iter_publish (0.12)
+
+```python
+from rabbitkit import BulkPublishOptions, BulkPublishStatus
+
+result = await broker.publish_many(
+    envelopes,                                   # a bounded collection
+    BulkPublishOptions(max_in_flight=256, max_buffer_bytes=8 << 20, overall_timeout=30.0),
+)
+for item in result.items:                        # input-ordered, one per envelope
+    if item.status is BulkPublishStatus.UNKNOWN:  # may have reached the broker → reconcile
+        reconcile(item.message_id, item.attempt_id)
+result.raise_for_status()                        # raise unless EVERY item is CONFIRMED
+
+async for item in broker.iter_publish(row_generator()):   # unbounded stream, bounded memory
+    ...
+```
+
+Same path as `publish()` (middleware once per attempt, flow control, size
+limit, batch publisher when configured). Statuses: `CONFIRMED`, `UNROUTABLE`,
+`NACKED`, `INVALID`, `NOT_SENT`, `UNKNOWN`. `SyncBroker` has the same API
+without `await` (sequential — pika cannot pipeline confirms).
+
+### ack_many / nack_many (0.12)
+
+```python
+report = await broker.ack_many(successful_deliveries)   # one multiple=False frame each
+report.raise_for_status()                                # DISPATCHED per item, never "confirmed"
+await broker.nack_many(failed_deliveries, requeue=False) # dead-letter the rest
+```
+
+Per-item statuses: `DISPATCHED`, `ALREADY_SETTLED`, `DUPLICATE`, `INVALID`,
+`STALE` (channel rebuilt since delivery), `NOT_ATTEMPTED` (fail-fast abort),
+`FAILED`. `TestBroker.ack_many` / `nack_many` mirror the contract.
+
+### CoalescingAcker (0.12)
+
+```python
+from rabbitkit import BatchAckConfig, CoalescingAcker
+
+acker = CoalescingAcker(ack_fn=safe_ack, nack_fn=safe_nack, reject_fn=safe_reject,
+                        config=BatchAckConfig(batch_size=50, flush_interval_ms=200))
+acker.register(tag)             # BEFORE the handler runs — the ledger must know EVERY delivery
+acker.complete(tag)             # or acker.fail(tag, requeue=False) / acker.retry_pending(tag)
+acker.on_reconnect()            # channel rebuilt: drop the ledger, never replay old tags
+```
+
+A cumulative `ack(tag, multiple=True)` is emitted only through the longest
+prefix of completed tags; anything behind a still-running or retry-pending
+delivery is acked individually after a bounded hold.
+
+**One acker per channel.** Delivery tags are a per-channel counter, and each
+subscriber queue gets its own channel. `channel_key=` makes that an enforced
+invariant (`ChannelMismatchError` on a foreign delivery), and
+`CoalescingAckerGroup` keeps one acker per channel for you:
+
+```python
+group = CoalescingAckerGroup(factory=build_acker_for)   # build_acker_for(channel)
+group.register(msg.raw_message.channel, msg.delivery_tag)
+group.complete(msg.raw_message.channel, msg.delivery_tag)
+group.on_reconnect(channel)    # that channel was rebuilt; group.reset() for all
+```
+
+See [Bulk Operations & Reliability Profiles](../bulk-operations.md) for the
+full contract and safety invariants.
 
 > **Important:** Do NOT mix sync and async APIs on the same batch instance.
 > Sync uses `threading.Lock` + `threading.Timer`; async uses `asyncio.Lock` + `asyncio.Task`.

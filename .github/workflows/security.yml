@@ -33,7 +33,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install uv && uv venv && uv pip install -e ".[all]"
+      # `[dev]` rather than `[all]`: the dev/integration toolchain (pytest,
+      # mkdocs, ruff, mypy, testcontainers, docker) is what actually EXECUTES
+      # in CI on checked-out code, and auditing only the runtime extras left
+      # it unscanned. `[dev]` includes `[all]`, so runtime coverage is a
+      # superset of what it was.
+      - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: pip-audit
         run: |
           uv pip install pip-audit
@@ -56,7 +61,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v7
-      - uses: github/codeql-action/init@v4
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd  # v4.38.1
         with:
           languages: python
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd  # v4.38.1

@@ -286,6 +286,91 @@ dedicated I/O thread), or scale out across processes.
 
 ---
 
+## Bulk operations and reliability profiles
+
+`publish_many` / `iter_publish` publish a bounded collection through the
+**same** middleware, flow-control, size-limit and transport path as
+`publish`, and return one outcome per input — never a guess. `ack_many` /
+`nack_many` settle exactly the deliveries you name, one frame each, and never
+issue a cumulative ack across a still-running sibling.
+
+```python
+from rabbitkit import AsyncBroker, BulkPublishOptions, BulkPublishStatus, MessageEnvelope
+
+
+async def publish_page(broker: AsyncBroker, rows: list[dict]) -> None:
+    envelopes = [
+        MessageEnvelope(
+            message_id=row["event_id"],  # stable, caller-owned id
+            exchange="events",
+            routing_key="tweet.received",
+            body=row["payload"],
+            mandatory=True,
+        )
+        for row in rows
+    ]
+    result = await broker.publish_many(
+        envelopes,
+        BulkPublishOptions(max_in_flight=256, max_buffer_bytes=8 * 1024 * 1024, overall_timeout=30.0),
+    )
+    for item in result.items:  # input-ordered; status ∈ CONFIRMED/UNROUTABLE/NACKED/INVALID/NOT_SENT/UNKNOWN
+        if item.status is BulkPublishStatus.UNKNOWN:
+            print("reconcile", item.message_id, item.attempt_id)  # may have reached the broker
+        elif item.status is BulkPublishStatus.NOT_SENT:
+            print("safe to resubmit", item.index)  # provably never left the process
+```
+
+```python
+from rabbitkit import AckPolicy, RabbitMessage, SyncBroker
+
+broker = SyncBroker()
+held: list[RabbitMessage] = []
+
+
+@broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
+def handle(body: bytes, msg: RabbitMessage) -> None:
+    held.append(msg)  # defer settlement to the batch commit
+
+
+def commit_batch(successful: list[RabbitMessage], failed: list[RabbitMessage]) -> None:
+    broker.ack_many(successful).raise_for_status()  # DISPATCHED per item — RabbitMQ never confirms consumer acks
+    broker.nack_many(failed, requeue=False)  # dead-letters via the auto-provisioned DLQ
+```
+
+Opt-in **reliability profiles** (`critical_config()`, `broker.preflight("critical",
+management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
+cap, quorum queues and a quorum retry chain — and report anything they cannot
+verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
+default, and a failing delay-queue handoff backs off instead of hot-looping.
+`CoalescingAcker` (and `AsyncCoalescingAcker`) is the only place a cumulative
+`basic.ack(multiple=True)` may originate: it knows every delivery on the
+channel and coalesces only through a completed prefix, so a still-running
+sibling is never acked early. Settlement follows a **plan / emit / commit**
+protocol — the ledger advances only for frames the broker actually accepted,
+and emission stops at the first failure, because a cumulative ack that
+follows a nack which never landed would acknowledge the very delivery meant
+to be requeued.
+Every bulk path emits bounded-label metrics
+(`rabbitkit_bulk_publish_items_total{status,reason}`,
+`rabbitkit_settlement_items_total{action,status}`,
+`rabbitkit_retry_handoff_failures_total{queue}`).
+
+Measured on one laptop (2,000 × 1 KiB, confirms on, median of 3; `python -m
+benchmarks.bench_bulk`, every run 2,000/2,000 accounted and the queue verified
+drained):
+
+| | one call per message | bulk API |
+|---|---|---|
+| async publish | 932 msg/s | 4,548 msg/s `publish_many` (defaults) → 9,862 msg/s with the batch publisher |
+| sync publish | 833 msg/s | 1,015 msg/s (sequential by design — outcomes, not speed) |
+| ack | 15,308 msg/s, 1 frame/msg | `ack_many` 11,808 msg/s, 1 frame/msg (correctness API) · `CoalescingAcker` 15,670 msg/s, **0.01 frame/msg** |
+
+Full contract: [docs/bulk-operations.md](docs/bulk-operations.md) ·
+runnable: [`examples/bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations) ·
+upgrade notes: [docs/migration.md](docs/migration.md#0120--upgrade-notes).
+
+---
+
 ## Message safety model
 
 rabbitkit is an **at-least-once** toolkit: a handler may run more than once
@@ -348,16 +433,18 @@ Structured logs carry message context (`message_id`, `correlation_id`,
 routing, queue, handler, retry count, settlement, duration, error type) with
 secret redaction on by default. Metrics cover consumed/acked/nacked/
 retried/dead-lettered counts, publish outcomes, handler latency,
-redeliveries, reconnects, and — via the management API poller — queue depth
-and consumer lag. Tracing is standard OpenTelemetry
+redeliveries, reconnects, confirm latency, in-flight handlers, broker/consumer
+lifecycle gauges, bulk-publish and settlement outcomes, retry-handoff
+failures, and — via the management API poller — queue depth and consumer lag. Tracing is standard OpenTelemetry
 (`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
 one continuous trace from publish to consume.
 
 ## Advanced & experimental
 
 **Advanced stable** (enable deliberately): publish-side backpressure
-(`FlowController`), batch publishing/acking, pipelined sync confirms
-(`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
+(`FlowController`), batch publishing/acking, bulk `publish_many` / `ack_many`
+with per-item outcomes, safe ack coalescing (`CoalescingAcker`), reliability
+profiles + `preflight`, pipelined sync confirms (`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
 topology validation/drift/migration CLI, health watcher, circuit-breaker
 middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
 pybreaker).
@@ -506,7 +593,7 @@ has before/after code for all three paths; the short version:
 ## Examples
 
 **[examples/](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples)** —
-25 self-contained, runnable projects covering every feature, each with its
+28 self-contained, runnable projects covering every feature, each with its
 own README. They run against a real broker in CI on every nightly build, so
 they can't silently drift from the API.
 
@@ -521,6 +608,7 @@ Start here:
 | Test handlers without a broker | [`testbroker_pytest/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/testbroker_pytest) |
 | Do RPC over RabbitMQ | [`rpc/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/rpc) |
 | Push throughput (batching, pools, backpressure) | [`highload/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/highload) |
+| Bulk publish with per-item outcomes, batch-commit acks, outbox/inbox, critical preflight | [`bulk_operations/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/bulk_operations) |
 | See a full production service | [`order_service/`](https://github.com/talaatmagdyx/rabbitkit/tree/main/examples/order_service) |
 
 ```bash
@@ -529,21 +617,22 @@ docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
 python examples/quickstart/02_async_broker.py
 ```
 
-The full index (all 25, grouped by topic) is in
+The full index (all 28, grouped by topic) is in
 [examples/README.md](https://github.com/talaatmagdyx/rabbitkit/blob/main/examples/README.md).
 
 ## Architecture
 
 ```
 rabbitkit/
-  core/                 # route registry, topology, pipeline, settlement, config
+  core/                 # route registry, topology, pipeline, config, bulk/settlement contracts,
+                        # reliability profiles + preflight, error sanitizer, retry-handoff tracker
   sync/                 # pika adapter (+ SyncBatchPublisher)
   async_/               # aio-pika adapter (+ AsyncBatchPublisher)
   middleware/           # retry, dedup, metrics, otel, compression, rate limit…
   serialization/        # JSON, msgspec, Pydantic, parser/decoder pipeline
   di/                   # Depends, Header, Path, Context
   testing/              # TestBroker and friends
-  highload/             # FlowController, BatchPublisher, BatchAcker
+  highload/             # FlowController, BatchPublisher, BatchAcker, CoalescingAcker
   cli/                  # dlq, topology, migrate, health, run, shell
   fastapi.py            # FastAPI lifespan integration
 ```

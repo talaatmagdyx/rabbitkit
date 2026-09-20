@@ -4,6 +4,28 @@ RabbitKit provides a built-in retry system based on RabbitMQ dead-letter exchang
 
 ---
 
+## Durability, sanitized triage headers, and handoff failures (0.12)
+
+Three `RetryConfig` knobs make the retry chain's reliability explicit. All
+defaults preserve the legacy topology, so upgrading never re-declares a queue:
+
+| Knob | Values | Default |
+|---|---|---|
+| `delay_queue_type` | `classic`, `quorum`, `inherit` (match the source queue) | `classic` |
+| `dlq_queue_type` | `inherit` (quorum when the source is quorum), `classic`, `quorum` | `inherit` |
+| `error_detail` | `sanitized` (redacted + capped), `omit`, `raw` (legacy) | `sanitized` |
+| `handoff` | `RetryHandoffConfig(...)` — bounded backoff when the **retry publish** itself fails | bounded |
+
+The DLQ triage headers now carry `x-rabbitkit-error-category`
+(`transient`/`permanent`) alongside `x-rabbitkit-error-type`, and
+`x-rabbitkit-error-message` is redacted (URL passwords, `password=`/`token=`
+pairs, bearer tokens, long opaque tokens) and length-capped. A failed
+delay-queue handoff never acks the source; it is nack-requeued and counted in
+`rabbitkit_retry_handoff_failures_total` with capped exponential backoff. See
+[Bulk Operations & Reliability Profiles](bulk-operations.md#retry-hardening).
+
+---
+
 ## Every Route Gets a Dead-Letter Path by Default
 
 In RabbitMQ, a message rejected with `requeue=False` is **permanently discarded** unless the queue has a dead-letter exchange. A plain subscriber with no retry can still reject — a handler raising `ValueError` on a malformed payload is classified as a permanent error and rejected. To prevent silent loss, RabbitKit auto-provisions a `{queue}.dlq` for **every** route that can reject, controlled by `SafetyConfig.reject_without_dlx`:

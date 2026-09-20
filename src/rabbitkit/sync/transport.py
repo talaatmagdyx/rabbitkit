@@ -1333,5 +1333,9 @@ class SyncTransport:
         message._ack_fn = ack_fn
         message._nack_fn = nack_fn
         message._reject_fn = reject_fn
+        # Bulk settlement (ack_many/nack_many) consults this to refuse a
+        # delivery tag whose channel is gone — on a rebuilt channel the same
+        # tag number names a DIFFERENT message.
+        message._channel_alive = lambda: bool(getattr(channel, "is_open", False))
 
         return message

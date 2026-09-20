@@ -246,6 +246,7 @@ class AsyncConnectionPool:
         publisher_confirms: bool = True,
         on_channel_opened: Callable[[], None] | None = None,
         on_channel_rebuilt: Callable[[], None] | None = None,
+        on_connection_created: Callable[[Any], None] | None = None,
     ) -> None:
         self._connection_config = connection_config
         self._security_config = security_config
@@ -254,6 +255,12 @@ class AsyncConnectionPool:
         # Item 3: forwarded to every AsyncChannelPool this pool constructs.
         self._on_channel_opened = on_channel_opened
         self._on_channel_rebuilt = on_channel_rebuilt
+        # Fired for EVERY connection this pool creates — the initial pair, a
+        # lazily re-created one, and a rebuilt publisher connection. The
+        # transport uses it to attach its reconnect/blocked callbacks, which
+        # previously were registered once in connect() and so were silently
+        # lost the moment a connection object was replaced.
+        self._on_connection_created = on_connection_created
 
         self._publisher_connection: Any | None = None
         self._consumer_connection: Any | None = None
@@ -378,9 +385,7 @@ class AsyncConnectionPool:
             if old_conn is not None and not old_conn.is_closed:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(old_conn.close(), timeout=timeout)
-            self._publisher_connection = await asyncio.wait_for(
-                self._create_connection(), timeout=timeout
-            )
+            self._publisher_connection = await asyncio.wait_for(self._create_connection(), timeout=timeout)
             self._publisher_channel_pool = AsyncChannelPool(
                 self._publisher_connection,
                 pool_size=self._pool_config.channel_pool_size,
@@ -444,7 +449,7 @@ class AsyncConnectionPool:
                 port_override=port,
             )
             try:
-                return await aio_pika.connect_robust(**kwargs)
+                connection = await aio_pika.connect_robust(**kwargs)
             except connection_errors as e:
                 if attempt == max_attempts:
                     raise
@@ -457,4 +462,11 @@ class AsyncConnectionPool:
                 )
                 await asyncio.sleep(sleep_for)
                 backoff = min(backoff * 2, max_backoff)
+            else:
+                if self._on_connection_created is not None:
+                    try:
+                        self._on_connection_created(connection)
+                    except Exception:  # pragma: no cover — never fail a connect on a hook
+                        logger.exception("on_connection_created callback raised")
+                return connection
         raise RuntimeError("unreachable")  # pragma: no cover

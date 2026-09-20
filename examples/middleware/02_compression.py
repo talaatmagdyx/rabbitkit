@@ -47,7 +47,7 @@ try:
     @broker.subscriber(queue="zstd-events", middlewares=[zstd_mw])
     async def handle_zstd(body: bytes) -> None:
         data = json.loads(body)
-        print(f"[zstd] decompressed {len(body)} bytes")
+        print(f"[zstd] decompressed {len(body)} bytes -> {data}")
 except Exception:
     print("zstd not available — skipping (pip install zstandard)")
 

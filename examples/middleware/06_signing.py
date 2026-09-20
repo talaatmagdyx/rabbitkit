@@ -16,7 +16,6 @@ import asyncio
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.middleware.signing import (
-    InvalidSignatureError,
     SigningConfig,
     SigningMiddleware,
 )

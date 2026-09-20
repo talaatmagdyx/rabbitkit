@@ -66,6 +66,7 @@ class SubscriberRegistry:
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
+        reply_to_allow: tuple[str, ...] | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator to register a message handler for a queue.
 
@@ -81,6 +82,12 @@ class SubscriberRegistry:
             description: Human-readable route description.
             name: Explicit route name (auto-generated if None).
             prefetch_count: Per-route prefetch override (None=use global).
+            reply_to_allow: Destinations this route may publish a handler
+                result to via the incoming message's ``reply_to``. That field
+                is set by the PUBLISHER, so leaving it unrestricted makes the
+                route a one-hop write into any queue in the vhost. ``None``
+                (default) allows anything and warns once per route. Entries
+                ending in ``*`` match as prefixes.
             reject_without_dlx: Per-route override of
                 ``SafetyConfig.reject_without_dlx`` — 'auto_provision',
                 'error', or 'discard' (None=inherit broker default).
@@ -144,6 +151,7 @@ class SubscriberRegistry:
                 description=description,
                 filter_fn=filter_fn,
                 reject_without_dlx=reject_without_dlx,
+                reply_to_allow=reply_to_allow,
             )
 
             # Validate at registration time (fail fast)

@@ -235,7 +235,11 @@ in-flight work is redelivered — this is why handlers are idempotent).
   heartbeat, so **a broker outage never trips liveness** and your fleet
   doesn't restart mid-outage.
 - **Reconnect visibility:** wire `MetricsMiddleware` and alert on the
-  reconnect counter — a flapping network looks like nothing else.
+  reconnect counter — a flapping network looks like nothing else. On
+  **sync** that is `rabbitkit_reconnects_total`; on **async** use
+  `rabbitkit_channel_rebuilds_total`, because aio-pika does not report a
+  broker-initiated reconnect
+  ([why](../observability.md#async-does-not-emit-reconnects_total)).
 
 ### 4.3 Retry, DLQ, and the poison-message defense in depth
 
@@ -301,7 +305,9 @@ another reason not to set prefetch by vibes.
   target ~50 ready messages per replica: manifest in
   [Kubernetes → HPA scaling](../kubernetes.md).
 - **Watch these five signals:** queue depth (per queue), DLQ depth (any
-  growth = incident), reconnect counter (flapping), `messages_retried_total`
+  growth = incident), reconnect counter (flapping —
+  `reconnects_total` on sync, `channel_rebuilds_total` on async),
+  `messages_retried_total`
   vs consumed (downstream health), unacked count vs `prefetch x pods`
   (stuck handlers).
 - **Millions of messages need drills, not hope:** before go-live, run the

@@ -5,7 +5,608 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] — 2026-09-20
+
+### Changed
+
+- **BREAKING: dedup keys are namespaced by the consuming queue.** The key was
+  `{key_prefix}:{id}` with no queue component, so one `DeduplicationMiddleware`
+  instance shared across routes — which the project's own examples do — gave
+  every queue a single shared keyspace. Two queues each handling a message with
+  id `order-1001` deduplicated against each other and one was silently dropped.
+  That is wrong regardless of who is publishing. The key is now
+  `{key_prefix}:{queue}:{id}`, where the queue comes from
+  `x-rabbitkit-original-queue`, a header both brokers overwrite at consume time
+  so a publisher cannot steer it.
+
+  **Migration:** this changes every key, so on deploy there is one `ttl`
+  window (24h by default) in which previously-seen messages are not recognised
+  as duplicates. Harmless for most workloads. If a duplicate is unacceptable,
+  set `namespace_by_queue=False`, deploy, then flip it during a quiet period.
+
+  `key_fn` still replaces the identity only; the namespace is applied on top,
+  so custom key functions do not reintroduce the collision.
+
+### Added
+
+- `DeduplicationConfig.namespace_by_queue` (default `True`) to opt out during
+  migration.
+- **`docs/security.md` now documents that dedup keys are publisher-controlled.**
+  `key_source` defaults to `message_id`, and on a key hit the message is acked
+  and skipped at debug level with no dead letter and no metric. Where an
+  untrusted party can publish into a deduplicated queue, one junk message
+  suppresses a real one for `ttl`. The page states when that matters, when it
+  does not, and shows binding the key to `user_id` — the one identity on a
+  message RabbitMQ validates against the authenticated connection.
+
+## [0.17.0] — 2026-09-20
+
+Stop treating publisher-set identifiers as capabilities. Four findings shared
+one root cause: `message_id`, `correlation_id` and `reply_to` are all chosen
+by the PUBLISHER, and each was used as a trust-bearing key into a shared
+store or as a routing destination.
+
+### Security
+
+- **`reply_to` was a one-hop write into any queue in the vhost.** A handler's
+  return value was published to `message.reply_to` verbatim, as a routing key
+  on the default exchange, with no check. A publisher who could reach ONE
+  queue could have that route's handler output delivered into a queue they
+  have no publish rights to — and, with a dedup result store, could replay a
+  victim's `message_id` with their own `reply_to` and receive the victim's
+  stored result. New `reply_to_allow` on `@subscriber` restricts the
+  destination; entries ending in `*` match as prefixes, and the broker's
+  private `amq.rabbitmq.reply-to` pseudo-queue is always permitted because it
+  can only reach the channel that issued the request. Leaving it unset keeps
+  the previous behaviour and warns **once per route**.
+- **One duplicate could drive ~3,160 redeliveries per second.** With
+  `mark_policy="claim"`, a duplicate of an in-flight message was
+  `nack(requeue=True)`-ed with no delay, so the broker redelivered it
+  immediately and it spun until the claim resolved — up to
+  `processing_timeout`, default 300 seconds. That burns a prefetch slot and
+  broker bandwidth, and an attacker who publishes a colliding id alongside a
+  slow payload gets the amplification for free. New
+  `DeduplicationConfig.in_flight_requeue_delay` (default 0.5s) bounds it to
+  single digits per second; set 0 for the old behaviour.
+- **Messages could read each other's context on the sync path.** A pooled
+  worker thread carries ONE `contextvars.Context` for its entire life, and
+  the handler was called directly rather than through a copied context — so
+  message A's `ContextVar` writes leaked into message B on the same thread.
+  With DI's `set_local`, tenant B could read tenant A's scope, contradicting
+  the isolation `ContextRepo` advertises. Both paths are fixed: the pooled
+  one and `worker_count=1`, which bypasses the pool and runs inline on the
+  transport's owner thread — a thread that lives for the whole process, so it
+  accumulated context just as badly.
+
+### Changed
+
+- **`security/` and `property/` are inside the coverage run.** They were
+  measured separately, so the adversarial regressions — the only tests
+  exercising several hardening paths — did not count toward the floor, and
+  those paths looked uncovered when they were not.
+
+## [0.16.0] — 2026-09-20
+
+Signing now fails **closed**, and rabbitkit's own log lines are scrubbed.
+Both are breaking if you relied on the previous defaults.
+
+### Security
+
+- **BREAKING: `reject_unsigned` now defaults to `True`.** It was `False`, so a
+  message whose signature header was simply *deleted* was accepted silently
+  and without logging. An attacker forged nothing; they removed a header. The
+  canonical example in `docs/security.md` used the plain constructor, so
+  anyone following the documentation had signing that enforced nothing. Pass
+  `reject_unsigned=False` explicitly if you genuinely mix signed and unsigned
+  traffic.
+- **BREAKING: keys shorter than 32 bytes are refused at construction.** The
+  docs always said "at least 32 bytes"; nothing enforced it, so
+  `secret_key=os.environ.get("SIGNING_KEY", "")` with the variable unset gave
+  a deployment where signing appeared to work end to end while every message
+  was forgeable by anyone who read the source. Empty keys are refused too.
+- **One free replay per window.** The acceptance window is
+  `abs(now - ts) <= max_skew`, i.e. `2 * max_skew` wide, but the nonce was
+  recorded for only `max_skew` and measured from *first receipt*. A message
+  received early relative to its timestamp — which is exactly what the future
+  half of the window is for — had its nonce expire while the timestamp was
+  still acceptable. Now recorded for the full window.
+- **Monitoring mode could be used to destroy genuine messages.** With
+  `reject_invalid=False` the signature was never computed, yet the nonce was
+  still recorded and a duplicate still raised. An observer who sniffed one
+  nonce could get the real message rejected as a replay. Verification now
+  always runs; the nonce is recorded only for an authentic message. That path
+  also had no log statement at all, so "monitoring mode" monitored nothing.
+- **rabbitkit's own logs leaked credentials.** `ErrorSanitizer` had exactly
+  one call site in the package — the dead-letter header — so
+  `error_detail="sanitized"` scrubbed the header while the log line next to
+  it printed the password. The structlog key-redaction processor did not help:
+  it matches key NAMES, and only 4 of 38 modules use structlog while 34 use
+  `logging` directly. New `SecretRedactingFilter` and
+  `SecretRedactingFormatter` redact credential-shaped *values* from rendered
+  records and tracebacks; `configure_structlog()` installs the filter across
+  the whole `rabbitkit` logger namespace automatically.
+
+### Added
+
+- **`SigningConfig.previous_keys`** — keys accepted on verify but never used
+  to sign, which is what makes rotation possible. Previously there was one
+  key, so rotating required every publisher and consumer to flip atomically
+  and any in-flight message signed with the old key was dead-lettered
+  permanently; the documented advice to rotate was unfollowable. Every
+  accepted key is compared without an early exit, so the number configured is
+  not observable in the response time. Rotation works on the default
+  freshness path, not just the legacy one.
+- `install_log_redaction()` for applications that do not use rabbitkit's
+  logging setup but still want its output scrubbed.
+
+## [0.15.2] — 2026-09-20
+
+Supply-chain and CI hardening. No code changes to the package itself.
+
+### Security
+
+- **Release authorization.** The `pypi` environment had zero protection
+  rules and the default branch was unprotected, so any credential with write
+  access could tag and publish a wheel with no review. Trusted Publishing
+  removes the *token* to steal, not the *authorization* question. The
+  environment now requires a reviewer and restricts deployments to `v*` tags;
+  `main` requires a pull request with passing checks and refuses force pushes.
+- **Actions holding elevated tokens are pinned to commit hashes.** The PyPI
+  publish step tracked `release/v1`, a mutable *branch*, while holding the
+  OIDC token — a compromise of that branch changes what runs in the release
+  job on the next tag. Same treatment for the code-scanning and Pages-deploy
+  actions, which hold `security-events: write` and `id-token: write`.
+- **Docs workflow permissions are now per job.** `pages: write` and
+  `id-token: write` sat at workflow level, so the build job inherited them
+  while installing the full unpinned toolchain. One compromised dev
+  dependency could mint an OIDC token. Only the deploy job needs them.
+- **Template injection in the soak workflow.** Two `workflow_dispatch` inputs
+  were interpolated straight into a `run:` block, where the Actions templater
+  substitutes before the shell parses. Moved to `env:` and quoted.
+- **The dependency audit now covers the dev toolchain.** It audited `[all]`
+  only, so pytest, mkdocs, ruff, mypy, testcontainers and docker — the
+  packages that actually execute in CI against checked-out code — were never
+  scanned.
+- **Three dependency floors permitted known-vulnerable resolutions.** CI
+  could not see this because it always resolves the newest version in range.
+  Floors verified against OSV per version:
+
+  | Package | Was | Advisories at the old floor | Now |
+  |---|---|---|---|
+  | `aiohttp` | `>=3.9.0` | 76 | `>=3.14.3` |
+  | `starlette` | `>=0.37.0` | 14 | `>=1.4.0` |
+  | `pydantic` | `>=2.0.0` | 2 | `>=2.4.0` |
+
+  All three are optional extras. The upper bounds are unchanged, and CI was
+  already testing above every new floor.
+
+### Fixed
+
+- **The chaos gate could fail on a port collision.** `RK_CHAOS_PORT` used
+  32778/32777, inside Docker's ephemeral range (32768-60999), so a
+  testcontainer from the preceding step could randomly publish on exactly
+  that port. Reachable since 0.15.0 disabled the Ryuk reaper (needed to stop
+  it wedging the job), which lets leaked containers linger. Moved to
+  5699/5698, and a bind failure now names the container holding the port.
+
+## [0.15.1] — 2026-09-20
+
+Security hardening from a full review of the package. No API changes.
+
+### Security
+
+- **Regular-expression denial of service in `ErrorSanitizer`.** The
+  URL-credential pattern had an unbounded scheme run (`[a-z0-9+.-]*` before
+  `://`), making it quadratic, and `summary_for` redacted the *entire*
+  exception text before truncating to 256 characters. Measured on 0.15.0:
+  8 KiB 0.06s, 16 KiB 0.25s, 32 KiB 0.96s, 64 KiB 3.8s — 4x per doubling,
+  extrapolating to roughly 16 minutes for 1 MiB. A handler echoing the body
+  into an exception is routine (`json.JSONDecodeError`, `ValidationError`,
+  `ValueError(f"bad: {body}")`), so one crafted message stalled the event
+  loop, missed heartbeats and wedged the consumer into a redelivery loop.
+  The scheme run is now bounded and the input is capped before redacting.
+  1 MiB now takes ~0.002s. The cap is a *multiple* of the kept length so a
+  secret starting inside the kept region is still matched whole.
+- **`SigningConfig.secret_key` appeared in `repr()`.** The dataclass-generated
+  repr printed every field, so the HMAC key reached any traceback, any
+  `logger.debug("cfg=%s", config)` and any pytest assertion diff. Possession
+  of that key is total compromise — an attacker can sign any body for any
+  route. Now masked with the same `_masked_repr` helper `ConnectionConfig` and
+  `ManagementConfig` already used.
+- **Truncated gzip bodies were accepted.** `_decompress_gzip_streaming`
+  returned partial data when the input ran out mid-member, skipping the gzip
+  trailer (CRC32 + ISIZE) — the payload's only integrity check. The stdlib
+  raises `EOFError`; so do we now.
+- **Concatenated gzip members were silently dropped.** Only the first member
+  was decoded, discarding the rest without error — a body-smuggling primitive
+  against anything that inspects the decompressed body separately. All
+  members are now decoded, matching `gzip.decompress`.
+- **Log injection via `content_encoding`.** That AMQP property is set by the
+  publisher and was logged verbatim, so an embedded newline forged whole log
+  lines attributed to a real logger. Now whitespace-collapsed and bounded.
+- **The CLI echoed credentials.** `topology`'s two failure paths printed the
+  `--url` verbatim, and that flag documents `http://user:pass@host:15672` as
+  its input form, so a password reached terminal scrollback and CI logs.
+  Userinfo is now stripped; the host is kept because it is the diagnostic.
+
+### Fixed
+
+- `SECURITY.md` claimed `1.x` was supported and `< 1.0` was not, which
+  described no released version and may have discouraged reports. It now
+  names the actually-supported line.
+
+## [0.15.0] — 2026-09-19
+
+Settlement correctness. A coalesced plan could turn an intended
+**NACK+requeue into an ACK**, losing the message. If you use
+`CoalescingAcker`, upgrade.
+
+### Fixed
+
+- **A cumulative ack could follow a settlement that never reached the
+  broker.** `SettlementCoordinator.plan()` removed deliveries from the ledger
+  at *planning* time, and the executor carried on after a failed frame. Those
+  two combine into loss. For
+
+      101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
+
+  the planner correctly emits `ack(102, multiple=True)`, `nack(103)`,
+  `ack(105, multiple=True)`. If the nack failed and the last frame still went
+  out, `basic_ack(105, multiple=True)` acknowledged **everything still
+  unacknowledged up to 105 — including 103**, the delivery that was supposed
+  to be requeued. The work was silently dropped instead of retried.
+
+  The code already knew the rule it was breaking: `plan()` documented that its
+  commands "MUST be emitted in that order", while `apply_commands()`
+  documented that the first error "does NOT stop later commands". Two
+  docstrings, opposite contracts, nothing enforcing either.
+
+- **`examples/pydantic_validation/worker.py` never decoded its model.** It
+  used `from __future__ import annotations`, which makes every annotation a
+  lazy string, so the pipeline's `inspect.signature()` read saw `"Order"`
+  rather than the class and handed the handler raw bytes
+  (`'bytes' object has no attribute 'id'`). It was also missing the
+  `serializer=` the other Pydantic examples pass. The bug was invisible while
+  the queue happened to be empty: with nothing to consume, the handler never
+  ran and the example reported healthy.
+
+### Added
+
+- **The plan/emit/commit protocol.** `SettlementCoordinator.prepare()` returns
+  a `SettlementBatch` and *reserves* its tags instead of consuming them;
+  `emit_batch()` (and `emit_batch_async()`) emits in order, commits each
+  command only after its frame lands, and stops at the first failure. The
+  ledger now moves forward only on evidence. `commit_command()`,
+  `fail_command()` and `release_commands()` are available for hand-rolled
+  drivers.
+  - A failed frame's tags become **unresolved**: they leave the ledger and are
+    never re-emitted, because re-sending a settlement whose first attempt may
+    have landed turns an ambiguity into a protocol error. Unacknowledged is
+    always safe — the broker redelivers.
+  - A failed **nack or reject invalidates the generation**. That tag may still
+    be unacknowledged, so no later cumulative ack on the channel can be
+    trusted. A failed **ack** does not: a later cumulative ack sweeping it up
+    produces the intended outcome anyway.
+- **`AsyncCoalescingAcker`** (`rabbitkit.highload`), an async-native acker that
+  owns the event-loop boundary. No timer thread, so no `marshal=` and no
+  silently-dropped cross-thread work. It also exists because the commit
+  protocol is *not implementable* synchronously on aio-pika: settlement there
+  is a coroutine, so a sync callable can only schedule it and never learns
+  whether the frame landed. Awaiting is what supplies the evidence.
+- **Failure-injection coverage**: a regression test asserting the exact wire
+  calls for the scenario above, plus a sweep injecting a failure at every
+  position of a five-command plan and checking that no tag is ever settled by
+  a frame that did not go out.
+
+### Changed
+
+- **`apply_commands()` now stops at the first failure** instead of continuing.
+  For a coalesced plan, continuing is never correct. Use `settle_many_sync` /
+  `settle_many_async` when tags really are independent.
+- **`CoalescingFlushReport` separates planned from settled.** New `emitted`,
+  `not_attempted` and `invalidated` fields; `settled_tags` counts only frames
+  that reached the broker. New coordinator stats: `reserved`, `unresolved`,
+  `frames_failed`, `frames_not_attempted`.
+- **The integration gate can no longer pass without a broker.** Every module
+  skips when Docker is missing, and **pytest exits 0 when every test skips** —
+  exit 5 only means "nothing collected", and a skipped test *is* collected. So
+  a runner with no Docker reported a green real-broker gate that executed
+  nothing. `RK_REQUIRE_BROKER=1` (set in CI) now turns a structural skip into a
+  failure. Environment-bound skips inside tests that did reach a broker stay
+  legal.
+- **All six chaos scenarios are gating**, not just restart-mid-consume. Each
+  asserts a message-safety property, which is deterministic correctness rather
+  than a benchmark. The remaining best-effort step is the throughput benchmark
+  suite, renamed to say so.
+- **The integration suite is roughly three times faster** with no assertion
+  weakened: one shared session container instead of eleven, live queue counts
+  instead of a management API that is structurally ~5s stale, and consumer
+  readiness polled instead of slept on.
+
+## [0.14.0] — 2026-09-19
+
+Observability correctness, and the lint/coverage gates tightened so the
+classes of bug fixed here cannot come back silently.
+
+### Fixed
+
+- **`PrometheusCollector` crashed on every UNLABELLED metric.** `inc_counter`
+  / `observe_histogram` / `set_gauge` called `metric.labels(**labels)`
+  unconditionally, and `prometheus_client` raises
+  `ValueError: No label names were set` when you call `.labels()` on a metric
+  declared without label names. Every unlabelled series rabbitkit emits was
+  affected — `channels_opened_total`, `channel_rebuilds_total`,
+  `broker_connected`, `consumer_active`, `worker_pool_pending`, the whole
+  `settlement_*` gauge family and `settlement_coalesced_total` — and the
+  exception propagated to the caller, so `broker.start()` raised on its very
+  first lifecycle gauge. The collector now uses the metric itself when there
+  are no labels. This was invisible because every existing metrics test used
+  a `MagicMock` collector, which accepts any call; there is now a suite that
+  runs against the real `prometheus_client` with a scoped `CollectorRegistry`.
+- **CI was never running the OpenTelemetry tests.**
+  `tests/unit/middleware/test_otel.py` opens with
+  `pytest.importorskip("opentelemetry.sdk")`, but the `[otel]` extra ships
+  only `opentelemetry-api` — all the middleware needs at runtime — and no
+  extra declared the SDK. So the entire module skipped silently on every CI
+  leg and `middleware/otel.py` sat at 24% coverage, while developers who
+  happened to have the SDK installed saw 100% locally. `opentelemetry-sdk`
+  is now a test-only `[dev]` dependency. A skipped `importorskip` module is
+  invisible: it reports as a skip, not a failure, and takes its whole file's
+  coverage with it.
+- **Example ports no longer collide.** Three examples bound `:8080`, so a
+  still-running example silently blocked the next one. The Kubernetes worker
+  now uses `:8081` and the production pipeline `:8082` / `:9102`.
+- **The examples smoke runner now always shows why a run failed** instead of
+  swallowing the output when its error pattern did not match.
+- **`examples/highload/04_backpressure.py` referenced a class that does not
+  exist** (`BlockedConnectionError`) in a commented-out block. The real name
+  is `BackpressureError`, and the demo now actually runs. Found by putting
+  `examples/` under the lint gate.
+- **`examples/dependency_injection/02_generator_deps.py` interpolated message
+  bytes straight into a SQL string.** The fake session is a demo, but the
+  pattern gets copied; it is parameterised now.
+
+### Added
+
+- **`marshal=` on `BatchPublisher` and `BatchAcker`**, matching the parameter
+  `CoalescingAcker` gained in 0.13.1. All three interval-driven batch helpers
+  now run their timer flush on the transport owner thread the same way, and
+  all three warn when `flush_interval_ms > 0` is set without one.
+
+### Changed
+
+- **`examples/` is now part of the lint gate**
+  (`ruff check src/ tests/ benchmarks/ examples/`), in CI, the Makefile,
+  pre-commit, `CONTRIBUTING.md` and the PR template. Examples are executable
+  documentation and had drifted to 39 findings, including the two real bugs
+  above.
+- **The CI coverage floor moved from 85% to 99%.** Actual unit coverage is
+  99.1%; the old floor was 14 points of slack in which a regression could
+  hide.
+- **The async broker no longer wires `reconnects_total`.** Verified against a
+  live broker: when the BROKER closes a connection, aio-pika 9.6 recovers
+  underneath the same `RobustConnection` without re-running its counted
+  connect path, so `reconnect_callbacks` never fires and the counter would
+  read a permanent 0 while connections really were flapping — worse than no
+  series at all. `channel_rebuilds_total` is the async reconnect signal; the
+  broker now logs that at startup. Sync is unaffected. See
+  `docs/observability.md`.
+
+### Removed
+
+- **`MetricsConfig.publish_total` and `MetricsConfig.publish_failures_total`.**
+  Neither ever had an emission site, and `publish_total` resolved to a
+  *different* default name than `published_total`
+  (`rabbitkit_publish_total` vs `rabbitkit_messages_published_total`), so any
+  dashboard built on it was scraping a series that never existed. Use
+  `published_total` and its `status` label: a publish failure is
+  `rabbitkit_messages_published_total{status="failure"}`.
+
+## [0.13.1] — 2026-09-19
+
+Fixes the two things 0.13.0 only documented or scoped around.
+
+### Fixed
+
+- **`CoalescingAcker` no longer fails silently when an interval timer is
+  used.** `flush_interval_ms` fires on a `threading.Timer` thread, so the
+  emit callables ran off the transport owner. That is not merely unsupported,
+  it is *invisible*: asyncio's cross-thread guard only runs under debug mode
+  (`BaseEventLoop.call_soon` checks the thread only `if self._debug`), so in
+  production a `loop.create_task()` from the timer thread is queued without
+  waking the loop — a busy loop happens to pick it up, an idle one never
+  does. At `prefetch=1` the loop goes idle waiting for the delivery that the
+  un-emitted ack would have unlocked, and the consumer deadlocks.
+  0.13.0 only documented the hazard; it is now fixed by construction:
+
+  - New **`marshal=`** parameter takes a zero-argument callable and runs the
+    WHOLE interval flush on the transport owner, so ordinary
+    `channel.basic_ack(...)` / `loop.create_task(...)` callables are safe.
+    Both standard entry points match the signature directly:
+    `marshal=loop.call_soon_threadsafe` (asyncio) or
+    `marshal=connection.add_callback_threadsafe` (pika).
+  - Arming an interval timer **without** `marshal` now emits a
+    `RuntimeWarning` (once per acker) instead of failing later and silently.
+  - Size-triggered, manual and close flushes already run on the caller's
+    thread and are unchanged.
+
+- **Emit failures are logged.** A failing `ack_fn`/`nack_fn`/`reject_fn` was
+  recorded on `last_error` and in the flush report but never logged, so a
+  broken callable was invisible in the logs. Each failing command is now
+  logged at ERROR with its kind, delivery tag, `multiple` flag, covered-tag
+  count and generation.
+
+- **Reconnect/blocked callbacks now follow every connection the pool
+  creates.** `AsyncTransportImpl.connect()` registered them once on the
+  initial publisher/consumer pair, so a connection rabbitkit replaced later
+  (a rebuilt publisher connection, or a lazy re-create) carried no callbacks
+  at all and `on_reconnect` never fired for it. `AsyncConnectionPool` now
+  takes an `on_connection_created` hook fired for every connection it builds,
+  and a connection created after `connect()` completed is treated as a
+  reconnect.
+
+- **A flaky concurrency test** introduced in 0.13.0: it drained with a single
+  `plan()`, which with `max_hold=1` holds every stranded delivery for one
+  round and can legitimately return nothing if the planner thread exited
+  first. It now drains with `drain_plan()`. The coordinator itself was never
+  at fault.
+
+### Changed
+
+- The connection-kill integration test now **requires convergence**: after
+  force-closing every connection mid-run it waits for all 150 messages to be
+  processed and the queue to drain to 0/0, rather than only asserting the
+  safety properties. 0.13.0 deliberately stopped short of that.
+
+### Known limitation (newly documented)
+
+`rabbitkit_reconnects_total` undercounts on `AsyncBroker`. Verified against a
+live broker on aio-pika 9.6: when the **broker** closes the connection,
+aio-pika recovers underneath the same `RobustConnection` object without
+re-running its counted connect path (`connection_attempt` never advances), so
+it never fires `reconnect_callbacks` — even though consumers are restored and
+traffic resumes. The sync transport is unaffected. See
+`docs/observability.md`; settlement correctness does not depend on the hook,
+because a rebuilt channel is a new object and therefore gets a fresh ledger.
+
+## [0.13.0] — 2026-09-19
+
+Settlement hardening. `SettlementCoordinator` is now an explicit,
+correctness-critical state machine with eight documented invariants enforced
+in code and pinned by deterministic, property-based, concurrency and
+real-broker failure-injection tests. See
+[the settlement safety model](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/bulk-operations.md#the-settlement-safety-model).
+
+### Added
+
+- **Explicit delivery states.** `DeliveryState` gains `FAILED` and
+  `CANCELLED` alongside `OUTSTANDING` / `SUCCESS` / `RETRY_PENDING` / `NACK`
+  / `REJECT`, plus the predicates `is_ack_safe`, `is_emittable` and
+  `blocks_frontier`. A delivery being *finished* is not the same as being
+  *safe to ack*: `SUCCESS` is reachable only from `OUTSTANDING` or
+  `RETRY_PENDING`, so a handler that failed or was cancelled can never be
+  acked (invariant I3). New `CoalescingAcker.abandon(tag)` /
+  `cancel(tag)` (and the `CoalescingAckerGroup` proxies) record those states
+  — they block the frontier, are never emitted, and leave the delivery
+  unacked for redelivery.
+- **Typed coordinator errors**, all subclassing `CoordinatorError`:
+  `UnknownDeliveryError` (never registered), `StaleGenerationError` (tag
+  from a dropped channel generation), `ContradictorySettlementError`
+  (changing a decision, or settling an already-emitted tag) and
+  `LedgerFullError`. A caller bug can no longer corrupt the frontier
+  silently.
+- **Ledger bounds.** `CoalescingAcker(max_pending=N)` /
+  `SettlementCoordinator(max_pending=N)` cap the ledger; exceeding it raises
+  `LedgerFullError` from `register()` so the caller applies backpressure.
+  Reaching a bound never relaxes the ack rules (I7). Default 0 = unbounded,
+  unchanged.
+- **Instrumentation.** `SettlementCoordinator` exposes `frontier`,
+  `ack_ready`, `gap_count`, `oldest_pending_age` and a `stats` dict with
+  `registered`, `frames_sent`, `coalescing_ratio`, `invalidations` and more;
+  `CoalescingAcker.metrics` / `CoalescingAckerGroup.metrics` surface them.
+  Pass `collector=`/`metrics_config=` to emit the new
+  `rabbitkit_settlement_{pending,ack_ready,frontier,gap_count,oldest_pending_age_seconds,coalescing_ratio}`
+  gauges on every flush.
+- **`RabbitManagementClient.close_connection(name)`** — force-close one
+  connection via the management API, for operator tooling and
+  failure-injection tests.
+- Tests: `tests/unit/core/test_settlement_state_machine.py` (114 cases, one
+  class per invariant); the Hypothesis machine now also drives
+  `FAILED`/`CANCELLED`, idempotent repeats, contradictions and unknown tags
+  across ~18k random operations per run, asserting the frontier and
+  ack-safety invariants after every step; concurrency tests for racing
+  completion against planning, invalidation and contradictory decisions; and
+  `tests/integration/test_settlement_chaos.py` — a prefetch matrix (1/10/100),
+  a convergence run with random nack+requeue redelivery, a graceful-shutdown
+  contract check, and real connection-kill failure injection asserting no ACK
+  ever covered an unfinished delivery and nothing was lost.
+
+### Changed
+
+- **Repeating a settlement decision is now an idempotent no-op** instead of
+  raising. `complete(t)` twice, or `fail(t, requeue=True)` twice, is
+  accepted; *changing* the decision (including flipping `requeue`) still
+  raises `ContradictorySettlementError`. Code that relied on the second
+  identical call raising will no longer see an exception.
+- **Multi-segment coalescing.** A nack or reject in the middle of a run
+  settles its own tag on the wire, so the deliveries after it can now form a
+  new cumulative range instead of degrading to individual acks:
+  `101 ✓ 102 ✓ 103 nack 104 ✓ 105 ✓` emits `ack(102, multiple)`,
+  `nack(103)`, `ack(105, multiple)` — three frames where 0.12 emitted four.
+  Commands are still returned in ascending tag order and must be emitted in
+  that order.
+- `SettlementCoordinator.stats` values are now `float` (it carries
+  `coalescing_ratio` and `oldest_pending_age` alongside the counters).
+
+### Fixed
+
+- **Documented the `CoalescingAcker` timer-thread hazard.** `flush_interval_ms`
+  fires the emit callables from a background `threading.Timer` thread, so a
+  bare `loop.create_task(...)` is silently never scheduled and acks simply
+  stop — most visibly at `prefetch=1`, where the broker then waits forever
+  for an ack that never leaves. The class docstring now shows the
+  `loop.call_soon_threadsafe` and `connection.add_callback_threadsafe`
+  recipes, matching the warning `BatchAcker` already carried. Found while
+  writing the prefetch-matrix test, which hit exactly this.
+
+## [0.12.1] — 2026-09-19
+
+Per-channel ack isolation. Purely additive — no behavior changes to existing
+code, no queue is re-declared.
+
+### Added
+
+- **`CoalescingAckerGroup`** — one `CoalescingAcker` per channel, created on
+  demand from a factory you supply. Delivery tags are a PER-CHANNEL counter
+  (tag 7 on channel A and tag 7 on channel B are different messages) and
+  rabbitkit gives every subscriber queue its own channel, so a multi-queue
+  consumer needs one ledger per channel:
+
+  ```
+  Channel A → CoalescingAcker A → SettlementCoordinator A
+  Channel B → CoalescingAcker B → SettlementCoordinator B
+  ```
+
+  The group keeps that isolation without hand-rolled bookkeeping:
+  `for_channel(ch)` builds/caches the acker, the per-delivery calls
+  (`register` / `complete` / `fail` / `retry_pending` / `release`) take the
+  channel and route to its ledger, and `flush()` / `close()` fan out and
+  return a `GroupFlushReport` aggregating every channel.
+  `on_reconnect(channel)` drops one rebuilt channel's ledger (old tags are
+  never replayed) and `reset()` drops all of them; `settled_total` /
+  `coalesced_total` survive a channel being retired so a reconnect does not
+  reset your metrics.
+
+- **`CoalescingAcker(channel_key=...)` and
+  `register(tag, channel_key=...)`** — turns "one acker per channel" from a
+  documented convention into an enforced invariant. A bound acker raises the
+  new **`ChannelMismatchError`** when handed a delivery from any other
+  channel, at registration time, before it can corrupt the ledger; an unbound
+  acker binds to the first key it is given. Without this, feeding two
+  channels into one acker let a cumulative ack computed from channel A's
+  completed prefix settle channel B's messages. Omitting `channel_key` keeps
+  the previous, unchecked behavior, so this is backward compatible.
+
+- **`examples/bulk_operations/08_two_channels_ack_isolation.py`** — two
+  queues carrying the same delivery tags, completed out of order, showing
+  each channel's frames covering only its own tags plus the guard firing on
+  a cross-channel mistake. Verified against a real broker: 40 deliveries
+  settled in 9 frames (39 tags coalesced), both queues drained.
+
+- Tests: `tests/unit/highload/test_ack_isolation.py` (31 cases — binding,
+  mismatch rejection, ledger separation, cumulative acks never crossing
+  channels, per-channel hold/fallback, reconnect/reset/close lifecycle,
+  retained stats, concurrent `for_channel`), and a live-broker
+  `test_coalescing_acker_group_isolates_two_queues` proving two subscriber
+  queues get two channels and both drain to 0/0.
+
+## [0.12.0] — 2026-09-18
+
+Reliability and bulk operations release. Implements the "Reliability and Bulk
+Operations" plan: first-class bulk publishing with per-item outcomes,
+selected acknowledgement, provably safe ack coalescing, reliability profiles
+with preflight, sanitized terminal metadata, and bounded retry-handoff
+failure handling. No existing queue is re-declared by any of it.
 
 ### Added
 
@@ -35,6 +636,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   purpose, is nacked, redelivered, and stored exactly once. Verified
   against a real broker; self-verifying single script (seeds, runs both
   stages, asserts, exits 0).
+
+- **`broker.publish_many(envelopes, options)` / `broker.iter_publish(...)`**
+  on both `SyncBroker` and `AsyncBroker`. Every item goes through the same
+  path as `publish()` (publish middlewares exactly once per attempt, flow
+  controller, size limit, batch publisher when configured, transport) and
+  gets one `BulkPublishItem` keyed by input index with a fresh `attempt_id`
+  and a bounded `reason` code. Statuses: `CONFIRMED`, `UNROUTABLE`,
+  `NACKED`, `INVALID`, `NOT_SENT`, `UNKNOWN` — `SENT` (confirms off), a
+  confirm timeout, an exception mid-publish and cancellation are all
+  `UNKNOWN`, never a success or a definite failure. Admission is bounded by
+  `max_in_flight`, `max_buffer_bytes`, `admission_timeout`,
+  `confirm_timeout`, `overall_timeout` (+ `drain_grace`) and `max_items`.
+  Prepared envelopes snapshot their headers so a caller cannot mutate a
+  queued message. (`core/bulk.py`, `core/bulk_runner.py`)
+- **`broker.ack_many(messages)` / `broker.nack_many(messages, requeue=)`**
+  (sync, async, and `TestBroker`): settle exactly the given deliveries with
+  individual `multiple=False` frames after a validation pass that reports
+  `ALREADY_SETTLED`, `DUPLICATE`, `INVALID` (no-ack delivery / wrong
+  runtime), `STALE` (channel rebuilt since delivery — the tag would name a
+  different message) and `NOT_ATTEMPTED` (fail-fast abort). Reports say
+  `DISPATCHED`, never "confirmed": RabbitMQ does not acknowledge consumer
+  acks. `RabbitMessage.channel_alive` exposes the transport-wired liveness
+  probe. (`core/settlement.py`)
+- **`SettlementCoordinator` + `CoalescingAcker`**: a channel-wide ledger
+  that only emits `ack(tag, multiple=True)` through a tag when every
+  still-outstanding lower tag is approved for success; NACK/REJECT intents
+  are individual and ordered; retry-pending deliveries block coalescing
+  above them; a bounded hold then individual fallback so one slow handler
+  never strands its siblings; `invalidate()` on reconnect drops the whole
+  ledger so old tags are never replayed. Property/state-machine tested.
+- **Reliability profiles** (`core/profiles.py`): `ReliabilityProfile.STANDARD`
+  / `CRITICAL`, `apply_profile()` / `critical_config()` /
+  `standard_config()` (fill requirements; raise on a pinned contradiction),
+  `validate_profile()`, `broker.preflight(profile, management_client=)` —
+  local checks plus read-only management-API verification of queue type,
+  `dead-letter-strategy: at-least-once`, `overflow: reject-publish` and
+  `delivery-limit`; anything unverifiable is reported `UNVERIFIED`, never
+  green — and `policy_templates()` rendering reviewed policy definitions
+  (management JSON / `rabbitmqctl`) for cluster owners to apply.
+- **`ErrorSanitizer`** (`core/sanitizer.py`) and
+  `RetryConfig.error_detail` (`sanitized` default / `omit` / `raw`): retry
+  and DLQ triage headers now carry an allowlisted
+  `x-rabbitkit-error-category` plus a redacted, length-capped message (URL
+  credentials, `password=`/`token=`/`api_key=` pairs, bearer/basic auth,
+  AWS key ids and long opaque tokens are masked). A stale raw message header
+  from a previous attempt is dropped on republish.
+- **`RetryConfig.delay_queue_type`** (`classic` default / `quorum` /
+  `inherit`) and **`dlq_queue_type`** (`inherit` default / `classic` /
+  `quorum`) make retry-chain durability explicit for critical work.
+- **`RetryHandoffConfig` + `RetryHandoffTracker`**: retry-PUBLISH failures
+  (returned, nacked, timed out, raised) are tracked separately from handler
+  attempts, with capped exponential backoff + jitter (awaited on async
+  handlers; surfaced through `on_handoff_failure` on sync ones — the sync
+  path never sleeps on the I/O thread), an `EXHAUSTED` state after
+  `max_consecutive_failures` / `recovery_deadline`, and an
+  `on_handoff_exhausted` hook so an owner can stop the consumer. The source
+  is never acked on a failed handoff.
+- **Metrics**: `bulk_publish_items_total{status,reason}`,
+  `bulk_publish_batch_size`, `settlement_items_total{action,status}`,
+  `settlement_coalesced_total`, `retry_handoff_failures_total{queue}`,
+  `retry_handoff_paused{queue}`; and the previously declared but never
+  emitted `publish_confirm_latency_seconds`, `in_flight_messages`,
+  `broker_connected`, `consumer_active`, `worker_pool_pending` are now
+  emitted.
+- `BatchPublisher.flush_report()` / `flush_report_async()`, `last_flush`,
+  `last_error`, `on_error=`; `BatchAcker.acked_total`, `last_error`,
+  `on_error=`; `BatchClosedError`, `BatchFlushError`, `FlushReport`,
+  `FlushItem`.
+- **`RabbitManagementClient.put_policy` / `get_policy` / `list_policies` /
+  `delete_policy`** — the deliberate, reviewed step for applying
+  `policy_templates()` output (accepts a `PolicyTemplate` directly).
+  rabbitkit still never applies policies on its own.
+- **Examples**: `examples/bulk_operations/` (7 runnable scripts — async and
+  sync `publish_many`, streaming `iter_publish`, batch-commit `ack_many`,
+  `CoalescingAcker` with out-of-order completion, critical-profile preflight
+  against the management API, sanitized headers + handoff backoff with no
+  broker, and a SQLite transactional outbox → `publish_many` → inbox).
+- **Docs**: `docs/bulk-operations.md` (contract, invariants, outbox/inbox
+  recipe, DLQ replay guidance, FAQ), `docs/api/bulk.md`; new sections in the
+  full guide (§10), production patterns (§2b bulk publisher + batch-commit
+  consumer), production checklist, observability reference (lifecycle
+  gauges now emitted; bulk/settlement/handoff metrics + alerting guidance),
+  migration guide (0.12.0 upgrade notes), roadmap; README section.
+- **Benchmark** `python -m benchmarks.bench_bulk` — bulk vs single for
+  publish (async sequential / gather / `publish_many` at pool 10 and 64 /
+  `publish_many` + batch publisher / sync sequential / sync `publish_many`)
+  and ack (`ack_async` each / `ack_many` ×100 / `CoalescingAcker` ×100), with
+  per-item accounting and management-API drain verification; results with
+  environment fingerprint in `benchmarks/results/bulk_<ts>.json`. Measured
+  numbers and interpretation in `docs/benchmarking.md` (Tier 2b) and
+  `docs/bulk-operations.md`.
+- **Tests**: unit coverage for every new module plus transport liveness
+  stamping, public-API exports, management policy endpoints; Hypothesis
+  state machine for `SettlementCoordinator`; live-broker integration suites
+  `tests/integration/test_bulk_operations.py` and
+  `tests/integration/test_reliability_features.py` (streaming
+  `iter_publish`, confirms-off → UNKNOWN, quorum delay chain declared,
+  sanitized headers on the wire, retry handoff failure against a deleted
+  delay queue, policy templates → fully verified preflight, `CoalescingAcker`
+  on a real channel, subset ack leaving the sibling unacked, nack-to-DLQ).
+
+### Fixed
+
+- **Async publish could report CONFIRMED for a message the broker had
+  RETURNED, when the same `message_id` was re-published on the same channel
+  while its previous publish was still unconfirmed.** aiormq correlates a
+  `Basic.Return` to its publish by `message_id` and pops that mapping when an
+  *earlier* publish of the same id confirms. The retry middleware re-publishes
+  the original `message_id` by design, so on a slow broker (durable-queue
+  fsync lagging behind consumer delivery) the sequence "source publish →
+  delivered → handler fails → retry publish (same id) → source confirm
+  arrives → retry Return" deleted the retry's mapping: aiormq logged
+  `Unhandled message ... returning`, the retry publish resolved as
+  `CONFIRMED`, the source was acked, and the message was gone. Surfaced by
+  the new live-broker test `test_retry_handoff_failure_nacks_and_recovers`
+  in CI. `AsyncTransportImpl._publish_on_channel` now serializes publishes
+  of the same `message_id` on the same channel (waits for the previous one
+  to settle, bounded by `confirm_timeout`), which closes the window on the
+  mandatory channel, batch-publisher channels and the reply-to channel
+  alike. Distinct ids and distinct channels are unaffected.
+- **Nightly examples smoke test false positive.** `examples/smoke_test.py`
+  matched bare exception names anywhere in a killed daemon's output; a
+  benign "coroutine was never awaited" `RuntimeWarning` quoting aio-pika's
+  `contextlib.suppress(AttributeError, RuntimeError)` source line failed
+  `header_inspector/chaos_reconnect.py` every night. The signature now
+  requires an actual exception line (`Name:`).
+
+### Changed
+
+- **`BatchAcker` default mode is now `individual`** (one `multiple=False`
+  frame per tag). The previous `ack(max_tag, multiple=True)` acked EVERY
+  outstanding tag on the channel up to the max — including a still-running
+  delivery that was never submitted (submitting 1 and 3 settled 2). The
+  legacy behaviour is `BatchAckConfig(mode="cumulative",
+  ordered_exclusive_owner=True)` and requires that attestation; use
+  `CoalescingAcker` for safe coalescing under arbitrary completion order.
+- **`BatchPublisher.flush()`** counts only items whose publish did not fail
+  locally (a non-ok `PublishOutcome` is no longer counted as published), and
+  a publish that RAISES mid-batch now raises `BatchFlushError` carrying a
+  `FlushReport` with real outcomes for the items already sent, `UNKNOWN`
+  for the raising item, and the unsent tail — nothing is silently
+  re-buffered. `add()` / `add_async()` after close raise
+  `BatchClosedError`; flushes are serialized so a timer flush and a manual
+  flush can never interleave; timer-thread failures are recorded instead of
+  vanishing.
+- `x-rabbitkit-error-message` is sanitized by default (see above). Set
+  `RetryConfig(error_detail="raw")` for the previous text.
+- `BatchAckConfig` now validates `batch_size > 0` and
+  `flush_interval_ms >= 0`.
+- `AsyncBroker.iter_publish` / `publish_many` cap the effective
+  `max_in_flight` at `PoolConfig.channel_pool_size` when no
+  `AsyncBatchPublisher` is configured: each in-flight publish holds one
+  pooled channel, so a larger value only queued callers on the pool with
+  "channel pool exhausted" warnings. With batching configured the caller's
+  value stands.
 
 ## [0.11.0] — 2026-07-11
 

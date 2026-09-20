@@ -12,11 +12,13 @@ Requirements:
 """
 
 import json
+import tempfile
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
-from rabbitkit import RabbitConfig, RabbitRouter
+from rabbitkit import RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 from rabbitkit.asyncapi.generator import (
     AsyncAPIGeneratorConfig,
@@ -120,8 +122,8 @@ def main() -> None:
 
     # Save to file
     json_str = generate_asyncapi_json(broker.routes, config, indent=2)
-    output_path = "/tmp/asyncapi.json"
-    with open(output_path, "w") as f:
+    output_path = Path(tempfile.gettempdir()) / "asyncapi.json"
+    with output_path.open("w") as f:
         f.write(json_str)
     print(f"\nSpec saved to: {output_path}")
     print("Open in AsyncAPI Studio: https://studio.asyncapi.com/")

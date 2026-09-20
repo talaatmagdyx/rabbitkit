@@ -59,6 +59,7 @@ class RabbitMessage:
     __slots__ = (
         "_ack_async_fn",
         "_ack_fn",
+        "_channel_alive",
         "_disposition",
         "_nack_async_fn",
         "_nack_fn",
@@ -139,6 +140,13 @@ class RabbitMessage:
         self._reject_fn: Callable[[bool], None] | None = None
         self._reject_async_fn: Callable[[bool], Awaitable[None]] | None = None
         self._disposition: str = "pending"
+        # Transport-injected liveness probe for the channel this delivery
+        # arrived on (``lambda: channel.is_open``). Delivery tags are only
+        # meaningful on their own channel generation; ``ack_many`` /
+        # ``nack_many`` consult this to report a STALE handle instead of
+        # issuing a tag onto a rebuilt channel (where it would settle a
+        # DIFFERENT message). ``None`` = unknown (TestBroker, hand-built).
+        self._channel_alive: Callable[[], bool] | None = None
 
     @property
     def is_settled(self) -> bool:
@@ -149,6 +157,23 @@ class RabbitMessage:
     def disposition(self) -> str:
         """Final settlement state: "pending", "acked", "nacked", or "rejected" (M2)."""
         return self._disposition
+
+    @property
+    def channel_alive(self) -> bool | None:
+        """Whether the channel this delivery arrived on is still open.
+
+        ``None`` when the transport did not wire a probe (in-memory
+        ``TestBroker``, hand-constructed messages). ``False`` means the
+        delivery tag is STALE — the broker has already (or will) redeliver
+        this message on a new channel and settling it here would be a
+        protocol error or, worse, settle a different message.
+        """
+        if self._channel_alive is None:
+            return None
+        try:
+            return bool(self._channel_alive())
+        except Exception:
+            return False
 
     # ── Sync settlement ───────────────────────────────────────────────────
 

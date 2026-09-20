@@ -53,7 +53,7 @@ class SimpleCircuitBreaker:
             result = func(*args, **kwargs)  # type: ignore[operator]
             self._failures = 0
             return result
-        except Exception as exc:
+        except Exception:
             self._failures += 1
             if self._failures >= self._fail_max:
                 self._open = True

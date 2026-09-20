@@ -16,7 +16,11 @@ Run:
     python worker.py
 """
 
-from __future__ import annotations
+# NOTE: deliberately NO `from __future__ import annotations` here.
+# It makes every annotation a lazy string, so the pipeline's
+# inspect.signature() read sees "Order" instead of the class and cannot
+# decode the body into the model — the handler then receives raw bytes and
+# fails with `'bytes' object has no attribute 'id'`.
 
 import asyncio
 import signal
@@ -25,6 +29,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from rabbitkit import AsyncBroker, RabbitConfig, RetryConfig
 from rabbitkit.core.config import ConnectionConfig
+from rabbitkit.serialization.json import JSONSerializer
 
 
 class Order(BaseModel):
@@ -45,7 +50,9 @@ config = RabbitConfig(
     connection=ConnectionConfig(host="localhost", port=5672),
     retry=RetryConfig(max_retries=3, delays=(5, 30, 120)),
 )
-broker = AsyncBroker(config)
+# serializer= is what lets a `body: Order` handler receive a decoded model.
+# Without it the pipeline hands the handler raw bytes.
+broker = AsyncBroker(config, serializer=JSONSerializer())
 
 
 @broker.subscriber(queue="pydantic.orders")

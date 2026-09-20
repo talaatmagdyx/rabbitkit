@@ -15,7 +15,6 @@ Requirements:
 """
 
 import asyncio
-import json
 
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 

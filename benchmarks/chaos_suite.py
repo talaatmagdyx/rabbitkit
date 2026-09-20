@@ -78,7 +78,19 @@ def start_broker() -> None:
         capture_output=True, text=True,
     )
     if run.returncode != 0:  # surface port conflicts etc. instead of a blind timeout
-        raise RuntimeError(f"docker run failed: {run.stderr.strip()}")
+        detail = run.stderr.strip()
+        if "address already in use" in detail:
+            holder = subprocess.run(
+                ["docker", "ps", "--filter", f"publish={PORT}", "--format", "{{.Names}} {{.Image}}"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            detail += (
+                f"\n  port {PORT} is held by: {holder or '<not a docker container>'}"
+                "\n  NOTE: keep RK_CHAOS_PORT outside Docker's ephemeral range"
+                " (32768-60999) or a testcontainer can randomly claim it."
+            )
+        raise RuntimeError(f"docker run failed: {detail}")
     _wait_ready(120)
 
 

@@ -17,15 +17,13 @@ Requirements:
 """
 
 import json
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import JSONResponse
 
     from rabbitkit.fastapi import rabbitkit_lifespan
     FASTAPI_AVAILABLE = True

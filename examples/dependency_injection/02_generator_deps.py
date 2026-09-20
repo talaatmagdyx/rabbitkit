@@ -13,7 +13,8 @@ Requirements:
 """
 
 import asyncio
-from typing import Annotated, AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator
+from typing import Annotated
 
 from rabbitkit import MessageEnvelope, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
@@ -29,8 +30,8 @@ class DbSession:
         self.name = name
         print(f"[db] OPEN: {self.name}")
 
-    def execute(self, query: str) -> str:
-        return f"result of: {query}"
+    def execute(self, query: str, params: tuple[object, ...] = ()) -> str:
+        return f"result of: {query} {params}"
 
     def close(self) -> None:
         print(f"[db] CLOSE: {self.name}")
@@ -53,7 +54,8 @@ async def handle_with_session(
     body: bytes,
     db: Annotated[DbSession, Depends(get_db_session)],
 ) -> None:
-    result = db.execute(f"SELECT * FROM events WHERE id = '{body.decode()}'")
+    # Parameterised — never interpolate message bytes into SQL.
+    result = db.execute("SELECT * FROM events WHERE id = ?", (body.decode(),))
     print(f"[handler] {result}")
 
 

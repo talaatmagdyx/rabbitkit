@@ -67,6 +67,26 @@ class RouteRuntimeState:
     """
 
     consumer_tag: str | None = None
+    #: One-shot latch for the unbounded-reply_to warning (see
+    #: RouteDefinition.reply_to_allow). Per route, so a busy queue does not
+    #: flood the log.
+    _warned_unbounded_reply_to: bool = False
+
+    def warn_unbounded_reply_to(self, route_name: str, reply_to: str) -> None:
+        """Warn ONCE that this route publishes results to an unrestricted
+        publisher-supplied destination."""
+        if self._warned_unbounded_reply_to:
+            return
+        self._warned_unbounded_reply_to = True
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Route %r published a handler result to reply_to=%r, which the PUBLISHER chose. "
+            "Without reply_to_allow this is a one-hop write into any queue in the vhost. "
+            "Set reply_to_allow=(...) on the subscriber to restrict it. Warned once per route.",
+            route_name,
+            reply_to,
+        )
 
 
 # ── Route definition ─────────────────────────────────────────────────────
@@ -123,6 +143,22 @@ class RouteDefinition:
 
     # Per-route override of SafetyConfig.reject_without_dlx (None = inherit)
     reject_without_dlx: str | None = None
+
+    # Destinations this route may publish a handler RESULT to via the
+    # incoming message's `reply_to`.
+    #
+    # `reply_to` is set by the PUBLISHER and was used verbatim as a routing
+    # key on the default exchange, which makes it a one-hop write primitive:
+    # a publisher who can reach one queue could have this route's handler
+    # output delivered into any queue in the vhost, including queues they
+    # have no publish rights to. Combined with a dedup result store, it also
+    # let a replayed message return someone else's stored result.
+    #
+    # None (default) keeps the previous behaviour and warns ONCE per route
+    # when a reply goes somewhere other than the broker's private
+    # direct-reply-to pseudo-queue. Set a tuple to enforce; entries ending in
+    # "*" are treated as prefixes.
+    reply_to_allow: tuple[str, ...] | None = None
 
     # ── Runtime state (mutable sub-object; populated by broker) ──
     runtime_state: RouteRuntimeState = field(default_factory=RouteRuntimeState)

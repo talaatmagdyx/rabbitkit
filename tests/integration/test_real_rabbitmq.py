@@ -27,6 +27,8 @@ from typing import Any
 
 import pytest
 
+from tests.integration.conftest import await_consumers
+
 # Module-level imports so typing.get_type_hints() can resolve annotations
 # even with `from __future__ import annotations` (PEP 563).
 try:
@@ -34,44 +36,23 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
-# ── Skip guard — skip entire module when testcontainers/docker unavailable ──
-
-try:
-    from testcontainers.rabbitmq import RabbitMqContainer  # type: ignore[import-untyped]
-
-    _TESTCONTAINERS_AVAILABLE = True
-except ImportError:
-    _TESTCONTAINERS_AVAILABLE = False
+# The testcontainers/Docker skip guard now lives on the suite-wide
+# ``rabbit_container`` fixture in conftest.py.
 
 pytestmark = pytest.mark.integration
-
-
-def _skip_no_docker() -> None:
-    """Raise pytest.skip() when prerequisites are missing."""
-    if not _TESTCONTAINERS_AVAILABLE:
-        pytest.skip("testcontainers not installed — run: pip install testcontainers[rabbitmq]")
-    try:
-        import docker  # type: ignore[import-untyped]
-
-        docker.from_env().ping()
-    except Exception:
-        pytest.skip("Docker daemon not reachable — skip real-RabbitMQ integration tests")
 
 
 # ── Fixture ──────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="module")
-def rabbitmq_url() -> str:  # type: ignore[return]
-    """Start a RabbitMQ container and yield its AMQP URL.
+def rabbitmq_url(rabbit_container: dict[str, Any]) -> str:
+    """AMQP URL of the suite-wide RabbitMQ container (see ``conftest.py``).
 
-    Module-scoped so the container is reused across tests in this file.
+    This file used to start its own; the whole integration suite now shares
+    one, which is worth ~4s of container startup per module.
     """
-    _skip_no_docker()
-    with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
-        host = container.get_container_host_ip()
-        port = container.get_exposed_port(5672)
-        yield f"amqp://guest:guest@{host}:{port}/"
+    return str(rabbit_container["url"])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -113,7 +94,7 @@ async def test_async_roundtrip_publish_consume(rabbitmq_url: str) -> None:
         done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)  # allow consumer registration
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-rt-orders", body=b'{"id": 1}'))
 
@@ -147,7 +128,7 @@ async def test_async_multiple_queues(rabbitmq_url: str) -> None:
         done_b.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-mq-alpha", body=b"msg-alpha"))
     await broker.publish(MessageEnvelope(routing_key="integ-mq-beta", body=b"msg-beta"))
@@ -206,7 +187,7 @@ async def test_async_ten_queues_one_broker_isolated_and_concurrent(rabbitmq_url:
         broker.subscriber(queue=f"integ-10q-{i}")(_make_handler(i))
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     for i in range(num_queues):
         for n in range(msgs_per_queue):
@@ -254,7 +235,7 @@ async def test_async_topic_exchange_routing(rabbitmq_url: str) -> None:
             all_done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(routing_key="order.created", body=b"order-msg", exchange="integ-topic-ex")
@@ -300,7 +281,7 @@ async def test_async_fanout_exchange(rabbitmq_url: str) -> None:
         done2.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(routing_key="", body=b"broadcast", exchange="integ-fanout-ex")
@@ -343,7 +324,7 @@ async def test_async_message_headers_preserved(rabbitmq_url: str) -> None:
         done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(
@@ -380,7 +361,7 @@ async def test_async_broker_publish_applies_signing_middleware(rabbitmq_url: str
     received_headers: dict[str, Any] = {}
     done = asyncio.Event()
 
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-integration-tests-pad!"))
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config, middlewares=[signing_mw])
 
@@ -391,7 +372,7 @@ async def test_async_broker_publish_applies_signing_middleware(rabbitmq_url: str
         done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(routing_key="integ-signed-publish-q", body=b"order-payload")
@@ -459,7 +440,7 @@ async def test_async_publish_without_confirms_reports_sent_not_confirmed(rabbitm
         done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     outcome = await broker.publish(MessageEnvelope(routing_key="integ-m4-sent-q", body=b"fire-and-forget"))
 
@@ -549,7 +530,7 @@ async def test_async_retry_exhaustion_to_dlq(rabbitmq_url: str) -> None:
         dead_lettered.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-dlq-src", body=b"doomed"))
 
@@ -605,7 +586,7 @@ async def test_async_retry_routes_back_through_topic_bound_queue(rabbitmq_url: s
         retried.set()  # only reached if the delay-queue dead-letter routed back
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(
@@ -674,7 +655,7 @@ async def test_async_retry_count_header_spoofing_clamped(rabbitmq_url: str) -> N
         raise TimeoutError("transient outage")
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(
         MessageEnvelope(
@@ -749,7 +730,7 @@ async def test_async_quorum_queue_delivery_limit_dead_letters_independent_of_app
         dead_lettered.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-quorum-delivery-limit-src", body=b"doomed"))
 
@@ -794,7 +775,7 @@ async def test_async_queue_consumer_timeout_declares_and_consumes(rabbitmq_url: 
         received.set()
 
     await broker.start()  # raises ConfigurationError here if the broker rejects the x-argument
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-consumer-timeout-q", body=b"slow-job"))
     await asyncio.wait_for(received.wait(), timeout=15.0)
@@ -841,7 +822,7 @@ async def test_async_filter_rejection_without_retry_preserved_in_auto_dlq(rabbit
     # log (see CHANGELOG 1.2.0). The auto-provisioned DLQ itself — this
     # test's real subject — is asserted below on the real broker.
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-h6-filter-q", body=b"filtered-payload"))
 
@@ -924,7 +905,7 @@ async def test_async_dedup_retry_composition_does_not_drop_retried_message(rabbi
         processed.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-h8-dedup-retry-q", body=b"h8-payload"))
 
@@ -957,7 +938,7 @@ async def test_async_worker_pool_concurrent_messages(rabbitmq_url: str) -> None:
             all_done.set()
 
     await broker.start(worker_config=WorkerConfig(worker_count=4))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     for i in range(num_messages):
         await broker.publish(MessageEnvelope(routing_key="integ-pool-q", body=f"msg-{i}".encode()))
@@ -1003,7 +984,7 @@ async def test_async_stop_drains_cleanly_under_load(rabbitmq_url: str) -> None:
         processed_first.append(body)
 
     await broker.start(worker_config=WorkerConfig(worker_count=4))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     for i in range(num_messages):
         await broker.publish(MessageEnvelope(routing_key="integ-shutdown-q", body=f"m{i}".encode()))
@@ -1075,7 +1056,7 @@ async def test_async_worker_pool_abandoned_handler_is_nacked_for_redelivery(rabb
         await asyncio.sleep(5.0)  # far longer than stop_timeout below
 
     await broker.start(worker_config=WorkerConfig(worker_count=2, stop_timeout=0.3))
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     await broker.publish(MessageEnvelope(routing_key="integ-h12-abandon-q", body=b"slow-msg"))
     await asyncio.wait_for(handler_started.wait(), timeout=10.0)
@@ -1144,7 +1125,7 @@ async def test_async_compression_roundtrip(rabbitmq_url: str) -> None:
         decoded_done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     original = b"hello world - compressed payload for integration test roundtrip"
     await broker.publish(MessageEnvelope(routing_key="integ-compress-raw-q", body=original))
@@ -1186,7 +1167,7 @@ async def test_async_signing_and_compression_compose_correctly(rabbitmq_url: str
     from rabbitkit.middleware.signing import SigningConfig, SigningMiddleware
 
     compression_mw = CompressionMiddleware(CompressionConfig(algorithm="gzip", threshold=0))
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="h7-integ-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-h7-integration-tests!"))
 
     config = _make_async_config(rabbitmq_url)
     broker = AsyncBroker(config=config, middlewares=[compression_mw, signing_mw])
@@ -1200,7 +1181,7 @@ async def test_async_signing_and_compression_compose_correctly(rabbitmq_url: str
         done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     original = b"order payload for H7 composition test " * 20
     await broker.publish(MessageEnvelope(routing_key="integ-h7-sign-compress-q", body=original))
@@ -1249,7 +1230,7 @@ async def test_async_rpc_request_response(rabbitmq_url: str) -> None:
         reply_done.set()
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     import uuid
 
@@ -1293,7 +1274,7 @@ async def test_async_rpc_via_real_rpc_client(rabbitmq_url: str) -> None:
         return body
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     assert broker._transport is not None
     client = AsyncRPCClient(broker._transport)
@@ -1318,7 +1299,7 @@ async def test_async_rpc_via_broker_request_shorthand(rabbitmq_url: str) -> None
         return body
 
     await broker.start()
-    await asyncio.sleep(0.3)
+    await await_consumers(rabbitmq_url, broker)
 
     response = await broker.request("integ-rpc-request-echo", b"via-request", timeout=10.0)
     assert response.body == b"via-request"
@@ -1965,7 +1946,7 @@ def test_sync_broker_publish_applies_signing_middleware(rabbitmq_url: str) -> No
 
     received_headers: list[dict[str, Any]] = []
 
-    signing_mw = SigningMiddleware(SigningConfig(secret_key="integ-test-secret"))
+    signing_mw = SigningMiddleware(SigningConfig(secret_key="not-a-real-" + "key-for-integration-tests-pad!"))
     config = _make_sync_config(rabbitmq_url)
     broker = SyncBroker(config=config, middlewares=[signing_mw])
 

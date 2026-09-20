@@ -194,13 +194,27 @@ class TestBatchAcker:
         ba.add(3)
         ba.add(7)
 
-        ack_fn.assert_called_once_with(7, multiple=True)
+        # Safe default (plan §4.1): one individual ack per tag, ascending.
+        assert [c.args for c in ack_fn.call_args_list] == [(3,), (5,), (7,)]
+        assert all(c.kwargs == {"multiple": False} for c in ack_fn.call_args_list)
         assert ba.pending == 0
 
-    def test_flush_uses_max_tag(self) -> None:
-        """Flush acks with the maximum delivery tag and multiple=True."""
+    def test_flush_acks_each_tag_individually(self) -> None:
+        """Default mode: every tag gets its own multiple=False frame."""
         ack_fn = MagicMock()
         ba = BatchAcker(ack_fn=ack_fn)
+
+        ba._tags = [10, 5, 20, 15]
+        count = ba.flush()
+
+        assert count == 4
+        assert [c.args[0] for c in ack_fn.call_args_list] == [5, 10, 15, 20]
+        assert ba.pending == 0
+
+    def test_flush_uses_max_tag_in_cumulative_mode(self) -> None:
+        """Opt-in cumulative mode keeps the legacy ack(max_tag, multiple=True)."""
+        ack_fn = MagicMock()
+        ba = BatchAcker(ack_fn=ack_fn, config=BatchAckConfig(mode="cumulative", ordered_exclusive_owner=True))
 
         ba._tags = [10, 5, 20, 15]
         count = ba.flush()
@@ -231,7 +245,7 @@ class TestBatchAcker:
         count = ba.close()
 
         assert count == 3
-        ack_fn.assert_called_once_with(3, multiple=True)
+        assert [c.args[0] for c in ack_fn.call_args_list] == [1, 2, 3]
 
     def test_close_empty(self) -> None:
         """Close on empty tags returns 0."""
@@ -255,7 +269,7 @@ class TestBatchAckerAsync:
         ack_fn.assert_not_called()
 
         await ba.add_async(20)
-        ack_fn.assert_called_once_with(20, multiple=True)
+        assert [c.args[0] for c in ack_fn.call_args_list] == [10, 20]
 
     async def test_flush_async(self) -> None:
         """Async flush acks all buffered tags."""
@@ -266,7 +280,7 @@ class TestBatchAckerAsync:
         count = await ba.flush_async()
 
         assert count == 3
-        ack_fn.assert_called_once_with(15, multiple=True)
+        assert [c.args[0] for c in ack_fn.call_args_list] == [5, 10, 15]
 
     async def test_flush_async_empty(self) -> None:
         """Async flush of empty tags returns 0."""
@@ -282,7 +296,7 @@ class TestBatchAckerAsync:
 
         count = await ba.close_async()
         assert count == 3
-        ack_fn.assert_called_once_with(3, multiple=True)
+        assert [c.args[0] for c in ack_fn.call_args_list] == [1, 2, 3]
 
 
 # ── Timer-based flush (flush_interval_ms) ────────────────────────────────
@@ -631,7 +645,7 @@ class TestBatchAckerAsyncLocking:
         # Wait beyond the original timer interval — the cancelled timer must
         # NOT fire (no extra ack).
         time.sleep(0.1)
-        ack_fn.assert_called_once_with(1, multiple=True)
+        ack_fn.assert_called_once_with(1, multiple=False)
 
     async def test_flush_async_awaitable_ack_fn(self) -> None:
         """Line 326: ack_fn returning an awaitable is awaited in flush_async."""
@@ -646,8 +660,8 @@ class TestBatchAckerAsyncLocking:
         count = await ba.flush_async()
 
         assert count == 3
-        assert len(acked) == 1
-        assert acked[0] == (20, True)
+        # Safe default: one awaited individual ack per tag, ascending.
+        assert acked == [(10, False), (15, False), (20, False)]
 
     async def test_close_async_cancels_flush_task(self) -> None:
         """Lines 334-335: close_async cancels the interval task when it exists."""
@@ -666,7 +680,7 @@ class TestBatchAckerAsyncLocking:
 
         assert ba._flush_task is None
         assert count == 1  # the one buffered tag was flushed
-        ack_fn.assert_called_once_with(42, multiple=True)
+        ack_fn.assert_called_once_with(42, multiple=False)
 
 
 # ── MH-1: sync timer reschedule race must not produce orphan timers ──────────
@@ -817,7 +831,7 @@ class TestBatchAckerCloseCancelsFlushTask:
 
         assert ba._flush_task is None
         assert count == 1  # the buffered tag was flushed
-        ack_fn.assert_called_once_with(42, multiple=True)
+        ack_fn.assert_called_once_with(42, multiple=False)
 
         # Allow event loop to process the cancellation.
         await asyncio.sleep(0)

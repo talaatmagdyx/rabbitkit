@@ -663,17 +663,17 @@ class TestMetricsConfigProperties:
         cfg = MetricsConfig(namespace="myapp")
         assert cfg.channel_rebuilds_total == "myapp_channel_rebuilds_total"
 
-    def test_publish_total_default(self) -> None:
-        cfg = MetricsConfig()
-        assert cfg.publish_total == "rabbitkit_publish_total"
+    def test_the_removed_alias_names_are_gone(self) -> None:
+        """0.14 dropped `publish_total` and `publish_failures_total`.
 
-    def test_publish_total_custom_counter(self) -> None:
-        cfg = MetricsConfig(published_counter="my_pub")
-        assert cfg.publish_total == "my_pub"
-
-    def test_publish_failures_total(self) -> None:
+        Neither ever had an emission site, and `publish_total` resolved to a
+        DIFFERENT default name than `published_total` — so any dashboard built
+        on it was already scraping a series that never existed.
+        """
         cfg = MetricsConfig()
-        assert cfg.publish_failures_total == "rabbitkit_publish_failures_total"
+        assert not hasattr(cfg, "publish_total")
+        assert not hasattr(cfg, "publish_failures_total")
+        assert cfg.published_total == "rabbitkit_messages_published_total"
 
     def test_publish_confirm_latency_seconds(self) -> None:
         cfg = MetricsConfig()

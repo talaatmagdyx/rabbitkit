@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger (release verification, or when event-driven runs need a
+  # re-run on a branch without an empty commit).
+  workflow_dispatch: {}
 
 jobs:
   lint:
@@ -16,12 +19,13 @@ jobs:
           python-version: "3.12"
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
       - name: Ruff
-        run: .venv/bin/ruff check src/ tests/ benchmarks/
+        run: .venv/bin/ruff check src/ tests/ benchmarks/ examples/
       - name: mypy
         run: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
@@ -41,13 +45,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
       - run: pip install uv && uv venv && uv pip install -e ".[dev]"
-      # NOTE(coverage): the project aims for ~100% coverage, but the floor is
-      # intentionally kept at 85 here so CI stays green while unreachable
-      # defensive guards and transport-shim paths are brought under test.
-      # Do NOT raise this to 100 — it would break the pipeline. Raise it
-      # incrementally as new tests close the gap.
+      # NOTE(coverage): security/ and property/ are INSIDE the coverage run.
+      # They were measured separately, so the adversarial regressions —
+      # which are the only tests exercising several hardening paths — did
+      # not count toward the floor, and those paths looked uncovered.
+      #
+      # The floor is 99% (actual 99.1%) on every leg. It was
+      # 85% before 0.14, which was 14 points of slack a regression could hide
+      # in. Raise it as new tests land; never lower it to make a change go
+      # green — add the test instead.
+      #
+      # If a leg reports ~98.4%, the cause is almost certainly a test-only
+      # dependency that failed to resolve rather than a missing test: an
+      # `importorskip` module drops out and takes its whole file's coverage
+      # with it. That is exactly how middleware/otel.py sat at 24% in CI
+      # until `opentelemetry-sdk` was added to the `[dev]` extra. Check the
+      # skip count and the install log before touching this number.
       - name: Tests
-        run: .venv/bin/pytest tests/unit/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=85
+        run: .venv/bin/pytest tests/unit/ tests/security/ tests/property/ --ignore=tests/unit/test_readme_examples.py -q --tb=short --cov=src/rabbitkit --cov-report=term-missing --cov-fail-under=99
       # L17: security regression scenarios (signing replay, decompression
       # bombs) and hypothesis property-based round-trip tests. Separate from
       # the coverage-gated run above -- these test the public API as
@@ -104,11 +119,18 @@ jobs:
   # Gating vs best-effort split:
   #   - The `Integration tests` step is GATING: a real regression in a marked
   #     integration test fails the job. Do NOT swallow its exit code.
-  #   - The `Chaos suite` step is best-effort (`continue-on-error: true` on the
-  #     step only): the chaos/benchmark suite may be flaky or environment-bound,
-  #     so it reports results without failing the pipeline.
+  #   - The `Chaos gate` runs ALL SIX chaos scenarios and is GATING. Each one
+  #     asserts a message-safety property (no loss across a restart, retry
+  #     exhaustion reaching the DLQ, unconfirmed publishes resent), which is
+  #     deterministic correctness, not a benchmark.
+  #   - The `Benchmark suite` step is best-effort: throughput numbers depend on
+  #     the runner hardware, so it reports without failing the pipeline.
   integration:
     runs-on: ubuntu-latest
+    # A healthy run of this whole job is ~7 minutes. Without a ceiling a hung
+    # step inherits GitHub's 6-hour default and blocks the PR that long — which
+    # is exactly what happened when the best-effort benchmark suite wedged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -118,20 +140,46 @@ jobs:
       # GATING: real integration regressions fail the job. `-m integration`
       # selects only marked tests; if none are marked pytest exits 5 (no tests
       # ran), which is treated as a failure so missing tests surface loudly.
+      # RK_REQUIRE_BROKER=1 makes tests/integration/conftest.py refuse to report
+      # a green gate that never reached a broker. Without it, a host with no
+      # Docker skips every test and pytest still exits 0 — exit 5 only covers
+      # "nothing collected", and a skipped test IS collected.
       - name: Integration tests
+        timeout-minutes: 15
+        env:
+          RK_REQUIRE_BROKER: "1"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short
       # GATING (M15): the critical restart-mid-consume scenarios (sync+async)
       # must pass — a reconnect/redelivery regression should break the build,
       # not merge green. Exit code is checked (no continue-on-error).
-      - name: Chaos gate (restart mid-consume)
+      - name: Chaos gate (all scenarios)
+        timeout-minutes: 15
         env:
-          RK_CHAOS_PORT: "32778"
-        run: .venv/bin/python -m benchmarks.chaos_suite "restart mid-consume"
-      # BEST-EFFORT: the remaining chaos/benchmark suite is allowed to fail
-      # without breaking the pipeline (`continue-on-error: true` on this step).
-      - name: Chaos suite (best-effort)
+          # 5699/5698 are deliberately OUTSIDE Docker's ephemeral range
+          # (32768-60999). The old 32778/32777 sat inside it, so a
+          # testcontainer in the previous step could randomly publish on
+          # exactly that port and the chaos broker then failed to bind:
+          # "address already in use". Disabling the Ryuk reaper (needed to
+          # stop it wedging) means leaked containers linger long enough to
+          # collide, so the ports have to move out of the range.
+          RK_CHAOS_PORT: "5699"
+          # Every benchmark module documents this invocation. The runner is
+          # ephemeral, so the testcontainers reaper buys nothing here and is a
+          # known source of hangs when a second suite starts its own stack.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: .venv/bin/python -m benchmarks.chaos_suite
+      # BEST-EFFORT, and genuinely so: this is the THROUGHPUT benchmark suite,
+      # whose numbers depend on the runner's CPU and disk. Correctness lives in
+      # the gate above.
+      # `continue-on-error` does NOT bound runtime: a wedged step still holds
+      # the job open. The timeout is what makes "best-effort" actually
+      # best-effort.
+      - name: Benchmark suite (best-effort)
         continue-on-error: true
+        timeout-minutes: 12
         env:
-          RK_CHAOS_PORT: "32777"
+          RK_CHAOS_PORT: "5698"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: |
-          .venv/bin/python -m benchmarks || echo "chaos suite skipped/failed (best-effort)"
+          .venv/bin/python -m benchmarks || echo "benchmark suite skipped/failed (best-effort)"

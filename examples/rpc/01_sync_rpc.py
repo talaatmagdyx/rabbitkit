@@ -14,7 +14,7 @@ Requirements:
 import json
 import threading
 
-from rabbitkit import MessageEnvelope, RabbitConfig
+from rabbitkit import RabbitConfig
 from rabbitkit.rpc import RPCClient, RPCTimeoutError
 from rabbitkit.sync import SyncBroker
 

@@ -114,6 +114,46 @@ to create it. `TopologyMode.MANUAL` goes further — it skips topology
 declaration/checking entirely, for callers that manage topology completely
 out-of-band (e.g. via `rabbitmqadmin`/Terraform).
 
+## Deduplication keys are publisher-controlled
+
+`DeduplicationConfig.key_source` defaults to `message_id`, which the
+**publisher** sets. On a key hit the message is acked and the handler is
+skipped, logged at debug level — no dead letter, no metric.
+
+That combination is a suppression primitive when an untrusted party can
+publish into a deduplicated queue. One junk message with
+`message_id="order-1001"` marks that key for `ttl` (24 hours by default);
+your genuine `order-1001` then arrives, is acknowledged, and is discarded
+silently. Business keys are the natural thing to put in `message_id`, which
+is exactly what makes them guessable.
+
+**This only matters if an untrusted publisher can reach the queue.** With a
+single publisher you control, or unguessable ids, it is theoretical.
+Deduplication is opt-in — nothing enables it for you.
+
+Two controls, both already available:
+
+```python
+# 1. Namespace: on by default since 0.18 (the consuming queue, taken from a
+#    header the broker overwrites, so a publisher cannot steer it).
+DeduplicationConfig(key_prefix="dedup:orders")
+
+# 2. Bind the key to an authenticated producer. RabbitMQ validates `user_id`
+#    against the connection's authenticated user when the publisher sets it,
+#    so it is the one identity on a message that cannot be forged.
+DeduplicationMiddleware(
+    redis,
+    key_fn=lambda m: f"{m.user_id}:{m.message_id}",
+)
+```
+
+`key_fn` replaces the identity only; the queue namespace is still applied.
+
+Requiring `user_id` is a deployment decision rabbitkit cannot make for you:
+it works only if every publisher sets it. If they do, it turns the key from
+"whatever the publisher claimed" into "this producer's claim", which is what
+closes the suppression path.
+
 ## Header Validation
 
 Headers are untrusted input. Validate and sanitize all routing headers before acting on them. Do not use header values as file paths, SQL queries, or shell arguments.
@@ -124,7 +164,24 @@ Do not let external callers control routing keys directly. A caller that control
 
 ## HMAC Signing
 
-`SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks. Configure it with a secret that is at least 32 bytes:
+`SigningMiddleware` signs and verifies messages using HMAC-SHA256 (or SHA-512). It uses `hmac.compare_digest` for constant-time comparison to prevent timing attacks.
+
+**Since 0.16 signing fails closed.** `reject_unsigned` and `reject_invalid` both
+default to `True`. Previously `reject_unsigned` defaulted to `False`, so a
+message whose signature header was simply *deleted* was accepted silently and
+without logging — an attacker forged nothing, they removed a header. The example
+below used the plain constructor, so anyone following this page had signing that
+enforced nothing.
+
+A key shorter than 32 bytes is now **refused at construction**. The page always
+said "at least 32 bytes"; nothing enforced it, so
+`secret_key=os.environ.get("SIGNING_KEY", "")` with the variable unset produced a
+deployment where signing appeared to work end to end while every message was
+forgeable by anyone who read the source. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 ```python
 from rabbitkit.experimental import SigningConfig
@@ -132,6 +189,27 @@ from rabbitkit.middleware.signing import SigningMiddleware
 
 mw = SigningMiddleware(config=SigningConfig(secret_key="a-long-random-secret-at-least-32-bytes"))
 ```
+
+### Rotating the key
+
+`previous_keys` holds keys that are **accepted on verify but never used to
+sign**, which is what makes rotation possible:
+
+```python
+SigningConfig(
+    secret_key=NEW_KEY,            # everything is signed with this
+    previous_keys=(OLD_KEY,),      # still verifies while messages drain
+)
+```
+
+Publish with the new key, keep the old one accepted until in-flight messages
+drain, then drop it. Before 0.16 there was only one key, so rotating required
+every publisher and consumer to flip atomically — and any message signed with
+the old key that was still in flight failed verification and was dead-lettered
+permanently. The advice to rotate was unfollowable in practice.
+
+Every accepted key is compared without an early exit, so the number of keys
+configured is not observable in the response time.
 
 The default (`require_freshness=True`) signature covers `timestamp`, `nonce`,
 `exchange`, `routing_key`, `content_encoding`, and `reply_to`, in addition to

@@ -30,7 +30,7 @@ and an in-memory `TestBroker`. Public beta on PyPI (`pip install rabbitkit`).
 
 ```bash
 .venv/bin/pytest tests/unit/ -q --tb=short
-.venv/bin/ruff check src/ tests/ benchmarks/
+.venv/bin/ruff check src/ tests/ benchmarks/ examples/
 .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 ```
 

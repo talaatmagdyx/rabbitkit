@@ -105,6 +105,28 @@ If you deliberately raised `max_message_size` in `rabbitmq.conf`, set
 advertise its limit, so rabbitkit can't discover it); `0` disables the
 guard. Better: store large payloads externally and publish a reference.
 
+## aio-pika 10 and connection-blocked backpressure
+
+rabbitkit pins `aio-pika>=9.1.0,<10.0.0`. If you force 10.x, note what changes.
+
+aio-pika 10 removed `connection_blocked` and `connection_unblocked` from
+`RobustConnection`; a live connection exposes only `close_callbacks` and
+`reconnect_callbacks`. rabbitkit's registration of those hooks is
+exception-guarded, so nothing raises — it just logs at debug level and the
+hooks never fire.
+
+**Publishing is still safe.** aiormq 7 handles the blocked state a layer down
+and transparently: it clears an internal event on `Connection.Blocked` and
+awaits it in `ready()`, so a publish simply waits while the broker's resource
+alarm is up.
+
+**What you lose is policy choice on async.** `FlowController` has nothing to
+fire from, so `on_blocked="raise"` and `on_blocked="drop"` cannot trigger.
+`on_blocked="wait"` is effectively what aiormq now does for you. The sync
+transport is unaffected — pika still exposes its own blocked callbacks.
+
+The dependency matrix runs an informational 10.0.1 leg so this stays visible.
+
 ## Installation
 
 **`ModuleNotFoundError: No module named 'pkg_resources'` when importing

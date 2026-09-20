@@ -19,6 +19,9 @@ permissions:
 jobs:
   dependency-matrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The out-of-range 10.0.1 leg is informational: it must not gate a merge.
+    continue-on-error: ${{ matrix.aio-pika-version == '10.0.1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,7 +29,14 @@ jobs:
         # 9.1.0, not 9.0.0: aio-pika 9.0.0 imports pkg_resources, which
         # setuptools>=81 no longer ships -- see pyproject.toml and
         # docs/troubleshooting.md. This IS the pinned floor, corrected.
-        aio-pika-version: ["9.1.0", "latest"]
+        # "10.0.1" is OUTSIDE the supported range (pyproject pins <10.0.0).
+        # It runs here for early signal on the next major, and is allowed to
+        # fail. aio-pika 10 removes connection_blocked/connection_unblocked
+        # from RobustConnection; aiormq 7 handles blocking transparently
+        # instead (it awaits an internal event in ready()), so publishes are
+        # still safe, but FlowController's non-"wait" on_blocked policies have
+        # nothing to fire from. See PR #14.
+        aio-pika-version: ["9.1.0", "latest", "10.0.1"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

@@ -1256,6 +1256,21 @@ class GroupFlushReport:
         return tuple(err for r in self.reports for err in r.errors)
 
 
+def _channel_open(channel: Any) -> bool:
+    """True only if *channel* says it is open (aiormq ``is_closed``, pika
+    ``is_open``/``is_closed``). Unknown or broken probes count as not open."""
+    try:
+        closed = getattr(channel, "is_closed", None)
+        if isinstance(closed, bool):
+            return not closed
+        is_open = getattr(channel, "is_open", None)
+        if isinstance(is_open, bool):
+            return is_open
+    except Exception:
+        return False
+    return False
+
+
 class CoalescingAckerGroup:
     """One :class:`CoalescingAcker` per channel, created on demand.
 
@@ -1282,15 +1297,16 @@ class CoalescingAckerGroup:
     a different object, so the next :meth:`for_channel` builds a fresh acker
     with an empty ledger and the stale one is never consulted again. Calling
     it releases the retired acker (and its channel reference) promptly and
-    keeps the metrics honest. Note that on ``AsyncBroker`` the transport's
-    ``on_reconnect`` hook does not fire for a broker-closed connection — see
-    the known gap in ``docs/observability.md`` — so do not rely on it as the
-    only trigger.
+    keeps the metrics honest.
 
-    Do NOT call :meth:`reset` on a live channel: dropping a ledger while its
-    channel is still open leaves those deliveries unacked on a connection the
-    broker still considers healthy, so they are not redelivered until it goes
-    away.
+    Wiring :meth:`reset` to the transport's ``on_reconnect`` hook is safe.
+    The hook fires once per rebuilt connection (publisher and consumer, on
+    both brokers, also for a broker-closed connection), after aio-pika has
+    restored the consumers, so restored channels may already be delivering
+    when it runs. :meth:`reset` therefore drops only the ledgers of channels
+    that are closed and leaves live ones alone. Dropping a live ledger would
+    leave its deliveries unacked on a channel the broker still considers
+    healthy, so they would never be redelivered.
 
     Usage::
 
@@ -1452,11 +1468,27 @@ class CoalescingAckerGroup:
         return dropped
 
     def reset(self) -> int:
-        """The whole connection was rebuilt: drop every ledger. Returns the
-        total number of dropped tags."""
+        """The connection was rebuilt: drop the ledger of every channel that
+        is CLOSED. Returns the total number of dropped tags.
+
+        A channel that is still open keeps its ledger. The reconnect hook
+        fires after aio-pika has already restored the consumers, and once
+        per connection (publisher and consumer), so by the time it runs a
+        restored channel may already be delivering. Dropping that live
+        ledger stranded its deliveries: their ``complete()`` found no
+        ledger, nothing was ever acked, and the broker never redelivered
+        them because the channel stayed open. A live channel's ledger is
+        valid, so keeping it is always correct; a closed channel's tags are
+        redelivered by the broker. A key that reports no liveness at all
+        (not a pika/aio-pika channel) is dropped, as before.
+        """
         with self._lock:
-            ackers = tuple(self._ackers.values())
-            self._ackers.clear()
+            ackers = []
+            for channel, acker in list(self._ackers.items()):
+                if _channel_open(channel):
+                    continue
+                del self._ackers[channel]
+                ackers.append(acker)
         dropped = 0
         for acker in ackers:
             dropped += len(acker.on_reconnect())

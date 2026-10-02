@@ -467,3 +467,76 @@ class TestGroupConcurrency:
             assert max(covered) == 50  # each channel settled its own 1..50
             assert all(kind == "ack" for kind, _, _ in ch.frames)
         assert group.settled_total == 200
+
+
+class _LiveChannel(FakeChannel):
+    """An aiormq-style channel: ``is_closed`` is a real bool."""
+
+    def __init__(self, name: str, *, closed: bool = False) -> None:
+        super().__init__(name)
+        self.is_closed = closed
+
+
+class _PikaChannel(FakeChannel):
+    """A pika-style channel: only ``is_open``."""
+
+    def __init__(self, name: str, *, open_: bool = True) -> None:
+        super().__init__(name)
+        self.is_open = open_
+
+
+class TestResetRace:
+    """The reconnect hook fires AFTER aio-pika restored the consumers, once
+    per connection. Measured on 10.1: the restored channel's first delivery
+    landed before the second on_reconnect. reset() used to drop that live
+    ledger, so complete() found nothing to settle and the delivery stayed
+    unacked on an open channel forever (the 180 s stall in the CI chaos run)."""
+
+    def test_late_reset_keeps_a_live_channels_ledger(self) -> None:
+        group = _group()
+        restored = _LiveChannel("restored")
+        group.register(restored, 1)  # delivery on the restored channel...
+        assert group.reset() == 0  # ...then the late reconnect callback
+        group.complete(restored, 1)  # must still settle
+        group.flush()
+        assert restored.frames == [("ack", 1, False)] or restored.frames == [("ack", 1, True)]
+        assert group.pending == 0
+
+    def test_reset_drops_only_closed_channels(self) -> None:
+        group = _group()
+        dead, live = _LiveChannel("dead", closed=True), _LiveChannel("live")
+        for ch in (dead, live):
+            group.register(ch, 1)
+            group.register(ch, 2)
+        assert group.reset() == 2  # dead's two tags; the broker redelivers them
+        assert group.channels == 1 and group.pending == 2
+        assert dead.frames == []
+
+    def test_pika_style_liveness(self) -> None:
+        group = _group()
+        live, dead = _PikaChannel("live"), _PikaChannel("dead", open_=False)
+        group.register(live, 1)
+        group.register(dead, 1)
+        assert group.reset() == 1
+        assert group.channels == 1
+
+    def test_unknown_or_broken_liveness_is_dropped_as_before(self) -> None:
+        class _Broken(FakeChannel):
+            @property
+            def is_closed(self) -> bool:
+                raise RuntimeError("probe failed")
+
+        group = _group()
+        group.register(FakeChannel("no-probe"), 1)
+        group.register(_Broken("broken"), 1)
+        assert group.reset() == 2 and group.channels == 0
+
+    def test_reset_twice_is_harmless(self) -> None:
+        group = _group()
+        live = _LiveChannel("live")
+        group.register(live, 1)
+        assert group.reset() == 0
+        assert group.reset() == 0  # publisher + consumer connection: two callbacks
+        group.complete(live, 1)
+        group.flush()
+        assert [f[0] for f in live.frames] == ["ack"]

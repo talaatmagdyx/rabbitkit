@@ -20,6 +20,11 @@ from rabbitkit.core.types import ErrorSeverity, TopologyMode
 
 # Item 8: max length for a single ConnectionConfig.client_properties value.
 _CLIENT_PROPERTY_VALUE_MAX_LEN = 256
+# Both clients (pika, aiormq) merge client_properties into their own with a
+# shallow dict.update, so a "capabilities" key REPLACES the capability table
+# and the broker stops sending connection.blocked, consumer-cancel and
+# auth-failure notifications. Never a legitimate override.
+_RESERVED_CLIENT_PROPERTIES = frozenset({"capabilities"})
 
 
 def _masked_repr(obj: object, *, secret_fields: tuple[str, ...] = ("password",)) -> str:
@@ -176,6 +181,12 @@ class ConnectionConfig:
         # arbitrary types through to the broker), length-capped so a runaway
         # value can't bloat every connection's handshake frame.
         for key, cp_value in self.client_properties.items():
+            if key in _RESERVED_CLIENT_PROPERTIES:
+                raise ConfigValidationError(
+                    f"ConnectionConfig.client_properties may not set {key!r}: it would replace the "
+                    "client's capability table, and the broker would stop sending connection.blocked "
+                    "(so is_blocked, FlowController and blocked_connection_timeout go silent)."
+                )
             if not isinstance(key, str) or not isinstance(cp_value, str):
                 raise ConfigValidationError(
                     f"ConnectionConfig.client_properties keys and values must be "

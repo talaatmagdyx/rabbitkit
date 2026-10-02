@@ -15,6 +15,16 @@ and 4.1.8, and the integration suite now runs against both.
 
 ### Fixed
 
+- **Security: async TLS was never used.** The async transport always built
+  an `amqp://` URL, and aiormq chooses TLS by the URL scheme alone, ignoring
+  `ssl_context` otherwise. With `SSLConfig(enabled=True)` the connection
+  spoke plaintext AMQP: it failed against a TLS port and, against a plain
+  port, **connected unencrypted with no error**. It now uses `amqps://`
+  whenever TLS is enabled. `SSLConfig.server_hostname` was silently ignored
+  on async as well (aio-pika drops the kwarg, and aiormq verifies against the
+  connect host); the SSL context now pins it. Both are verified against a
+  TLS broker in the new `tests/integration/test_tls.py`. Sync (pika) was
+  unaffected.
 - **Peeking a quorum DLQ on RabbitMQ 4.x deleted its messages (#32).** A
   peek is `basic.get` plus a requeue, and a quorum queue counts every
   requeue, and every channel close, as a delivery. 4.x applies a default
@@ -97,7 +107,19 @@ and 4.1.8, and the integration suite now runs against both.
 ### Changed
 
 - **`aio-pika>=9.1.0,<11.0.0` (#38).** aio-pika 10 / aiormq 7 / pamqp 4 are
-  supported; the unit and integration suites pass on 9.6.2 and 10.1.0.
+  supported; the unit, integration, chaos and examples suites pass on 9.6.2
+  and 10.1.0. Upgrade notes:
+  - aio-pika 9 silently dropped `client_properties` when given a URL, so
+    `connection_name`, `library` and `ConnectionConfig.client_properties`
+    never reached the broker on async. On aio-pika 10 they do, so they show
+    up in the management UI.
+  - Exception text changes: aiormq 7 formats `DeliveryError`/`PublishError`
+    as `Message delivery failed: Basic.Return(...)`.
+  - An over-long short-string property now fails as an invalid envelope
+    (`REASON_INVALID_ENVELOPE`) in bulk publish, not a publish error.
+- `ConnectionConfig.client_properties` rejects a `capabilities` key. pika and
+  aiormq merge client properties with a shallow update, so it replaced their
+  capability table and the broker stopped sending `connection.blocked`.
 - **`DLQInspector` refuses to browse a limited quorum queue (#32).** Pass
   `management=RabbitManagementClient(...)` and `peek()` / filtered
   `replay()` check the queue's type, arguments and effective policy first,

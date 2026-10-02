@@ -1085,3 +1085,29 @@ class TestAsyncChannelPoolCloseAllInUse:
         # _in_use must be cleared and _created reset
         assert pool._in_use == set()
         assert pool.created_count == 0
+
+
+class TestExhaustedWarningIsRateLimited:
+    @pytest.mark.asyncio
+    async def test_one_warning_per_interval_then_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Under a burst every waiting acquire hits the exhausted path; 2000
+        concurrent publishes logged 11874 identical warnings."""
+        import logging
+
+        mock_conn = AsyncMock()
+        channel = AsyncMock()
+        channel.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=channel)
+        pool = AsyncChannelPool(mock_conn, pool_size=1, acquire_timeout=2.0)
+        held = await pool.acquire()
+
+        with caplog.at_level(logging.DEBUG, logger="rabbitkit.async_.pool"):
+            waiters = [asyncio.create_task(pool.acquire()) for _ in range(2)]
+            await asyncio.sleep(0.01)  # both are now waiting on the exhausted pool
+            await pool.release(held)  # the first waiter gets it ...
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            await pool.release(done.pop().result())  # ... then the second
+            await asyncio.gather(*waiters)
+
+        levels = [r.levelno for r in caplog.records if "pool exhausted" in r.getMessage()]
+        assert levels == [logging.WARNING, logging.DEBUG]

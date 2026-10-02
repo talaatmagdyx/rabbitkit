@@ -509,9 +509,9 @@ class TestPublish:
         assert outcome.error is not None
 
     @pytest.mark.asyncio
-    async def test_disconnect_closes_mandatory_publish_channel(self) -> None:
-        """The dedicated mandatory-publish channel must be closed and reset
-        on disconnect(), matching the fast-channel cleanup."""
+    async def test_disconnect_closes_mandatory_channels(self) -> None:
+        """The mandatory-publish channels belong to the connection pool and are
+        closed with it on disconnect()."""
         transport = _make_transport()
         channel = await self._connect_transport(transport)
         channel.get_exchange = AsyncMock(return_value=AsyncMock())
@@ -521,12 +521,12 @@ class TestPublish:
             mock_msg_cls.return_value = MagicMock()
             await transport.publish(envelope)
 
-        assert transport._mandatory_publish_channel is not None
+        assert transport._conn_pool._mandatory_channel_pool is not None
         channel.is_closed = False
 
         await transport.disconnect()
 
-        assert transport._mandatory_publish_channel is None
+        assert transport._conn_pool._mandatory_channel_pool is None
         channel.close.assert_called()
 
 
@@ -1840,72 +1840,87 @@ class TestGetFastChannel:
         assert rebuilt == [1]
 
 
-# ── _get_mandatory_channel (H1) ──────────────────────────────────────────
+# ── mandatory-publish channels (H1): one publish per channel ────────────
 
 
-class TestGetMandatoryChannel:
-    @pytest.mark.asyncio
-    async def test_get_mandatory_channel_reuses_existing_open_channel(self) -> None:
-        """Line 317: _get_mandatory_channel() returns existing open channel."""
-        transport = _make_transport()
-        existing_ch = MagicMock()
-        existing_ch.is_closed = False
-        transport._mandatory_publish_channel = existing_ch
+class TestMandatoryChannelPool:
+    def _pool(self, connection: Any) -> Any:
+        from rabbitkit.async_.pool import AsyncConnectionPool
 
-        ch = await transport._get_mandatory_channel()
-        assert ch is existing_ch
-
-    @pytest.mark.asyncio
-    async def test_get_mandatory_channel_raises_when_no_publisher_connection(self) -> None:
-        """Line 324: _get_mandatory_channel() raises RuntimeError when no conn."""
-        transport = _make_transport()
-        transport._conn_pool._publisher_connection = None
-
-        with pytest.raises(RuntimeError, match="Publisher connection is not available"):
-            await transport._get_mandatory_channel()
-
-    @pytest.mark.asyncio
-    async def test_get_mandatory_channel_first_creation_fires_opened_not_rebuilt(self) -> None:
-        """Item 3: a first-ever mandatory-channel open is not a rebuild."""
-        transport = _make_transport()
         opened: list[int] = []
-        rebuilt: list[int] = []
-        transport.on_channel_opened(lambda: opened.append(1))
-        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
-
-        mock_pub_conn = MagicMock()
-        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
-        transport._conn_pool._publisher_connection = mock_pub_conn
-
-        await transport._get_mandatory_channel()
-
-        assert opened == [1]
-        assert rebuilt == []
+        pool = AsyncConnectionPool(
+            ConnectionConfig(), SecurityConfig(), on_channel_opened=lambda: opened.append(1)
+        )
+        pool._publisher_connection = connection
+        return pool, opened
 
     @pytest.mark.asyncio
-    async def test_get_mandatory_channel_reopen_fires_opened_and_rebuilt(self) -> None:
-        """Item 3: reopening a found-closed mandatory channel (e.g. after a
-        confirm-timeout recycle) is a rebuild."""
-        transport = _make_transport()
-        closed_ch = MagicMock()
-        closed_ch.is_closed = True
-        transport._mandatory_publish_channel = closed_ch
-        opened: list[int] = []
-        rebuilt: list[int] = []
-        transport.on_channel_opened(lambda: opened.append(1))
-        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
-
-        mock_pub_conn = MagicMock()
-        mock_pub_conn.channel = AsyncMock(return_value=AsyncMock())
-        transport._conn_pool._publisher_connection = mock_pub_conn
-
-        await transport._get_mandatory_channel()
-
+    async def test_channels_are_confirmed_raise_on_return_and_are_reused(self) -> None:
+        mock_conn = _make_mock_connection()
+        pool, opened = self._pool(mock_conn)
+        first = await pool.acquire_mandatory_channel()
+        await pool.release_mandatory_channel(first)
+        again = await pool.acquire_mandatory_channel()
+        assert again is first
+        mock_conn.channel.assert_called_once_with(publisher_confirms=True, on_return_raises=True)
         assert opened == [1]
-        assert rebuilt == [1]
 
+    @pytest.mark.asyncio
+    async def test_a_closed_channel_is_discarded_not_reused(self) -> None:
+        mock_conn = _make_mock_connection()
+        closed, fresh = AsyncMock(), AsyncMock()
+        closed.is_closed, fresh.is_closed = False, False
+        mock_conn.channel = AsyncMock(side_effect=[closed, fresh])
+        pool, _ = self._pool(mock_conn)
+        ch = await pool.acquire_mandatory_channel()
+        ch.is_closed = True  # the broker closed it (a refused publish)
+        await pool.release_mandatory_channel(ch)
+        assert await pool.acquire_mandatory_channel() is fresh
 
-# ── _publish_on_channel timeout ───────────────────────────────────────────
+    @pytest.mark.asyncio
+    async def test_creates_the_publisher_connection_lazily(self) -> None:
+        pool, _ = self._pool(None)
+        mock_conn = _make_mock_connection()
+
+        async def connect() -> Any:
+            pool._publisher_connection = mock_conn
+            return mock_conn
+
+        with patch.object(pool, "get_publisher_connection", side_effect=connect):
+            await pool.acquire_mandatory_channel()
+        mock_conn.channel.assert_called_once_with(publisher_confirms=True, on_return_raises=True)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_acquire_rebuilds_the_connection_once(self) -> None:
+        broken, healthy = _make_mock_connection(), _make_mock_connection()
+        broken.channel = AsyncMock(side_effect=RuntimeError("wedged"))
+        pool, _ = self._pool(broken)
+
+        async def rebuild(stale: Any) -> None:
+            assert stale is broken
+            pool._mandatory_channel_pool = None
+            pool._publisher_connection = healthy
+
+        with patch.object(pool, "_rebuild_publisher_connection", side_effect=rebuild):
+            channel = await pool.acquire_mandatory_channel()
+        assert channel is healthy.channel.return_value
+
+    @pytest.mark.asyncio
+    async def test_release_without_a_pool_is_a_no_op(self) -> None:
+        pool, _ = self._pool(_make_mock_connection())
+        await pool.release_mandatory_channel(AsyncMock())  # nothing acquired yet
+
+    @pytest.mark.asyncio
+    async def test_a_rebuild_drops_the_old_connections_mandatory_channels(self) -> None:
+        old = _make_mock_connection()
+        pool, _ = self._pool(old)
+        await pool.acquire_mandatory_channel()
+        new = _make_mock_connection()
+        with patch.object(pool, "_create_connection", new_callable=AsyncMock, return_value=new):
+            await pool._rebuild_publisher_connection(stale=old)
+        assert pool._mandatory_channel_pool is None
+        await pool.acquire_mandatory_channel()
+        new.channel.assert_called_once_with(publisher_confirms=True, on_return_raises=True)
 
 
 class TestPublishOnChannelTimeout:
@@ -1968,9 +1983,9 @@ class TestPublishOnChannelTimeout:
 
 
 class TestMandatoryChannelClosedOnTimeout:
-    """M17: publish()'s mandatory=True branch closes the (shared, persistent)
-    mandatory channel AFTER its own call resolves -- not from inside
-    _publish_on_channel, which cannot know if it's the sole user."""
+    """M17: a mandatory publish whose confirm timed out closes ITS channel (it
+    is the channel's only user) before releasing it, so the pool never hands a
+    possibly-wedged channel to the next publish."""
 
     @pytest.mark.asyncio
     async def test_timeout_closes_mandatory_channel_for_next_publish(self) -> None:
@@ -1988,20 +2003,22 @@ class TestMandatoryChannelClosedOnTimeout:
         timed_out_channel.close = AsyncMock(side_effect=_close)
         fresh_channel = AsyncMock()
         fresh_channel.is_closed = False
-
         mock_conn.channel = AsyncMock(side_effect=[timed_out_channel, fresh_channel])
 
-        with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
-            mock_pub.return_value = PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
+        used: list[Any] = []
+
+        async def fake_publish(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+            used.append(channel)
+            status = PublishStatus.TIMEOUT if len(used) == 1 else PublishStatus.CONFIRMED
+            return PublishOutcome(status=status, exchange="", routing_key="q")
+
+        with patch.object(transport, "_publish_on_channel", side_effect=fake_publish):
             envelope = MessageEnvelope(routing_key="q", body=b"x", mandatory=True)
             outcome = await transport.publish(envelope)
-
-        assert outcome.status == PublishStatus.TIMEOUT
-        timed_out_channel.close.assert_called_once()
-        # Next mandatory publish must get a FRESH channel (the old one was
-        # closed, so _get_mandatory_channel()'s is_closed check reopens it).
-        next_ch = await transport._get_mandatory_channel()
-        assert next_ch is fresh_channel
+            assert outcome.status == PublishStatus.TIMEOUT
+            timed_out_channel.close.assert_called_once()
+            assert (await transport.publish(envelope)).status == PublishStatus.CONFIRMED
+        assert used == [timed_out_channel, fresh_channel]
 
     @pytest.mark.asyncio
     async def test_confirmed_mandatory_publish_does_not_close_channel(self) -> None:
@@ -2403,60 +2420,61 @@ class TestBasicGetAndPurge:
 # confirm timeout while siblings are in flight ────────────────────────────
 
 
-class TestMandatoryChannelTimeoutRecycle:
+class TestRefusedMandatoryPublishIsIsolated:
     @pytest.mark.asyncio
-    async def test_timeout_does_not_close_channel_while_sibling_in_flight(self) -> None:
-        """One mandatory publish timing out while another is still awaiting
-        its own confirm must NOT close the shared channel under the sibling —
-        it is recycled only when the LAST in-flight publish resolves."""
+    async def test_a_refused_publish_does_not_fail_a_concurrent_one(self) -> None:
+        """A publish the broker refuses (a forged user_id, an unknown exchange)
+        closes its channel, and everything in flight on that channel fails
+        with it. On one shared mandatory channel a refused publish therefore
+        failed every concurrent innocent one (5 of 5 runs against 4.1.8).
+        Each mandatory publish now has a channel of its own."""
         import asyncio as _asyncio
 
-        from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
+        from aiormq.exceptions import ChannelPreconditionFailed
 
         transport = _make_transport()
         transport._connected = True
+        mock_conn = _make_mock_connection()
+        transport._conn_pool._publisher_connection = mock_conn
+        opened: list[tuple[Any, dict[str, Any]]] = []
 
-        channel = AsyncMock()
-        channel.is_closed = False
-        transport._mandatory_publish_channel = channel
-
-        async def get_channel() -> AsyncMock:
+        async def new_channel(**kwargs: Any) -> Any:
+            channel = AsyncMock()
+            channel.is_closed = False
+            opened.append((channel, kwargs))
             return channel
 
-        transport._get_mandatory_channel = get_channel  # type: ignore[method-assign]
+        mock_conn.channel = AsyncMock(side_effect=new_channel)
+        gate = _asyncio.Event()
+        refusal = "PRECONDITION_FAILED - user_id property set to 'intruder' but authenticated user was 'app'"
 
-        slow_gate = _asyncio.Event()
-        outcomes: dict[str, PublishStatus] = {}
+        async def broker(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+            if envelope.user_id == "intruder":
+                channel.is_closed = True  # the broker closes the channel
+                raise ChannelPreconditionFailed(refusal)
+            await gate.wait()
+            if channel.is_closed:  # in flight on a closed channel: fails with it
+                raise ChannelPreconditionFailed(refusal)
+            return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key=envelope.routing_key)
 
-        async def fake_publish_on_channel(ch: AsyncMock, envelope: MessageEnvelope) -> PublishOutcome:
-            if envelope.routing_key == "slow":
-                await slow_gate.wait()
-                return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key="slow")
-            return PublishOutcome(status=PublishStatus.TIMEOUT, routing_key="fast")
+        with (
+            patch.object(transport, "_publish_on_channel", side_effect=broker),
+            patch.object(transport, "_wait_for_recovery", new_callable=AsyncMock, return_value=True),
+        ):
+            innocent = _asyncio.create_task(
+                transport.publish(MessageEnvelope(routing_key="q", body=b"ok", mandatory=True))
+            )
+            await _asyncio.sleep(0)
+            refused = await transport.publish(
+                MessageEnvelope(routing_key="q", body=b"bad", mandatory=True, user_id="intruder")
+            )
+            gate.set()
+            ok = await innocent
 
-        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
-
-        slow_task = _asyncio.create_task(
-            transport.publish(MessageEnvelope(routing_key="slow", body=b"x", mandatory=True))
-        )
-        await _asyncio.sleep(0)  # let the slow publish enter the in-flight section
-
-        fast = await transport.publish(MessageEnvelope(routing_key="fast", body=b"x", mandatory=True))
-        outcomes["fast"] = fast.status
-
-        # The fast publish TIMED OUT — but the slow sibling is still in
-        # flight, so the shared channel must NOT have been closed yet.
-        channel.close.assert_not_called()
-        assert transport._mandatory_channel_recycle is True
-
-        slow_gate.set()
-        slow = await slow_task
-        outcomes["slow"] = slow.status
-
-        # Last in-flight resolved → deferred recycle now closes the channel.
-        channel.close.assert_called_once()
-        assert transport._mandatory_channel_recycle is False
-        assert outcomes == {"fast": PublishStatus.TIMEOUT, "slow": PublishStatus.CONFIRMED}
+        assert refused.status == PublishStatus.ERROR
+        assert isinstance(refused.error, ChannelPreconditionFailed)
+        assert ok.status == PublishStatus.CONFIRMED
+        assert all(kwargs == {"publisher_confirms": True, "on_return_raises": True} for _, kwargs in opened)
 
 
 class TestBindingRestoreAfterReconnect:

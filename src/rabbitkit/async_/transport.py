@@ -176,21 +176,14 @@ class AsyncTransportImpl:
         self._fast_publish_channel: Any | None = None
         self._fast_channel_lock: asyncio.Lock = asyncio.Lock()
 
-        # H1: dedicated, always-confirmed channel for mandatory=True publishes,
-        # independent of confirm_delivery. Detecting an unroutable Basic.Return
-        # reliably requires BOTH publisher confirms AND on_return_raises=True —
-        # neither the fast channel (no confirms at all) nor the regular pool
-        # (confirms follow confirm_delivery, which may be False) guarantee that.
-        self._mandatory_publish_channel: Any | None = None
-        # M3: in-flight mandatory publishes on the shared channel + a
-        # deferred-recycle flag set by a confirm timeout (closed at zero).
-        self._mandatory_in_flight = 0
-        self._mandatory_channel_recycle = False
+        # H1: mandatory=True publishes use the connection pool's mandatory
+        # channels (acquire_mandatory_channel): always confirmed and
+        # on_return_raises=True, independent of confirm_delivery, one publish
+        # per channel so a refused publish fails only itself.
         # m3: bindings recorded for re-apply after robust reconnect (they are
         # not in RobustChannel's restoration registry — see bind_queue).
         self._recorded_bindings: list[tuple[str, str, str, str, dict[str, Any] | None]] = []
         self._binding_restore_tasks: set[Any] = set()
-        self._mandatory_channel_lock: asyncio.Lock = asyncio.Lock()
 
         # Backpressure callbacks (FlowController registers here). Each is a
         # zero-arg callable; aio-pika's blocked/unblocked frames are adapted.
@@ -510,15 +503,7 @@ class AsyncTransportImpl:
                     pass
             self._fast_publish_channel = None
 
-            # Close the dedicated mandatory-publish channel (H1)
-            if self._mandatory_publish_channel is not None and not self._mandatory_publish_channel.is_closed:
-                try:
-                    await self._mandatory_publish_channel.close()
-                except Exception:  # pragma: no cover — best effort close, network errors only
-                    pass
-            self._mandatory_publish_channel = None
-
-            await self._conn_pool.close_all()
+            await self._conn_pool.close_all()  # includes the mandatory-publish channels
         except Exception as e:
             logger.warning("Error during disconnect: %s", e)
         finally:
@@ -632,36 +617,6 @@ class AsyncTransportImpl:
                 self._fire_channel_rebuilt()
             return self._fast_publish_channel
 
-    async def _get_mandatory_channel(self) -> Any:
-        """Return the dedicated always-confirmed channel for mandatory=True
-        publishes, (re)opening if needed.
-
-        H1: ``on_return_raises=True`` makes an unroutable ``Basic.Return``
-        raise ``aio_pika.exceptions.PublishError`` (caught by
-        :meth:`_publish_on_channel` and mapped to ``PublishStatus.RETURNED``)
-        instead of silently resolving the confirmation with the returned
-        message — indistinguishable from success otherwise. This channel is
-        used for every ``mandatory=True`` publish regardless of the broker's
-        ``confirm_delivery`` setting, since reliable return detection needs
-        confirms + on_return_raises unconditionally.
-        """
-        ch = self._mandatory_publish_channel
-        if ch is not None and not ch.is_closed:
-            return ch
-        async with self._mandatory_channel_lock:
-            ch = self._mandatory_publish_channel
-            if ch is not None and not ch.is_closed:  # pragma: no cover — concurrent path
-                return ch
-            conn = self._conn_pool._publisher_connection
-            if conn is None:
-                raise RuntimeError("Publisher connection is not available")
-            is_rebuild = ch is not None  # replacing a closed/recycled channel
-            self._mandatory_publish_channel = await conn.channel(publisher_confirms=True, on_return_raises=True)
-            self._fire_channel_opened()
-            if is_rebuild:
-                self._fire_channel_rebuilt()
-            return self._mandatory_publish_channel
-
     def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
         """Build an aio_pika.Message from a MessageEnvelope.
 
@@ -697,8 +652,8 @@ class AsyncTransportImpl:
 
         H1: a ``mandatory=True`` publish that the broker cannot route raises
         ``aio_pika.exceptions.PublishError`` when the channel has
-        ``on_return_raises=True`` (only true for channels obtained via
-        :meth:`_get_mandatory_channel` — regular pool/fast channels default to
+        ``on_return_raises=True`` (only true for the connection pool's
+        mandatory channels — regular pool/fast channels default to
         ``on_return_raises=False`` and would otherwise resolve the confirmation
         with the returned message instead of raising, indistinguishable from
         success). Mapped to ``PublishStatus.RETURNED`` so callers keying off
@@ -817,10 +772,13 @@ class AsyncTransportImpl:
         "PRECONDITION_FAILED - fast reply consumer does not exist".
 
         H1: a ``mandatory=True`` envelope (that isn't a direct reply-to
-        request) always publishes via the dedicated always-confirmed channel
-        from :meth:`_get_mandatory_channel`, regardless of ``confirm_delivery``
-        — see that method's docstring for why neither the fast nor the regular
-        pool channel can reliably report an unroutable ``Basic.Return``.
+        request) always publishes on a mandatory channel of its own
+        (``AsyncConnectionPool.acquire_mandatory_channel``): confirmed and
+        ``on_return_raises=True`` regardless of ``confirm_delivery``, since
+        neither the fast nor the regular pool channel reliably reports an
+        unroutable ``Basic.Return``. One publish per channel: a publish the
+        broker refuses closes its channel and fails everything in flight on
+        it, so a shared channel let one refused publish fail its siblings.
 
         The confirmed (pooled-channel) path is handled by
         :meth:`_publish_confirmed`, OUTSIDE this method's own try/except
@@ -835,36 +793,7 @@ class AsyncTransportImpl:
                 if not channel.is_closed:
                     return await self._publish_on_channel(channel, envelope)
 
-            if envelope.mandatory:
-                channel = await self._get_mandatory_channel()
-                # M3 (architect review): this single persistent channel is
-                # shared by ALL concurrent mandatory publishes. Closing it the
-                # instant OUR publish times out cascades channel-closed errors
-                # into every sibling still awaiting its own confirm (spurious
-                # NACKED/ERROR → caller retries → duplicates). Ref-count
-                # in-flight publishes and recycle the channel only when the
-                # last one resolves; _get_mandatory_channel() lazily reopens.
-                self._mandatory_in_flight += 1
-                try:
-                    outcome = await self._publish_on_channel(channel, envelope)
-                finally:
-                    self._mandatory_in_flight -= 1
-                if outcome.status == PublishStatus.TIMEOUT:
-                    self._mandatory_channel_recycle = True
-                current = self._mandatory_publish_channel
-                if (
-                    self._mandatory_channel_recycle
-                    and self._mandatory_in_flight == 0
-                    and current is not None
-                    and channel is current
-                    and not current.is_closed
-                ):
-                    self._mandatory_channel_recycle = False
-                    with contextlib.suppress(Exception):
-                        await current.close()
-                return outcome
-
-            if not self._confirm_delivery:
+            if not envelope.mandatory and not self._confirm_delivery:
                 # Fast path: persistent channel, no confirm wait, no pool overhead
                 message = self._build_aio_message(envelope)
                 channel = await self._get_fast_channel()
@@ -917,17 +846,23 @@ class AsyncTransportImpl:
            which discards it since it's closed). No wait/recovery, or a
            second failure, returns ERROR — never raises.
         """
+        pool = self._conn_pool
+        acquire, release = (
+            (pool.acquire_mandatory_channel, pool.release_mandatory_channel)
+            if envelope.mandatory
+            else (pool.acquire_publisher_channel, pool.release_publisher_channel)
+        )
         last_exc: Exception | None = None
         for attempt in range(2):
             channel = None
             try:
-                channel = await self._conn_pool.acquire_publisher_channel()
+                channel = await acquire()
                 outcome = await self._publish_on_channel(channel, envelope)
             except Exception as e:
                 last_exc = e
                 if channel is not None:
                     with contextlib.suppress(Exception):
-                        await self._conn_pool.release_publisher_channel(channel)
+                        await release(channel)
                 if attempt == 0 and _is_connection_error(e) and await self._wait_for_recovery():
                     logger.warning(
                         "Publish hit a connection error, retrying once after recovery: exchange=%s routing_key=%s",
@@ -952,7 +887,7 @@ class AsyncTransportImpl:
                     with contextlib.suppress(Exception):
                         await channel.close()
                 with contextlib.suppress(Exception):
-                    await self._conn_pool.release_publisher_channel(channel)
+                    await release(channel)
                 return outcome
 
         return PublishOutcome(  # pragma: no cover — defensive; the loop always returns above

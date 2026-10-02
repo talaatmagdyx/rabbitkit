@@ -616,8 +616,11 @@ def enrich_failure_headers(env, exc, retry_count):
 # dlq_tools.py
 from rabbitkit.dlq import DLQInspector
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.management import RabbitManagementClient
 
-inspector = DLQInspector(broker._transport)   # or the async transport
+# management= lets peek/filtered replay refuse a quorum DLQ with a delivery
+# limit (every requeue counts as a delivery there); see retry-and-dlq.md.
+inspector = DLQInspector(broker._transport, management=RabbitManagementClient())   # or the async transport
 
 # peek (non-destructive-ish: basic_get + nack requeue=true; MAY reorder — see caveat)
 msgs: list[RabbitMessage] = await inspector.peek_async("orders.queue.dlq", limit=50)
@@ -640,6 +643,7 @@ await inspector.purge_async("orders.queue.dlq")   # ⚠️ irreversible
 
 **Caveats baked into the library (be honest about them):**
 - `peek` uses `basic_get` + `nack(requeue=true)`, which **can change message order**. Treat peek as sampling, not a stable snapshot. For stable inspection, prefer the management API to read counts and a shadow/quarantine queue for content.
+- On a **quorum** DLQ every requeue counts as a delivery, and past the delivery limit (20 by default on RabbitMQ 4.x) the message is dropped. rabbitkit declares new quorum DLQs unlimited on 4.x, and the inspector refuses a limited one; see [Quorum DLQs and delivery limits](retry-and-dlq.md#quorum-dlqs-and-delivery-limits).
 - `DLQInspector` has **no built-in dry-run, throttling, or batching**. Build controlled replay yourself (§31) — replay-all into a degraded system is how you turn one incident into two.
 
 **Replay targets:**
@@ -1453,6 +1457,8 @@ async def safe_replay(inspector, dlq: str, predicate, *, batch=50, pause=2.0, ma
         # dry-run visibility before acting
         matching = [m for m in sample if predicate(m)]
         log.info("replay_batch_preview", dlq=dlq, batch=len(sample), matching=len(matching))
+        if not matching:
+            break   # nothing left to replay; looping would re-peek the same messages forever
         n = await inspector.replay_async(dlq, predicate=predicate)   # replays matching this pass
         replayed += n
         if await error_rate_too_high():     # your metric check — abort on spike

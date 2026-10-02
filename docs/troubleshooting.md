@@ -48,6 +48,11 @@ independent of any application logic, use a quorum queue with
 
 **The DLQ is growing and I don't know why.**
 Use `DLQInspector.peek("queue.dlq", limit=10)` to look without consuming.
+On a quorum DLQ every peek counts as a delivery, so pass a management client
+(`DLQInspector(transport, management=RabbitManagementClient())`) and the
+inspector refuses a queue with a delivery limit instead of slowly dropping
+its messages; see
+[Quorum DLQs and delivery limits](retry-and-dlq.md#quorum-dlqs-and-delivery-limits).
 Check the message's `x-death` header (standard RabbitMQ dead-letter
 metadata) for the original queue and reason. If it's a `filter_fn`
 rejection, the auto-declared `<queue>.dlq` and its `RuntimeWarning` at
@@ -107,25 +112,40 @@ guard. Better: store large payloads externally and publish a reference.
 
 ## aio-pika 10 and connection-blocked backpressure
 
-rabbitkit pins `aio-pika>=9.1.0,<10.0.0`. If you force 10.x, note what changes.
+rabbitkit supports `aio-pika>=9.1.0,<11.0.0` (aiormq 6 and 7) since 0.19.
 
-aio-pika 10 removed `connection_blocked` and `connection_unblocked` from
-`RobustConnection`; a live connection exposes only `close_callbacks` and
-`reconnect_callbacks`. rabbitkit's registration of those hooks is
-exception-guarded, so nothing raises — it just logs at debug level and the
-hooks never fire.
+No aio-pika release surfaces RabbitMQ's `connection.blocked` frames: neither
+9.x nor 10.x has `connection_blocked` / `connection_unblocked` callbacks.
+(The 0.18 docs said aio-pika 10 removed them. It never had them.) Before
+0.19 the async transport registered on those missing hooks, and the failure
+only logged at debug level, so `is_blocked`, `FlowController` and
+`blocked_connection_timeout` were silently inactive on async on every
+version.
 
-**Publishing is still safe.** aiormq 7 handles the blocked state a layer down
-and transparently: it clears an internal event on `Connection.Blocked` and
-awaits it in `ready()`, so a publish simply waits while the broker's resource
-alarm is up.
+aiormq is where the state lives: it clears an internal event on
+`Connection.Blocked` and sets it on `Connection.Unblocked`. Since 0.19 every
+async connection gets a `BlockedConnectionMonitor` that polls that event
+(every 0.25 s) and drives `is_blocked`, the `FlowController` callbacks and,
+after `blocked_connection_timeout`, a forced reconnect of the publisher
+connection: it closes the underlying AMQP connection so `RobustConnection`
+reconnects. The consumer connection is tracked but never force-closed, since
+that would requeue every in-flight delivery. `blocked_connection_timeout=0`
+tracks the state without ever reconnecting. If a future
+aiormq renames the event, the monitor logs a **warning** at connect instead
+of going quiet.
 
-**What you lose is policy choice on async.** `FlowController` has nothing to
-fire from, so `on_blocked="raise"` and `on_blocked="drop"` cannot trigger.
-`on_blocked="wait"` is effectively what aiormq now does for you. The sync
-transport is unaffected — pika still exposes its own blocked callbacks.
+**Publishing is safe either way.** aiormq awaits the same event before
+writing, so a publish simply waits while the alarm is up.
 
-The dependency matrix runs an informational 10.0.1 leg so this stays visible.
+Two aio-pika 10 notes:
+
+- aiormq 7's `DeliveryError.__str__` raises when the error has no frame.
+  `PublishOutcome` formats its error defensively, so
+  `raise_for_status()` raises `PublishError` as it should.
+- pamqp 3 (aio-pika 9) cannot encode field-table integers from -128 to -1
+  (`x-delivery-limit: -1`, a header value of -1). The async transport
+  patches that one encoder function at connect; it changes only values that
+  raised before. pamqp 4 (aio-pika 10) needs no patch.
 
 ## Installation
 

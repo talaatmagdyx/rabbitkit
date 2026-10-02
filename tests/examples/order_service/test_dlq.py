@@ -55,3 +55,13 @@ async def test_safe_replay_respects_max_total() -> None:
     total = await safe_replay(insp, "orders.queue.dlq", lambda m: True, pause=0.0, max_total=2)
     assert total == 5  # one batch ran, then the cap stopped the loop
     assert insp.replay_calls == 1
+
+
+async def test_safe_replay_stops_when_nothing_matches() -> None:
+    """#33: the sample never empties when the predicate matches nothing, so
+    the loop used to re-peek (and re-replay) the same messages forever."""
+    stuck = [_msg(**{"x-error-type": "InvalidTenant"})]
+    insp = _FakeInspector(peeks=[stuck] * 1000, replays=[0] * 1000)
+    total = await safe_replay(insp, "orders.queue.dlq", error_type_is("HandlerTimeoutError"), pause=0.0)
+    assert total == 0
+    assert insp.replay_calls == 0

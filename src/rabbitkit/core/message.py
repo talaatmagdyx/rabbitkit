@@ -71,6 +71,7 @@ class RabbitMessage:
         "content_encoding",
         "content_type",
         "correlation_id",
+        "delivery_mode",
         "delivery_tag",
         "exchange",
         "expiration",
@@ -103,6 +104,7 @@ class RabbitMessage:
         priority: int | None = None,
         expiration: str | None = None,
         user_id: str | None = None,
+        delivery_mode: int | None = None,
         routing_key: str = "",
         exchange: str = "",
         delivery_tag: int | None = None,
@@ -124,6 +126,9 @@ class RabbitMessage:
         self.priority = priority
         self.expiration = expiration
         self.user_id = user_id
+        # 1 = transient, 2 = persistent, None = the publisher set none
+        # (the broker treats that as transient).
+        self.delivery_mode = delivery_mode
         self.routing_key = routing_key
         self.exchange = exchange
         self.delivery_tag = delivery_tag

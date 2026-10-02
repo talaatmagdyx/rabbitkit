@@ -212,6 +212,25 @@ class TestMakeAioPikaConnectKwargs:
 
         assert "rabbit-host" in kwargs["url"]
 
+    @pytest.mark.parametrize(
+        ("vhost", "encoded"),
+        [("/", "%2F"), ("orders", "orders"), ("orders/eu", "orders%2Feu"), ("a#b?c%d", "a%23b%3Fc%25d")],
+    )
+    def test_every_vhost_is_percent_encoded(self, vhost: str, encoded: str) -> None:
+        """#40: only "/" used to be encoded; "orders/eu" went in raw and named
+        the wrong vhost (or broke the URL parse)."""
+        from yarl import URL
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        conn = ConnectionConfig(host="h", vhost=vhost)
+        url = make_aio_pika_connect_kwargs(conn, SecurityConfig())["url"]
+        assert url.startswith(f"amqp://guest:guest@h:5672/{encoded}?")
+        # aiormq takes the vhost from URL.path minus the leading slash.
+        assert URL(url).path[1:] == vhost
+        # Same encoding as ConnectionConfig.url, so the two paths agree.
+        assert conn.url.endswith(f"/{encoded}")
+
     def test_with_connection_name(self) -> None:
         """Client properties include connection_name."""
         try:
@@ -419,114 +438,267 @@ class TestBuildSSLContextCerts:
             )
 
 
-# -- I-11: blocked-connection watchdog --------------------------------------
+# -- I-11 / #37: blocked-connection monitor ----------------------------------
 
 
-class _FakeCallbackCollection:
-    """Minimal stand-in for aio-pika CallbackCollection."""
+def _aiormq_connection() -> Any:
+    """A real (never connected) aiormq Connection, so the private event the
+    monitor reads is the one aiormq actually creates."""
+    import aiormq
 
-    def __init__(self) -> None:
-        self.callbacks: list = []
-
-    def add_callback(self, cb: Any) -> None:
-        self.callbacks.append(cb)
-
-    async def fire(self, *args: Any) -> None:
-        for cb in list(self.callbacks):
-            await cb(*args)
+    return aiormq.Connection("amqp://guest:guest@localhost/")
 
 
-class TestBlockedConnectionWatchdog:
-    """I-11: a blocked alarm with no unblock within the timeout closes the
-    connection (aio-pika has no native blocked_connection_timeout knob)."""
+def _robust(underlay: Any) -> Any:
+    from unittest.mock import MagicMock
 
-    async def test_blocked_alarm_without_unblock_closes_connection(self) -> None:
+    conn = MagicMock()
+    conn.is_closed = False
+    conn.transport.connection = underlay
+    return conn
+
+
+def _unblocked(underlay: Any) -> Any:
+    return underlay._Connection__connection_unblocked
+
+
+class TestAiormqContract:
+    """aio-pika has no blocked callbacks on any release; the monitor depends on
+    aiormq's private event. Fail loudly here if aiormq renames it."""
+
+    async def test_aiormq_connection_has_unblocked_event(self) -> None:
         import asyncio
-        from unittest.mock import AsyncMock, MagicMock
 
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        from rabbitkit.async_.connection import aiormq_unblocked_event
 
-        connection = MagicMock()
-        connection.connection_blocked = _FakeCallbackCollection()
-        connection.connection_unblocked = _FakeCallbackCollection()
-        connection.close = AsyncMock()
+        underlay = _aiormq_connection()
+        assert isinstance(aiormq_unblocked_event(_robust(underlay)), asyncio.Event)
 
-        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
+    async def test_aio_pika_has_no_blocked_callbacks(self) -> None:
+        """Documents why the monitor exists (#37): the API the old code hooked is absent."""
+        import aio_pika
 
-        # Fire the blocked alarm; no unblock follows.
-        await connection.connection_blocked.fire()
-        await asyncio.sleep(0.15)
+        conn = aio_pika.RobustConnection("amqp://guest:guest@localhost/")
+        assert not hasattr(conn, "connection_blocked")
+        assert not hasattr(conn, "connection_unblocked")
 
-        assert connection.close.await_count >= 1  # connection was closed to force reconnect
 
-    async def test_unblock_cancels_watchdog_timer(self) -> None:
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock
+class TestBlockedConnectionMonitor:
+    async def test_transitions_fire_callbacks(self) -> None:
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        underlay = _aiormq_connection()
+        events: list[str] = []
+        monitor = BlockedConnectionMonitor(
+            _robust(underlay),
+            blocked_timeout=0,
+            on_blocked=lambda: events.append("blocked"),
+            on_unblocked=lambda: events.append("unblocked"),
+        )
+        _unblocked(underlay).set()
+        await monitor.poll(0.0)
+        assert events == [] and not monitor.is_blocked
 
-        connection = MagicMock()
-        connection.connection_blocked = _FakeCallbackCollection()
-        connection.connection_unblocked = _FakeCallbackCollection()
-        connection.close = AsyncMock()
+        _unblocked(underlay).clear()  # what aiormq does on Connection.Blocked
+        await monitor.poll(1.0)
+        await monitor.poll(2.0)  # no second fire for the same alarm
+        assert events == ["blocked"] and monitor.is_blocked
 
-        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
+        _unblocked(underlay).set()  # Connection.Unblocked
+        await monitor.poll(3.0)
+        assert events == ["blocked", "unblocked"] and not monitor.is_blocked
 
-        # Fire blocked, then immediately unblock -> the timer must be cancelled.
-        await connection.connection_blocked.fire()
-        await connection.connection_unblocked.fire()
-        await asyncio.sleep(0.15)
+    async def test_timeout_closes_underlying_connection_once(self) -> None:
+        from unittest.mock import AsyncMock
 
-        assert connection.close.await_count == 0  # transient alarm did not close
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-    async def test_zero_timeout_is_noop(self) -> None:
-        from unittest.mock import AsyncMock, MagicMock
+        underlay = _aiormq_connection()
+        underlay.close = AsyncMock()
+        robust = _robust(underlay)
+        monitor = BlockedConnectionMonitor(robust, blocked_timeout=5.0)
 
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        _unblocked(underlay).clear()
+        await monitor.poll(10.0)
+        await monitor.poll(14.9)
+        underlay.close.assert_not_awaited()
+        await monitor.poll(15.0)
+        await monitor.poll(16.0)
+        underlay.close.assert_awaited_once()
+        # The aiormq connection is closed, never the RobustConnection: that
+        # would stop it reconnecting.
+        robust.close.assert_not_called()
+        assert isinstance(underlay.close.await_args.args[0], ConnectionError)
+        assert monitor.forced_reconnects == 1
 
-        connection = MagicMock()
-        connection.connection_blocked = _FakeCallbackCollection()
-        connection.connection_unblocked = _FakeCallbackCollection()
-        connection.close = AsyncMock()
+    async def test_unblock_before_timeout_does_not_close(self) -> None:
+        from unittest.mock import AsyncMock
 
-        await install_blocked_connection_watchdog(connection, blocked_timeout=0.0)
-        # No callbacks should have been registered.
-        assert connection.connection_blocked.callbacks == []
-        assert connection.connection_unblocked.callbacks == []
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-    async def test_missing_collections_is_noop(self) -> None:
-        """A connection without the callback collections is tolerated (no raise)."""
+        underlay = _aiormq_connection()
+        underlay.close = AsyncMock()
+        monitor = BlockedConnectionMonitor(_robust(underlay), blocked_timeout=5.0)
+        _unblocked(underlay).clear()
+        await monitor.poll(0.0)
+        _unblocked(underlay).set()
+        await monitor.poll(4.0)
+        await monitor.poll(20.0)
+        underlay.close.assert_not_awaited()
+
+    async def test_zero_timeout_tracks_state_but_never_closes(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
+
+        underlay = _aiormq_connection()
+        underlay.close = AsyncMock()
+        monitor = BlockedConnectionMonitor(_robust(underlay), blocked_timeout=0)
+        _unblocked(underlay).clear()
+        await monitor.poll(0.0)
+        await monitor.poll(1e6)
+        assert monitor.is_blocked
+        underlay.close.assert_not_awaited()
+
+    async def test_reconnect_resets_state_and_timer(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
+
+        first = _aiormq_connection()
+        first.close = AsyncMock()
+        robust = _robust(first)
+        events: list[str] = []
+        monitor = BlockedConnectionMonitor(
+            robust, blocked_timeout=5.0, on_unblocked=lambda: events.append("unblocked")
+        )
+        _unblocked(first).clear()
+        await monitor.poll(0.0)
+
+        robust.transport = None  # mid-reconnect: state is held, not guessed
+        await monitor.poll(1.0)
+        assert monitor.is_blocked
+
+        second = _aiormq_connection()
+        second.close = AsyncMock()
+        _unblocked(second).set()  # aiormq sets it when the reader starts
+        robust.transport = type("T", (), {"connection": second})()
+        await monitor.poll(2.0)
+        assert not monitor.is_blocked and events == ["unblocked"]
+        await monitor.poll(30.0)
+        first.close.assert_not_awaited()
+        second.close.assert_not_awaited()
+
+    async def test_unsupported_aiormq_warns_and_does_not_start(self, caplog: pytest.LogCaptureFixture) -> None:
         from unittest.mock import MagicMock
 
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-        connection = MagicMock()
-        # Remove the collections so getattr returns a MagicMock default - emulate
-        # a connection that truly lacks them by deleting the attrs.
-        del connection.connection_blocked
-        del connection.connection_unblocked
+        robust = MagicMock()
+        robust.transport.connection = object()  # live, but no unblocked event
+        monitor = BlockedConnectionMonitor(robust, blocked_timeout=1.0)
+        with caplog.at_level("WARNING"):
+            assert monitor.start() is False
+        assert "inactive" in caplog.text
 
-        # Should not raise.
-        await install_blocked_connection_watchdog(connection, blocked_timeout=0.05)
-
-    async def test_reblocked_replaces_pending_timer(self) -> None:
-        """A second blocked alarm replaces the pending timer (no double-close)."""
+    async def test_run_loop_exits_when_connection_closed(self) -> None:
         import asyncio
-        from unittest.mock import AsyncMock, MagicMock
 
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-        connection = MagicMock()
-        connection.connection_blocked = _FakeCallbackCollection()
-        connection.connection_unblocked = _FakeCallbackCollection()
-        connection.close = AsyncMock()
+        underlay = _aiormq_connection()
+        _unblocked(underlay).set()
+        robust = _robust(underlay)
+        monitor = BlockedConnectionMonitor(robust, blocked_timeout=0, poll_interval=0.01)
+        assert monitor.start() is True
+        await asyncio.sleep(0.03)
+        robust.is_closed = True
+        await asyncio.wait_for(monitor._task, timeout=1.0)  # type: ignore[arg-type]
+        await monitor.stop()
 
-        await install_blocked_connection_watchdog(connection, blocked_timeout=0.2)
-        # Fire blocked, then fire blocked again shortly after (resets the timer).
-        await connection.connection_blocked.fire()
-        await asyncio.sleep(0.05)
-        await connection.connection_blocked.fire()
-        await asyncio.sleep(0.3)
+    async def test_stop_cancels_running_task(self) -> None:
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
 
-        # Closed exactly once (the first timer was cancelled, the second fired).
-        assert connection.close.await_count == 1
+        underlay = _aiormq_connection()
+        _unblocked(underlay).set()
+        monitor = BlockedConnectionMonitor(_robust(underlay), blocked_timeout=0, poll_interval=0.01)
+        monitor.start()
+        task = monitor._task
+        await monitor.stop()
+        assert task is not None and task.done()
+        await monitor.stop()  # idempotent
+
+
+# -- pamqp < 4 negative field-table ints -------------------------------------
+
+
+class TestPamqpNegativeInts:
+    @pytest.mark.parametrize(
+        ("arguments", "expected"),
+        [({"x-delivery-limit": -1}, True), ({"x": -128}, True), ({"x": -129}, False), ({"x": 0}, False),
+         ({"x": True}, False), ({"x": "-1"}, False), (None, False), ({}, False)],
+    )
+    def test_has_small_negative_int(self, arguments: Any, expected: bool) -> None:
+        from rabbitkit.async_.connection import has_small_negative_int
+
+        assert has_small_negative_int(arguments) is expected
+
+    def test_fixed_encoder_round_trips_every_small_int(self) -> None:
+        """Whatever pamqp is installed, after the fix -128..127 encode as the
+        signed short-short type and decode back to themselves."""
+        from pamqp import decode, encode
+
+        from rabbitkit.async_.connection import ensure_pamqp_encodes_negative_ints
+
+        ensure_pamqp_encodes_negative_ints()
+        ensure_pamqp_encodes_negative_ints()  # idempotent
+        for value in (-128, -1, 0, 1, 127):
+            raw = encode.table_integer(value)
+            assert raw[:1] == b"b"
+            assert decode.short_short_int(raw[1:])[1] == value
+        assert encode.table_integer(-129)[:1] == b"s"  # larger values untouched
+        table = encode.field_table({"x-delivery-limit": -1})
+        assert decode.field_table(table)[1] == {"x-delivery-limit": -1}
+
+    def test_patch_only_applies_where_pamqp_is_broken(self) -> None:
+        import struct
+        from unittest.mock import patch
+
+        from pamqp import encode
+
+        from rabbitkit.async_.connection import ensure_pamqp_encodes_negative_ints
+
+        def broken(value: int) -> bytes:
+            if -128 <= value <= 127:
+                return b"b" + struct.Struct("B").pack(value)
+            return b"s" + struct.Struct(">h").pack(value)
+
+        def fixed(value: int) -> bytes:
+            return b"b" + struct.Struct(">b").pack(value)
+
+        with patch.object(encode, "table_integer", broken):
+            ensure_pamqp_encodes_negative_ints()
+            assert encode.table_integer is not broken
+            assert encode.table_integer(-1) == b"b\xff"
+            assert encode.table_integer(5) == b"b\x05"
+        with patch.object(encode, "table_integer", fixed):
+            ensure_pamqp_encodes_negative_ints()
+            assert encode.table_integer is fixed  # already correct: left alone
+
+
+class TestForcedReconnectScope:
+    async def test_may_force_reconnect_false_tracks_but_never_closes(self) -> None:
+        """The consumer connection: closing it would requeue in-flight deliveries."""
+        from unittest.mock import AsyncMock
+
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
+
+        underlay = _aiormq_connection()
+        underlay.close = AsyncMock()
+        monitor = BlockedConnectionMonitor(_robust(underlay), blocked_timeout=1.0, may_force_reconnect=lambda: False)
+        _unblocked(underlay).clear()
+        await monitor.poll(0.0)
+        await monitor.poll(5.0)
+        assert monitor.is_blocked
+        underlay.close.assert_not_awaited()
+        assert monitor.forced_reconnects == 0

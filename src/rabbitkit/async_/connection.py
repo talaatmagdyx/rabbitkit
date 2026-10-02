@@ -7,9 +7,11 @@ Provides helpers to build aio_pika.connect_robust() kwargs from rabbitkit config
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import ssl
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -128,12 +130,11 @@ def make_aio_pika_connect_kwargs(
 
     Note: aio-pika has no native ``blocked_connection_timeout`` knob (unlike
     pika's ``ConnectionParameters.blocked_connection_timeout``). To honour
-    ``ConnectionConfig.blocked_connection_timeout`` on the async side, call
-    :func:`install_blocked_connection_watchdog` on the returned connection
-    after ``connect_robust`` succeeds. That helper drives a timer task that
-    closes the connection when a ``connection.blocked`` alarm is not cleared
-    by ``connection.unblocked`` within the configured timeout, forcing a
-    reconnect instead of stalling publishes indefinitely.
+    ``ConnectionConfig.blocked_connection_timeout`` on the async side, start a
+    :class:`BlockedConnectionMonitor` on the returned connection after
+    ``connect_robust`` succeeds. It forces a reconnect when a
+    ``connection.blocked`` alarm is not cleared within the configured timeout,
+    instead of stalling publishes indefinitely.
     """
     try:
         import aio_pika  # noqa: F401
@@ -155,9 +156,11 @@ def make_aio_pika_connect_kwargs(
     raw_user, raw_pwd = connection.resolve_credentials()
     user = quote(raw_user, safe="")
     pwd = quote(raw_pwd, safe="")
-    vhost = connection.vhost
-    if vhost == "/":
-        vhost = "%2F"
+    # Every vhost is percent-encoded, not just "/": a vhost such as
+    # "orders/eu" or "a#b" inserted raw splits the path or starts a fragment,
+    # so the client connects to the wrong vhost or fails to parse the URL.
+    # Matches ConnectionConfig.url.
+    vhost = quote(connection.vhost, safe="")
     # M9: allow the caller (pool) to target a specific cluster node.
     host = host_override if host_override is not None else connection.host
     port = port_override if port_override is not None else connection.port
@@ -210,78 +213,207 @@ def make_aio_pika_connect_kwargs(
     return kwargs
 
 
-async def install_blocked_connection_watchdog(connection: Any, blocked_timeout: float) -> None:
-    """Install a watchdog that closes *connection* when a blocked alarm lingers.
+def has_small_negative_int(arguments: dict[str, Any] | None) -> bool:
+    """True if a field table holds an int pamqp < 4 can't encode (-128..-1)."""
+    return any(
+        isinstance(v, int) and not isinstance(v, bool) and -128 <= v < 0 for v in (arguments or {}).values()
+    )
 
-    aio-pika has no native ``blocked_connection_timeout`` (I-11), so without
-    this a ``connection.blocked`` alarm from RabbitMQ (memory/disk pressure)
-    can stall publishes indefinitely while the connection stays "open". This
-    helper registers ``connection.connection_blocked`` /
-    ``connection.connection_unblocked`` callbacks that drive a timer task:
 
-    - on ``blocked``: start (or replace) a task that sleeps *blocked_timeout*
-      then closes the connection (forcing ``connect_robust`` to reconnect).
-    - on ``unblocked``: cancel the pending timer so a transient alarm does not
-      tear down a recovered connection.
+def ensure_pamqp_encodes_negative_ints() -> None:
+    """Fix pamqp 3.x's encoding of field-table integers from -128 to -1.
 
-    Safe to call with ``blocked_timeout <= 0`` (no-op) or on a connection
-    that does not expose the callback collections (logged at debug, no raise).
-    Must be called from the event loop that owns *connection*.
+    pamqp 3 (what aio-pika 9 depends on) tags them as the signed short-short
+    type ``b`` but packs them unsigned, so encoding raises
+    ``struct.error: 'B' format requires 0 <= number <= 255``. That made a
+    quorum queue with ``x-delivery-limit: -1`` impossible to declare on the
+    async transport. pamqp 4 packs them signed. This replaces
+    ``pamqp.encode.table_integer`` with one that does the same for the
+    broken range and defers to the original for everything else; it only
+    changes values that raised before. A no-op where pamqp is already fixed.
     """
-    if blocked_timeout <= 0:
+    import struct
+
+    from pamqp import encode
+
+    if getattr(encode.table_integer, "_rabbitkit_signed_fix", False):
         return
-
-    blocked_cb_collection = getattr(connection, "connection_blocked", None)
-    unblocked_cb_collection = getattr(connection, "connection_unblocked", None)
-    if blocked_cb_collection is None or unblocked_cb_collection is None:
-        logger.debug(
-            "connection does not expose connection_blocked/connection_unblocked "
-            "callback collections; blocked-connection watchdog not installed"
-        )
-        return
-
-    loop = asyncio.get_event_loop()
-    state: dict[str, asyncio.Task[None] | None] = {"timer": None}
-
-    async def _on_blocked(*_args: Any) -> None:
-        # Replace any pending timer with a fresh one.
-        existing = state.get("timer")
-        if existing is not None and not existing.done():
-            existing.cancel()
-        logger.warning(
-            "Connection blocked by RabbitMQ; will close in %.1fs if not unblocked",
-            blocked_timeout,
-        )
-        state["timer"] = asyncio.ensure_future(_close_after(blocked_timeout))
-
-    async def _on_unblocked(*_args: Any) -> None:
-        existing = state.get("timer")
-        if existing is not None and not existing.done():
-            existing.cancel()
-        state["timer"] = None
-        logger.info("Connection unblocked; watchdog timer cancelled")
-
-    async def _close_after(delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
-        logger.warning("Connection blocked for > %.1fs; closing to force reconnect", delay)
-        try:
-            close = connection.close
-            result = close()
-            if hasattr(result, "__await__"):
-                await result
-        except Exception:  # pragma: no cover — best effort; connect_robust will retry
-            logger.debug("watchdog close raised", exc_info=True)
-
-    # aio-pika CallbackCollection.add_callback accepts a coroutine fn.
     try:
-        blocked_cb_collection.add_callback(_on_blocked)
-        unblocked_cb_collection.add_callback(_on_unblocked)
-    except Exception:  # pragma: no cover — defensive across aio-pika versions
-        logger.debug("Could not register blocked/unblocked watchdog callbacks", exc_info=True)
-        return
-    # Keep a reference so the timer is not GC'd and the callbacks are traceable.
-    connection._rabbitkit_blocked_watchdog = state
-    connection._rabbitkit_blocked_watchdog_loop = loop
+        encode.table_integer(-1)
+        return  # pamqp >= 4
+    except struct.error:
+        pass
+
+    original = encode.table_integer
+    signed = struct.Struct(">b")
+
+    def table_integer(value: int) -> bytes:
+        if -128 <= value < 0:
+            return b"b" + signed.pack(value)
+        return original(value)
+
+    table_integer._rabbitkit_signed_fix = True  # type: ignore[attr-defined]
+    encode.table_integer = table_integer
+
+
+# Poll period for BlockedConnectionMonitor. Reading an asyncio.Event is a few
+# attribute lookups, so a quarter second costs nothing and bounds how late
+# FlowController hears about an alarm.
+BLOCKED_POLL_INTERVAL = 0.25
+
+
+def aiormq_unblocked_event(connection: Any) -> asyncio.Event | None:
+    """Return aiormq's internal "not blocked" event for an aio-pika connection.
+
+    No aio-pika release surfaces ``connection.blocked``: 9.x and 10.x have no
+    ``connection_blocked`` / ``connection_unblocked`` callback collections.
+    aiormq (6.x and 7.x) handles the frames itself. It clears a private
+    ``Connection.__connection_unblocked`` event on ``Connection.Blocked`` and
+    sets it on ``Connection.Unblocked``, so that event is the only place the
+    state exists. ``None`` when the connection has no live transport
+    (mid-reconnect) or aiormq no longer has the attribute.
+    """
+    underlay = getattr(getattr(connection, "transport", None), "connection", None)
+    event = getattr(underlay, "_Connection__connection_unblocked", None)
+    return event if isinstance(event, asyncio.Event) else None
+
+
+class BlockedConnectionMonitor:
+    """Track RabbitMQ's ``connection.blocked`` state for one aio-pika connection.
+
+    Polls :func:`aiormq_unblocked_event` and, on each transition, calls
+    *on_blocked* / *on_unblocked* (the transport's ``is_blocked`` flag and any
+    ``FlowController``). With ``blocked_timeout > 0`` it also forces a
+    reconnect when an alarm outlasts the timeout. It does that by closing the
+    UNDERLYING aiormq connection, so ``RobustConnection`` reconnects. Calling
+    ``RobustConnection.close()`` would shut it down for good.
+
+    *may_force_reconnect* limits the forced reconnect to some connections:
+    the transport allows it only on its publisher connection, because closing
+    the consumer connection requeues every in-flight delivery.
+
+    The task ends by itself once the connection is closed for good. Call
+    :meth:`stop` on shutdown.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        *,
+        blocked_timeout: float,
+        on_blocked: Callable[[], None] | None = None,
+        on_unblocked: Callable[[], None] | None = None,
+        poll_interval: float = BLOCKED_POLL_INTERVAL,
+        may_force_reconnect: Callable[[], bool] | None = None,
+    ) -> None:
+        self._connection = connection
+        self._blocked_timeout = blocked_timeout
+        self._on_blocked = on_blocked
+        self._on_unblocked = on_unblocked
+        self._poll_interval = poll_interval
+        self._may_force_reconnect = may_force_reconnect
+        self._blocked = False
+        self._blocked_since: float | None = None
+        self._underlay: Any = None
+        self._task: asyncio.Task[None] | None = None
+        self.forced_reconnects = 0
+
+    @property
+    def is_blocked(self) -> bool:
+        return self._blocked
+
+    @staticmethod
+    def supported(connection: Any) -> bool:
+        """False when the connection is live but aiormq has no unblocked event.
+
+        That means an aiormq release this code doesn't know. The monitor
+        can't work there, and that should be visible, not a silent no-op.
+        """
+        underlay = getattr(getattr(connection, "transport", None), "connection", None)
+        return underlay is None or aiormq_unblocked_event(connection) is not None
+
+    def start(self) -> bool:
+        """Start polling. Returns False (and logs a warning) if unsupported."""
+        if not self.supported(self._connection):
+            logger.warning(
+                "aiormq exposes no connection-blocked state on this version; "
+                "is_blocked, FlowController and blocked_connection_timeout are "
+                "inactive on the async transport"
+            )
+            return False
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(self._run())
+        return True
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not bool(getattr(self._connection, "is_closed", False)):
+            await self.poll(loop.time())
+            await asyncio.sleep(self._poll_interval)
+
+    async def poll(self, now: float) -> None:
+        """One observation. Public so tests can drive it without sleeping."""
+        event = aiormq_unblocked_event(self._connection)
+        if event is None:
+            return  # no live transport (reconnecting): keep the last state
+        underlay = self._connection.transport.connection
+        if underlay is not self._underlay:
+            # A new AMQP connection starts unblocked; any earlier alarm
+            # belonged to the old one, so its timer must not carry over.
+            self._underlay = underlay
+            self._blocked_since = now if self._blocked else None
+        blocked = not event.is_set()
+        if blocked and not self._blocked:
+            self._blocked = True
+            self._blocked_since = now
+            if self._blocked_timeout > 0:
+                logger.warning(
+                    "Connection blocked by RabbitMQ; forcing a reconnect in %.1fs if not unblocked",
+                    self._blocked_timeout,
+                )
+            else:
+                logger.warning("Connection blocked by RabbitMQ (resource alarm)")
+            self._fire(self._on_blocked)
+        elif not blocked and self._blocked:
+            self._blocked = False
+            self._blocked_since = None
+            logger.info("Connection unblocked by RabbitMQ")
+            self._fire(self._on_unblocked)
+        if (
+            self._blocked
+            and self._blocked_timeout > 0
+            and self._blocked_since is not None
+            and now - self._blocked_since >= self._blocked_timeout
+        ):
+            self._blocked_since = None  # one close per alarm, not one per poll
+            if self._may_force_reconnect is None or self._may_force_reconnect():
+                await self._force_reconnect(underlay)
+
+    async def _force_reconnect(self, underlay: Any) -> None:
+        logger.warning(
+            "Connection blocked for > %.1fs; closing it so the robust connection reconnects",
+            self._blocked_timeout,
+        )
+        self.forced_reconnects += 1
+        try:
+            await underlay.close(
+                ConnectionError(f"connection blocked by RabbitMQ for more than {self._blocked_timeout:.1f}s")
+            )
+        except Exception:  # pragma: no cover — best effort; connect_robust still retries
+            logger.debug("closing the blocked connection raised", exc_info=True)
+
+    @staticmethod
+    def _fire(callback: Callable[[], None] | None) -> None:
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # pragma: no cover — never break the poll loop
+            logger.exception("blocked/unblocked callback raised")

@@ -95,9 +95,17 @@ View messages in a DLQ without consuming them.
 
 ```bash
 rabbitkit dlq inspect orders.created.dlq
-rabbitkit dlq inspect orders.created.dlq --full        # include full body
 rabbitkit dlq inspect orders.created.dlq --limit 20
+rabbitkit dlq inspect orders.created.dlq --management-url http://ops:secret@rabbit:15672
 ```
+
+Each message is shown once: all fetched messages are held unacked until the
+fetch ends, then requeued. On a quorum queue every requeue counts as a
+delivery, so with `--management-url` (or `RABBITMQ_MANAGEMENT_URL`) the
+command first checks the queue's delivery limit and refuses (exit 2) when
+browsing could eventually drop messages. Without it, the command stops at
+the first message carrying `x-delivery-count`. `--no-delivery-limit-check`
+skips both. See [Quorum DLQs and delivery limits](../retry-and-dlq.md#quorum-dlqs-and-delivery-limits).
 
 ### dlq replay
 
@@ -108,8 +116,13 @@ rabbitkit dlq replay orders.created.dlq orders
 rabbitkit dlq replay orders.created.dlq orders --limit 10
 ```
 
-Messages are republished with the original routing key and headers, with `x-retry-count` reset to `0`.
-Replay uses publisher confirms — if a message fails to publish, replay stops and reports the error.
+Messages are republished with their original routing key (`--routing-key`
+overrides it) and headers verbatim; `--reset-retry-count` strips the retry
+counter. Replay uses publisher confirms and `mandatory=True`: a message whose
+republish fails stays on the DLQ, replay continues with the rest, and the
+command exits 1. A message that would be published back into the DLQ itself
+is skipped. `--dry-run` requeues what it shows, so it gets the same
+delivery-limit checks as `inspect`.
 
 ---
 

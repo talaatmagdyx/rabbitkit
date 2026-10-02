@@ -1,5 +1,5 @@
 # Loop Engineering Review, Testing: rabbitkit pins pika/aio-pika to ranges
-# (pika>=1.3.0,<2.0.0; aio-pika>=9.1.0,<10.0.0 -- see pyproject.toml) but the
+# (pika>=1.3.0,<2.0.0; aio-pika>=9.1.0,<11.0.0 -- see pyproject.toml) but the
 # regular CI jobs only ever install whatever pip currently resolves within
 # that range, which drifts toward "latest" over time and never actually
 # exercises the pinned MINIMUM. This job tests both ends of the range
@@ -20,8 +20,6 @@ jobs:
   dependency-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # The out-of-range 10.0.1 leg is informational: it must not gate a merge.
-    continue-on-error: ${{ matrix.aio-pika-version == '10.0.1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,14 +27,9 @@ jobs:
         # 9.1.0, not 9.0.0: aio-pika 9.0.0 imports pkg_resources, which
         # setuptools>=81 no longer ships -- see pyproject.toml and
         # docs/troubleshooting.md. This IS the pinned floor, corrected.
-        # "10.0.1" is OUTSIDE the supported range (pyproject pins <10.0.0).
-        # It runs here for early signal on the next major, and is allowed to
-        # fail. aio-pika 10 removes connection_blocked/connection_unblocked
-        # from RobustConnection; aiormq 7 handles blocking transparently
-        # instead (it awaits an internal event in ready()), so publishes are
-        # still safe, but FlowController's non-"wait" on_blocked policies have
-        # nothing to fire from. See PR #14.
-        aio-pika-version: ["9.1.0", "latest", "10.0.1"]
+        # 9.6.2 is the last 9.x (aiormq 6, pamqp 3); "latest" resolves 10.x
+        # (aiormq 7, pamqp 4). Both majors are supported since 0.19 (#38).
+        aio-pika-version: ["9.1.0", "9.6.2", "latest"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -58,3 +51,26 @@ jobs:
       # currently resolves).
       - name: Tests
         run: .venv/bin/pytest tests/unit/ -q --tb=short
+
+  # Real-broker suite on the last aio-pika 9.x. The PR-time integration job
+  # in ci.yml resolves the newest aio-pika, which is 10.x now that both
+  # majors are supported, so the 9.x line (aiormq 6, pamqp 3, which needs the
+  # negative-integer encoder fix) is exercised against a broker here.
+  integration-aio-pika-9:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[integration]" "aio-pika==9.6.2"
+      - name: Report resolved versions
+        run: |
+          .venv/bin/python -c "import importlib.metadata as m; print({p: m.version(p) for p in ('aio-pika', 'aiormq', 'pamqp')})"
+      - name: Integration tests
+        timeout-minutes: 20
+        env:
+          RK_REQUIRE_BROKER: "1"
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: .venv/bin/pytest tests/integration/ -m integration -q --tb=short

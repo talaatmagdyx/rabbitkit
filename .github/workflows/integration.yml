@@ -54,8 +54,9 @@ jobs:
           if-no-files-found: ignore
 
   # Runs every example/ script against a real broker so the examples can't
-  # silently drift when the package API changes (they aren't in the wheel,
-  # so PR-time checks never touch them). Uses `services:` on the default
+  # silently drift when the package API changes (they aren't in the wheel).
+  # ci.yml runs the same job on every PR (#41); this nightly copy catches
+  # drift from dependency releases between merges. Uses `services:` on the default
   # ports the examples connect to (5672 / 6379). GATING: a broken example is
   # a real doc regression — the runner's exit code is the FAIL count.
   examples:

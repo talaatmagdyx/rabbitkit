@@ -341,7 +341,22 @@ class HandoffState(str, Enum):
     EXHAUSTED = "exhausted"
 
 
-@dataclass(frozen=True, slots=True)
+def safe_exception_repr(exc: BaseException) -> str:
+    """``repr(exc)`` that cannot raise.
+
+    Some transport errors break their own formatting: aiormq 7's
+    ``DeliveryError.__str__`` (and ``__repr__``, which calls it) raises
+    ``AttributeError`` when the error carries no frame. Anything that formats
+    a publish error has to survive that, or the formatting replaces the
+    original failure with an unrelated exception.
+    """
+    try:
+        return repr(exc)
+    except Exception:
+        return f"<{type(exc).__name__} (unprintable)>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class PublishOutcome:
     """Result of a publish operation."""
 
@@ -351,6 +366,17 @@ class PublishOutcome:
     routing_key: str = ""
     error: BaseException | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __repr__(self) -> str:
+        # Hand-written so a broken error repr (see safe_exception_repr) can't
+        # make the outcome itself unprintable: raise_for_status() builds its
+        # message from this, and used to raise AttributeError on aiormq 7.
+        error = None if self.error is None else safe_exception_repr(self.error)
+        return (
+            f"PublishOutcome(status={self.status!r}, delivery_tag={self.delivery_tag!r}, "
+            f"exchange={self.exchange!r}, routing_key={self.routing_key!r}, error={error}, "
+            f"timestamp={self.timestamp!r})"
+        )
 
     @property
     def ok(self) -> bool:

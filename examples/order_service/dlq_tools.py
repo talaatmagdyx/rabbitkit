@@ -47,6 +47,10 @@ async def safe_replay(
             break  # DLQ drained (of currently-visible messages)
         matching = [m for m in sample if predicate(m)]
         logger.info("replay preview dlq=%s batch=%d matching=%d", dlq, len(sample), len(matching))
+        if not matching:
+            # Nothing in this batch matches: looping would re-peek the same
+            # messages forever (and spend a delivery on each, on a quorum DLQ).
+            break
 
         replayed += await inspector.replay_async(dlq, predicate=predicate)
 

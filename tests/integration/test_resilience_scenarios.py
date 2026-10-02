@@ -29,6 +29,7 @@ Skipped when testcontainers / Docker is unavailable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import threading
 import time
@@ -194,72 +195,68 @@ async def test_async_reconnect_resume_after_connection_drop(rabbit_container: di
 
 
 async def test_blocked_connection_watchdog_closes_on_alarm() -> None:
-    """A RabbitMQ memory alarm (vm_memory_high_watermark=0) triggers
-    connection.blocked; the async watchdog must close the connection within
-    blocked_connection_timeout so the pod doesn't appear healthy while stalled.
+    """A disk alarm makes RabbitMQ send ``connection.blocked``. The async
+    transport must see it (``is_blocked``, the FlowController callbacks) and,
+    after ``blocked_connection_timeout``, force a reconnect; once the alarm
+    clears it must be unblocked and publishing again.
+
+    No aio-pika release exposes the blocked frames (#37): the old watchdog
+    hooked callbacks that don't exist, so it never ran, and this test skipped
+    instead of failing. It also set the disk limit to 0, which can't raise an
+    alarm (the alarm fires when free space drops BELOW the limit).
     """
     _skip_no_docker()
-    from rabbitkit.core.config import ConnectionConfig, RabbitConfig
+    from rabbitkit.async_.transport import AsyncTransportImpl
+    from rabbitkit.core.config import ConnectionConfig
+    from rabbitkit.core.types import MessageEnvelope
 
     with RabbitMqContainer("rabbitmq:3.13-management-alpine") as container:
         url = _amqp_url(container)
-        # Tiny blocked_connection_timeout so the watchdog fires quickly.
-        config = RabbitConfig(
-            connection=ConnectionConfig.from_url(url + "?blocked_connection_timeout=3"),
-        )
-        from rabbitkit.async_.transport import AsyncTransportImpl
-
-        transport = AsyncTransportImpl(connection_config=config.connection)
+        config = ConnectionConfig.from_url(url + "?blocked_connection_timeout=3")
+        transport = AsyncTransportImpl(connection_config=config)
         await transport.connect()
-        assert transport.is_connected()
+        events: list[str] = []
+        transport.on_blocked(lambda: events.append("blocked"))
+        transport.on_unblocked(lambda: events.append("unblocked"))
+        assert transport._blocked_monitors, "no blocked-connection monitor was started"
+        loop = asyncio.get_running_loop()
 
-        # Trigger a disk alarm: set the disk free limit to 0 → the broker
-        # thinks it's out of disk space → sends connection.blocked to all publishers.
-        # (Disk alarms are more reliable than memory watermark for triggering
-        # connection.blocked in testcontainers.)
-        result = _exec(container, ["rabbitmqctl", "set_disk_free_limit", "0"])
-        exit_code = result[0] if isinstance(result, tuple) else getattr(result, "exit_code", 1)
-        if exit_code != 0:
-            pytest.skip("rabbitmqctl set_disk_free_limit failed — alarm not triggerable in this env")
+        async def until(predicate: Any, timeout: float, what: str) -> None:
+            deadline = loop.time() + timeout
+            while not predicate():
+                assert loop.time() < deadline, what
+                await asyncio.sleep(0.1)
 
-        # Publish a message to trigger the broker to send connection.blocked to
-        # this publisher (the blocked notification is sent on the next publish
-        # attempt, not proactively when the alarm is raised).
-        from rabbitkit.core.types import MessageEnvelope
+        publish: asyncio.Task[Any] | None = None
         try:
-            await transport.publish(
-                MessageEnvelope(routing_key="", body=b"trigger-blocked")
+            result = _exec(container, ["rabbitmqctl", "set_disk_free_limit", "100000GB"])
+            exit_code = result[0] if isinstance(result, tuple) else result.exit_code
+            assert exit_code == 0, "could not raise a disk alarm"
+            # The broker blocks a connection when it next publishes.
+            publish = asyncio.create_task(transport.publish(MessageEnvelope(routing_key="", body=b"trigger")))
+
+            await until(lambda: transport.is_blocked, 15, "connection.blocked was never observed")
+            assert events[:1] == ["blocked"]
+            await until(
+                lambda: sum(m.forced_reconnects for m in transport._blocked_monitors) >= 1,
+                10,
+                "the watchdog did not force a reconnect after blocked_connection_timeout",
             )
-        except Exception:
-            pass  # publish may fail/timeout — the blocked frame is what matters
+        finally:
+            _exec(container, ["rabbitmqctl", "set_disk_free_limit", "50MB"])
 
-        # The watchdog should close the connection within ~blocked_connection_timeout
-        # (+ grace). blocked_connection_timeout=3 above, so a real blocked frame
-        # closes this by ~4s; the rest of a 20s deadline was only ever a slower
-        # route to the skip below.
-        deadline = time.monotonic() + 7.0
-        closed = False
-        while time.monotonic() < deadline:
-            if not transport.is_connected():
-                closed = True
-                break
-            await asyncio.sleep(0.3)
-
-        # Restore the disk limit so teardown is clean.
         try:
-            _exec(container, ["rabbitmqctl", "set_disk_free_limit", "2GB"])
-        except Exception:
-            pass
-        try:
+            await until(lambda: not transport.is_blocked, 30, "never unblocked after the alarm cleared")
+            await until(transport.is_connected, 30, "never reconnected")
+            assert "unblocked" in events
+            outcome = await transport.publish(MessageEnvelope(routing_key="", body=b"after"))
+            assert outcome.ok, outcome
+        finally:
+            if publish is not None:
+                publish.cancel()
+                with contextlib.suppress(BaseException):
+                    await publish
             await transport.disconnect()
-        except Exception:
-            pass
-
-        if not closed:
-            pytest.skip(
-                "blocked-connection alarm did not trigger connection.blocked in this "
-                "RabbitMQ build/env (watchdog logic is unit-tested separately)"
-            )
 
 
 # ── 3. Heartbeat wedge detection ──────────────────────────────────────────────

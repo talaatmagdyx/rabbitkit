@@ -5,6 +5,154 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-10-02
+
+Fixes all eleven issues from the review of 0.18.0 (#31-#41). The theme:
+DLQ tooling that was meant to look without touching could delete the
+messages it was looking at, and two async health signals reported state that
+never existed. Every RabbitMQ behaviour below was measured against 3.13.7
+and 4.1.8, and the integration suite now runs against both.
+
+### Fixed
+
+- **Peeking a quorum DLQ on RabbitMQ 4.x deleted its messages (#32).** A
+  peek is `basic.get` plus a requeue, and a quorum queue counts every
+  requeue, and every channel close, as a delivery. 4.x applies a default
+  delivery limit of 20, and rabbitkit's DLQs have no dead-letter exchange,
+  so the 21st peek dropped the message. rabbitkit now declares a *new*
+  quorum DLQ (retry DLQs and the safety DLX alike) with
+  `x-delivery-limit: -1` on 4.x. On 3.x it adds no argument, because there
+  `-1` drops a message on its first return.
+- **`rabbitkit dlq inspect` showed the head message N times (#31).** Each
+  message was requeued before the next `basic_get` on the same channel, so it
+  went straight back to the head: `--limit 20` printed the first message 20
+  times and spent 20 of its quorum deliveries. `inspect` and
+  `replay --dry-run` now hold every message until the fetch ends and requeue
+  them in a `finally`. `replay` holds failed and skipped messages the same
+  way; requeueing them at once let the next `basic_get` fetch them again.
+- **`replay()` without a target could loop forever (#33).** It routed by
+  `x-rabbitkit-original-queue`, a header that exists only in memory at
+  consume time (or on the wire as `""` after a retry), and fell back to the
+  routing key, which on a broker dead-lettered message is the DLQ's own
+  name. Replay republished into the queue it was draining and never emptied
+  it. It now reads the broker's own `x-last-death-queue` / `x-death` records,
+  and skips a message whose destination would be the DLQ itself
+  (`ReplayResult.skipped`, or `allow_self_replay=True` to opt in). The CLI
+  resolves the original routing key from `x-death` the same way and skips
+  a message that would land back in the DLQ. The `safe_replay` recipe in
+  `docs/rabbitmq-retry-architecture.md` and `examples/order_service` looped
+  forever when nothing matched; it now stops.
+- **`peek` / `replay` stranded messages when anything raised (#34).** A
+  raising predicate, a cancelled task or a failed `basic_get` left every
+  fetched message unacked on a long-lived channel, invisible to consumers
+  until the process reconnected. Held messages are now requeued in a
+  `finally` on all four methods.
+- **All async inspections shared one channel (#35).** One caller's channel
+  error (a 404 for a mistyped queue) closed it for everyone and requeued
+  every caller's held messages. `DLQInspector` now runs each operation on a
+  channel of its own via the transports' new `inspection_session()`; closing
+  it also returns anything still unsettled.
+- **Replay changed message properties (#36).** `timestamp` was dropped,
+  `delivery_mode` became 2, an absent `message_id` became `""` and an absent
+  `content_type` became `application/octet-stream`. aio-pika truncates
+  `expiration` (`"1001"` -> `"1000"`, `"65526"` -> `"65525"`) on both decode
+  and encode. Replay now carries every property and leaves absent ones
+  absent (aiormq still stamps a `message_id` on every async publish without
+  one). The async transport sends `expiration` to the millisecond.
+  `RabbitMessage` gains `delivery_mode`.
+- **The async blocked-connection watchdog never ran (#37).** No aio-pika
+  release has `connection_blocked` / `connection_unblocked` (the 0.18 docs
+  said 10.x removed them), so on async `is_blocked`, `FlowController` and
+  `blocked_connection_timeout` were silently inactive on every version. A
+  new `BlockedConnectionMonitor` polls the event where aiormq keeps that
+  state and drives all three. On timeout it now closes the underlying AMQP
+  connection of the *publisher* so `RobustConnection` reconnects; the old
+  code would have called `RobustConnection.close()`, which stops it for
+  good. The consumer connection's blocked state is tracked but it is never
+  force-closed, since that would requeue every in-flight delivery. The
+  integration test that skipped instead of failing now fails. It had also
+  set the disk limit to 0, which can never raise an alarm.
+- **`is_connected()` reported a reconnecting async connection as healthy
+  (#39).** `RobustConnection.is_closed` stays False throughout a reconnect,
+  so a readiness probe kept a disconnected pod in rotation. It now follows
+  aio-pika's `connected` event, for both the publisher and the consumer
+  connection.
+- **Only vhost `/` was URL-encoded on async (#40).** `orders/eu` went into
+  the AMQP URL raw and named the wrong vhost. Every vhost is now
+  percent-encoded, matching `ConnectionConfig.url`.
+- **`raise_for_status()` could raise `AttributeError` instead of
+  `PublishError` on aiormq 7 (#38)**, whose `DeliveryError.__str__` raises
+  when the error carries no frame. `PublishOutcome` formats its error
+  defensively.
+- **The async transport could not encode field-table integers from -128 to
+  -1 on aio-pika 9** (`x-delivery-limit: -1`, `x-priority: -1`, a header
+  value). pamqp 3 tags them signed but packs them unsigned and raises
+  `struct.error`. `AsyncTransportImpl.connect()` patches that one encoder
+  function; it changes only values that raised before, and pamqp 4 is
+  already correct and left alone.
+- **The nightly Integration workflow was red for a month (#41)**:
+  `examples/middleware/06_signing.py` used a 30-byte key after 0.16 started
+  requiring 32.
+
+### Changed
+
+- **`aio-pika>=9.1.0,<11.0.0` (#38).** aio-pika 10 / aiormq 7 / pamqp 4 are
+  supported; the unit and integration suites pass on 9.6.2 and 10.1.0.
+- **`DLQInspector` refuses to browse a limited quorum queue (#32).** Pass
+  `management=RabbitManagementClient(...)` and `peek()` / filtered
+  `replay()` check the queue's type, arguments and effective policy first,
+  raising the new `UnsafeToBrowseError` for a quorum queue whose limit isn't
+  unlimited, and failing closed when they can't tell. Without a management
+  client they stop at the first message carrying `x-delivery-count` (only
+  quorum queues set it) and refuse that queue afterwards.
+  `check_delivery_limit=False` turns both checks off. An unfiltered
+  `replay()` acks what it republishes, so it checks lazily, at the first
+  message it has to requeue (a failed or skipped one), and raises there; a
+  message that keeps failing would otherwise lose a delivery every run. A
+  management 404 (e.g. the wrong vhost) leaves the header tripwire armed,
+  and `vhost` now defaults to the transport's.
+- `rabbitkit dlq inspect` and `replay` take `--management-url`
+  (`RABBITMQ_MANAGEMENT_URL`) and `--no-delivery-limit-check`, and exit 2
+  when they refuse (`--dry-run` up front, a real replay at its first
+  requeue). `dlq replay` exits 1 when it skips a message as well as when a
+  publish fails.
+- **Async upgrade note:** `blocked_connection_timeout` (60 s by default) now
+  takes effect on the async transport, as it always did on sync: a
+  publisher connection blocked by a broker alarm for longer than that is
+  force-reconnected. Raise the timeout, or set it to 0 to only track the
+  state.
+- An existing quorum DLQ is no longer redeclared (any version): RabbitMQ
+  refuses to add or remove `x-delivery-limit` on an existing queue (406). A
+  route that consumes another route's quorum DLQ declares it the same way.
+  Make an existing 4.x quorum DLQ unlimited with a policy,
+  `rabbitmqctl set_policy dlq-unlimited '\.dlq$' '{"delivery-limit": -1}' --apply-to quorum_queues`.
+  RabbitMQ applies only the highest-priority matching policy, so if one
+  already matches the DLQ (e.g. a `policy_templates()` `rabbitkit-<queue>-dlq`
+  policy, priority 10), add `"delivery-limit": -1` to that one instead.
+- **Rollback note:** a quorum DLQ that 0.19 creates on 4.x carries
+  `x-delivery-limit: -1`, and rabbitkit 0.18 and earlier redeclare it
+  without the argument, which is a 406 at startup. Before rolling back, set
+  `SafetyConfig(on_topology_conflict="warn_continue")` or delete the
+  (empty) DLQ.
+- `MessageEnvelope` with `message_id=""` or `content_type=""` now publishes
+  no such property (both transports), instead of an empty string. Replay of a
+  message whose `delivery_mode` is unknown stays persistent (2).
+- The examples smoke test now runs on every PR (`ci.yml`), not only
+  nightly. The dependency matrix tests aio-pika 9.1.0, 9.6.2 and latest
+  (10.x), plus a nightly real-broker run on 9.6.2.
+
+### Added
+
+- `UnsafeToBrowseError` (top-level export).
+- `rabbitkit.core.quorum`: `effective_delivery_limit()`, `assert_browsable()`,
+  `dlq_delivery_limit()` and friends. These are transport-free helpers over
+  the management API's queue JSON.
+- `rabbitkit.dlq.original_queue()` / `original_routing_key()`.
+- Transports: `server_version`, `queue_exists()` (probes on a throwaway
+  channel) and `inspection_session()`.
+- `rabbitkit.async_.connection.BlockedConnectionMonitor`, replacing
+  `install_blocked_connection_watchdog`, which hooked APIs that never existed.
+
 ## [0.18.0] — 2026-09-20
 
 ### Changed

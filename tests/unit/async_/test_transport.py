@@ -362,20 +362,39 @@ class TestPublish:
         assert outcome.status == PublishStatus.CONFIRMED
         mock_exchange.publish.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_publish_expiration_ms_converted_to_seconds(self) -> None:
-        """Regression: envelope.expiration is milliseconds; aio-pika expects SECONDS.
-        Was `* 1000`, making the TTL 1e6x too long and inconsistent with sync."""
+    @pytest.mark.parametrize("expiration", ["60000", "1001", "65526", "1"])
+    def test_expiration_goes_on_the_wire_exactly(self, expiration: str) -> None:
+        """envelope.expiration is a millisecond string. The old `* 1000` bug
+        made the TTL 1e6x too long; then the seconds round-trip through
+        aio-pika truncated some values by 1 ms ("1001" -> "1000", #36). The
+        wire value must be the string verbatim."""
         transport = _make_transport()
-        channel = await self._connect_transport(transport)
-        channel.get_exchange = AsyncMock(return_value=AsyncMock())
+        envelope = MessageEnvelope(routing_key="q", body=b"{}", expiration=expiration)
+        msg = transport._build_aio_message(envelope)
+        assert msg.properties.expiration == expiration
 
-        envelope = MessageEnvelope(routing_key="q", body=b"{}", exchange="e", expiration="60000")
-        with patch("aio_pika.Message") as mock_msg_cls:
-            mock_msg_cls.return_value = MagicMock()
-            await transport.publish(envelope)
+    def test_no_expiration_stays_absent(self) -> None:
+        msg = _make_transport()._build_aio_message(MessageEnvelope(routing_key="q", body=b"{}"))
+        assert msg.properties.expiration is None
 
-        assert mock_msg_cls.call_args.kwargs["expiration"] == 60.0  # 60000 ms -> 60 s
+    def test_empty_message_id_and_content_type_are_absent(self) -> None:
+        """#36: DLQ replay passes "" for a property the original lacked."""
+        envelope = MessageEnvelope(routing_key="q", body=b"x", message_id="", content_type="", delivery_mode=1)
+        props = _make_transport()._build_aio_message(envelope).properties
+        assert props.message_id is None
+        assert props.content_type is None
+        assert props.delivery_mode == 1
+
+    def test_incoming_expiration_decodes_without_truncation(self) -> None:
+        """aio-pika hands us 1.001 s for "1001"; int(1.001 * 1000) is 1000."""
+        transport = _make_transport()
+        aio_msg = MagicMock()
+        aio_msg.headers = {}
+        aio_msg.expiration = float("1001") / 1000
+        aio_msg.delivery_mode = 1
+        msg = transport._build_message(aio_msg)
+        assert msg.expiration == "1001"
+        assert msg.delivery_mode == 1
 
     @pytest.mark.asyncio
     async def test_publish_default_exchange(self) -> None:
@@ -540,18 +559,18 @@ class TestIsConnectionError:
 
 
 class TestWaitForRecovery:
-    """Item 6: _wait_for_recovery polls is_connected() bounded by a timeout."""
+    """Item 6: _wait_for_recovery polls the publisher connection bounded by a timeout."""
 
     @pytest.mark.asyncio
     async def test_returns_true_immediately_when_already_connected(self) -> None:
         transport = _make_transport()
-        with patch.object(transport, "is_connected", return_value=True):
+        with patch.object(transport, "_publisher_live", return_value=True):
             assert await transport._wait_for_recovery(timeout=1.0) is True
 
     @pytest.mark.asyncio
     async def test_returns_false_after_timeout_when_never_recovers(self) -> None:
         transport = _make_transport()
-        with patch.object(transport, "is_connected", return_value=False):
+        with patch.object(transport, "_publisher_live", return_value=False):
             assert await transport._wait_for_recovery(timeout=0.05) is False
 
     @pytest.mark.asyncio
@@ -563,7 +582,7 @@ class TestWaitForRecovery:
             calls["n"] += 1
             return calls["n"] >= 3
 
-        with patch.object(transport, "is_connected", side_effect=_is_connected):
+        with patch.object(transport, "_publisher_live", side_effect=_is_connected):
             assert await transport._wait_for_recovery(timeout=2.0) is True
 
 
@@ -1223,6 +1242,62 @@ class TestDisconnectEdgeCases:
         assert not transport.is_connected()
 
 
+class TestIsConnectedLiveness:
+    """#39: RobustConnection.is_closed stays False while it reconnects, so
+    is_connected() must follow the ``connected`` event aio-pika clears on a
+    dropped connection and sets again once it reconnects."""
+
+    def _transport_with(self, pub: Any, consumer: Any = None) -> AsyncTransportImpl:
+        transport = _make_transport()
+        transport._connected = True
+        transport._conn_pool._publisher_connection = pub
+        transport._conn_pool._consumer_connection = consumer
+        return transport
+
+    @staticmethod
+    def _conn(*, connected: bool, is_closed: bool = False) -> MagicMock:
+        import asyncio
+
+        conn = MagicMock()
+        conn.is_closed = is_closed
+        conn.connected = asyncio.Event()
+        if connected:
+            conn.connected.set()
+        return conn
+
+    def test_live_connections_are_connected(self) -> None:
+        pub, con = self._conn(connected=True), self._conn(connected=True)
+        assert self._transport_with(pub, con).is_connected()
+
+    def test_reconnecting_publisher_is_not_connected(self) -> None:
+        pub = self._conn(connected=False)  # dropped; is_closed still False
+        assert not self._transport_with(pub, self._conn(connected=True)).is_connected()
+
+    def test_reconnecting_consumer_is_not_connected(self) -> None:
+        con = self._conn(connected=False)
+        assert not self._transport_with(self._conn(connected=True), con).is_connected()
+
+    def test_recovers_when_the_event_is_set_again(self) -> None:
+        pub = self._conn(connected=False)
+        transport = self._transport_with(pub)
+        assert not transport.is_connected()
+        pub.connected.set()
+        assert transport.is_connected()
+
+    def test_closed_connection_is_not_connected(self) -> None:
+        pub = self._conn(connected=True, is_closed=True)
+        assert not self._transport_with(pub).is_connected()
+
+    def test_shared_connection_checked_once(self) -> None:
+        pub = self._conn(connected=True)
+        assert self._transport_with(pub, pub).is_connected()
+
+    def test_connection_without_event_falls_back_to_is_closed(self) -> None:
+        pub = MagicMock(spec=["is_closed"])
+        pub.is_closed = False
+        assert self._transport_with(pub).is_connected()
+
+
 # ── _ensure_connected ────────────────────────────────────────────────────
 
 
@@ -1422,8 +1497,36 @@ class TestBlockedUnblockedCallbacks:
         called: list[str] = []
         transport.on_unblocked(lambda: called.append("cb1"))
         transport.on_unblocked(lambda: called.append("cb2"))
+        transport._aio_blocked()
         transport._aio_unblocked()
         assert called == ["cb1", "cb2"]
+
+    def test_unblocked_without_prior_block_is_silent(self) -> None:
+        transport = _make_transport()
+        called: list[str] = []
+        transport.on_unblocked(lambda: called.append("cb"))
+        transport._aio_unblocked()
+        assert called == []
+
+    def test_blocked_state_is_the_or_of_both_connections(self) -> None:
+        """Publisher and consumer connections each have a monitor. One of them
+        unblocking must not report the transport unblocked while the other is
+        still blocked, and a second block must not fire twice."""
+        transport = _make_transport()
+        events: list[str] = []
+        transport.on_blocked(lambda: events.append("blocked"))
+        transport.on_unblocked(lambda: events.append("unblocked"))
+        pub, con = MagicMock(is_blocked=True), MagicMock(is_blocked=True)
+        transport._blocked_monitors = [pub, con]
+        transport._aio_blocked()
+        transport._aio_blocked()
+        assert events == ["blocked"] and transport.is_blocked
+        pub.is_blocked = False
+        transport._aio_unblocked()
+        assert events == ["blocked"] and transport.is_blocked
+        con.is_blocked = False
+        transport._aio_unblocked()
+        assert events == ["blocked", "unblocked"] and not transport.is_blocked
 
     def test_aio_blocked_with_no_callbacks_is_noop(self) -> None:
         """_aio_blocked() with empty list does nothing."""
@@ -2560,3 +2663,133 @@ class TestSameMessageIdPublishSerialization:
                 assert transport._inflight_message_ids == {}
                 o = await transport._publish_on_channel(ch, e)
         assert o.status is PublishStatus.CONFIRMED
+
+
+# ── #32/#35: server_version, queue_exists, inspection_session (async) ────
+
+
+class TestInspectionPrimitivesAsync:
+    async def _connect(self, transport: AsyncTransportImpl) -> AsyncMock:
+        conn = _make_mock_connection()
+        with patch(
+            "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+        ):
+            with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
+                await transport.connect()
+        return conn
+
+    @pytest.mark.parametrize(("raw", "version"), [("4.1.8", "4.1.8"), (b"3.13.7", "3.13.7"), (None, None)])
+    async def test_server_version(self, raw: object, version: str | None) -> None:
+        transport = _make_transport()
+        conn = await self._connect(transport)
+        conn.transport = MagicMock()
+        conn.transport.connection.server_properties = {"version": raw}
+        assert transport.server_version == version
+
+    def test_server_version_before_connect(self) -> None:
+        assert _make_transport().server_version is None
+
+    async def test_queue_exists_probes_on_a_throwaway_channel(self) -> None:
+        import aio_pika.exceptions
+
+        transport = _make_transport()
+        conn = await self._connect(transport)
+        topology = transport._topology_channel
+        probe = AsyncMock(is_closed=False)
+        conn.channel = AsyncMock(return_value=probe)
+        assert await transport.queue_exists("orders.dlq") is True
+        probe.declare_queue.assert_awaited_once_with("orders.dlq", passive=True)
+        probe.close.assert_awaited_once()
+
+        missing = AsyncMock(is_closed=True)
+        missing.declare_queue.side_effect = aio_pika.exceptions.ChannelNotFoundEntity("NOT_FOUND")
+        conn.channel = AsyncMock(return_value=missing)
+        assert await transport.queue_exists("nope") is False
+        missing.close.assert_not_awaited()
+        assert transport._topology_channel is topology  # untouched
+
+    async def test_inspection_session_uses_and_closes_its_own_channel(self) -> None:
+        transport = _make_transport()
+        conn = await self._connect(transport)
+        scoped = AsyncMock(is_closed=False)
+        queue = AsyncMock()
+        aio_msg = MagicMock(headers={}, expiration=None, delivery_mode=2)
+        aio_msg.nack = AsyncMock()
+        queue.get = AsyncMock(side_effect=[aio_msg, None])
+        scoped.get_queue = AsyncMock(return_value=queue)
+        conn.channel = AsyncMock(return_value=scoped)
+
+        async with transport.inspection_session() as session:
+            msg = await session.basic_get("orders.dlq")
+            assert msg is not None and msg.delivery_mode == 2
+            assert await session.basic_get("orders.dlq") is None
+            await msg.nack_async(requeue=True)
+        aio_msg.nack.assert_awaited_once_with(requeue=True)
+        queue.get.assert_awaited_with(fail=False, no_ack=False)
+        scoped.close.assert_awaited_once()
+        transport._topology_channel.get_queue.assert_not_called()
+
+    async def test_inspection_session_closes_on_error(self) -> None:
+        transport = _make_transport()
+        conn = await self._connect(transport)
+        scoped = AsyncMock(is_closed=False)
+        conn.channel = AsyncMock(return_value=scoped)
+        with pytest.raises(RuntimeError):
+            async with transport.inspection_session():
+                raise RuntimeError("boom")
+        scoped.close.assert_awaited_once()
+
+
+class TestDisconnectStopsBlockedMonitors:
+    async def test_monitors_stopped_and_state_cleared(self) -> None:
+        transport = _make_transport()
+        transport._connected = True
+        monitor = MagicMock()
+        monitor.stop = AsyncMock()
+        transport._blocked_monitors = [monitor]
+        transport._blocked_state = True
+        transport._conn_pool.close_all = AsyncMock()  # type: ignore[method-assign]
+        await transport.disconnect()
+        monitor.stop.assert_awaited_once()
+        assert transport._blocked_monitors == [] and not transport.is_blocked
+
+
+class TestReviewFindingsAsyncTransport:
+    async def test_only_the_publisher_connection_may_be_force_reconnected(self) -> None:
+        import aiormq
+
+        transport = _make_transport()
+        pub, con = MagicMock(is_closed=False), MagicMock(is_closed=False)
+        for c in (pub, con):
+            c.transport.connection = aiormq.Connection("amqp://localhost/")
+            transport._attach_connection_callbacks(c)
+        transport._conn_pool._publisher_connection = pub
+        transport._conn_pool._consumer_connection = con
+        by_conn = {id(m._connection): m for m in transport._blocked_monitors}
+        assert by_conn[id(pub)]._may_force_reconnect() is True
+        assert by_conn[id(con)]._may_force_reconnect() is False
+        for m in transport._blocked_monitors:
+            await m.stop()
+
+    async def test_recovery_waits_on_the_publisher_only(self) -> None:
+        import asyncio
+
+        transport = _make_transport()
+        transport._connected = True
+        pub, con = MagicMock(is_closed=False), MagicMock(is_closed=False)
+        pub.connected, con.connected = asyncio.Event(), asyncio.Event()
+        pub.connected.set()  # publisher back; consumer still reconnecting
+        transport._conn_pool._publisher_connection = pub
+        transport._conn_pool._consumer_connection = con
+        assert not transport.is_connected()
+        assert await transport._wait_for_recovery(timeout=0.2) is True
+
+    async def test_connect_fixes_pamqp_before_any_frame(self) -> None:
+        transport = _make_transport()
+        with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
+            with patch(
+                "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+            ):
+                with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
+                    await transport.connect()
+        fix.assert_called_once()

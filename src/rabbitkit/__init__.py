@@ -46,6 +46,7 @@ from rabbitkit.core.errors import (
     MissingDependencyError,
     SettlementError,
     TopologyValidationError,
+    UnsafeToBrowseError,
     UnsafeTopologyError,
 )
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
@@ -288,6 +289,7 @@ __all__ = [
     "TopologyMode",
     "TopologyValidationError",
     "UnknownDeliveryError",
+    "UnsafeToBrowseError",
     "UnsafeTopologyError",
     "WorkerConfig",
     "__version__",

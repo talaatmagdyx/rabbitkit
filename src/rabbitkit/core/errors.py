@@ -248,6 +248,17 @@ class PublishError(Exception):
 # ── Backpressure error ───────────────────────────────────────────────────
 
 
+class UnsafeToBrowseError(RuntimeError):
+    """Peeking at or replaying from a queue could lose messages.
+
+    Raised by :class:`~rabbitkit.dlq.DLQInspector` and the ``rabbitkit dlq``
+    CLI for a quorum queue with a delivery limit: every requeue counts as a
+    delivery, and past the limit RabbitMQ drops the message or dead-letters
+    it away. Also raised when the limit can't be determined (fail closed).
+    The message says how to make the queue safe to browse.
+    """
+
+
 class BackpressureError(Exception):
     """Raised when publish-side flow control blocks a publish attempt.
 

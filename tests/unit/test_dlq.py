@@ -456,7 +456,7 @@ class TestReplayPublishOutcome:
         assert result + 1 == 4
         assert result.failed == 2
         assert result.requeued == 1
-        assert repr(result) == "ReplayResult(replayed=3, failed=2, requeued=1)"
+        assert repr(result) == "ReplayResult(replayed=3, failed=2, requeued=1, skipped=0)"
 
     def test_predicate_rejections_counted_as_requeued(self) -> None:
         transport = _OutcomeTransport(messages=[_make_message(), _make_message()])

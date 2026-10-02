@@ -2708,3 +2708,100 @@ class TestBuildMessageChannelLiveness:
         msg = self._msg(channel, no_ack=True)
         assert msg.channel_alive is None
         assert msg._ack_fn is None
+
+
+# ── #32/#35: server_version, queue_exists, inspection_session (sync) ─────
+
+
+class TestInspectionPrimitivesSync:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _connect(self, transport: SyncTransport) -> MagicMock:
+        main = MagicMock(is_open=True)
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as mock_conn:
+                mock_conn.return_value.channel.return_value = main
+                mock_conn.return_value.is_open = True
+                transport.connect()
+        return main
+
+    @pytest.mark.parametrize(("raw", "version"), [("4.1.8", "4.1.8"), (b"3.13.7", "3.13.7"), (None, None)])
+    def test_server_version(self, raw: object, version: str | None) -> None:
+        transport = _make_transport()
+        self._connect(transport)
+        transport._connection._impl.server_properties = {"version": raw}
+        assert transport.server_version == version
+
+    def test_server_version_before_connect(self) -> None:
+        assert _make_transport().server_version is None
+
+    def test_queue_exists_probes_on_a_throwaway_channel(self) -> None:
+        import pika
+
+        transport = _make_transport()
+        main = self._connect(transport)
+        probe = MagicMock(is_open=True)
+        transport._connection.channel.return_value = probe
+        assert transport.queue_exists("orders.dlq") is True
+        probe.queue_declare.assert_called_once_with(queue="orders.dlq", passive=True)
+        probe.close.assert_called_once()
+        main.queue_declare.assert_not_called()
+
+        missing = MagicMock()
+        missing.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND")
+        missing.is_open = False  # the 404 closed it
+        transport._connection.channel.return_value = missing
+        assert transport.queue_exists("nope") is False
+        missing.close.assert_not_called()
+
+    def test_queue_exists_reraises_other_channel_errors(self) -> None:
+        import pika
+
+        transport = _make_transport()
+        self._connect(transport)
+        bad = MagicMock(is_open=False)
+        bad.queue_declare.side_effect = pika.exceptions.ChannelClosedByBroker(403, "ACCESS_REFUSED")
+        transport._connection.channel.return_value = bad
+        with pytest.raises(pika.exceptions.ChannelClosedByBroker):
+            transport.queue_exists("secret")
+
+    def test_inspection_session_uses_and_closes_its_own_channel(self) -> None:
+        transport = _make_transport()
+        main = self._connect(transport)
+        scoped = MagicMock(is_open=True)
+        method = MagicMock(routing_key="orders.dlq", exchange="", delivery_tag=3, redelivered=False)
+        props = MagicMock(headers=None, timestamp=None, delivery_mode=1)
+        scoped.basic_get.side_effect = [(method, props, b"x"), (None, None, None)]
+        transport._connection.channel.return_value = scoped
+
+        with transport.inspection_session() as session:
+            msg = session.basic_get("orders.dlq")
+            assert msg is not None and msg.delivery_mode == 1
+            assert session.basic_get("orders.dlq") is None
+            msg.nack(requeue=True)
+        scoped.basic_nack.assert_called_once_with(delivery_tag=3, requeue=True)  # settled on ITS channel
+        scoped.close.assert_called_once()
+        main.basic_get.assert_not_called()
+
+    def test_inspection_session_closes_on_error(self) -> None:
+        transport = _make_transport()
+        self._connect(transport)
+        scoped = MagicMock(is_open=True)
+        transport._connection.channel.return_value = scoped
+        with pytest.raises(RuntimeError):
+            with transport.inspection_session():
+                raise RuntimeError("boom")
+        scoped.close.assert_called_once()
+
+    def test_empty_message_id_and_content_type_are_sent_as_absent(self) -> None:
+        transport = _make_transport()
+        channel = self._connect(transport)
+        transport._publish_on_channel(
+            channel, MessageEnvelope(routing_key="q", body=b"x", message_id="", content_type="", delivery_mode=1)
+        )
+        props = channel.basic_publish.call_args.kwargs["properties"]
+        assert props.message_id is None
+        assert props.content_type is None
+        assert props.delivery_mode == 1

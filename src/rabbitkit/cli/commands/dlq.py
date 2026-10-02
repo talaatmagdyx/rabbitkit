@@ -3,10 +3,119 @@
 from __future__ import annotations
 
 import json
+import urllib.parse
+from typing import Any
 
 import typer
 
 dlq_app = typer.Typer(help="Dead-letter queue commands.")
+
+_MANAGEMENT_URL_HELP = (
+    "RabbitMQ management API URL, e.g. http://user:pass@host:15672. With it, the command first "
+    "checks the queue's type and delivery limit, and refuses a quorum queue where requeueing would "
+    "eventually drop messages. Credentials default to the AMQP URL's."
+)
+_NO_LIMIT_CHECK_HELP = "Skip the quorum delivery-limit checks (see --management-url)."
+
+
+class _Unsafe(Exception):
+    """Internal: the queue is not safe to browse; the message says why."""
+
+
+def _management_client(management_url: str, amqp_url: str) -> Any:
+    from rabbitkit.management import ManagementConfig, RabbitManagementClient
+
+    parsed = urllib.parse.urlparse(management_url)
+    amqp = urllib.parse.urlparse(amqp_url)
+    username = urllib.parse.unquote(parsed.username or amqp.username or "guest")
+    password = urllib.parse.unquote(parsed.password or amqp.password or "guest")
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    url = urllib.parse.urlunparse((parsed.scheme, netloc, parsed.path.rstrip("/"), "", "", ""))
+    return RabbitManagementClient(ManagementConfig(url=url, username=username, password=password))
+
+
+def _vhost(amqp_url: str) -> str:
+    path = urllib.parse.urlparse(amqp_url).path
+    return urllib.parse.unquote(path[1:]) if len(path) > 1 else "/"
+
+
+def _check_browsable(queue: str, management_url: str | None, amqp_url: str) -> bool:
+    """Refuse up front when the management API shows requeueing is destructive.
+
+    Returns True when the queue was VETTED. False (no management URL, or the
+    API doesn't know the queue) means the x-delivery-count tripwire stays armed.
+    """
+    if management_url is None:
+        return False
+    from rabbitkit.core.errors import UnsafeToBrowseError
+    from rabbitkit.core.quorum import assert_browsable
+
+    client = _management_client(management_url, amqp_url)
+    try:
+        info = client.get_queue(queue, vhost=_vhost(amqp_url))
+    except Exception as exc:
+        if getattr(exc, "code", None) == 404:
+            return False  # basic_get reports a missing queue; a wrong vhost is caught by the tripwire
+        raise _Unsafe(f"could not read {queue!r} from the management API: {exc}") from exc
+    try:
+        version = client.overview().get("rabbitmq_version")
+    except Exception as exc:
+        raise _Unsafe(f"could not read the RabbitMQ version from the management API: {exc}") from exc
+    try:
+        assert_browsable(queue, dict(info), str(version) if version else None)
+    except UnsafeToBrowseError as exc:
+        raise _Unsafe(str(exc)) from exc
+    return True
+
+
+def _tripwire_message(queue: str) -> str:
+    from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER, unlimited_fix
+
+    return (
+        f"{queue!r} is a quorum queue (its messages carry {DELIVERY_COUNT_HEADER!r}): every requeue "
+        "counts as a delivery, and past its delivery limit RabbitMQ drops the message. Stopped "
+        "before going further. Pass --management-url to verify the limit, or make the queue "
+        f"unlimited first: {unlimited_fix(None)}."
+    )
+
+
+def _release(channel: Any, delivery_tags: list[int]) -> None:
+    """Requeue held deliveries; best effort, the channel close requeues the rest."""
+    for tag in delivery_tags:
+        try:
+            channel.basic_nack(delivery_tag=tag, requeue=True)
+        except Exception:
+            break
+
+
+def _vet_requeue(
+    queue: str,
+    management_url: str | None,
+    amqp_url: str,
+    no_limit_check: bool,
+    vetted: bool | None,
+    properties: Any,
+) -> tuple[str | None, bool | None]:
+    """A real replay is about to requeue a message: (refusal or None, vetted)."""
+    from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
+
+    if no_limit_check:
+        return None, vetted
+    if vetted is None:
+        try:
+            vetted = _check_browsable(queue, management_url, amqp_url)
+        except _Unsafe as exc:
+            return str(exc), vetted
+    if not vetted and DELIVERY_COUNT_HEADER in (properties.headers or {}):
+        return _tripwire_message(queue), vetted
+    return None, vetted
+
+
+def _fail(message: str) -> typer.Exit:
+    typer.echo(f"REFUSED: {message}", err=True)
+    return typer.Exit(2)
 
 
 @dlq_app.command("inspect")
@@ -21,11 +130,17 @@ def dlq_inspect(
     ),
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum messages to fetch"),
     output_format: str = typer.Option("table", "--format", "-f", help="Output format: table or json"),
+    management_url: str | None = typer.Option(
+        None, "--management-url", "-m", envvar="RABBITMQ_MANAGEMENT_URL", help=_MANAGEMENT_URL_HELP
+    ),
+    no_limit_check: bool = typer.Option(False, "--no-delivery-limit-check", help=_NO_LIMIT_CHECK_HELP),
 ) -> None:
     """Inspect messages in a dead-letter queue without removing them.
 
-    Connects directly to RabbitMQ and peeks at the DLQ contents using
-    basic_get in passive mode.
+    Fetches up to ``--limit`` messages with ``basic_get`` and holds them all
+    unacked until the fetch ends, so each message is shown once, then
+    requeues them. (Requeueing each one straight away put it back at the
+    head, so the same message came back ``--limit`` times.)
 
     Example::
 
@@ -37,29 +152,49 @@ def dlq_inspect(
     except ImportError:
         typer.echo("pika is required: pip install pika", err=True)
         raise typer.Exit(1) from None
+    from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
+
+    armed = False  # the x-delivery-count tripwire
+    if not no_limit_check:
+        try:
+            armed = not _check_browsable(queue, management_url, amqp_url)
+        except _Unsafe as exc:
+            raise _fail(str(exc)) from None
 
     params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
 
     messages = []
-    for _ in range(limit):
-        method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
-        if method is None:
-            break
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-        entry = {
-            "routing_key": method.routing_key,
-            "exchange": method.exchange,
-            "redelivered": method.redelivered,
-            "message_id": properties.message_id,
-            "correlation_id": properties.correlation_id,
-            "headers": dict(properties.headers or {}),
-            "body_preview": body[:200].decode(errors="replace"),
-        }
-        messages.append(entry)
+    held: list[int] = []
+    tripped = False
+    try:
+        for _ in range(limit):
+            method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
+            if method is None:
+                break
+            held.append(method.delivery_tag)
+            headers = dict(properties.headers or {})
+            if armed and DELIVERY_COUNT_HEADER in headers:
+                tripped = True
+                break
+            messages.append(
+                {
+                    "routing_key": method.routing_key,
+                    "exchange": method.exchange,
+                    "redelivered": method.redelivered,
+                    "message_id": properties.message_id,
+                    "correlation_id": properties.correlation_id,
+                    "headers": headers,
+                    "body_preview": body[:200].decode(errors="replace"),
+                }
+            )
+    finally:
+        _release(channel, held)
+        connection.close()
 
-    connection.close()
+    if tripped:
+        raise _fail(_tripwire_message(queue))
 
     if output_format == "json":
         typer.echo(json.dumps(messages, indent=2, default=str))
@@ -108,13 +243,25 @@ def dlq_replay(
         "--retry-count-header",
         help="Header name --reset-retry-count strips. Match RetryConfig.retry_header if customized.",
     ),
+    management_url: str | None = typer.Option(
+        None, "--management-url", "-m", envvar="RABBITMQ_MANAGEMENT_URL", help=_MANAGEMENT_URL_HELP
+    ),
+    no_limit_check: bool = typer.Option(False, "--no-delivery-limit-check", help=_NO_LIMIT_CHECK_HELP),
 ) -> None:
     """Replay messages from a dead-letter queue to a target exchange/queue.
 
     Messages are consumed from the DLQ and published to the target with
     publisher confirms and ``mandatory=True``. The DLQ message is acked
     (removed) only after the broker confirms the republish; a failed or
-    unroutable publish is nack-requeued so the message stays on the DLQ.
+    unroutable publish is requeued so the message stays on the DLQ.
+
+    Without ``--routing-key``, a message is published with the routing key
+    it had before it was dead-lettered (``x-rabbitkit-original-routing-key``,
+    then the broker's ``x-death``). A message that would be published
+    straight back into the DLQ is skipped.
+
+    ``--dry-run`` requeues every message it shows, so it gets the same
+    quorum delivery-limit checks as ``inspect``.
 
     Example::
 
@@ -136,6 +283,19 @@ def dlq_replay(
     except ImportError:
         typer.echo("pika is required: pip install pika", err=True)
         raise typer.Exit(1) from None
+    from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
+    from rabbitkit.dlq import original_routing_key
+
+    # --dry-run requeues everything it shows: vet up front. A real replay
+    # acks what it republishes and vets at its first requeue (a failed or
+    # skipped message), since each one costs a delivery per run.
+    vetted: bool | None = None
+    if dry_run and not no_limit_check:
+        try:
+            vetted = _check_browsable(queue, management_url, amqp_url)
+        except _Unsafe as exc:
+            raise _fail(str(exc)) from None
+    refusal: str | None = None
 
     params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
@@ -146,45 +306,79 @@ def dlq_replay(
 
     replayed = 0
     failed = 0
-    for _ in range(limit):
-        method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
-        if method is None:
-            break
+    skipped = 0
+    tripped = False
+    # Requeued only after the loop: a message requeued at once goes back to
+    # the head, and the next basic_get would fetch it again.
+    held: list[int] = []
+    try:
+        for _ in range(limit):
+            method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
+            if method is None:
+                break
 
-        rk = routing_key or method.routing_key
-        if reset_retry_count and properties.headers and retry_count_header in properties.headers:
-            properties.headers.pop(retry_count_header, None)
+            if vetted is False and DELIVERY_COUNT_HEADER in (properties.headers or {}):
+                held.append(method.delivery_tag)
+                tripped = True
+                break
 
-        if dry_run:
-            typer.echo(f"[dry-run] Would publish to exchange={target!r} routing_key={rk!r}  body={body[:100]!r}")
-            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            continue
+            rk = routing_key or original_routing_key(dict(properties.headers or {})) or method.routing_key
+            if reset_retry_count and properties.headers and retry_count_header in properties.headers:
+                properties.headers.pop(retry_count_header, None)
 
-        try:
-            channel.basic_publish(
-                exchange=target,
-                routing_key=rk,
-                body=body,
-                properties=properties,
-                mandatory=True,
-            )
-        except (pika_exceptions.UnroutableError, pika_exceptions.NackError) as exc:
-            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            typer.echo(
-                f"FAILED (stays on DLQ): routing_key={rk!r}  message_id={properties.message_id}  ({exc})",
-                err=True,
-            )
-            failed += 1
-            continue
+            if dry_run:
+                typer.echo(f"[dry-run] Would publish to exchange={target!r} routing_key={rk!r}  body={body[:100]!r}")
+                held.append(method.delivery_tag)
+                continue
 
-        channel.basic_ack(delivery_tag=method.delivery_tag)
-        typer.echo(f"Replayed: routing_key={rk!r}  message_id={properties.message_id}")
-        replayed += 1
+            if target == "" and rk == queue:
+                typer.echo(
+                    f"SKIPPED (stays on DLQ): message_id={properties.message_id} would be published back "
+                    f"into {queue!r}; pass --routing-key",
+                    err=True,
+                )
+                held.append(method.delivery_tag)
+                skipped += 1
+                refusal, vetted = _vet_requeue(queue, management_url, amqp_url, no_limit_check, vetted, properties)
+                if refusal:
+                    break
+                continue
 
-    connection.close()
+            try:
+                channel.basic_publish(
+                    exchange=target,
+                    routing_key=rk,
+                    body=body,
+                    properties=properties,
+                    mandatory=True,
+                )
+            except (pika_exceptions.UnroutableError, pika_exceptions.NackError) as exc:
+                held.append(method.delivery_tag)
+                typer.echo(
+                    f"FAILED (stays on DLQ): routing_key={rk!r}  message_id={properties.message_id}  ({exc})",
+                    err=True,
+                )
+                failed += 1
+                refusal, vetted = _vet_requeue(queue, management_url, amqp_url, no_limit_check, vetted, properties)
+                if refusal:
+                    break
+                continue
+
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            typer.echo(f"Replayed: routing_key={rk!r}  message_id={properties.message_id}")
+            replayed += 1
+    finally:
+        _release(channel, held)
+        connection.close()
+
+    if tripped:
+        raise _fail(_tripwire_message(queue))
+    if refusal:
+        typer.echo(f"Replayed {replayed} message(s) before stopping.", err=True)
+        raise _fail(refusal)
 
     if not dry_run:
         typer.echo(f"\nReplayed {replayed} message(s) from {queue!r} → {target!r}.")
-        if failed:
-            typer.echo(f"{failed} message(s) failed to publish and remain on {queue!r}.", err=True)
+        if failed or skipped:
+            typer.echo(f"{failed + skipped} message(s) were not replayed and remain on {queue!r}.", err=True)
             raise typer.Exit(1)

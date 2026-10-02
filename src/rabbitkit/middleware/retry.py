@@ -19,6 +19,7 @@ from typing import Any
 from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.errors import ErrorPredicate
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.retry_handoff import RetryHandoffTracker
 from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.topology import RabbitQueue
@@ -603,6 +604,29 @@ class RetryMiddleware(BaseMiddleware):
         raise
 
 
+def dlq_queue_definition(name: str, *, quorum: bool, broker_version: str | None) -> RabbitQueue:
+    """The DLQ declaration both the retry router and the safety DLX use.
+
+    A quorum DLQ on RabbitMQ 4.x gets ``x-delivery-limit: -1``. Without it
+    the broker's default limit of 20 applies, and since rabbitkit's DLQs have
+    no dead-letter exchange, the 21st requeue (20 peeks, say) DELETES the
+    failed message the DLQ exists to keep. 3.x gets no argument: there, no
+    limit is already unlimited and ``-1`` would drop on the first return.
+
+    The argument can't be added to a queue that already exists (406), so
+    brokers declare a DLQ that carries it only when the queue is missing;
+    see :func:`rabbitkit.core.quorum.dlq_delivery_limit`.
+    """
+    if not quorum:
+        return RabbitQueue(name=name, durable=True, queue_type=QueueType.CLASSIC)
+    return RabbitQueue(
+        name=name,
+        durable=True,
+        queue_type=QueueType.QUORUM,
+        delivery_limit=dlq_delivery_limit(broker_version),
+    )
+
+
 class RetryRouter:
     """Declares delay queue topology at startup.
 
@@ -648,8 +672,13 @@ class RetryRouter:
         source_exchange_name: str,  # kept for signature stability (M5) — see docstring
         *,
         source_queue_type: QueueType | None = None,
+        broker_version: str | None = None,
     ) -> list[RabbitQueue]:
         """Generate delay queue definitions for a source queue.
+
+        *broker_version* (the RabbitMQ version string the connection
+        reported) decides the DLQ's delivery limit when it is a quorum queue;
+        see :func:`dlq_queue_definition`.
 
         Returns list of RabbitQueue objects for delay queues + DLQ.
         The DLQ is now reachable because ``get_source_queue_dlq_arguments()``
@@ -715,12 +744,7 @@ class RetryRouter:
         # inherited: basic_get-based DLQ inspection/replay doesn't apply to
         # stream semantics.)
         dlq_type = self._resolve_queue_type(self._config.dlq_queue_type, source_queue_type, default="classic")
-        dlq = RabbitQueue(
-            name=dlq_name,
-            durable=True,
-            queue_type=QueueType.QUORUM if dlq_type == "quorum" else QueueType.CLASSIC,
-        )
-        queues.append(dlq)
+        queues.append(dlq_queue_definition(dlq_name, quorum=dlq_type == "quorum", broker_version=broker_version))
 
         return queues
 

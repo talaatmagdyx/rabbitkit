@@ -203,11 +203,15 @@ What is unaffected:
 
 - The **sync** transport fires its own reconnect hook and still emits the
   counter.
-- The async pool still attaches `reconnect_callbacks`, `connection_blocked`
-  and `connection_unblocked` to *every* connection it creates, and a
+- The async pool still attaches `reconnect_callbacks` and a
+  blocked-connection monitor to *every* connection it creates, and a
   connection created after `connect()` finished still counts as a reconnect
   for any hook you register yourself via `transport.on_reconnect`. Only the
   built-in metric wiring is gone.
+- `transport.is_connected()` follows aio-pika's `connected` event, so it is
+  False while a `RobustConnection` reconnects (before 0.19 it read
+  `is_closed`, which stays False during a reconnect, and a readiness probe
+  kept a disconnected pod in rotation).
 
 For async connection-churn alerting use `rabbitkit_channel_rebuilds_total`,
 `rabbitkit_settlement_items_total{status="stale"}` and the broker's own

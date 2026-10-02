@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from rabbitkit.async_.connection import get_connection_errors
@@ -52,6 +53,55 @@ def _is_connection_error(exc: BaseException) -> bool:
     cannot import aio-pika), this file already depends on aio-pika directly.
     """
     return isinstance(exc, get_connection_errors())
+
+
+def _exact_expiration_message_class() -> Any:
+    """An ``aio_pika.Message`` that sends ``expiration`` exactly as given.
+
+    aio-pika (9.x and 10.x) takes expiration in float seconds and encodes it
+    with ``int()`` truncation, so some values lose a millisecond on the wire:
+    "1001" ms -> 1.001 s -> "1000". A replayed or retried message must keep
+    the TTL it had, so this puts the millisecond string back verbatim.
+    Built lazily so importing this module never needs aio-pika.
+    """
+    import aio_pika
+
+    base = aio_pika.Message
+    if not isinstance(base, type):  # patched out (tests): nothing to subclass
+        return base
+    return _exact_expiration_subclass(base)
+
+
+@functools.cache
+def _exact_expiration_subclass(base: type[Any]) -> type[Any]:
+    class _ExactExpirationMessage(base):  # type: ignore[misc]
+        __slots__ = ("_expiration_ms",)
+
+        def __init__(self, body: bytes, *, expiration_ms: str | None, **kwargs: Any) -> None:
+            super().__init__(body, **kwargs)
+            self._expiration_ms = expiration_ms
+
+        @property
+        def properties(self) -> Any:
+            properties = super().properties
+            properties.expiration = self._expiration_ms
+            return properties
+
+    return _ExactExpirationMessage
+
+
+def _connection_live(conn: Any) -> bool:
+    """True when an aio-pika connection has a live AMQP connection under it."""
+    try:
+        if bool(getattr(conn, "is_closed", False)):
+            return False
+        connected = getattr(conn, "connected", None)
+        is_set = getattr(connected, "is_set", None)
+        if callable(is_set) and not is_set():
+            return False  # dropped; RobustConnection is reconnecting
+    except Exception:  # pragma: no cover — defensive
+        return False
+    return True
 
 
 class AsyncTransportImpl:
@@ -166,6 +216,10 @@ class AsyncTransportImpl:
         # reads this (via the is_blocked property) so a broker/disk/memory
         # alarm is visible even when the caller never opted into FlowController.
         self._blocked_state: bool = False
+        # One BlockedConnectionMonitor per connection the pool creates. They
+        # are the only source of blocked state on async: aio-pika has no
+        # blocked callbacks (see async_/connection.py).
+        self._blocked_monitors: list[Any] = []
 
     def on_reconnect(self, callback: Callable[[], None]) -> None:
         """Register a callback fired on every ``connect_robust`` re-connection
@@ -221,20 +275,15 @@ class AsyncTransportImpl:
         fired for that very common path and ``reconnects_total`` undercounted
         to zero.
         """
-        for collection, callback in (
-            ("reconnect_callbacks", self._aio_reconnected),
-            ("connection_blocked", self._aio_blocked),
-            ("connection_unblocked", self._aio_unblocked),
-        ):
-            target = getattr(connection, collection, None)
-            if target is None:  # pragma: no cover — older aio-pika may differ
-                continue
+        target = getattr(connection, "reconnect_callbacks", None)
+        if target is not None:
             try:
                 adder = getattr(target, "add", None) or getattr(target, "add_callback", None)
                 if adder is not None:
-                    adder(callback)
+                    adder(self._aio_reconnected)
             except Exception:  # pragma: no cover — never fail a connect on a hook
-                logger.debug("Could not register %s on a new connection", collection)
+                logger.debug("Could not register reconnect_callbacks on a new connection")
+        self._start_blocked_monitor(connection)
         if self._connected:
             logger.info("Replacement AMQP connection created — treating it as a reconnect")
             self._aio_reconnected()
@@ -316,7 +365,41 @@ class AsyncTransportImpl:
         ``FlowController``."""
         return self._blocked_state
 
+    def _start_blocked_monitor(self, connection: Any) -> None:
+        """Watch *connection* for ``connection.blocked`` (issue #37).
+
+        Drives ``is_blocked``, the FlowController callbacks and
+        ``blocked_connection_timeout``. Both the publisher and the consumer
+        connection get one: the consumer connection carries the topology and
+        direct-reply-to channels, so RPC request publishes stall there too.
+        Only the publisher connection is force-reconnected on timeout.
+        """
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover — the pool only connects inside a loop
+            return
+        monitor = BlockedConnectionMonitor(
+            connection,
+            blocked_timeout=self._connection_config.blocked_connection_timeout,
+            on_blocked=self._aio_blocked,
+            on_unblocked=self._aio_unblocked,
+            # Blocked state is tracked on both connections, but only the
+            # publisher one is force-reconnected: the alarm is what stalls
+            # publishes, and closing the consumer connection would requeue
+            # every in-flight delivery and duplicate running handlers.
+            may_force_reconnect=lambda: connection is self._conn_pool._publisher_connection,
+        )
+        if monitor.start():
+            self._blocked_monitors = [m for m in self._blocked_monitors if m._task is not None and not m._task.done()]
+            self._blocked_monitors.append(monitor)
+
     def _aio_blocked(self, *_args: Any) -> None:
+        # Fire on the transport-wide transition only: with two connections a
+        # second block (or the first of two unblocks) changes nothing.
+        if self._blocked_state:
+            return
         self._blocked_state = True
         for cb in list(self._blocked_callbacks):
             try:
@@ -325,6 +408,10 @@ class AsyncTransportImpl:
                 logger.exception("blocked callback raised")
 
     def _aio_unblocked(self, *_args: Any) -> None:
+        if any(m.is_blocked for m in self._blocked_monitors):
+            return
+        if not self._blocked_state:
+            return
         self._blocked_state = False
         for cb in list(self._unblocked_callbacks):
             try:
@@ -337,16 +424,19 @@ class AsyncTransportImpl:
         if self._connected:
             return
 
+        # aio-pika 9's pamqp can't encode field-table ints from -128 to -1
+        # (queue/consume/bind arguments, publish headers); fix it before any
+        # frame is built. A no-op on pamqp 4.
+        from rabbitkit.async_.connection import ensure_pamqp_encodes_negative_ints
+
+        ensure_pamqp_encodes_negative_ints()
+
         await self._conn_pool.connect()
 
-        # Register connection blocked/unblocked callbacks (C-6) so a
-        # FlowController can throttle publishes when RabbitMQ raises an alarm.
+        # Blocked-state monitors (C-6, I-11) are started per connection by
+        # _attach_connection_callbacks, which the pool calls for every
+        # connection it creates, so they follow rebuilt connections too.
         pub_conn = await self._conn_pool.get_publisher_connection()
-        try:
-            pub_conn.connection_blocked.add_callback(self._aio_blocked)
-            pub_conn.connection_unblocked.add_callback(self._aio_unblocked)
-        except Exception:  # pragma: no cover - older aio-pika may differ
-            logger.debug("Could not register blocked/unblocked callbacks")
 
         # Connection-churn metric hook: connect_robust reconnects silently
         # (well, logged) -- count them so a flapping broker/network is
@@ -359,35 +449,6 @@ class AsyncTransportImpl:
                 consumer_conn_for_cb.reconnect_callbacks.add(self._aio_reconnected)
         except Exception:  # pragma: no cover - older aio-pika may differ
             logger.debug("Could not register reconnect callbacks")
-
-        # I-11: install a blocked-connection watchdog so a broker alarm that isn't
-        # cleared within blocked_connection_timeout closes the connection (forcing
-        # reconnect) — aio-pika has no native knob for this.
-        # m2 (architect review): the CONSUMER connection gets the same
-        # blocked hooks + watchdog — it carries the topology channel and the
-        # direct-reply-to channel (RPC request publishes go out on it), so a
-        # block there used to stall RPC with no watchdog and is_blocked False.
-        from rabbitkit.async_.connection import install_blocked_connection_watchdog
-
-        try:
-            await install_blocked_connection_watchdog(pub_conn, self._connection_config.blocked_connection_timeout)
-        except Exception:  # pragma: no cover - best effort
-            logger.debug("Could not install publisher blocked-connection watchdog")
-        # Separate try (verification gap 4): a publisher-watchdog failure
-        # must not silently skip the consumer connection's wiring too.
-        try:
-            consumer_conn_wd = await self._conn_pool.get_consumer_connection()
-            if consumer_conn_wd is not pub_conn:
-                try:
-                    consumer_conn_wd.connection_blocked.add_callback(self._aio_blocked)
-                    consumer_conn_wd.connection_unblocked.add_callback(self._aio_unblocked)
-                except Exception:  # pragma: no cover - older aio-pika may differ
-                    logger.debug("Could not register consumer-connection blocked callbacks")
-                await install_blocked_connection_watchdog(
-                    consumer_conn_wd, self._connection_config.blocked_connection_timeout
-                )
-        except Exception:  # pragma: no cover - best effort
-            logger.debug("Could not install consumer blocked-connection watchdog")
 
         # Open topology channel on consumer connection
         consumer_conn = await self._conn_pool.get_consumer_connection()
@@ -417,6 +478,11 @@ class AsyncTransportImpl:
             return
 
         try:
+            for monitor in self._blocked_monitors:
+                await monitor.stop()
+            self._blocked_monitors.clear()
+            self._blocked_state = False
+
             # Close per-queue consumer channels
             for ch in list(self._consumer_channels.values()):
                 try:
@@ -460,26 +526,26 @@ class AsyncTransportImpl:
             logger.info("Disconnected from RabbitMQ (async)")
 
     def is_connected(self) -> bool:
-        """Check if connected to RabbitMQ.
+        """Check if connected to RabbitMQ, right now.
 
-        Reflects the real underlying robust-connection state rather than a
-        stale cached flag: if our cached flag is False we return False;
-        otherwise we inspect the robust connection's ``is_closed`` attribute
-        (guarded) so a connection that aio-pika has silently dropped is not
-        reported as healthy.
+        ``RobustConnection.is_closed`` is no use on its own: it stays False
+        for the whole time aio-pika is reconnecting after a broker or network
+        loss, so a readiness probe built on it kept a disconnected pod in
+        rotation (issue #39). The live signal is the connection's
+        ``connected`` event, which aio-pika clears when the AMQP connection
+        drops and sets again once the reconnect completes. Both the publisher
+        and the consumer connection must be up.
         """
         if not self._connected:
             return False
-        conn = self._conn_pool._publisher_connection
-        if conn is None:
+        pub = self._conn_pool._publisher_connection
+        if pub is None:
             return False
-        try:
-            # RobustConnection exposes ``is_closed``; True means fully closed.
-            if bool(getattr(conn, "is_closed", False)):
-                return False
-        except Exception:  # pragma: no cover — defensive
-            return False
-        return True
+        conns = [pub]
+        consumer = self._conn_pool._consumer_connection
+        if consumer is not None and consumer is not pub:
+            conns.append(consumer)
+        return all(_connection_live(c) for c in conns)
 
     @property
     def has_open_channels(self) -> bool:
@@ -515,9 +581,9 @@ class AsyncTransportImpl:
         """Bounded wait for aio-pika's own ``connect_robust()`` to restore the
         publisher connection after a connection-class publish error (item 6).
 
-        aio-pika owns reconnection entirely here -- this only OBSERVES it via
-        :meth:`is_connected`, which re-checks the live connection's
-        ``is_closed`` flag on every call. ``self._connected`` itself is NOT a
+        aio-pika owns reconnection entirely here -- this only OBSERVES the
+        publisher connection's liveness (only it matters for a publish; the
+        consumer connection may still be reconnecting). ``self._connected`` itself is NOT a
         usable recovery signal: it is set once at the first successful
         ``connect()`` and never flipped by connect_robust's background
         recovery, so ``_ensure_connected()`` alone can't detect a mid-flight
@@ -527,10 +593,14 @@ class AsyncTransportImpl:
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.is_connected():
+            if self._publisher_live():
                 return True
             await asyncio.sleep(0.1)
-        return self.is_connected()
+        return self._publisher_live()
+
+    def _publisher_live(self) -> bool:
+        conn = self._conn_pool._publisher_connection
+        return self._connected and conn is not None and _connection_live(conn)
 
     async def _ensure_connected(self) -> None:
         """Ensure connection is established."""
@@ -593,20 +663,25 @@ class AsyncTransportImpl:
             return self._mandatory_publish_channel
 
     def _build_aio_message(self, envelope: MessageEnvelope) -> Any:
-        """Build an aio_pika.Message from a MessageEnvelope."""
+        """Build an aio_pika.Message from a MessageEnvelope.
+
+        An empty message_id/content_type means "no such property" (DLQ
+        replay of a message that had none). aiormq still stamps a random
+        message_id on any publish without one.
+        """
         import aio_pika
 
-        return aio_pika.Message(
+        return _exact_expiration_message_class()(
             body=envelope.body,
-            message_id=envelope.message_id,
+            expiration_ms=envelope.expiration or None,
+            message_id=envelope.message_id or None,
             correlation_id=envelope.correlation_id,
             reply_to=envelope.reply_to,
-            content_type=envelope.content_type,
+            content_type=envelope.content_type or None,
             content_encoding=envelope.content_encoding,
             headers=envelope.headers or None,
             delivery_mode=aio_pika.DeliveryMode(envelope.delivery_mode),
             priority=envelope.priority,
-            expiration=(int(envelope.expiration) / 1000 if envelope.expiration else None),
             type=envelope.type,
             user_id=envelope.user_id,
             app_id=envelope.app_id,
@@ -1127,6 +1202,61 @@ class AsyncTransportImpl:
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 
+    @property
+    def server_version(self) -> str | None:
+        """RabbitMQ version the broker reported at connect (``"4.1.8"``), or None."""
+        conn = self._conn_pool._consumer_connection or self._conn_pool._publisher_connection
+        underlay = getattr(getattr(conn, "transport", None), "connection", None)
+        props = getattr(underlay, "server_properties", None)
+        version = props.get("version") if isinstance(props, dict) else None
+        if isinstance(version, bytes):
+            version = version.decode(errors="replace")
+        return str(version) if version else None
+
+    async def queue_exists(self, queue: str) -> bool:
+        """True if *queue* exists. Probes on a throwaway channel.
+
+        A passive declare of a missing queue is a 404 that closes the
+        channel it ran on, so it must not run on the topology channel.
+        """
+        await self._ensure_connected()
+        import aio_pika.exceptions
+
+        consumer_conn = await self._conn_pool.get_consumer_connection()
+        channel = await consumer_conn.channel()
+        try:
+            await channel.declare_queue(queue, passive=True)
+            return True
+        except aio_pika.exceptions.ChannelNotFoundEntity:
+            return False
+        finally:
+            if not channel.is_closed:
+                with contextlib.suppress(Exception):
+                    await channel.close()
+
+    @contextlib.asynccontextmanager
+    async def inspection_session(self) -> AsyncIterator[AsyncInspectionSession]:
+        """A channel of its own for one peek/replay operation (issue #35).
+
+        ``basic_get`` used the shared topology channel, so concurrent
+        inspections interleaved on it, and one caller's channel error (a 404
+        for a mistyped queue, a 406) closed it for everyone: the broker
+        requeued every caller's held messages and their later acks failed.
+        Closing the session's channel also returns anything still unsettled
+        to the queue, so a cancelled inspection can't strand messages.
+        """
+        await self._ensure_connected()
+        consumer_conn = await self._conn_pool.get_consumer_connection()
+        channel = await consumer_conn.channel()
+        try:
+            yield AsyncInspectionSession(self, channel)
+        finally:
+            if not channel.is_closed:
+                try:
+                    await channel.close()
+                except Exception:  # pragma: no cover — the connection is going anyway
+                    logger.debug("closing the inspection channel raised", exc_info=True)
+
     async def basic_get(self, queue: str) -> RabbitMessage | None:
         """Get a single message without subscribing.
 
@@ -1174,9 +1304,11 @@ class AsyncTransportImpl:
             # RabbitMessage/MessageEnvelope.expiration use everywhere else (matches
             # the raw string pika.BasicProperties.expiration carries unmodified),
             # so a retry/DLQ-replay envelope built from this message round-trips
-            # correctly regardless of which transport received it.
-            expiration=(str(int(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
+            # correctly regardless of which transport received it. round(), not
+            # int(): "1001" decodes to 1.001 s, and int(1.001 * 1000) is 1000.
+            expiration=(str(round(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
             user_id=aio_message.user_id,
+            delivery_mode=(int(aio_message.delivery_mode) if aio_message.delivery_mode is not None else None),
             timestamp=aio_message.timestamp,  # was never surfaced on consume
             routing_key=aio_message.routing_key,
             exchange=aio_message.exchange or "",
@@ -1211,3 +1343,18 @@ class AsyncTransportImpl:
         message._channel_alive = _channel_alive
 
         return message
+
+
+class AsyncInspectionSession:
+    """``basic_get`` on one dedicated channel; see ``AsyncTransportImpl.inspection_session``."""
+
+    def __init__(self, transport: AsyncTransportImpl, channel: Any) -> None:
+        self._transport = transport
+        self._channel = channel
+
+    async def basic_get(self, queue: str) -> RabbitMessage | None:
+        q = await self._channel.get_queue(queue, ensure=False)
+        aio_msg = await q.get(fail=False, no_ack=False)
+        if aio_msg is None:
+            return None
+        return self._transport._build_message(aio_msg)

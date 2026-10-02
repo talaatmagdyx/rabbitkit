@@ -77,6 +77,12 @@ Docs build: `.venv/bin/mkdocs build --strict`
   resolve. Decorator order: `@publisher` inner, `@subscriber` outer.
 - **pytest examples run via pytest**, not `python file.py` (they'd exit 0
   without running). The examples smoke test handles this automatically.
+- **Quorum queues count every requeue as a delivery.** On RabbitMQ 4.x the
+  default limit is 20, so peeking a quorum queue in a test loop drops its
+  messages; on 3.x `x-delivery-limit: -1` drops on the FIRST return. See
+  `core/quorum.py`. Also: `rabbitmqctl list_queues` reports quorum queues as
+  `0 0` on 4.1, so count them with a passive declare (`QueueProbe` in
+  `tests/integration/conftest.py`), not `live_counts`.
 
 ## New-feature checklist
 

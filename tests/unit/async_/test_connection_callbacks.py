@@ -99,8 +99,25 @@ class TestTransportAttachesCallbacks:
         conn = _connection()
         transport._attach_connection_callbacks(conn)
         conn.reconnect_callbacks.add.assert_called_once_with(transport._aio_reconnected)
-        conn.connection_blocked.add.assert_called_once_with(transport._aio_blocked)
-        conn.connection_unblocked.add.assert_called_once_with(transport._aio_unblocked)
+        # Nothing is registered on connection_blocked/unblocked: no aio-pika
+        # release has them (#37). Blocked state comes from a monitor instead.
+        conn.connection_blocked.add.assert_not_called()
+        conn.connection_unblocked.add.assert_not_called()
+
+    async def test_a_blocked_monitor_follows_every_new_connection(self) -> None:
+        import aiormq
+
+        transport = self._transport()
+        conns = []
+        for _ in range(2):
+            conn = MagicMock()
+            conn.is_closed = False
+            conn.transport.connection = aiormq.Connection("amqp://localhost/")
+            conns.append(conn)
+            transport._attach_connection_callbacks(conn)
+        assert [m._connection for m in transport._blocked_monitors] == conns
+        for m in transport._blocked_monitors:
+            await m.stop()
 
     def test_a_connection_created_before_connect_is_not_a_reconnect(self) -> None:
         transport = self._transport()
@@ -138,7 +155,6 @@ class TestTransportAttachesCallbacks:
         conn = _connection()
         conn.reconnect_callbacks.add.side_effect = RuntimeError("closed collection")
         transport._attach_connection_callbacks(conn)  # must not raise
-        conn.connection_blocked.add.assert_called_once()  # and keeps going
 
     def test_a_raising_reconnect_callback_never_escapes(self) -> None:
         transport = self._transport()

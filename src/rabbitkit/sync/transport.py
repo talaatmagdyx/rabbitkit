@@ -18,7 +18,7 @@ import random
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
@@ -742,11 +742,13 @@ class SyncTransport:
             if envelope.mandatory:
                 self._ensure_mandatory_confirms(channel)
 
+            # An empty message_id/content_type means "no such property"
+            # (DLQ replay of a message that had none), not an empty string.
             properties = pika.BasicProperties(
-                message_id=envelope.message_id,
+                message_id=envelope.message_id or None,
                 correlation_id=envelope.correlation_id,
                 reply_to=envelope.reply_to,
-                content_type=envelope.content_type,
+                content_type=envelope.content_type or None,
                 content_encoding=envelope.content_encoding,
                 headers=envelope.headers or None,
                 delivery_mode=envelope.delivery_mode,
@@ -1252,6 +1254,65 @@ class SyncTransport:
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 
+    @property
+    def server_version(self) -> str | None:
+        """RabbitMQ version the broker reported at connect (``"4.1.8"``), or None."""
+        impl = getattr(self._connection, "_impl", None)
+        props = getattr(impl, "server_properties", None)
+        version = props.get("version") if isinstance(props, dict) else None
+        if isinstance(version, bytes):
+            version = version.decode(errors="replace")
+        return str(version) if version else None
+
+    def queue_exists(self, queue: str) -> bool:
+        """True if *queue* exists. Probes on a throwaway channel.
+
+        A passive declare of a missing queue is a 404 that closes the
+        channel it ran on, so it must not run on the topology channel.
+        """
+        self._ensure_connected()
+        import pika
+
+        connection = self._connection
+
+        def probe() -> bool:
+            channel = connection.channel()
+            try:
+                channel.queue_declare(queue=queue, passive=True)
+                return True
+            except pika.exceptions.ChannelClosedByBroker as exc:
+                if exc.reply_code == 404:
+                    return False
+                raise
+            finally:
+                if channel.is_open:
+                    channel.close()
+
+        return self._run_on_io_thread(probe)
+
+    @contextlib.contextmanager
+    def inspection_session(self) -> Iterator[SyncInspectionSession]:
+        """A channel of its own for one peek/replay operation (issue #35).
+
+        ``basic_get`` deliveries are settled on the channel they came from.
+        On the shared channel, one inspection's channel error (a 404 for a
+        mistyped queue, a 406) closed it for every other caller and requeued
+        everybody's held messages. Closing the session's channel also returns
+        anything still unsettled to the queue, so a crash mid-inspection
+        can't strand messages.
+        """
+        self._ensure_connected()
+        connection = self._connection
+        channel = self._run_on_io_thread(connection.channel)
+        try:
+            yield SyncInspectionSession(self, channel)
+        finally:
+            if channel.is_open:
+                try:
+                    self._run_on_io_thread(channel.close)
+                except Exception:  # pragma: no cover — the connection is going anyway
+                    logger.debug("closing the inspection channel raised", exc_info=True)
+
     def basic_get(self, queue: str) -> RabbitMessage | None:
         """Get a single message without subscribing (auto_ack=False).
 
@@ -1303,6 +1364,7 @@ class SyncTransport:
             priority=properties.priority,
             expiration=properties.expiration,
             user_id=properties.user_id,
+            delivery_mode=properties.delivery_mode,
             timestamp=timestamp,
             routing_key=method.routing_key,
             exchange=method.exchange,
@@ -1339,3 +1401,20 @@ class SyncTransport:
         message._channel_alive = lambda: bool(getattr(channel, "is_open", False))
 
         return message
+
+
+class SyncInspectionSession:
+    """``basic_get`` on one dedicated channel; see ``SyncTransport.inspection_session``."""
+
+    def __init__(self, transport: SyncTransport, channel: Any) -> None:
+        self._transport = transport
+        self._channel = channel
+
+    def basic_get(self, queue: str) -> RabbitMessage | None:
+        channel = self._channel
+        method, properties, body = self._transport._run_on_io_thread(
+            lambda: channel.basic_get(queue=queue, auto_ack=False)
+        )
+        if method is None:
+            return None
+        return self._transport._build_message(channel, method, properties, body)

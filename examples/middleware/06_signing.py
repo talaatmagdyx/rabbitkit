@@ -22,7 +22,9 @@ from rabbitkit.middleware.signing import (
 
 broker = AsyncBroker(RabbitConfig())
 
-SHARED_SECRET = "super-secret-key-do-not-commit"
+# SigningConfig requires a key of at least 32 bytes. Generate a real one with:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+SHARED_SECRET = "example-signing-key-change-me-in-production"
 
 # ── Both publisher and consumer share the same middleware ─────────────────────
 # In practice, they'd be in different services with the same secret.

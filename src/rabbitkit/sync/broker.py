@@ -38,6 +38,7 @@ from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
+from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
@@ -53,7 +54,7 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
-from rabbitkit.middleware.retry import RetryRouter
+from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors
 from rabbitkit.sync.transport import SyncTransport
@@ -1129,7 +1130,22 @@ class SyncBroker:
                 source_queue = route.queue
 
             # Declare queue (with DLQ routing arguments if retry/safety DLX applies)
-            self._transport.declare_queue(source_queue)
+            if source_queue is route.queue and is_anothers_dlq and route.queue.queue_type == QueueType.QUORUM:
+                # Consuming another route's quorum DLQ: declare it exactly as
+                # that route's retry/safety topology does, or the two
+                # declarations disagree on x-delivery-limit (406).
+                self._declare_dlq(
+                    replace(
+                        route.queue,
+                        delivery_limit=(
+                            route.queue.delivery_limit
+                            if route.queue.delivery_limit is not None
+                            else dlq_delivery_limit(self._broker_server_version())
+                        ),
+                    )
+                )
+            else:
+                self._transport.declare_queue(source_queue)
 
             # Bind queue to exchange (C4: bind_arguments matter for headers exchanges)
             if route.exchange is not None:
@@ -1144,22 +1160,52 @@ class SyncBroker:
             if retry_config is not None:
                 exchange_name = route.exchange.name if route.exchange else ""
                 delay_queues = retry_router.get_delay_queue_definitions(
-                    route.queue.name, exchange_name, source_queue_type=route.queue.queue_type
+                    route.queue.name,
+                    exchange_name,
+                    source_queue_type=route.queue.queue_type,
+                    broker_version=self._broker_server_version(),
                 )
+                dlq_name = retry_router.get_dlq_name(route.queue.name)
                 for delay_queue in delay_queues:
-                    self._transport.declare_queue(delay_queue)
+                    if delay_queue.name == dlq_name:
+                        self._declare_dlq(delay_queue)
+                    else:
+                        self._transport.declare_queue(delay_queue)
             elif safety_dlq_name is not None:
-                self._transport.declare_queue(
-                    RabbitQueue(
-                        name=safety_dlq_name,
-                        durable=True,
-                        # Inherit quorum from a quorum source (see RetryRouter
-                        # DLQ note): the DLQ stores failures indefinitely.
-                        queue_type=(
-                            QueueType.QUORUM if route.queue.queue_type == QueueType.QUORUM else QueueType.CLASSIC
-                        ),
+                # Inherit quorum from a quorum source (see RetryRouter DLQ
+                # note): the DLQ stores failures indefinitely.
+                self._declare_dlq(
+                    dlq_queue_definition(
+                        safety_dlq_name,
+                        quorum=route.queue.queue_type == QueueType.QUORUM,
+                        broker_version=self._broker_server_version(),
                     )
                 )
+
+    def _broker_server_version(self) -> str | None:
+        version = getattr(self._transport, "server_version", None)
+        return version if isinstance(version, str) else None
+
+    def _declare_dlq(self, dlq: RabbitQueue) -> None:
+        """Declare a DLQ, leaving an existing one exactly as it is.
+
+        A quorum DLQ on RabbitMQ 4.x carries ``x-delivery-limit: -1`` (see
+        ``dlq_queue_definition``). RabbitMQ refuses to add that argument to
+        a queue declared without it, and refuses to drop it from one declared
+        with it (406 either way). So a DLQ that already exists is not
+        redeclared at all; its delivery limit is the operator's to fix, with
+        a policy, and ``DLQInspector`` refuses to browse it until they do.
+        """
+        if dlq.queue_type is QueueType.QUORUM and self._config.topology_mode is TopologyMode.AUTO_DECLARE:
+            # Probe whatever the version: an existing DLQ may carry the
+            # argument (created by 0.19 on 4.x) even when this connection
+            # can't tell which broker version it is talking to.
+            assert self._transport is not None
+            if self._transport.queue_exists(dlq.name) is True:
+                logger.debug("DLQ %r already exists; not redeclaring it", dlq.name)
+                return
+        assert self._transport is not None
+        self._transport.declare_queue(dlq)
 
     def _mark_heartbeat(self) -> None:
         """Refresh the liveness heartbeat (I-4/L14).

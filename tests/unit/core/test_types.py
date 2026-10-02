@@ -129,6 +129,42 @@ class TestPublishOutcome:
         outcome = PublishOutcome(status=PublishStatus.NACKED)
         assert outcome.ok is False
 
+    def test_repr_survives_an_error_whose_repr_raises(self) -> None:
+        """#38: aiormq 7's DeliveryError.__str__/__repr__ raise AttributeError
+        when the error has no frame. Formatting the outcome, and so
+        raise_for_status(), must still work and raise PublishError."""
+        from rabbitkit.core.errors import PublishError
+
+        class Unprintable(Exception):
+            def __str__(self) -> str:
+                raise AttributeError("frame")
+
+            __repr__ = __str__
+
+        outcome = PublishOutcome(status=PublishStatus.NACKED, routing_key="rk", error=Unprintable())
+        text = repr(outcome)
+        assert "<Unprintable (unprintable)>" in text and "routing_key='rk'" in text
+        assert str(outcome) == text
+        with pytest.raises(PublishError):
+            outcome.raise_for_status()
+
+    def test_repr_shows_error_and_fields(self) -> None:
+        outcome = PublishOutcome(status=PublishStatus.ERROR, exchange="ex", error=ValueError("boom"))
+        text = repr(outcome)
+        assert text.startswith("PublishOutcome(status=<PublishStatus.ERROR: 'error'>")
+        assert "exchange='ex'" in text and "error=ValueError('boom')" in text
+        assert "error=None" in repr(PublishOutcome(status=PublishStatus.CONFIRMED))
+
+    def test_real_aiormq_delivery_error_without_frame(self) -> None:
+        """The concrete case from #38, against whichever aiormq is installed."""
+        aio_pika_exceptions = pytest.importorskip("aio_pika.exceptions")
+        from rabbitkit.core.errors import PublishError
+
+        err = aio_pika_exceptions.DeliveryError(None, None)
+        outcome = PublishOutcome(status=PublishStatus.NACKED, error=err)
+        with pytest.raises(PublishError):
+            outcome.raise_for_status()
+
     def test_timeout_is_not_ok(self) -> None:
         outcome = PublishOutcome(status=PublishStatus.TIMEOUT)
         assert outcome.ok is False

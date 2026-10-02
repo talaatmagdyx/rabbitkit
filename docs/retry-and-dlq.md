@@ -287,11 +287,10 @@ rabbitkit dlq inspect orders.created.dlq
 
 This prints a summary of messages including headers, routing key, original exchange, and failure reason if recorded.
 
-To see the full body of each message:
-
-```bash
-rabbitkit dlq inspect orders.created.dlq --full
-```
+`inspect` fetches up to `--limit` messages with `basic_get`, holds them all
+unacked until the fetch ends, then requeues them, so each message is shown
+once. Before 0.19 it requeued each message straight away; the message went
+back to the head and `--limit 20` printed the first one 20 times.
 
 ---
 
@@ -317,9 +316,92 @@ rabbitkit dlq replay orders.created.dlq orders --limit 10
 
 Replay uses publisher confirms and `mandatory=True`, and acks each DLQ
 original only after its republish is confirmed. A message whose republish
-fails is **left on the DLQ** (nack-requeued) and replay **continues** with
-the rest, reporting the failure count (non-zero exit) at the end — one
-poison target doesn't strand the remaining replayable messages.
+fails is **left on the DLQ** (requeued once the fetch loop ends) and replay
+**continues** with the rest, reporting the failure count (non-zero exit) at
+the end — one poison target doesn't strand the remaining replayable messages.
+
+Without `--routing-key`, each message goes out with the routing key it had
+before it was dead-lettered: `x-rabbitkit-original-routing-key`, then the
+broker's `x-death` record. A broker dead-lettered message's own routing key
+is the DLQ's name, so a message that would be published straight back into
+the DLQ is skipped and left there.
+
+`DLQInspector.replay()` without `target_queue` resolves the source queue the
+same way (`x-rabbitkit-original-queue`, then `x-last-death-queue` /
+`x-death`). If none is present it skips the message (`ReplayResult.skipped`)
+instead of republishing it into the queue it is draining, which used to make
+`replay(dlq)` loop forever. Pass `allow_self_replay=True` to opt out.
+
+Replay copies every property the original carried (`timestamp`,
+`delivery_mode`, `expiration` to the millisecond, priority, ...) and leaves
+absent ones absent. One exception on the async transport: aiormq stamps a
+random `message_id` on any publish that lacks one.
+
+## Quorum DLQs and delivery limits
+
+AMQP 0-9-1 has no browse, so a peek is `basic_get` plus a requeue, and a
+**quorum queue counts every requeue as a delivery** (closing the channel
+counts too). Past the queue's delivery limit RabbitMQ dead-letters the
+message, or drops it if the queue has no dead-letter exchange. rabbitkit's
+DLQs have none. Measured on 3.13.7 and 4.1.8:
+
+| | RabbitMQ 3.x | RabbitMQ 4.x |
+|---|---|---|
+| no limit configured | unlimited | **20** (the default) |
+| `x-delivery-limit: -1` | **drops on the first return** | unlimited |
+| argument and policy both set | lowest wins | lowest non-negative wins |
+
+So on 4.x, 20 peeks of a quorum DLQ deleted its messages.
+
+**What rabbitkit declares.** A DLQ inherits quorum from a quorum source
+queue (retry DLQs and the safety DLX alike). On 4.x a *new* quorum DLQ is
+declared with `x-delivery-limit: -1`; on 3.x it gets no limit argument.
+RabbitMQ refuses to add or remove that argument on an existing queue (406),
+so a DLQ that already exists is not redeclared. Fix an existing 4.x quorum
+DLQ with a policy, which needs no redeclare:
+
+```bash
+rabbitmqctl set_policy dlq-unlimited '\.dlq$' '{"delivery-limit": -1}' --apply-to quorum_queues
+```
+
+RabbitMQ applies only the highest-priority matching policy. If one already
+matches the DLQ (for example a `rabbitkit-<queue>-dlq` policy rendered by
+`policy_templates()`, priority 10), add `"delivery-limit": -1` to it rather
+than creating a second one that would be shadowed.
+
+A route that consumes another route's quorum DLQ declares it the same way.
+Note that a 4.x DLQ created by 0.19 carries the argument, so an older
+rabbitkit that redeclares it without the argument gets a 406; set
+`SafetyConfig(on_topology_conflict="warn_continue")` before rolling back.
+In a mixed 3.x/4.x cluster mid-upgrade, the version is the node the
+connection reached: let new quorum DLQs be created only once every node runs
+4.x.
+
+**What the inspector checks.** Give `DLQInspector` a management client and
+`peek` / filtered `replay` read the queue's type, arguments and effective
+policy first. They raise `UnsafeToBrowseError` for a quorum queue whose
+limit isn't unlimited, and fail closed when they can't tell (unknown broker
+version, or statistics not emitted yet):
+
+```python
+from rabbitkit import DLQInspector, RabbitManagementClient
+
+inspector = DLQInspector(transport, management=RabbitManagementClient())
+```
+
+Without a management client (or when the API answers 404, e.g. a wrong
+vhost; `vhost` defaults to the transport's) the inspector stops as soon as a
+fetched message carries `x-delivery-count`, a header only quorum queues set
+(from a message's second delivery on), and refuses that queue from then on.
+That caps the damage at about two deliveries per message. A `replay()`
+without a predicate acks what it republishes, so it checks lazily, at the
+first message it has to requeue (a failed or skipped one): a message that
+keeps failing would otherwise lose a delivery every run.
+`check_delivery_limit=False` turns both checks off.
+
+The CLI does the same. `rabbitkit dlq inspect` and `replay` take
+`--management-url` (or `RABBITMQ_MANAGEMENT_URL`), stop on
+`x-delivery-count` without it, and exit 2 when they refuse.
 
 
 ## Retry jitter: `jitter_mode="sharded"`

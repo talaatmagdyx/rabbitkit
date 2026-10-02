@@ -31,7 +31,15 @@ from typing import Any
 
 from rabbitkit.core.errors import UnsafeToBrowseError
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER, assert_browsable, unlimited_fix
+from rabbitkit.core.quorum import (
+    DEFAULT_MAX_QUORUM_SCAN,
+    DELIVERY_COUNT_HEADER,
+    assert_browsable,
+    assert_whole_scan,
+    is_quorum,
+    too_deep,
+    unlimited_fix,
+)
 from rabbitkit.core.types import MessageEnvelope
 
 logger = logging.getLogger(__name__)
@@ -190,9 +198,13 @@ class DLQInspector:
         management: Any = None,
         vhost: str | None = None,
         check_delivery_limit: bool = True,
+        max_quorum_scan: int = DEFAULT_MAX_QUORUM_SCAN,
     ) -> None:
         self._transport = transport
         self._management = management
+        self._max_quorum_scan = max_quorum_scan
+        # Vetted quorum queues: read only whole (a partial read reorders them).
+        self._whole: set[str] = set()
         if vhost is None:
             configured = getattr(getattr(transport, "_connection_config", None), "vhost", None)
             vhost = configured if isinstance(configured, str) else "/"
@@ -244,7 +256,28 @@ class DLQInspector:
         if info is None:
             return False
         assert_browsable(queue, info, self._version())
+        if is_quorum(info):
+            assert_whole_scan(queue, info, self._max_quorum_scan)
+            self._whole.add(queue)
+        else:
+            self._whole.discard(queue)
         return True
+
+    def _fetch_limit(self, queue: str, limit: int) -> int:
+        # one past the scan limit: a whole read must see the queue's end
+        return self._max_quorum_scan + 1 if queue in self._whole else limit
+
+    def _check_whole(self, queue: str, fetched: int) -> None:
+        if queue in self._whole and fetched > self._max_quorum_scan:  # grew while it was read
+            raise UnsafeToBrowseError(too_deep(queue, fetched, self._max_quorum_scan))
+
+    def _check_partial_replay(self, queue: str, predicate: Any, limit: int | None) -> None:
+        if queue in self._whole and predicate is not None and limit is not None:
+            raise UnsafeToBrowseError(
+                f"{queue!r} is a quorum queue: a filtered replay with a limit would requeue the "
+                "non-matching messages behind the ones it didn't read, which reorders the queue. "
+                "Drop the limit, so the replay reads the whole queue and keeps its order."
+            )
 
     async def _ensure_browsable_async(self, queue: str) -> bool:
         # The management client's sync methods need no aiohttp; run them off
@@ -326,8 +359,15 @@ class DLQInspector:
 
         Every message is held unacked until the fetch loop ends, so the loop
         never re-fetches one it already has. All of them are requeued in a
-        ``finally``, including when ``basic_get`` fails midway. Ordering may
-        change after this operation.
+        ``finally``, in the order they were read, including when
+        ``basic_get`` fails midway.
+
+        A quorum queue the management API vetted is read whole (up to
+        ``max_quorum_scan``) and the first ``limit`` messages are returned:
+        it puts returned messages at the back, so a partial read would
+        reorder it. Without a management client a quorum queue can't be
+        told apart until its messages carry ``x-delivery-count``, so the
+        first peek of an unvetted one can still reorder it.
 
         Raises:
             UnsafeToBrowseError: The queue is a quorum queue with a delivery
@@ -340,16 +380,17 @@ class DLQInspector:
         messages: list[RabbitMessage] = []
         with self._session() as session:
             try:
-                for _ in range(limit):
+                for _ in range(self._fetch_limit(queue, limit)):
                     msg = session.basic_get(queue)
                     if msg is None:
                         break
                     messages.append(msg)
                     if self._tripwire(queue, msg, vetted):
                         self._raise_tripwire(queue)
+                self._check_whole(queue, len(messages))
             finally:
                 _release_messages(messages)
-        return messages
+        return messages[:limit]
 
     @staticmethod
     def _resolve_routing_key(msg: RabbitMessage, target_queue: str | None) -> str:
@@ -494,6 +535,7 @@ class DLQInspector:
         # A filtered replay requeues by design: vet up front. An unfiltered
         # one acks what it republishes and vets lazily, at its first requeue.
         vetted: bool | None = self._ensure_browsable(queue) if predicate is not None else None
+        self._check_partial_replay(queue, predicate, limit)
         replayed = 0
         held_for_requeue: list[RabbitMessage] = []
         failed = 0
@@ -567,16 +609,17 @@ class DLQInspector:
         messages: list[RabbitMessage] = []
         async with self._session_async() as session:
             try:
-                for _ in range(limit):
+                for _ in range(self._fetch_limit(queue, limit)):
                     msg = await session.basic_get(queue)
                     if msg is None:
                         break
                     messages.append(msg)
                     if self._tripwire(queue, msg, vetted):
                         self._raise_tripwire(queue)
+                self._check_whole(queue, len(messages))
             finally:
                 await _release_messages_async(messages)
-        return messages
+        return messages[:limit]
 
     async def replay_async(
         self,
@@ -595,6 +638,7 @@ class DLQInspector:
         held, not nacked, until the fetch loop has fully exhausted the queue
         (termination guarantee)."""
         vetted: bool | None = await self._ensure_browsable_async(queue) if predicate is not None else None
+        self._check_partial_replay(queue, predicate, limit)
         replayed = 0
         held_for_requeue: list[RabbitMessage] = []
         failed = 0

@@ -48,6 +48,9 @@ independent of any application logic, use a quorum queue with
 
 **The DLQ is growing and I don't know why.**
 Use `DLQInspector.peek("queue.dlq", limit=10)` to look without consuming.
+A quorum queue puts returned messages at the back, so with a management
+client the inspector reads a quorum DLQ whole (up to `max_quorum_scan`,
+default 5000) to leave its order as it was.
 On a quorum DLQ every peek counts as a delivery, so pass a management client
 (`DLQInspector(transport, management=RabbitManagementClient())`) and the
 inspector refuses a queue with a delivery limit instead of slowly dropping

@@ -19,6 +19,12 @@ Redeclaring an existing quorum queue with a different ``x-delivery-limit``
 (including adding one it was declared without) is ``406
 PRECONDITION_FAILED`` on both. Fix an existing queue with a policy instead.
 
+A quorum queue also puts every returned message at the **back** (a classic
+queue puts it back where it was). So peeking at part of one rotates the
+messages it read to the tail, and the next peek shows different ones. Only a
+read of the whole queue, requeued in the order it was read, leaves it as it
+was: see :func:`assert_whole_scan`.
+
 Transport-free: these helpers read the management API's queue JSON and the
 broker version string, nothing else.
 """
@@ -36,6 +42,9 @@ DELIVERY_COUNT_HEADER = "x-delivery-count"
 
 #: The limit RabbitMQ 4.x applies to a quorum queue that configures none.
 DEFAULT_DELIVERY_LIMIT_4X = 20
+
+#: How many messages a whole-queue read of a quorum queue may hold at once.
+DEFAULT_MAX_QUORUM_SCAN = 5000
 
 
 def broker_major_version(version: str | None) -> int | None:
@@ -65,6 +74,22 @@ def dlq_delivery_limit(version: str | None) -> int | None:
 def is_quorum(queue_info: Mapping[str, Any]) -> bool:
     arguments = queue_info.get("arguments") or {}
     return (queue_info.get("type") or arguments.get("x-queue-type")) == "quorum"
+
+
+def too_deep(queue: str, messages: int, max_scan: int) -> str:
+    return (
+        f"{queue!r} is a quorum queue holding {messages} messages, more than one inspection reads "
+        f"({max_scan}). A quorum queue puts every returned message at the back, so reading part "
+        "of one would reorder it; rabbitkit reads quorum queues only whole. Raise max_quorum_scan, "
+        "or shovel the queue to a classic one to inspect it."
+    )
+
+
+def assert_whole_scan(queue: str, queue_info: Mapping[str, Any], max_scan: int) -> None:
+    """Raise :class:`UnsafeToBrowseError` if a quorum queue is too deep to read whole."""
+    ready = int(queue_info.get("messages_ready", queue_info.get("messages", 0)) or 0)
+    if ready > max_scan:
+        raise UnsafeToBrowseError(too_deep(queue, ready, max_scan))
 
 
 def effective_delivery_limit(queue_info: Mapping[str, Any], version: str | None) -> int | None:

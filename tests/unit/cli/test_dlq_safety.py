@@ -307,3 +307,51 @@ class TestReviewFindingsCli:
             result = runner.invoke(app, ["dlq", "replay", "orders.dlq", "orders"])
         assert result.exit_code == 2
         assert channel.basic_publish.call_count == 1 and queue.unacked == {}
+
+
+class _QuorumQueue(_Queue):
+    """A quorum queue: a requeued message goes to the BACK (measured on 3.13 and 4.1)."""
+
+    def basic_nack(self, delivery_tag: int, requeue: bool = True) -> None:
+        self.events.append("nack")
+        body = self.unacked.pop(delivery_tag)
+        if requeue:
+            self.ready.append((delivery_tag, body))
+
+
+class TestQuorumInspectKeepsOrder:
+    def _run_quorum(self, queue: _Queue, ready: int, args: list[str]) -> Any:
+        info = {"type": "quorum", "arguments": {"x-queue-type": "quorum", "x-delivery-limit": -1},
+                "messages": ready, "messages_ready": ready}
+        client = MagicMock()
+        client.get_queue.return_value = info
+        client.overview.return_value = {"rabbitmq_version": "4.1.8"}
+        with patch("rabbitkit.management.RabbitManagementClient", return_value=client):
+            result, _ = _run(queue, ["inspect", "orders.dlq", "-m", "http://localhost:15672", *args])
+        return result
+
+    def test_a_quorum_queue_is_read_whole_so_its_order_survives(self) -> None:
+        queue = _QuorumQueue([b"a", b"b", b"c", b"d"])
+        result = self._run_quorum(queue, 4, ["--limit", "2", "--format", "json"])
+        assert result.exit_code == 0, result.output
+        assert result.output.count("id-") == 2  # shows --limit of them
+        assert [body for _, body in queue.ready] == [b"a", b"b", b"c", b"d"]  # not rotated
+
+    def test_a_partial_read_would_have_rotated_it(self) -> None:
+        """What 0.19.0 did: --limit 2 moved a and b behind c and d."""
+        queue = _QuorumQueue([b"a", b"b", b"c", b"d"])
+        result, _ = _run(queue, ["inspect", "orders.dlq", "--limit", "2", "--no-delivery-limit-check"])
+        assert result.exit_code == 0
+        assert [body for _, body in queue.ready] == [b"c", b"d", b"a", b"b"]
+
+    def test_a_quorum_queue_deeper_than_one_scan_is_refused_before_connecting(self) -> None:
+        queue = _QuorumQueue([b"a"])
+        result = self._run_quorum(queue, 5001, [])
+        assert result.exit_code == 2 and "only whole" in result.output
+        assert queue.events == []
+
+    def test_a_quorum_queue_that_grew_while_read_is_refused_and_released(self) -> None:
+        queue = _QuorumQueue([b"m"] * 5001)  # the stats said 10
+        result = self._run_quorum(queue, 10, [])
+        assert result.exit_code == 2 and "holding 5001 messages" in result.output
+        assert len(queue.ready) == 5001 and not queue.unacked

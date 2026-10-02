@@ -47,17 +47,23 @@ def _check_browsable(queue: str, management_url: str | None, amqp_url: str) -> b
     Returns True when the queue was VETTED. False (no management URL, or the
     API doesn't know the queue) means the x-delivery-count tripwire stays armed.
     """
+    return _browse_plan(queue, management_url, amqp_url)[0]
+
+
+def _browse_plan(queue: str, management_url: str | None, amqp_url: str) -> tuple[bool, bool]:
+    """(vetted, read whole). A vetted quorum queue is read only whole: it puts returned
+    messages at the back, so a partial read would reorder it."""
     if management_url is None:
-        return False
+        return False, False
     from rabbitkit.core.errors import UnsafeToBrowseError
-    from rabbitkit.core.quorum import assert_browsable
+    from rabbitkit.core.quorum import DEFAULT_MAX_QUORUM_SCAN, assert_browsable, assert_whole_scan, is_quorum
 
     client = _management_client(management_url, amqp_url)
     try:
         info = client.get_queue(queue, vhost=_vhost(amqp_url))
     except Exception as exc:
         if getattr(exc, "code", None) == 404:
-            return False  # basic_get reports a missing queue; a wrong vhost is caught by the tripwire
+            return False, False  # basic_get reports a missing queue; a wrong vhost trips the wire
         raise _Unsafe(f"could not read {queue!r} from the management API: {exc}") from exc
     try:
         version = client.overview().get("rabbitmq_version")
@@ -65,9 +71,12 @@ def _check_browsable(queue: str, management_url: str | None, amqp_url: str) -> b
         raise _Unsafe(f"could not read the RabbitMQ version from the management API: {exc}") from exc
     try:
         assert_browsable(queue, dict(info), str(version) if version else None)
+        if is_quorum(dict(info)):
+            assert_whole_scan(queue, dict(info), DEFAULT_MAX_QUORUM_SCAN)
+            return True, True
     except UnsafeToBrowseError as exc:
         raise _Unsafe(str(exc)) from exc
-    return True
+    return True, False
 
 
 def _tripwire_message(queue: str) -> str:
@@ -139,8 +148,11 @@ def dlq_inspect(
 
     Fetches up to ``--limit`` messages with ``basic_get`` and holds them all
     unacked until the fetch ends, so each message is shown once, then
-    requeues them. (Requeueing each one straight away put it back at the
-    head, so the same message came back ``--limit`` times.)
+    requeues them in the order they were read. (Requeueing each one straight
+    away put it back at the head, so the same message came back ``--limit``
+    times.) With ``--management-url``, a quorum queue is read whole and the
+    first ``--limit`` are shown: it puts returned messages at the back, so a
+    partial read would reorder it.
 
     Example::
 
@@ -152,14 +164,16 @@ def dlq_inspect(
     except ImportError:
         typer.echo("pika is required: pip install pika", err=True)
         raise typer.Exit(1) from None
-    from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
+    from rabbitkit.core.quorum import DEFAULT_MAX_QUORUM_SCAN, DELIVERY_COUNT_HEADER, too_deep
 
     armed = False  # the x-delivery-count tripwire
+    whole = False
     if not no_limit_check:
         try:
-            armed = not _check_browsable(queue, management_url, amqp_url)
+            vetted, whole = _browse_plan(queue, management_url, amqp_url)
         except _Unsafe as exc:
             raise _fail(str(exc)) from None
+        armed = not vetted
 
     params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
@@ -168,8 +182,10 @@ def dlq_inspect(
     messages = []
     held: list[int] = []
     tripped = False
+    # one past the scan limit: a whole read must see the queue's end
+    fetch = DEFAULT_MAX_QUORUM_SCAN + 1 if whole else limit
     try:
-        for _ in range(limit):
+        for _ in range(fetch):
             method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
             if method is None:
                 break
@@ -195,6 +211,9 @@ def dlq_inspect(
 
     if tripped:
         raise _fail(_tripwire_message(queue))
+    if whole and len(held) > DEFAULT_MAX_QUORUM_SCAN:  # it grew while it was read
+        raise _fail(too_deep(queue, len(held), DEFAULT_MAX_QUORUM_SCAN))
+    messages = messages[:limit]
 
     if output_format == "json":
         typer.echo(json.dumps(messages, indent=2, default=str))

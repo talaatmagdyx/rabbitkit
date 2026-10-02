@@ -586,3 +586,79 @@ class TestReviewFindings:
         transport = _Failing([_msg(headers={"x-delivery-count": 2})])
         with pytest.raises(UnsafeToBrowseError):
             await DLQInspector(transport).replay_async("orders.dlq", target_queue="orders")
+
+
+# ── quorum queues return messages to the back: read them whole ────────────
+
+
+def _ordered(n: int, released: list[int]) -> list[RabbitMessage]:
+    """Messages that record the order they are requeued in."""
+    out = []
+    for i in range(n):
+        msg = _msg(str(i).encode())
+        msg._nack_fn = MagicMock(side_effect=lambda *_a, i=i: released.append(i))
+
+        async def _nack(*_a: Any, i: int = i) -> None:
+            released.append(i)
+
+        msg._nack_async_fn = MagicMock(side_effect=_nack)
+        out.append(msg)
+    return out
+
+
+def _quorum_with(messages: int) -> dict[str, Any]:
+    return {**_quorum(-1), "messages": messages, "messages_ready": messages}
+
+
+class TestQuorumOrder:
+    """Measured on 3.13 and 4.1: a quorum queue puts returned messages at the
+    back, so peeking part of one rotated what it read to the tail."""
+
+    def test_a_quorum_queue_is_read_whole_and_requeued_in_order(self) -> None:
+        released: list[int] = []
+        transport = _Transport(_ordered(6, released))
+        inspector = DLQInspector(transport, management=_management(_quorum_with(6)))
+        peeked = inspector.peek("q", limit=2)
+        assert [m.body for m in peeked] == [b"0", b"1"]
+        assert transport.gets == 7  # all six, then the empty get that proves the end
+        assert released == [0, 1, 2, 3, 4, 5]  # a full rotation: the order is as it was
+
+    def test_a_classic_queue_reads_only_the_limit(self) -> None:
+        transport = _Transport([_msg() for _ in range(6)])
+        info = {"type": "classic", "arguments": {}, "messages": 6}
+        assert len(DLQInspector(transport, management=_management(info)).peek("q", limit=2)) == 2
+        assert transport.gets == 2
+
+    def test_a_quorum_queue_deeper_than_one_scan_is_refused_before_any_read(self) -> None:
+        transport = _Transport([_msg() for _ in range(10)])
+        inspector = DLQInspector(transport, management=_management(_quorum_with(10)), max_quorum_scan=5)
+        with pytest.raises(UnsafeToBrowseError, match="only whole"):
+            inspector.peek("q")
+        assert transport.gets == 0
+
+    def test_a_quorum_queue_that_grows_while_it_is_read_is_refused_and_released(self) -> None:
+        released: list[int] = []
+        transport = _Transport(_ordered(7, released))  # the stats said 3; 7 are there
+        inspector = DLQInspector(transport, management=_management(_quorum_with(3)), max_quorum_scan=5)
+        with pytest.raises(UnsafeToBrowseError, match="holding 6 messages"):
+            inspector.peek("q")
+        assert released == [0, 1, 2, 3, 4, 5]
+
+    def test_a_filtered_replay_with_a_limit_is_refused_on_a_quorum_queue(self) -> None:
+        inspector = DLQInspector(_Transport([_msg()]), management=_management(_quorum_with(1)))
+        with pytest.raises(UnsafeToBrowseError, match="reorders the queue"):
+            inspector.replay("q", predicate=lambda m: True, target_queue="t", limit=5)
+        assert int(inspector.replay("q", predicate=lambda m: True, target_queue="t")) == 1
+
+    async def test_async_reads_whole_and_refuses_a_partial_filtered_replay(self) -> None:
+        released: list[int] = []
+        transport = _AsyncTransport(_ordered(4, released))
+        inspector = DLQInspector(transport, management=_management(_quorum_with(4)))
+        assert [m.body for m in await inspector.peek_async("q", limit=1)] == [b"0"]
+        assert released == [0, 1, 2, 3]
+        with pytest.raises(UnsafeToBrowseError, match="reorders the queue"):
+            await inspector.replay_async("q", predicate=lambda m: True, limit=2)
+        grown = DLQInspector(_AsyncTransport([_msg() for _ in range(3)]),
+                             management=_management(_quorum_with(1)), max_quorum_scan=2)
+        with pytest.raises(UnsafeToBrowseError, match="holding 3 messages"):
+            await grown.peek_async("q")

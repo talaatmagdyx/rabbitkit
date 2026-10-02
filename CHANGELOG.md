@@ -23,6 +23,23 @@ and 4.1.8, and the integration suite now runs against both.
   quorum DLQ (retry DLQs and the safety DLX alike) with
   `x-delivery-limit: -1` on 4.x. On 3.x it adds no argument, because there
   `-1` drops a message on its first return.
+- **Peeking a quorum queue reordered it.** A quorum queue puts every
+  returned message at the *back* (a classic queue puts it back where it
+  was), so a peek of `limit` messages rotated them to the tail. The next
+  peek showed different messages, and the queue's order drifted with every
+  look. A quorum queue the management API vetted is now read whole, up to
+  `DLQInspector(max_quorum_scan=5000)`, and requeued in read order. That's
+  a full rotation, so the order is as it was, and `peek` returns the first
+  `limit`.
+  - One deeper than that raises `UnsafeToBrowseError` before anything is
+    read, and so does one that grows past it while being read.
+  - A *filtered* `replay(..., limit=)` on a quorum queue is refused, since
+    it would requeue the non-matching messages behind the unread rest.
+    Drop the limit so it reads the whole queue.
+  - `rabbitkit dlq inspect --management-url` does the same.
+  - Without a management client, a quorum queue can't be told apart until
+    its messages carry `x-delivery-count`, so the first peek of an unvetted
+    one can still reorder it.
 - **`rabbitkit dlq inspect` showed the head message N times (#31).** Each
   message was requeued before the next `basic_get` on the same channel, so it
   went straight back to the head: `--limit 20` printed the first message 20

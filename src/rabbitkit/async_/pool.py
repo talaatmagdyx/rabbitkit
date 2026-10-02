@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,6 +22,9 @@ from rabbitkit.async_.connection import get_connection_errors, make_aio_pika_con
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 
 logger = logging.getLogger(__name__)
+
+#: Seconds between "Channel pool exhausted" warnings from one pool.
+_EXHAUSTED_WARNING_INTERVAL = 60.0
 
 
 class AsyncChannelPool:
@@ -42,11 +46,14 @@ class AsyncChannelPool:
         publisher_confirms: bool = True,
         on_channel_opened: Callable[[], None] | None = None,
         on_channel_rebuilt: Callable[[], None] | None = None,
+        on_return_raises: bool = False,
     ) -> None:
         self._connection = connection
         self._pool_size = pool_size
         self._acquire_timeout = acquire_timeout
         self._publisher_confirms = publisher_confirms
+        self._on_return_raises = on_return_raises
+        self._exhausted_warned_at = -_EXHAUSTED_WARNING_INTERVAL
         self._pool: asyncio.Queue[Any] = asyncio.Queue(maxsize=pool_size)
         self._lock = asyncio.Lock()
         self._created = 0
@@ -111,7 +118,7 @@ class AsyncChannelPool:
                 # turns the hang into a raise so ``acquire_publisher_channel``
                 # can rebuild the connection.
                 async with asyncio.timeout(self._acquire_timeout):
-                    channel = await self._connection.channel(publisher_confirms=self._publisher_confirms)
+                    channel = await self._connection.channel(**self._channel_kwargs())
             except BaseException:
                 # creation failed (or timed out) — give the reserved slot back.
                 async with self._lock:
@@ -128,7 +135,15 @@ class AsyncChannelPool:
         # Pool exhausted — wait with timeout to avoid deadlocks. R-timeout:
         # ``asyncio.timeout`` (3.11+) replaces ``asyncio.wait_for`` to avoid
         # the wrapper-task overhead.
-        logger.warning(
+        # Once a minute at WARNING, then DEBUG: under a burst every waiting
+        # publish lands here (2000 concurrent mandatory publishes logged 11874
+        # warnings), and a wait that runs out still raises TimeoutError below.
+        now = time.monotonic()
+        log = logger.debug
+        if now - self._exhausted_warned_at >= _EXHAUSTED_WARNING_INTERVAL:
+            self._exhausted_warned_at = now
+            log = logger.warning
+        log(
             "Channel pool exhausted (pool_size=%d, created=%d). "
             "Waiting up to %.1fs for a channel to be released. "
             "Consider increasing PoolConfig.channel_pool_size.",
@@ -151,6 +166,12 @@ class AsyncChannelPool:
         async with self._lock:
             self._in_use.add(channel)
         return channel
+
+    def _channel_kwargs(self) -> dict[str, bool]:
+        kwargs = {"publisher_confirms": self._publisher_confirms}
+        if self._on_return_raises:
+            kwargs["on_return_raises"] = True
+        return kwargs
 
     async def release(self, channel: Any) -> None:
         """Release a channel back to the pool."""
@@ -265,6 +286,9 @@ class AsyncConnectionPool:
         self._publisher_connection: Any | None = None
         self._consumer_connection: Any | None = None
         self._publisher_channel_pool: AsyncChannelPool | None = None
+        # mandatory=True publishes: confirmed channels that raise on Basic.Return,
+        # one publish per channel at a time — see acquire_mandatory_channel()
+        self._mandatory_channel_pool: AsyncChannelPool | None = None
         self._lock = asyncio.Lock()
         self._prewarmed = False
 
@@ -378,10 +402,12 @@ class AsyncConnectionPool:
             if self._publisher_connection is not stale:
                 return  # another worker already rebuilt it
             old_pool, self._publisher_channel_pool = self._publisher_channel_pool, None
+            old_mandatory, self._mandatory_channel_pool = self._mandatory_channel_pool, None
             old_conn, self._publisher_connection = self._publisher_connection, None
-            if old_pool is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(old_pool.close_all(), timeout=timeout)
+            for stale_pool in (old_pool, old_mandatory):
+                if stale_pool is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(stale_pool.close_all(), timeout=timeout)
             if old_conn is not None and not old_conn.is_closed:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(old_conn.close(), timeout=timeout)
@@ -398,12 +424,57 @@ class AsyncConnectionPool:
         if self._publisher_channel_pool is not None:
             await self._publisher_channel_pool.release(channel)
 
+    def _mandatory_pool(self) -> AsyncChannelPool:
+        if self._mandatory_channel_pool is None:
+            assert self._publisher_connection is not None
+            self._mandatory_channel_pool = AsyncChannelPool(
+                self._publisher_connection,
+                pool_size=self._pool_config.channel_pool_size,
+                acquire_timeout=self._pool_config.channel_acquire_timeout,
+                publisher_confirms=True,
+                on_return_raises=True,
+                on_channel_opened=self._on_channel_opened,
+                on_channel_rebuilt=self._on_channel_rebuilt,
+            )
+        return self._mandatory_channel_pool
+
+    async def acquire_mandatory_channel(self) -> Any:
+        """A channel for one ``mandatory=True`` publish: confirms on, and
+        ``on_return_raises=True`` so an unroutable return raises.
+
+        One publish per channel at a time, like the confirmed pool. A publish
+        the broker refuses (403, 404, 406: an unknown exchange, a forged
+        ``user_id``) closes its channel, and every operation still in flight
+        on that channel fails with it. One shared mandatory channel therefore
+        let one refused publish fail every concurrent innocent one. Closed
+        channels are discarded on release. Self-heals a wedged connection the
+        same way :meth:`acquire_publisher_channel` does.
+        """
+        if self._publisher_connection is None:
+            await self.get_publisher_connection()
+        try:
+            return await self._mandatory_pool().acquire()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Mandatory channel acquire failed (%s); rebuilding connection", exc)
+            await self._rebuild_publisher_connection(stale=self._publisher_connection)
+            return await self._mandatory_pool().acquire()
+
+    async def release_mandatory_channel(self, channel: Any) -> None:
+        """Return a mandatory-publish channel to its pool (a closed one is discarded)."""
+        if self._mandatory_channel_pool is not None:
+            await self._mandatory_channel_pool.release(channel)
+
     async def close_all(self) -> None:
         """Close all channel pools and connections."""
         async with self._lock:
             if self._publisher_channel_pool is not None:
                 await self._publisher_channel_pool.close_all()
                 self._publisher_channel_pool = None
+            if self._mandatory_channel_pool is not None:
+                await self._mandatory_channel_pool.close_all()
+                self._mandatory_channel_pool = None
 
             for conn in [self._publisher_connection, self._consumer_connection]:
                 if conn is not None:

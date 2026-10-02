@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **One refused `mandatory=True` publish failed every concurrent one.** All
+  async mandatory publishes shared one persistent channel. A publish the
+  broker refuses closes its channel, and every operation still in flight on
+  that channel fails with it. That covers a `user_id` that isn't the
+  connection's user, an unknown exchange, or a missing permission. So one bad
+  publish turned every concurrent innocent publish into `ERROR`: 5 of 5 runs
+  against 4.1.8.
+  - Mandatory publishes now take a channel of their own from a pool
+    (`AsyncConnectionPool.acquire_mandatory_channel`), like confirmed
+    publishes already do. The channels are always confirmed and opened with
+    `on_return_raises=True`.
+  - A refused publish fails alone, and its closed channel is discarded.
+  - Confirms now complete on several channels in parallel, so throughput rose
+    rather than fell. 2000 concurrent mandatory publishes to a local 4.1
+    broker: 5.6k → 10.5k msg/s at the default `channel_pool_size=10`, and
+    7.0k → 12.5k at 32.
+  - Concurrency is now bounded by `channel_pool_size`, as for confirmed
+    publishes; raise it for more in flight.
+  - The shared channel's ref-counted timeout recycling is gone. A timed-out
+    publish closes its own channel.
+- **"Channel pool exhausted" is logged once a minute per pool, then at
+  DEBUG.** Every publish waiting for a channel logged it at WARNING: 2000
+  concurrent publishes produced 11 874 identical lines. A wait that runs out
+  still raises `TimeoutError`.
+
 ## [0.19.0] — 2026-10-02
 
 Fixes all eleven issues from the review of 0.18.0 (#31-#41). The theme:

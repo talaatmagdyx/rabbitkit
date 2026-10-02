@@ -52,11 +52,34 @@ def get_connection_errors() -> tuple[type[BaseException], ...]:
         return base_errors
 
 
+class _PinnedHostnameSSLContext(ssl.SSLContext):
+    """An SSLContext that verifies the peer against a fixed hostname.
+
+    aiormq opens the TLS socket with ``server_hostname=url.host`` and aio-pika
+    drops any ``server_hostname`` kwarg, so ``SSLConfig.server_hostname`` (for
+    connecting by IP or through a load balancer) can only be applied here:
+    asyncio hands the hostname to ``wrap_bio``, which substitutes this one.
+    """
+
+    pinned_hostname: str = ""
+
+    def wrap_bio(
+        self,
+        incoming: ssl.MemoryBIO,
+        outgoing: ssl.MemoryBIO,
+        server_side: bool = False,
+        server_hostname: str | bytes | None = None,
+        session: ssl.SSLSession | None = None,
+    ) -> ssl.SSLObject:
+        return super().wrap_bio(incoming, outgoing, server_side, self.pinned_hostname, session)
+
+
 def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
     """Build stdlib ssl.SSLContext from SSLConfig.
 
-    Returns None if SSL is not enabled.
-    Shared with sync/connection.py — same logic.
+    Returns None if SSL is not enabled. Mirrors sync/connection.py, except
+    that ``server_hostname`` is applied by the context itself (pika takes it
+    through ``SSLOptions``; aio-pika has no equivalent).
     """
     if not ssl_config.enabled:
         return None
@@ -81,7 +104,11 @@ def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:
             stacklevel=2,
         )
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if ssl_config.server_hostname:
+        ctx: ssl.SSLContext = _PinnedHostnameSSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.pinned_hostname = ssl_config.server_hostname  # type: ignore[attr-defined]
+    else:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     # Defense in depth: never negotiate below TLS 1.2.
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -164,7 +191,13 @@ def make_aio_pika_connect_kwargs(
     # M9: allow the caller (pool) to target a specific cluster node.
     host = host_override if host_override is not None else connection.host
     port = port_override if port_override is not None else connection.port
-    base_url = f"amqp://{user}:{pwd}@{host}:{port}/{vhost}"
+    # TLS is chosen by the URL SCHEME: aiormq uses its TLS transport only for
+    # "amqps" and otherwise ignores ssl_context. With "amqp" here, an
+    # SSLConfig(enabled=True) connection spoke plaintext AMQP: it failed
+    # against a TLS port and, against a plain port, connected UNENCRYPTED.
+    ssl_context = build_ssl_context(security.ssl)
+    scheme = "amqps" if ssl_context is not None else "amqp"
+    base_url = f"{scheme}://{user}:{pwd}@{host}:{port}/{vhost}"
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}heartbeat={connection.heartbeat}"
 
@@ -188,19 +221,18 @@ def make_aio_pika_connect_kwargs(
     }
 
     # SSL
-    ssl_context = build_ssl_context(security.ssl)
     if ssl_context is not None:
-        kwargs["ssl_context"] = ssl_context
+        kwargs["ssl_context"] = ssl_context  # carries SSLConfig.server_hostname, if set
 
     # Client properties (item 8): rabbitkit always identifies itself;
     # connection_name and any caller-supplied escape-hatch properties
     # (ConnectionConfig.client_properties) are additive on top. aiormq merges
-    # this dict INTO its own base properties (product/platform/capabilities/
-    # version) at connect time rather than replacing them wholesale — see
-    # aiormq.connection.Connection._client_properties — so these never
-    # clobber aiormq's own identification or capability flags. Key names
-    # avoid "product"/"version"/"platform"/"capabilities"/"information" for
-    # that reason.
+    # this dict into its own base properties with a SHALLOW update (see
+    # aiormq.connection.Connection._client_properties), so a same-named key
+    # replaces aiormq's: rabbitkit's names avoid "product"/"version"/
+    # "platform"/"capabilities"/"information", and ConnectionConfig rejects a
+    # user "capabilities". Note aio-pika 9 drops client_properties when given
+    # a URL, so these reach the broker only on aio-pika 10+.
     client_properties: dict[str, str] = {
         "library": "rabbitkit",
         "library_version": __version__,

@@ -308,6 +308,51 @@ class TestMakeAioPikaConnectKwargs:
 
         assert "ssl_context" in kwargs
         assert isinstance(kwargs["ssl_context"], ssl.SSLContext)
+        # TLS is chosen by the scheme: with "amqp" aiormq ignores ssl_context
+        # and connects in plaintext (silently unencrypted on a plain port).
+        assert kwargs["url"].startswith("amqps://")
+
+    def test_without_ssl_uses_plain_scheme(self) -> None:
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        kwargs = make_aio_pika_connect_kwargs(ConnectionConfig(), SecurityConfig())
+        assert kwargs["url"].startswith("amqp://") and "ssl_context" not in kwargs
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_aiormq_picks_the_matching_transport(self, enabled: bool) -> None:
+        """Contract with the real aiormq: the URL rabbitkit builds selects the
+        TLS transport exactly when TLS is enabled, and our context is used."""
+        import aiormq
+        from aiormq.connection import TCPTransportFactory, TLSTransportFactory
+
+        from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
+
+        sec = SecurityConfig(ssl=SSLConfig(enabled=enabled, cert_reqs="CERT_REQUIRED"))
+        kwargs = make_aio_pika_connect_kwargs(ConnectionConfig(), sec)
+        conn = aiormq.Connection(kwargs["url"], context=kwargs.get("ssl_context"))
+        factory = TLSTransportFactory if enabled else TCPTransportFactory
+        assert isinstance(conn._transport_factory, factory)
+        if enabled:
+            assert conn.ssl_context is kwargs["ssl_context"]
+
+    def test_server_hostname_is_pinned_in_the_context(self) -> None:
+        """aio-pika drops a server_hostname kwarg and aiormq verifies against
+        the URL host, so the context itself substitutes the configured name."""
+        from rabbitkit.async_.connection import _PinnedHostnameSSLContext, build_ssl_context
+
+        ctx = build_ssl_context(SSLConfig(enabled=True, server_hostname="rabbit.internal"))
+        assert isinstance(ctx, _PinnedHostnameSSLContext)
+        sslobj = ctx.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="10.0.0.5")
+        assert sslobj.server_hostname == "rabbit.internal"
+        assert ctx.check_hostname and ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+
+    def test_no_server_hostname_uses_a_plain_context(self) -> None:
+        from rabbitkit.async_.connection import _PinnedHostnameSSLContext, build_ssl_context
+
+        ctx = build_ssl_context(SSLConfig(enabled=True))
+        assert ctx is not None and not isinstance(ctx, _PinnedHostnameSSLContext)
+        assert ctx.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="h").server_hostname == "h"
 
     def test_without_ssl(self) -> None:
         try:

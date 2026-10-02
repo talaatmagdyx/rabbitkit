@@ -155,11 +155,11 @@ def make_pika_connection_params(
     # Client properties (item 8): rabbitkit always identifies itself;
     # connection_name and any caller-supplied escape-hatch properties
     # (ConnectionConfig.client_properties) are additive on top. pika merges
-    # this dict INTO its own base properties (product/platform/capabilities/
-    # version) at connect time rather than replacing them wholesale — see
-    # pika.connection.Connection._client_properties — so these never clobber
-    # pika's own identification or capability flags. Key names avoid "product"
-    # /"version"/"platform"/"capabilities"/"information" for that reason.
+    # this dict into its own base properties with a SHALLOW update (see
+    # pika.connection.Connection._client_properties), so a same-named key
+    # replaces pika's: rabbitkit's names avoid "product"/"version"/"platform"/
+    # "capabilities"/"information", and ConnectionConfig rejects a user
+    # "capabilities".
     client_properties: dict[str, str] = {
         "library": "rabbitkit",
         "library_version": __version__,

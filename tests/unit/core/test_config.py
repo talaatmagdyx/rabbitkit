@@ -219,6 +219,17 @@ class TestClientProperties:
         with pytest.raises(ValueError, match="must be strings"):
             ConnectionConfig(client_properties={"pod_name": 123})  # type: ignore[dict-item]
 
+    def test_capabilities_key_rejected(self) -> None:
+        """pika and aiormq merge with a shallow update: this key would replace
+        their capability table and silence connection.blocked (aio-pika 10
+        is the first aio-pika that actually sends client_properties)."""
+        with pytest.raises(ValueError, match="capabilities"):
+            ConnectionConfig(client_properties={"capabilities": "x"})
+
+    @pytest.mark.parametrize("key", ["product", "version", "platform", "information"])
+    def test_identification_keys_still_allowed(self, key: str) -> None:
+        assert ConnectionConfig(client_properties={key: "x"}).client_properties == {key: "x"}
+
     def test_non_string_key_rejected(self) -> None:
         with pytest.raises(ValueError, match="must be strings"):
             ConnectionConfig(client_properties={42: "x"})  # type: ignore[dict-item]

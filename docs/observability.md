@@ -186,18 +186,22 @@ all.** This is a deliberate removal, not an oversight. Use
 `rabbitkit_channel_rebuilds_total` as the async reconnect signal; the broker
 logs a line saying so at startup.
 
-The counter is driven by `transport.on_reconnect`, which on async depends on
-aio-pika reporting a reconnect. Verified against a live broker on aio-pika
-9.6, it does not: when the **broker** closes the connection, aio-pika recovers
-underneath the *same* `RobustConnection` object without re-running its counted
-connect path. `connection_attempt` never advances, and
-`reconnect_callbacks`, `close_callbacks` and the channel callbacks all stay
-silent — even though consumers are restored and traffic resumes.
+The counter is driven by `transport.on_reconnect`. The 0.14 removal rested
+on a measurement that said aio-pika 9.6 never fires `reconnect_callbacks` when
+the **broker** closes the connection. **That measurement was wrong.**
+Re-measured in 0.19.2 against RabbitMQ 3.13 with `rabbitmqctl
+close_all_connections`, on aio-pika 9.6.2 and 10.1.0 alike:
 
-That is the common case, so the series would have read a permanent `0` while
-connections really were flapping. A panel pinned at zero and an alert that can
-never fire are worse than no series at all: both read as "healthy". Removing
-it makes the gap visible instead of silent.
+- the callbacks fire, once per AMQP connection (publisher and consumer: two
+  per outage);
+- they fire *after* aio-pika has restored the consumers, so a restored
+  channel can already be delivering when they run (on 10.1 the first
+  restored delivery landed before the second callback).
+
+The second point is why `CoalescingAckerGroup.reset()` now keeps live
+channels' ledgers (see [bulk operations](bulk-operations.md)). The counter
+itself is still not wired on async; re-adding it (it would count
+connections, two per outage) is a separate change.
 
 What is unaffected:
 
@@ -206,8 +210,9 @@ What is unaffected:
 - The async pool still attaches `reconnect_callbacks` and a
   blocked-connection monitor to *every* connection it creates, and a
   connection created after `connect()` finished still counts as a reconnect
-  for any hook you register yourself via `transport.on_reconnect`. Only the
-  built-in metric wiring is gone.
+  for any hook you register yourself via `transport.on_reconnect`. A
+  broker-closed connection fires it too, once per connection, after the
+  consumers are restored. Only the built-in metric wiring is gone.
 - `transport.is_connected()` follows aio-pika's `connected` event, so it is
   False while a `RobustConnection` reconnects (before 0.19 it read
   `is_closed`, which stays False during a reconnect, and a readiness probe

@@ -1194,23 +1194,17 @@ class AsyncBroker:
         """Wire the channel-churn counters via the first route
         ``MetricsMiddleware``'s collector, if any. No-op without metrics.
 
-        Deliberately does NOT wire ``reconnects_total``, unlike the sync
-        broker. It is driven by ``on_reconnect``, which on async depends on
-        aio-pika telling us a reconnect happened — and 9.6 does not: when the
-        BROKER closes the connection it recovers underneath the same
-        ``RobustConnection`` object without firing ``reconnect_callbacks``,
-        ``close_callbacks`` or advancing ``connection_attempt`` (verified
-        against a live broker). Registering the counter anyway would publish a
-        series that is permanently 0 while connections really are flapping,
-        which is worse than no series at all: a dashboard panel and an alert
-        would both look healthy. ``channel_rebuilds_total`` IS driven by
-        rabbitkit's own observations and is the churn signal to use on async —
+        Does NOT wire ``reconnects_total``, unlike the sync broker. 0.14
+        removed it on a measurement that said aio-pika never fires
+        ``reconnect_callbacks`` for a broker-closed connection; re-measured in
+        0.19.2 (aio-pika 9.6.2 and 10.1.0), it does, once per connection and
+        after the consumers are restored. Re-adding the counter is a separate
+        change; ``channel_rebuilds_total`` remains the async churn signal —
         see ``docs/observability.md``.
 
-        ``on_reconnect`` itself still works and still fires whenever rabbitkit
-        REPLACES a connection (a rebuilt publisher connection, a lazy
-        re-create), so wiring your own callback to it remains useful; it is
-        only unsuitable as the sole basis for a churn metric.
+        ``on_reconnect`` fires for a broker-closed connection and whenever
+        rabbitkit REPLACES a connection (a rebuilt publisher connection, a
+        lazy re-create).
         """
         if self._transport is None:
             return

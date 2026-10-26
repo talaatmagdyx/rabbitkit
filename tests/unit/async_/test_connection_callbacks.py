@@ -10,12 +10,10 @@ stopped running.
 The pool now fires `on_connection_created` for EVERY connection it makes, and
 a connection created after `connect()` finished is treated as a reconnect.
 
-Known limitation, verified against a live broker and documented in
-`docs/observability.md`: when the BROKER closes the connection, aio-pika
-9.6 recovers underneath the same `RobustConnection` object without re-running
-its counted connect path (`connection_attempt` stays put), so it never fires
-`reconnect_callbacks` and rabbitkit never creates a replacement connection.
-That case is invisible to `on_reconnect` regardless of this wiring.
+A broker-closed connection is recovered by aio-pika under the same
+`RobustConnection` object, and it DOES fire `reconnect_callbacks` (once per
+connection, after the consumers are restored; re-measured in 0.19.2 on
+aio-pika 9.6.2 and 10.1.0, contradicting an earlier note here).
 """
 
 from __future__ import annotations

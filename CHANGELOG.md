@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.19.2] — 2026-10-02
 
+### Fixed
+
+- **`CoalescingAckerGroup.reset()` could strand deliveries forever.** The
+  recommended wiring is `transport.on_reconnect(lambda: group.reset())`. That
+  hook fires once per AMQP connection (publisher and consumer), *after*
+  aio-pika has restored the consumers, so a restored channel can already be
+  delivering when it runs. Measured on aio-pika 10.1, the first restored
+  delivery landed before the second callback. `reset()` dropped every
+  ledger, including that live channel's, so the handler's `complete()` found
+  no ledger, nothing was acked, and the broker never redelivered because the
+  channel stayed open. CI caught it as a 180 s stall in
+  `test_connection_loss_never_acks_unfinished_work`. `reset()` now drops only
+  the ledgers of closed channels (aiormq `is_closed`, pika `is_open`); a live
+  channel's ledger is valid and is kept. Keys with no liveness signal are
+  dropped as before.
+- The docs said aio-pika never fires `reconnect_callbacks` for a
+  broker-closed connection. Re-measured on 9.6.2 and 10.1.0, it does, once
+  per connection; `docs/observability.md` and the docstrings are corrected.
+
 ### Security
 
 - **Async TLS was never used.** The async transport always built an

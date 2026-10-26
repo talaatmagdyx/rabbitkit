@@ -230,7 +230,7 @@ async def handle(body: bytes, msg: RabbitMessage) -> None:
 | `group.register/complete/fail/retry_pending/release(ch, tag)` | Routed to that channel's ledger, channel-checked |
 | `group.flush()` | Fans out; returns a `GroupFlushReport` aggregating every channel |
 | `group.on_reconnect(ch)` | One channel rebuilt: drop its ledger, retire its acker, return the dropped tags |
-| `group.reset()` | Whole connection rebuilt: drop every ledger |
+| `group.reset()` | Connection rebuilt: drop the ledgers of closed channels; live (restored) channels keep theirs, so it is safe on the `on_reconnect` hook |
 | `group.close()` | Drain approved work on every channel, then reject further use |
 
 Channels are dict keys (pika and aio-pika channels are identity-hashable) and

@@ -403,14 +403,81 @@ async def test_connection_loss_never_acks_unfinished_work(rabbit: dict[str, str]
     assert len(succeeded) > before, "nothing was processed after the kill — recovery never happened"
     assert ledger.violations == [], f"{len(ledger.violations)} unsafe acks, first 3: {ledger.violations[:3]}"
     assert succeeded == {f"m{i}" for i in range(total)}, "a message was lost across the connection kill"
-    # NOTE: `reconnects` is deliberately not asserted. aio-pika 9.6 recovers a
-    # broker-closed connection underneath the same RobustConnection object
-    # without re-running its counted connect path, so it never fires
-    # reconnect_callbacks — see docs/observability.md. Settlement stays safe
-    # regardless: the replacement channels are new objects, so the group
-    # builds fresh ledgers and the stale ones are never consulted again.
+    # NOTE: `reconnects` is deliberately not asserted: how many callbacks fire
+    # (one per connection) is an aio-pika detail. They DO fire for a
+    # broker-closed connection, after the consumers are restored, which is
+    # why reset() keeps live channels' ledgers (see
+    # test_late_reset_never_strands_live_deliveries). The replacement
+    # channels are new objects, so the group builds fresh ledgers for them.
     assert group.channels >= 1
     await _await_drained(rabbit, queue, timeout=120)
+    await broker.stop()
+
+
+async def test_late_reset_never_strands_live_deliveries(rabbit: dict[str, str]) -> None:
+    """The race behind a CI stall, made deterministic.
+
+    The reconnect hook fires after aio-pika has restored the consumers, once
+    per connection, so a ``group.reset()`` wired to it can run while a
+    restored channel already has deliveries in flight (measured: on aio-pika
+    10.1 the first restored delivery landed before the second callback).
+    reset() used to drop that live ledger: ``complete()`` then found no
+    ledger, nothing was acked, and the broker never redelivered because the
+    channel stayed open. The queue never drained.
+    """
+    import json
+
+    from rabbitkit.async_.broker import AsyncBroker
+    from rabbitkit.core.config import ConsumerConfig, WorkerConfig
+    from rabbitkit.core.types import AckPolicy, MessageEnvelope
+    from rabbitkit.highload.batch import CoalescingAckerGroup
+
+    total = 40
+    queue = f"chaos-late-reset-{uuid.uuid4().hex[:8]}"
+    broker = AsyncBroker(config=_config(rabbit["url"], consumer=ConsumerConfig(prefetch_count=total)))
+    loop = asyncio.get_running_loop()
+    ledger = Ledger()
+    group = CoalescingAckerGroup(factory=lambda ch: _make_acker(ch, ledger, loop))
+    release = asyncio.Event()
+    registered: set[str] = set()
+    all_registered = asyncio.Event()
+    lost: list[str] = []
+
+    @broker.subscriber(queue=queue, ack_policy=AckPolicy.MANUAL)
+    async def handle(body: bytes, msg: _RabbitMessage) -> None:
+        channel = msg.raw_message.channel
+        message_id = json.loads(body)["id"]
+        group.register(channel, msg.delivery_tag)
+        ledger.seen[msg.delivery_tag] = message_id
+        registered.add(message_id)
+        if len(registered) >= total:
+            all_registered.set()
+        await release.wait()  # in flight on a LIVE channel when reset() runs
+        ledger.done[msg.delivery_tag] = message_id
+        try:
+            group.complete(channel, msg.delivery_tag)
+        except CoordinatorError:
+            lost.append(message_id)  # the old reset(): stranded, never acked
+
+    await broker.start(worker_config=WorkerConfig(worker_count=total))
+    await await_consumers(rabbit["url"], broker)
+    envelopes = [
+        MessageEnvelope(routing_key=queue, body=json.dumps({"id": f"m{i}"}).encode(), message_id=f"m{i}")
+        for i in range(total)
+    ]
+    (await broker.publish_many(envelopes)).raise_for_status()
+    await asyncio.wait_for(all_registered.wait(), timeout=30)
+
+    # The late reconnect callback(s): publisher AND consumer connection.
+    assert group.reset() == 0
+    assert group.reset() == 0
+    release.set()
+
+    await _await_settled(ledger, total)
+    group.flush()
+    await _await_drained(rabbit, queue, timeout=30)
+    assert lost == []
+    assert ledger.violations == []
     await broker.stop()
 
 

@@ -17,3 +17,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # init and analyze must share one version or the CodeQL job fails.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

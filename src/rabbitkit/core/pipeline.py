@@ -1387,6 +1387,10 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         if message.is_settled:
+            # [retry hook] RetryMiddleware already published a confirmed,
+            # metadata-stamped DLQ copy and acked the source: nothing to do.
+            if getattr(exc, "_rabbitkit_dead_lettered", False):
+                return
             # Already settled (e.g., MANUAL mode handler settled then raised)
             logger.warning("Exception after settlement: %s", exc)
             return
@@ -1443,6 +1447,9 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         if message.is_settled:
+            # [retry hook] see _handle_sync_exception_inner.
+            if getattr(exc, "_rabbitkit_dead_lettered", False):
+                return
             logger.warning("Exception after settlement: %s", exc)
             return
 

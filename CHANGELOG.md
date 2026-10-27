@@ -7,8 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Terminal failures are dead-lettered by `RetryMiddleware` itself, with
+  metadata** (`RetryConfig.terminal_action`, default `"dead_letter"`). A
+  permanent, exhausted or too-old failure is published (mandatory,
+  confirm-gated) to `<queue>.dlq` with the CURRENT attempt's metadata, and
+  only then is the source acked. Previously the pipeline rejected it and the
+  broker's DLX moved it: a first-attempt permanent failure reached the DLQ
+  with nothing but `x-death`, and after retries the error headers described
+  the previous attempt. The DLQ copy now carries `x-rabbitkit-error-class`
+  (plus the existing `-error-type`/`-error-category`/sanitized
+  `-error-message`), `x-rabbitkit-failure-category`
+  (`permanent`/`exhausted`/`retry-age-exceeded`), `x-rabbitkit-attempts`,
+  `x-rabbitkit-first-failed-at`, `-last-failed-at`, `-dead-lettered-at`,
+  `x-rabbitkit-original-queue`/`-exchange`/`-routing-key`,
+  `x-rabbitkit-original-message-id`, and the original `correlation_id`,
+  `timestamp` and other properties. If the DLQ publish is returned, nacked
+  or times out, the middleware falls back to the legacy reject, so nothing
+  is lost. **Observable change:** the source delivery's disposition on this
+  path is `acked` (it was `rejected`); `TestBroker` tests asserting
+  `assert_rejected` after a terminal failure should assert the DLQ publish
+  instead, or set `terminal_action="reject"` for the old behaviour. With
+  `ExceptionMiddleware(swallow_permanent=True)` the DLQ copy is still
+  written. The pipeline gained a one-line hook: an exception tagged
+  `_rabbitkit_dead_lettered` after settlement is not logged as
+  "Exception after settlement".
+- **Retry copies keep the message's identity and properties.** The AMQP
+  `timestamp` (dropped before) and `delivery_mode` are preserved;
+  `expiration` is still not copied onto a delay-queue copy (it would expire
+  inside the delay queue) and is recorded as
+  `x-rabbitkit-original-expiration`. A message published without a
+  `message_id` gets one id on its first handoff (recorded as
+  `x-rabbitkit-original-message-id`) and keeps it on every retry and on the
+  DLQ copy; before, the client library stamped a new random id on every
+  republish.
+- **Attempt count is harder to reset.** The retry count is the larger of
+  `x-rabbitkit-retry-count` and the broker's `x-death` history for this
+  queue's `<queue>.retry.<n>` tiers, and rabbitkit never lowers the count,
+  `x-rabbitkit-attempts` or `x-rabbitkit-first-failed-at` on its own
+  republish. Trust model (documented on `RetryConfig`): these headers are
+  client-controlled; a producer that strips all of them restarts the
+  budget, which `max_retry_age` and a quorum `x-delivery-limit` bound.
+
+### Added
+
+- `RetryConfig.max_retry_age` (seconds since the first failure; exceeded →
+  terminal, category `retry-age-exceeded`), `RetryConfig.terminal_action`
+  (`TerminalAction.DEAD_LETTER` / `REJECT`), and
+  `RetryConfig.exponential(max_retries=, initial_delay=, multiplier=,
+  max_delay=, **kwargs)` which builds `delays` as a capped exponential.
+  New enums `TerminalAction` and `FailureCategory` in `rabbitkit.core.types`.
+
+### Deprecated
+
+- `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
+  `<queue>.dlq` via the default exchange); a non-empty value now emits a
+  `DeprecationWarning`. `jitter_factor` is documented as effective only with
+  `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
+  classic queue only expires its head message (head-of-line blocking).
+
 ### Fixed
 
+- **`RetryMiddleware` retried handler settlement signals.** With
+  `unknown_policy=TRANSIENT` (or a predicate returning `True`), a handler
+  raising `AckMessage()` ran `max_retries + 1` times, and `RejectMessage()`
+  ran every retry before landing on the DLQ. `AckMessage` / `NackMessage` /
+  `RejectMessage` now pass straight through to the pipeline regardless of
+  classifier, predicates or policy.
+- **Retry-handoff failures no longer hot-loop.** When the delay-queue publish
+  failed (queue deleted, broker alarm), the async path nacked first and slept
+  afterwards, so the redelivery ran in parallel: 9,325 handler executions in
+  10 s against a deleted delay queue. The backoff now runs while the delivery
+  is still held (bounded by `backoff_max`, cancellable, the nack is in a
+  `finally`), and once the tracker is `EXHAUSTED` every failing delivery is
+  held for the full `backoff_max` (consumption of the queue is effectively
+  paused at `prefetch` messages per `backoff_max`) with one CRITICAL log per
+  outage. The sync path still never sleeps on the I/O thread.
+- **The "Terminal failure" log printed raw exception text** (e.g.
+  `password=hunter2`) while the headers were sanitized. It now uses the same
+  `ErrorSanitizer`.
 - **`RetryHandoffTracker` crashed after ~1,025 consecutive handoff
   failures.** The backoff was `initial * 2 ** (n - 1)` with an uncapped
   exponent, so a long outage of the delay queue raised

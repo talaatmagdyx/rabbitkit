@@ -47,16 +47,10 @@ async def test_transient_routes_to_delay_queue(make_broker: Callable[..., TestBr
 async def test_exhausted_transient_goes_to_dlq(
     make_broker: Callable[..., TestBroker], reject_spy: list[bool]
 ) -> None:
-    """At the retry ceiling, RetryMiddleware marks the failure terminal and the
-    pipeline settles it via reject(requeue=False) -> source-queue DLX -> DLQ
-    (no hot loop).
-
-    Terminal failures from an EXHAUSTED RetryMiddleware are REJECTED, not
-    NACKED -- nack(requeue=False) is what a route with NO RetryMiddleware
-    uses under AckPolicy.NACK_ON_ERROR (see test_orders.py). A RetryMiddleware
-    instead marks the exception ``_rabbitkit_terminal``, which the pipeline
-    routes through reject() specifically, so this path is never confused
-    with the plain-NACK_ON_ERROR path.
+    """At the retry ceiling, RetryMiddleware publishes a confirmed,
+    metadata-stamped copy to ``<queue>.dlq`` and only then acks the source
+    (no hot loop, no requeue). If that DLQ publish failed it would fall back
+    to the pipeline's reject(requeue=False) -> source-queue DLX -> DLQ.
     """
     retry_mw, captured = _capturing_retry()
     broker = make_broker(middlewares=[retry_mw])
@@ -69,9 +63,11 @@ async def test_exhausted_transient_goes_to_dlq(
         headers={"x-rabbitkit-retry-count": str(ORDERS_RETRY.max_retries)},
     )
 
-    assert captured == []  # no further delay-queue publish
-    assert broker.consumed_messages[-1]._disposition == "rejected"
-    assert reject_spy == [False]  # reject(requeue=False) → DLQ, NOT a requeue=True hot loop
+    # no further delay-queue publish: the only publish is the DLQ copy
+    assert [e.routing_key for e in captured] == ["orders.queue.dlq"]
+    assert captured[0].headers["x-rabbitkit-failure-category"] == "exhausted"
+    assert broker.consumed_messages[-1]._disposition == "acked"
+    assert reject_spy == []  # never a requeue=True hot loop
 
 
 def test_http_error_mapping_by_type() -> None:

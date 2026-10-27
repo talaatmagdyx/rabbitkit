@@ -333,6 +333,54 @@ class PreflightStatus(str, Enum):
     FAILED = "failed"
 
 
+class TerminalAction(str, Enum):
+    """What ``RetryMiddleware`` does with a message whose failure is terminal
+    (permanent, retries exhausted, or ``max_retry_age`` exceeded).
+
+    * ``DEAD_LETTER`` (default): publish a copy to ``<queue>.dlq`` carrying
+      the terminal failure metadata (error class, sanitized message,
+      category, attempts, timestamps, original queue/exchange/routing key,
+      message id), wait for the broker confirm, THEN ack the source. If that
+      publish fails, fall back to ``REJECT`` so the message is never lost.
+    * ``REJECT``: legacy behaviour — reject ``requeue=False`` and let the
+      source queue's dead-letter exchange move it. The DLQ copy then carries
+      only the broker's ``x-death`` and the PREVIOUS attempt's headers.
+    """
+
+    DEAD_LETTER = "dead_letter"
+    REJECT = "reject"
+
+
+class FailureCategory(str, Enum):
+    """Failure category stamped on retry/DLQ copies as
+    ``x-rabbitkit-failure-category``.
+
+    ``TRANSIENT`` / ``TIMEOUT_UNKNOWN`` describe a failure that was retried
+    (``TIMEOUT_UNKNOWN``: the handler timed out, so whether its side effects
+    happened is unknown). ``PERMANENT`` / ``EXHAUSTED`` /
+    ``RETRY_AGE_EXCEEDED`` describe why a message went to the DLQ.
+    """
+
+    TRANSIENT = "transient"
+    TIMEOUT_UNKNOWN = "timeout-unknown"
+    PERMANENT = "permanent"
+    EXHAUSTED = "exhausted"
+    RETRY_AGE_EXCEEDED = "retry-age-exceeded"
+
+
+class DeadLetterStrategy(str, Enum):
+    """Quorum-queue ``x-dead-letter-strategy``.
+
+    ``AT_LEAST_ONCE`` keeps a dead-lettered message on the source until the
+    dead-letter target confirms it (requires ``overflow="reject-publish"``;
+    RabbitMQ 3.10+). ``AT_MOST_ONCE`` is the broker default: the message is
+    dropped if the target is missing or full.
+    """
+
+    AT_MOST_ONCE = "at-most-once"
+    AT_LEAST_ONCE = "at-least-once"
+
+
 class HandoffState(str, Enum):
     """Retry-handoff tracker state (see :mod:`rabbitkit.core.retry_handoff`)."""
 

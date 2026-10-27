@@ -80,14 +80,17 @@ from rabbitkit.core.settlement import (
     UnknownDeliveryError,
 )
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
+from rabbitkit.core.topology_validation import TopologyFinding, TopologyReport, verify_topology
 from rabbitkit.core.types import (
     AckPolicy,
     BulkPublishStatus,
     ClassifiedError,
+    DeadLetterStrategy,
     DeduplicationMarkPolicy,
     DeliveryState,
     ErrorSeverity,
     ExchangeType,
+    FailureCategory,
     FlushReason,
     HandoffState,
     MessageEnvelope,
@@ -99,6 +102,7 @@ from rabbitkit.core.types import (
     ReliabilityProfile,
     SettlementAction,
     SettlementItemStatus,
+    TerminalAction,
     TopologyMode,
 )
 from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
@@ -203,6 +207,7 @@ __all__ = [
     "DIResolver",
     "DLQInspector",
     "DataclassDecoder",
+    "DeadLetterStrategy",
     "DeduplicationConfig",
     "DeduplicationMarkPolicy",
     "DeduplicationMiddleware",
@@ -212,6 +217,7 @@ __all__ = [
     "ErrorSanitizer",
     "ErrorSeverity",
     "ExchangeType",
+    "FailureCategory",
     "FlowController",
     "FlushItem",
     "FlushReason",
@@ -288,7 +294,10 @@ __all__ = [
     "SyncBatchPublisher",
     "SyncBroker",
     "SyncWorkerPool",
+    "TerminalAction",
+    "TopologyFinding",
     "TopologyMode",
+    "TopologyReport",
     "TopologyValidationError",
     "UnknownDeliveryError",
     "UnsafeToBrowseError",
@@ -314,4 +323,5 @@ __all__ = [
     "standard_config",
     "start_metrics_server",
     "validate_profile",
+    "verify_topology",
 ]

@@ -910,8 +910,9 @@ class TestMaxRetriesZero:
         with pytest.raises(OSError):
             mw.consume_scope(handler, msg)
 
-        # No delay-queue publish — message was terminal immediately
-        assert published == []
+        # No delay-queue publish — message was terminal immediately; the
+        # only publish is the metadata-stamped DLQ copy.
+        assert [e.routing_key for e in published] == ["orders-queue.dlq"]
         # Exception is marked terminal
         try:
             mw.consume_scope(handler, msg)
@@ -937,7 +938,7 @@ class TestMaxRetriesZero:
         with pytest.raises(OSError):
             await mw.consume_scope_async(handler, msg)
 
-        assert published == []
+        assert [e.routing_key for e in published] == ["orders-queue.dlq"]
 
 
 class TestRetryAsyncPublishFailure:

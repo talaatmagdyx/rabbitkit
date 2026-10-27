@@ -152,12 +152,15 @@ from rabbitkit.core.types import ErrorSeverity
 RETRY = RetryConfig(
     max_retries=4,                       # 4 retry attempts after the first delivery
     delays=(5, 30, 120, 600),            # seconds: 5s → 30s → 2m → 10m
-    jitter_factor=0.1,                   # ±10% applied to each delay
     unknown_policy=ErrorSeverity.PERMANENT,  # unclassified error → DO NOT retry (safe default)
     per_queue=True,                      # each queue gets its own retry/DLQ topology
     retry_header="x-rabbitkit-retry-count",
-    dead_letter_exchange="",             # "" = default exchange → routes by DLQ name
+    max_retry_age=None,                  # optional: seconds since first failure → terminal
+    terminal_action="dead_letter",       # confirmed, metadata-stamped copy to <queue>.dlq, then ack
 )
+# jitter: only with jitter_mode="sharded" (TTL spread across shard queues);
+# jitter_factor alone does nothing — per-message TTL would block the queue head.
+# dead_letter_exchange is deprecated (never used): the DLQ is always <queue>.dlq.
 ```
 
 Total worst-case retained lifetime before DLQ ≈ `5 + 30 + 120 + 600 = 755s` (~12.5 min) plus processing time, before a message is declared dead. Tune `delays` to your SLO (see §23).
@@ -298,7 +301,7 @@ def build_config(env: str) -> RabbitConfig:
 **`TopologyMode` is the most important environment difference:**
 
 - **`AUTO_DECLARE`** (dev/staging): the broker declares exchanges/queues/bindings on start. Fast iteration. **Dangerous in production** — a code change silently mutates broker topology, and two app versions can fight over arguments (declaring a queue with different args than it has = `PRECONDITION_FAILED`, consumer won't start).
-- **`PASSIVE_ONLY`** (production, common): the broker asserts the topology exists (passive declare) but never creates/changes it. Topology is owned by a controlled process (Terraform, a migration job, or platform team). Mismatch = loud failure at startup, not silent drift.
+- **`PASSIVE_ONLY`** (production, common): the broker asserts the topology exists (passive declare) and performs **no writes at all** — no declares, no bindings (before 0.20 it still created missing bindings). Topology is owned by a controlled process (Terraform, a migration job, or platform team). A passive declare proves only existence: a classic queue where code declares quorum, a missing argument or a missing binding is invisible to AMQP. Run `report = await broker.verify_topology(management_client)` before `start()` (read-only management API calls) and `report.raise_for_failures()` to turn drift into a loud startup failure; without a client the brokers log at startup exactly what was not verified.
 - **`MANUAL`** (production, mature platforms): rabbitkit touches no topology at all. Everything is provisioned out-of-band. Maximum control, requires discipline.
 
 > **Why not AUTO_DECLARE in prod?** See §34 and the FMEA (topology drift). The one-line rule: *application code should not have write access to production topology.*
@@ -568,7 +571,7 @@ async def also_bad(event, msg):
 
 ## 9. Retry Header Design
 
-rabbitkit auto-sets: `x-rabbitkit-retry-count`, `x-rabbitkit-original-exchange`, `x-rabbitkit-original-routing-key`, `x-rabbitkit-original-queue`. Everything else below you add yourself (producer or enrichment middleware).
+rabbitkit auto-sets on every retry and DLQ copy: `x-rabbitkit-retry-count`, `x-rabbitkit-attempts`, `x-rabbitkit-original-message-id`, `x-rabbitkit-original-exchange` / `-routing-key` / `-queue`, `x-rabbitkit-first-failed-at` / `-last-failed-at`, `x-rabbitkit-error-class` / `-error-type` / `-error-category` / sanitized `-error-message`, `x-rabbitkit-failure-category`, and on DLQ copies `x-rabbitkit-dead-lettered-at` (see [retry-and-dlq.md](retry-and-dlq.md#metadata-on-every-retry-and-dlq-copy)). `message_id`, `correlation_id`, `timestamp` and all application headers (trace context, idempotency keys) are preserved. The rows below without **auto** are yours to add.
 
 | Header | Purpose | PII risk | Notes |
 |---|---|---|---|
@@ -644,7 +647,7 @@ await inspector.purge_async("orders.queue.dlq")   # ⚠️ irreversible
 **Caveats baked into the library (be honest about them):**
 - `peek` uses `basic_get` + `nack(requeue=true)`, which **can change message order**. Treat peek as sampling, not a stable snapshot. For stable inspection, prefer the management API to read counts and a shadow/quarantine queue for content.
 - On a **quorum** DLQ every requeue counts as a delivery, and past the delivery limit (20 by default on RabbitMQ 4.x) the message is dropped. rabbitkit declares new quorum DLQs unlimited on 4.x, and the inspector refuses a limited one; see [Quorum DLQs and delivery limits](retry-and-dlq.md#quorum-dlqs-and-delivery-limits).
-- `DLQInspector` has **no built-in dry-run, throttling, or batching**. Build controlled replay yourself (§31) — replay-all into a degraded system is how you turn one incident into two.
+- `DLQInspector` has **no built-in dry-run, throttling, or batching**. Build controlled replay yourself (§31) — replay-all into a degraded system is how you turn one incident into two. It does stamp `x-rabbitkit-replay-count` / `-replayed-at` / `-replayed-by`, refuses a message replayed `max_replays` (3) times, and logs start/finish audit records to `rabbitkit.dlq.audit`.
 
 **Replay targets:**
 - **Original queue** — after the root cause is fixed and deployed. The common case.
@@ -705,6 +708,7 @@ dedupe_mw = DeduplicationMiddleware(
     key_fn=lambda m: m.headers.get("x-idempotency-key") or m.message_id,
 )
 ```
+- **When the key is written:** only when the pipeline ACKS the delivery — after the handler returned AND its result (`@publisher` / RPC reply) was published. A failed result publish nack-requeues without a mark, so the redelivery is processed instead of being acked as a duplicate (which lost the result before 0.20). With `mark_policy="claim", store_results=True` a storable result is written at once and a duplicate replays it.
 - **TTL selection:** must exceed the longest possible redelivery window (sum of delays + processing + replay horizon). Too short → a legitimately-delayed retry is treated as new and double-processed. 24h is a safe default for the 12.5-min policy.
 - **`fallback_on_redis_error=True`:** when Redis is unavailable, *process the message* and rely on Layer 2. The alternative (block all processing on Redis) makes Redis a hard dependency for your message pipeline — usually worse. Alert on the fallback (§22).
 - **`body_hash` risks:** two semantically-identical events with different non-meaningful fields (timestamps, ordering of JSON keys) hash differently → dedupe misses. And a retried message with enriched headers but identical body hashes the same → fine. Prefer an explicit key over body hashing.

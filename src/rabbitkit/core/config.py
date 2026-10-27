@@ -10,11 +10,12 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from rabbitkit.core.errors import ConfigValidationError
 from rabbitkit.core.logging import LoggingConfig
-from rabbitkit.core.types import ErrorSeverity, TopologyMode
+from rabbitkit.core.types import ErrorSeverity, TerminalAction, TopologyMode
 
 # ── Connection ─────────────────────────────────────────────────────────────
 
@@ -524,16 +525,40 @@ class RetryConfig:
       ``"sanitized"`` (default: redacted + capped), ``"omit"``, or ``"raw"``
       (legacy). See :mod:`rabbitkit.core.sanitizer`.
     * ``handoff``: bounded behavior when the retry publish itself fails.
+
+    Retry policy:
+
+    * ``max_retries`` / ``delays`` — the ladder (delays in whole seconds,
+      one fixed-TTL delay queue per tier). :meth:`exponential` builds
+      ``delays`` from ``initial_delay`` / ``multiplier`` / ``max_delay``.
+    * ``max_retry_age`` (seconds, ``None`` = unbounded) — a transient
+      failure more than this long after the message's FIRST failure
+      (``x-rabbitkit-first-failed-at``) is terminal (category
+      ``retry-age-exceeded``) even with retries left.
+    * ``terminal_action`` — :class:`~rabbitkit.core.types.TerminalAction`:
+      ``"dead_letter"`` (default) publishes a confirmed, metadata-stamped
+      copy to ``<queue>.dlq`` before acking; ``"reject"`` is the legacy
+      broker dead-letter path.
+    * Jitter: ``jitter_factor`` only takes effect with
+      ``jitter_mode="sharded"``. Per-message TTL jitter is deliberately not
+      offered: a classic queue expires messages only at its head, so a
+      message with a long TTL blocks every shorter one behind it.
+
+    Trust model: the retry count, first-failure timestamp and original-*
+    headers travel on the message and are client-controlled. rabbitkit
+    never lowers them on its own republish, takes the larger of the header
+    count and the broker's ``x-death`` history for this queue's delay
+    tiers, and clamps to ``max_retries``; a producer that strips every
+    header restarts the budget — ``max_retry_age`` and a quorum source's
+    ``x-delivery-limit`` bound that case.
     """
 
     max_retries: int = 4
     delays: tuple[int, ...] = (5, 30, 120, 600)
     retry_header: str = "x-rabbitkit-retry-count"
-    # RESERVED / no-op (M2): queue-based retry uses a fixed per-queue
-    # x-message-ttl, so jitter would require per-message TTL — which
-    # reintroduces head-of-line blocking on classic queues. Kept for API
-    # stability; does not affect delay timing. Spread retries across a fleet
-    # via the per-process reconnect jitter, not this.
+    # Only used with jitter_mode="sharded" (TTL spread across shard queues).
+    # With jitter_mode="off" it has no effect: per-message TTL jitter would
+    # reintroduce head-of-line blocking on classic delay queues.
     jitter_factor: float = 0.1
     # F4: "off" (default — single delay queue per tier, exact legacy topology)
     # or "sharded" — each tier becomes jitter_shards sub-queues with uniform
@@ -544,6 +569,8 @@ class RetryConfig:
     # enabling this on an existing topology is additive (no 406s).
     jitter_mode: str = "off"
     jitter_shards: int = 3
+    # DEPRECATED, never used: the DLQ is always "<queue>.dlq" reached via the
+    # default exchange. A non-empty value warns.
     dead_letter_exchange: str = ""
     per_queue: bool = True
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT
@@ -552,10 +579,53 @@ class RetryConfig:
     dlq_queue_type: str = "inherit"
     error_detail: str = "sanitized"
     handoff: RetryHandoffConfig = field(default_factory=RetryHandoffConfig)
+    max_retry_age: float | None = None
+    terminal_action: TerminalAction = TerminalAction.DEAD_LETTER
+    # Quorum options for the retry chain (applied only to the delay queues /
+    # DLQ that resolve to quorum). None = broker defaults = legacy topology.
+    quorum_initial_group_size: int | None = None
+    # x-dead-letter-strategy for QUORUM delay queues: "at-least-once" keeps an
+    # expired message on the delay queue until the source queue confirms it
+    # (also sets x-overflow=reject-publish on them, which RabbitMQ requires).
+    delay_queue_dead_letter_strategy: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ConfigValidationError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
+        try:
+            object.__setattr__(self, "terminal_action", TerminalAction(self.terminal_action))
+        except ValueError:
+            raise ConfigValidationError(
+                f"RetryConfig.terminal_action must be one of {[a.value for a in TerminalAction]}, "
+                f"got {self.terminal_action!r}"
+            ) from None
+        if self.quorum_initial_group_size is not None and self.quorum_initial_group_size < 1:
+            raise ConfigValidationError(
+                f"RetryConfig.quorum_initial_group_size must be >= 1, got {self.quorum_initial_group_size}"
+            )
+        if self.delay_queue_dead_letter_strategy not in (None, "at-most-once", "at-least-once"):
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy must be None, 'at-most-once' or "
+                f"'at-least-once', got {self.delay_queue_dead_letter_strategy!r}"
+            )
+        if self.delay_queue_dead_letter_strategy is not None and self.delay_queue_type == "classic":
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy needs quorum delay queues "
+                "(delay_queue_type='quorum' or 'inherit'); classic queues have no dead-letter strategy"
+            )
+        if self.max_retry_age is not None and self.max_retry_age <= 0:
+            raise ConfigValidationError(f"RetryConfig.max_retry_age must be > 0 seconds, got {self.max_retry_age}")
+        if any(d < 0 for d in self.delays):
+            raise ConfigValidationError(f"RetryConfig.delays must be >= 0 seconds, got {self.delays}")
+        if self.dead_letter_exchange:
+            warnings.warn(
+                "RetryConfig.dead_letter_exchange is deprecated and has never been used: retry "
+                "dead-letters to '<queue>.dlq' through the default exchange. Remove the argument; "
+                "for an infrastructure-managed dead-letter exchange use terminal_action='reject' "
+                "with TopologyMode.PASSIVE_ONLY.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
         if self.delay_queue_type not in RETRY_QUEUE_TYPES:
             raise ConfigValidationError(
                 f"RetryConfig.delay_queue_type must be one of {RETRY_QUEUE_TYPES}, got {self.delay_queue_type!r}"
@@ -608,9 +678,38 @@ class RetryConfig:
             )
             if self.strict_delays:
                 raise ConfigValidationError(msg)
-            import warnings
-
             warnings.warn(msg, UserWarning, stacklevel=2)
+
+
+    @classmethod
+    def exponential(
+        cls,
+        *,
+        max_retries: int = 4,
+        initial_delay: float = 5.0,
+        multiplier: float = 2.0,
+        max_delay: float = 600.0,
+        **kwargs: Any,
+    ) -> RetryConfig:
+        """Build a ``RetryConfig`` whose ``delays`` follow a capped exponential.
+
+        ``delays[i] = min(max_delay, initial_delay * multiplier ** i)``,
+        rounded to whole seconds (minimum 1) because each tier is a delay
+        queue with a fixed ``x-message-ttl``. Every other field is passed
+        through ``kwargs``.
+        """
+        if initial_delay <= 0:
+            raise ConfigValidationError(f"initial_delay must be > 0, got {initial_delay}")
+        if multiplier < 1:
+            raise ConfigValidationError(f"multiplier must be >= 1, got {multiplier}")
+        if max_delay < initial_delay:
+            raise ConfigValidationError(f"max_delay ({max_delay}) must be >= initial_delay ({initial_delay})")
+        delays: list[int] = []
+        current = float(initial_delay)
+        for _ in range(max_retries):
+            delays.append(max(1, round(min(max_delay, current))))
+            current = min(max_delay, current * multiplier)
+        return cls(max_retries=max_retries, delays=tuple(delays), **kwargs)
 
 
 # NOTE: ``RetryConfig`` no longer imports ``warnings`` at module top-level; the

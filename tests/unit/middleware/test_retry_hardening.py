@@ -310,3 +310,46 @@ class TestHandoffFailureAsync:
         tracker = RetryHandoffTracker(RetryHandoffConfig())
         mw = RetryMiddleware(RetryConfig(), handoff_tracker=tracker)
         assert mw.handoff_tracker is tracker
+
+
+# ── Quorum options for the retry chain (§7.2, 16.2) ───────────────────────
+
+
+class TestRetryChainQuorumOptions:
+    def test_defaults_add_nothing(self) -> None:
+        router = RetryRouter(RetryConfig(max_retries=1, delays=(1,), delay_queue_type="quorum"))
+        delay, dlq = router.get_delay_queue_definitions("q", "", source_queue_type=QueueType.QUORUM)
+        assert "x-quorum-initial-group-size" not in delay.arguments
+        assert "x-dead-letter-strategy" not in delay.arguments
+        assert dlq.quorum_initial_group_size is None
+
+    def test_group_size_and_at_least_once_on_quorum_delay_queues_and_dlq(self) -> None:
+        cfg = RetryConfig(
+            max_retries=1,
+            delays=(1,),
+            delay_queue_type="quorum",
+            quorum_initial_group_size=3,
+            delay_queue_dead_letter_strategy="at-least-once",
+        )
+        delay, dlq = RetryRouter(cfg).get_delay_queue_definitions("q", "", source_queue_type=QueueType.QUORUM)
+        assert delay.arguments["x-quorum-initial-group-size"] == 3
+        assert delay.arguments["x-dead-letter-strategy"] == "at-least-once"
+        assert delay.arguments["x-overflow"] == "reject-publish"
+        assert dlq.queue_type is QueueType.QUORUM
+        assert dlq.to_declare_kwargs()["arguments"]["x-quorum-initial-group-size"] == 3
+
+    def test_inherit_from_classic_source_ignores_quorum_options(self) -> None:
+        cfg = RetryConfig(
+            max_retries=1, delays=(1,), delay_queue_type="inherit", delay_queue_dead_letter_strategy="at-least-once"
+        )
+        delay, _ = RetryRouter(cfg).get_delay_queue_definitions("q", "", source_queue_type=QueueType.CLASSIC)
+        assert delay.arguments["x-queue-type"] == "classic"
+        assert "x-dead-letter-strategy" not in delay.arguments
+
+    def test_validation(self) -> None:
+        with pytest.raises(ConfigValidationError):
+            RetryConfig(quorum_initial_group_size=0)
+        with pytest.raises(ConfigValidationError):
+            RetryConfig(delay_queue_type="quorum", delay_queue_dead_letter_strategy="exactly-once")
+        with pytest.raises(ConfigValidationError, match="quorum delay queues"):
+            RetryConfig(delay_queue_dead_letter_strategy="at-least-once")  # classic delay queues

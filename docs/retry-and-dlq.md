@@ -16,13 +16,57 @@ defaults preserve the legacy topology, so upgrading never re-declares a queue:
 | `error_detail` | `sanitized` (redacted + capped), `omit`, `raw` (legacy) | `sanitized` |
 | `handoff` | `RetryHandoffConfig(...)` — bounded backoff when the **retry publish** itself fails | bounded |
 
-The DLQ triage headers now carry `x-rabbitkit-error-category`
+The DLQ triage headers carry `x-rabbitkit-error-category`
 (`transient`/`permanent`) alongside `x-rabbitkit-error-type`, and
 `x-rabbitkit-error-message` is redacted (URL passwords, `password=`/`token=`
 pairs, bearer tokens, long opaque tokens) and length-capped. A failed
 delay-queue handoff never acks the source; it is nack-requeued and counted in
 `rabbitkit_retry_handoff_failures_total` with capped exponential backoff. See
 [Bulk Operations & Reliability Profiles](bulk-operations.md#retry-hardening).
+
+---
+
+## Retry policy
+
+| Field | Meaning | Default |
+|---|---|---|
+| `max_retries` / `delays` | the ladder; one fixed-TTL delay queue per tier (whole seconds) | `4` / `(5, 30, 120, 600)` |
+| `RetryConfig.exponential(max_retries=, initial_delay=, multiplier=, max_delay=)` | builds `delays` as `min(max_delay, initial_delay * multiplier**i)` | — |
+| `max_retry_age` | seconds since the FIRST failure after which a transient failure is terminal (`retry-age-exceeded`) | `None` (unbounded) |
+| `terminal_action` | `"dead_letter"`: confirmed, metadata-stamped copy to `<queue>.dlq`, then ack; `"reject"`: legacy broker DLX | `"dead_letter"` |
+| `jitter_mode` / `jitter_shards` / `jitter_factor` | TTL spread across shard queues (see the end of this page) | off |
+| `unknown_policy` | severity for exceptions no predicate/type tuple classifies | `PERMANENT` |
+
+```python
+from rabbitkit import RetryConfig
+
+retry = RetryConfig.exponential(max_retries=5, initial_delay=2, multiplier=3, max_delay=300, max_retry_age=3600)
+# delays == (2, 6, 18, 54, 162)
+```
+
+There is no immediate-retry mode: every retry waits in a delay queue, and a
+failed handoff to the delay queue is braked before the message can come back
+(see *Handoff failures* below), so a failure can never spin the handler.
+
+**Handler settlement signals are not failures.** `AckMessage`,
+`NackMessage` and `RejectMessage` raised by a handler pass straight through
+`RetryMiddleware` — whatever `unknown_policy` or a predicate says — and the
+pipeline settles exactly as asked.
+
+### Handoff failures
+
+If the publish to the delay queue is returned, nacked, times out or raises
+(the delay queue was deleted, a broker alarm), the source is never acked. On
+async routes the middleware **holds the delivery** for the backoff
+(`RetryHandoffConfig`: capped exponential, `backoff_max` 30 s by default,
+cancellable) and only then nack-requeues it, so the broker cannot hand it
+straight back. Once the tracker is `EXHAUSTED` (`max_consecutive_failures` or
+`recovery_deadline`), every failing delivery is held for the full
+`backoff_max` — consumption of that queue is effectively paused at
+`prefetch` messages per `backoff_max` — and one CRITICAL log line is written
+per outage; wire `on_handoff_exhausted` to stop the route if you prefer.
+The sync path never sleeps on pika's I/O thread; it reports the backoff via
+`on_handoff_failure`.
 
 ---
 
@@ -137,11 +181,41 @@ By default `RetryConfig` requires `len(delays) >= max_retries`
 
 The retry count is stored in the AMQP message header `x-rabbitkit-retry-count` (configurable via `RetryConfig.retry_header`). On each retry delivery:
 
-1. RabbitKit reads `x-rabbitkit-retry-count` from the incoming message headers.
-2. It increments the value and sets it on the outbound retry message.
+1. RabbitKit reads `x-rabbitkit-retry-count` from the incoming message headers
+   and takes the larger of it and the delay tiers the broker's `x-death`
+   history shows (`<queue>.retry.<n>` ⇒ at least `n` retries happened).
+2. It increments the value and sets it on the outbound retry message — never
+   lowering a larger value already on the message.
 3. The incremented value is used to select the appropriate delay queue for the current attempt.
 
 Headers are preserved across re-deliveries. If `x-rabbitkit-retry-count` is absent, it is treated as `0` (first attempt).
+
+### Metadata on every retry and DLQ copy
+
+| Header | Meaning |
+|---|---|
+| `x-rabbitkit-retry-count` | retries done so far (selects the delay tier) |
+| `x-rabbitkit-attempts` | handler executions including this one (never lowered) |
+| `x-rabbitkit-original-message-id` | the id every copy carries; an id-less message gets one on its first handoff |
+| `x-rabbitkit-original-queue` / `-exchange` / `-routing-key` | where the message was consumed / originally published |
+| `x-rabbitkit-first-failed-at` / `-last-failed-at` | ISO-8601; first is set once (the `max_retry_age` clock) |
+| `x-rabbitkit-error-class` / `-error-type` / `-error-category` / `-error-message` | the CURRENT attempt's exception class, severity and sanitized message |
+| `x-rabbitkit-failure-category` | `transient` / `timeout-unknown` on a retry copy; `permanent` / `exhausted` / `retry-age-exceeded` on a DLQ copy |
+| `x-rabbitkit-dead-lettered-at` | DLQ copies only |
+| `x-rabbitkit-original-expiration` | the producer's `expiration`, which is not copied onto delay/DLQ copies |
+
+The AMQP properties are preserved too: `message_id`, `correlation_id`,
+`timestamp`, `type`, `app_id`, `user_id`, `priority`, `reply_to`,
+`content_type`/`content_encoding`, `delivery_mode`, and every application
+header (trace context such as `traceparent`, idempotency keys).
+`expiration` is the one exception: on a delay queue it would expire the copy
+early and collapse the backoff; on the DLQ it would delete the failure
+record.
+
+**Trust model.** These headers are client-controlled. rabbitkit never lowers
+them and clamps the count to `max_retries`, but a producer that strips every
+header (including `x-death`) restarts the budget. Bound that case with
+`max_retry_age` and, against crash loops, a quorum `x-delivery-limit`.
 
 ---
 
@@ -206,19 +280,32 @@ def handle(order: Order) -> None:
 
 ## What Happens After max_retries
 
-When `x-rabbitkit-retry-count` equals `max_retries` and the handler raises again (or the
-error is permanent), `RetryMiddleware` tags the exception `_rabbitkit_terminal`
-and re-raises it rather than routing to another delay queue. The pipeline
-recognizes that marker and rejects the message
-(`message.reject(requeue=False)`) instead of applying the normal AckPolicy
-classification -- this is what stops an exhausted *transient* error from being
-re-classified as transient again and `nack(requeue=True)`'d into a hot loop.
+A failure is terminal when the error is permanent, the retries are exhausted
+(`x-rabbitkit-retry-count` equals `max_retries`), or `max_retry_age` has
+passed since the first failure. With the default
+`terminal_action="dead_letter"`, `RetryMiddleware` then publishes a copy to
+`<queue>.dlq` (mandatory, confirm-gated) carrying the CURRENT attempt's
+metadata (table above), and only after the broker confirms it acks the
+source — the same confirmed-publish-then-ack pattern as a retry. The
+exception is re-raised tagged `_rabbitkit_terminal` (so an outer
+`ExceptionMiddleware` still sees it) and `_rabbitkit_dead_lettered`, which
+tells the pipeline the message is already settled.
 
-RabbitMQ itself then routes the rejected message to the DLQ, via the
-`x-dead-letter-exchange` / `x-dead-letter-routing-key` arguments the broker set
-on the *source* queue when it declared the retry topology -- rabbitkit does not
-publish to the DLQ directly. The DLQ is a plain durable queue with no TTL.
-Messages accumulate there until replayed or discarded manually.
+If that DLQ publish fails (DLQ missing, returned, nacked, timed out), the
+middleware falls back to the legacy path: the pipeline rejects the message
+(`requeue=False`) and RabbitMQ moves it via the `x-dead-letter-exchange` /
+`x-dead-letter-routing-key` arguments on the source queue. That copy carries
+only the broker's `x-death` and the previous attempt's headers — and on a
+quorum source with `dead_letter_strategy="at-least-once"` it is kept on the
+source until the DLQ is back (see *Quorum DLQs* below).
+`terminal_action="reject"` always takes the legacy path.
+
+Note for `TestBroker` users: on the default path the consumed message's
+disposition is `acked` (the DLQ copy is in `broker.published_messages`), not
+`rejected`.
+
+The DLQ is a plain durable queue with no TTL. Messages accumulate there until
+replayed or discarded manually.
 
 ---
 
@@ -322,17 +409,47 @@ back to the head and `--limit 20` printed the first one 20 times.
 
 ## Replaying from the DLQ
 
-To re-publish all messages from a DLQ back to the original exchange for reprocessing:
+To re-publish messages from a DLQ back to the queue each one failed on:
+
+```bash
+rabbitkit dlq replay orders.created.dlq ""
+```
+
+or through an exchange, by each message's original routing key:
 
 ```bash
 rabbitkit dlq replay orders.created.dlq orders
 ```
 
-The second argument is the target exchange name. Messages are republished
-with the original routing key and headers **verbatim** — including
-`x-rabbitkit-retry-count`, meaning a previously max-retried message is
-terminal after ONE failed attempt and returns to the DLQ. Pass
-`--reset-retry-count` to strip the header and grant a fresh retry ladder.
+The second argument is the target exchange name (`""` = default exchange).
+**Routing rule, shared by the CLI and `DLQInspector.replay()`:** an explicit
+routing key (`--routing-key` / `target_queue`) wins; to the default exchange
+a message is routed by its original QUEUE (`x-rabbitkit-original-queue`, then
+the broker's `x-last-death-queue` / `x-death`); to a named exchange by its
+original ROUTING KEY (`x-rabbitkit-original-routing-key`, then `x-death`).
+
+Headers are kept — including `x-rabbitkit-retry-count`, meaning a previously
+max-retried message is terminal after ONE failed attempt and returns to the
+DLQ. Pass `--reset-retry-count` to grant a fresh retry ladder: it strips the
+count, the broker's `x-death`/`x-first-death-*`/`x-last-death-*` history and
+`x-rabbitkit-first-failed-at`, keeping the old count as
+`x-rabbitkit-previous-retry-count`.
+
+**Loop prevention.** Each replayed copy carries `x-rabbitkit-replay-count`,
+`x-rabbitkit-replayed-at` and `x-rabbitkit-replayed-by`. A message already
+replayed `--max-replays` times (default 3; `DLQInspector.replay(max_replays=3)`)
+is refused and stays on the DLQ; `--ignore-replay-limit` /
+`max_replays=None` lifts that, deliberately.
+
+**Audit.** Every run logs a start record (actor, queue, target, predicate,
+limit, reset flag, replay limit) and a finish record with the counts
+(replayed, failed, requeued, skipped, refused) to the `rabbitkit.dlq.audit`
+logger; route it to your audit sink. `--actor` / `actor=` (default: the OS
+user) names who ran it.
+
+**Authorization** is RabbitMQ's job: run replays as a dedicated user with
+`read` on the DLQs and `write` on the replay targets only. rabbitkit adds no
+authorization layer of its own.
 
 To replay only a subset:
 
@@ -346,17 +463,12 @@ fails is **left on the DLQ** (requeued once the fetch loop ends) and replay
 **continues** with the rest, reporting the failure count (non-zero exit) at
 the end — one poison target doesn't strand the remaining replayable messages.
 
-Without `--routing-key`, each message goes out with the routing key it had
-before it was dead-lettered: `x-rabbitkit-original-routing-key`, then the
-broker's `x-death` record. A broker dead-lettered message's own routing key
-is the DLQ's name, so a message that would be published straight back into
-the DLQ is skipped and left there.
-
-`DLQInspector.replay()` without `target_queue` resolves the source queue the
-same way (`x-rabbitkit-original-queue`, then `x-last-death-queue` /
-`x-death`). If none is present it skips the message (`ReplayResult.skipped`)
-instead of republishing it into the queue it is draining, which used to make
-`replay(dlq)` loop forever. Pass `allow_self_replay=True` to opt out.
+A broker dead-lettered message's own routing key is the DLQ's name, so when
+no origin can be resolved a message that would be published straight back
+into the DLQ is skipped and left there (`ReplayResult.skipped`; the CLI
+prints `SKIPPED`), instead of republishing it into the queue being drained,
+which used to make `replay(dlq)` loop forever. Pass `allow_self_replay=True`
+to opt out.
 
 Replay copies every property the original carried (`timestamp`,
 `delivery_mode`, `expiration` to the millisecond, priority, ...) and leaves
@@ -430,6 +542,25 @@ The CLI does the same. `rabbitkit dlq inspect` and `replay` take
 `x-delivery-count` without it, and exit 2 when they refuse.
 
 
+## Quorum dead-letter strategy and replica count
+
+`RabbitQueue(queue_type=QueueType.QUORUM, dead_letter_strategy="at-least-once",
+overflow="reject-publish")` makes the broker keep a dead-lettered message on
+the source queue until the dead-letter target confirms it, instead of
+dropping it when the DLQ is missing or full (RabbitMQ 3.10+;
+`at-least-once` without `overflow="reject-publish"` is rejected at
+construction, because RabbitMQ would silently fall back to at-most-once).
+Verified on RabbitMQ 4.1: with the DLQ deleted, a terminally failed message
+stays on the source (`messages_dlx=1` in the management API); with
+`at-most-once` it is gone. `quorum_initial_group_size=3` sets
+`x-quorum-initial-group-size`.
+
+For the retry chain: `RetryConfig(delay_queue_type="quorum",
+delay_queue_dead_letter_strategy="at-least-once", quorum_initial_group_size=3)`
+applies the same to the delay queues (adding `x-overflow=reject-publish`) and
+the replica count to a quorum DLQ. All default to `None`, so existing
+topology is declared exactly as before.
+
 ## Retry jitter: `jitter_mode="sharded"`
 
 By default every message that fails at the same moment retries at the same
@@ -448,3 +579,8 @@ the same cadence across redeliveries and processes. Shard 0 keeps the
 legacy queue name and exact TTL, so enabling this on an existing topology
 is purely additive: no 406s, no migration. The default `"off"` produces
 byte-identical topology to previous releases.
+
+`jitter_factor` has no effect with `jitter_mode="off"`. This is deliberate:
+the only way to jitter a single TTL delay queue is a per-message
+`expiration`, and a classic queue expires messages only at its head, so one
+long-TTL message would hold back every shorter one queued behind it.

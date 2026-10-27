@@ -1050,15 +1050,9 @@ class SyncTransport:
             )
             return
         if exc.reply_code == 406:
-            raise ConfigurationError(
-                f"Cannot declare {kind} {name!r}: it already exists with incompatible "
-                f"arguments (broker said: {exc.reply_text}). This usually means it was "
-                f"created outside rabbitkit (e.g. ops tooling) with different arguments "
-                f"(e.g. quorum vs classic queue type, a different TTL, or a different "
-                f"dead-letter exchange). Either delete/reconcile the existing {kind}, "
-                f"adjust its rabbitkit definition to match, or use "
-                f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
-            ) from exc
+            from rabbitkit.core.topology import describe_declare_conflict  # [retry/topology hook]
+
+            raise ConfigurationError(describe_declare_conflict(kind, name, str(exc.reply_text))) from exc
         raise exc
 
     def bind_queue(

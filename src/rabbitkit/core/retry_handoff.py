@@ -27,6 +27,23 @@ from rabbitkit.core.config import RetryHandoffConfig
 from rabbitkit.core.types import HandoffState
 
 
+def _capped_exponential(initial: float, maximum: float, failures: int) -> float:
+    """``min(maximum, initial * 2 ** (failures - 1))`` without overflow.
+
+    The exponent is capped before it is evaluated: a float ``2 ** 1024``
+    raises ``OverflowError``, so an uncapped streak of ~1,025 consecutive
+    handoff failures used to crash the middleware's failure path itself.
+    Once ``initial * 2 ** n`` reaches ``maximum`` further doubling cannot
+    change the result, so the exponent never needs to grow past that point.
+    """
+    if failures <= 1:
+        return min(maximum, initial)
+    # 2.0 ** 1000 is still a finite float; float multiplication saturates to
+    # inf rather than raising, and min() then returns maximum.
+    exponent = min(failures - 1, 1000)
+    return min(maximum, initial * (2.0**exponent))
+
+
 class RetryHandoffTracker:
     """Thread-safe consecutive-failure tracker for one route.
 
@@ -115,7 +132,7 @@ class RetryHandoffTracker:
                 self._first_failure_at = now
             self._last_failure_at = now
             cfg = self._config
-            base = min(cfg.backoff_max, cfg.backoff_initial * (2 ** (self._consecutive - 1)))
+            base = _capped_exponential(cfg.backoff_initial, cfg.backoff_max, self._consecutive)
             if cfg.jitter > 0:
                 spread = base * cfg.jitter
                 base = base - spread + (2 * spread * self._rng())

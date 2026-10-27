@@ -210,7 +210,11 @@ orders.created
 Transient failures retry with backoff. Permanent failures skip the ladder
 and go straight to the DLQ. By default, rejected messages do not disappear
 silently — every rejecting route gets a DLQ unless you explicitly opt into
-discard behavior.
+discard behavior. A terminal failure reaches the DLQ as a broker-confirmed
+copy carrying the final attempt's error class, sanitized message, failure
+category, attempt count, timestamps and original queue/exchange/routing key;
+`RetryConfig.max_retry_age` bounds the total retry time and
+`RetryConfig.exponential(...)` builds the delay ladder.
 
 ### 4. Test it without RabbitMQ
 
@@ -394,7 +398,10 @@ duplicates). The rule is simple:
 | Handler raises forever | Retry ladder, then DLQ |
 | Malformed payload | Classified permanent, preserved in DLQ |
 | Reject with no DLX | Safe default auto-provisions a DLQ — no silent discard |
-| Retry publish times out | Original is **not** acked as if the retry succeeded |
+| Retry publish times out | Original is **not** acked as if the retry succeeded; the delivery is held for a capped backoff before it is requeued, so it cannot hot-loop |
+| Handler raises `AckMessage`/`RejectMessage` | Settled exactly as asked — never retried |
+| Result publish fails after dedup | The redelivery is processed again, not acked as a duplicate |
+| Infrastructure-managed topology | `TopologyMode.PASSIVE_ONLY` performs no writes; `broker.verify_topology(management_client)` detects type/argument/binding drift |
 | DLQ replay publish fails | DLQ message is **not** removed as if replay succeeded |
 | Message unroutable | Mandatory publishing returns a distinct `RETURNED` outcome |
 | Broker blips | Readiness changes; liveness does **not** kill the pod |
@@ -513,7 +520,9 @@ rabbitkit health myapp.main:broker
 ```
 
 The DLQ replay acks a message only after its republish is broker-confirmed —
-the recovery tool cannot itself lose messages.
+the recovery tool cannot itself lose messages. Every replay is audit-logged
+and stamps `x-rabbitkit-replay-count`; a message replayed 3 times is refused
+unless you pass `--ignore-replay-limit`.
 
 <p align="center"><img src="https://raw.githubusercontent.com/talaatmagdyx/rabbitkit/main/assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
 

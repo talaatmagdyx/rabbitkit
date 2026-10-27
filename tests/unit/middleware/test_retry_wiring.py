@@ -31,6 +31,11 @@ def _retry_publishes(broker: TestBroker) -> list:
     return [e for e in broker.published_messages if ".retry." in e.routing_key]
 
 
+def _dlq_publishes(broker: TestBroker) -> list:
+    """Envelopes the retry middleware published to the DLQ (terminal handoff)."""
+    return [e for e in broker.published_messages if e.routing_key.endswith(".dlq")]
+
+
 # ── the middleware is actually installed ─────────────────────────────────────
 
 
@@ -119,8 +124,13 @@ def test_exhausted_transient_dead_letters_not_requeue() -> None:
     broker.publish("orders", b'{"id": 1}', headers={RETRY_HEADER: 1})
 
     msg = broker.consumed_messages[0]
-    broker.assert_rejected(msg, requeue=False)  # → source-queue DLX → DLQ
+    # Confirmed DLQ copy first, then ack (never a nack-requeue hot loop).
+    broker.assert_acked(msg)
     assert _retry_publishes(broker) == [], "exhausted retries must not re-publish to a delay queue"
+    [dlq] = _dlq_publishes(broker)
+    assert dlq.routing_key == "orders.dlq"
+    assert dlq.headers["x-rabbitkit-failure-category"] == "exhausted"
+    assert dlq.headers["x-rabbitkit-attempts"] == 2
 
 
 # ── permanent error → immediate dead-letter, no retries ──────────────────────
@@ -137,8 +147,26 @@ def test_permanent_error_dead_letters_immediately() -> None:
     broker.publish("orders", b'{"id": 1}')
 
     msg = broker.consumed_messages[0]
-    broker.assert_rejected(msg, requeue=False)
+    broker.assert_acked(msg)
     assert _retry_publishes(broker) == [], "permanent errors must not be retried"
+    [dlq] = _dlq_publishes(broker)
+    assert dlq.headers["x-rabbitkit-failure-category"] == "permanent"
+    assert dlq.headers["x-rabbitkit-error-class"] == "ValueError"
+    assert dlq.headers["x-rabbitkit-attempts"] == 1
+
+
+def test_terminal_action_reject_keeps_broker_dead_lettering() -> None:
+    broker = TestBroker()
+
+    @broker.subscriber(queue="orders", retry=RetryConfig(max_retries=3, delays=(5, 30, 120), terminal_action="reject"))
+    def handle(body: bytes) -> None:
+        raise ValueError("malformed order")
+
+    broker.start()
+    broker.publish("orders", b'{"id": 1}')
+
+    broker.assert_rejected(broker.consumed_messages[0], requeue=False)  # → source-queue DLX → DLQ
+    assert _dlq_publishes(broker) == []
 
 
 # ── idempotency: no double-wiring ────────────────────────────────────────────
@@ -225,8 +253,9 @@ async def test_exhausted_transient_dead_letters_async() -> None:
     await broker.publish_async("orders", b'{"id": 1}', headers={RETRY_HEADER: 1})
 
     msg = broker.consumed_messages[0]
-    broker.assert_rejected(msg, requeue=False)
+    broker.assert_acked(msg)
     assert _retry_publishes(broker) == []
+    assert len(_dlq_publishes(broker)) == 1
 
 
 # ── middleware ordering: retry outer of ordinary middlewares, inner of

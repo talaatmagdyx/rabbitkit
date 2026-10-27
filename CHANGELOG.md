@@ -117,6 +117,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RabbitMessage` attribute) with the default `AckPolicy.AUTO`, which would
   have settled every delivery twice. It now uses `AckPolicy.MANUAL` and
   `msg.raw_message.channel`, and does not re-raise after `acker.fail()`.
+### Changed
+
+- **Terminal failures are dead-lettered by `RetryMiddleware` itself, with
+  metadata** (`RetryConfig.terminal_action`, default `"dead_letter"`). A
+  permanent, exhausted or too-old failure is published (mandatory,
+  confirm-gated) to `<queue>.dlq` with the CURRENT attempt's metadata, and
+  only then is the source acked. Previously the pipeline rejected it and the
+  broker's DLX moved it: a first-attempt permanent failure reached the DLQ
+  with nothing but `x-death`, and after retries the error headers described
+  the previous attempt. The DLQ copy now carries `x-rabbitkit-error-class`
+  (plus the existing `-error-type`/`-error-category`/sanitized
+  `-error-message`), `x-rabbitkit-failure-category`
+  (`permanent`/`exhausted`/`retry-age-exceeded`), `x-rabbitkit-attempts`,
+  `x-rabbitkit-first-failed-at`, `-last-failed-at`, `-dead-lettered-at`,
+  `x-rabbitkit-original-queue`/`-exchange`/`-routing-key`,
+  `x-rabbitkit-original-message-id`, and the original `correlation_id`,
+  `timestamp` and other properties. If the DLQ publish is returned, nacked
+  or times out, the middleware falls back to the legacy reject, so nothing
+  is lost. **Observable change:** the source delivery's disposition on this
+  path is `acked` (it was `rejected`); `TestBroker` tests asserting
+  `assert_rejected` after a terminal failure should assert the DLQ publish
+  instead, or set `terminal_action="reject"` for the old behaviour. With
+  `ExceptionMiddleware(swallow_permanent=True)` the DLQ copy is still
+  written. The pipeline gained a one-line hook: an exception tagged
+  `_rabbitkit_dead_lettered` after settlement is not logged as
+  "Exception after settlement".
+- **Retry copies keep the message's identity and properties.** The AMQP
+  `timestamp` (dropped before) and `delivery_mode` are preserved;
+  `expiration` is still not copied onto a delay-queue copy (it would expire
+  inside the delay queue) and is recorded as
+  `x-rabbitkit-original-expiration`. A message published without a
+  `message_id` gets one id on its first handoff (recorded as
+  `x-rabbitkit-original-message-id`) and keeps it on every retry and on the
+  DLQ copy; before, the client library stamped a new random id on every
+  republish.
+- **Attempt count is harder to reset.** The retry count is the larger of
+  `x-rabbitkit-retry-count` and the broker's `x-death` history for this
+  queue's `<queue>.retry.<n>` tiers, and rabbitkit never lowers the count,
+  `x-rabbitkit-attempts` or `x-rabbitkit-first-failed-at` on its own
+  republish. Trust model (documented on `RetryConfig`): these headers are
+  client-controlled; a producer that strips all of them restarts the
+  budget, which `max_retry_age` and a quorum `x-delivery-limit` bound.
+
+### Added
+
+- `RetryConfig.max_retry_age` (seconds since the first failure; exceeded →
+  terminal, category `retry-age-exceeded`), `RetryConfig.terminal_action`
+  (`TerminalAction.DEAD_LETTER` / `REJECT`), and
+  `RetryConfig.exponential(max_retries=, initial_delay=, multiplier=,
+  max_delay=, **kwargs)` which builds `delays` as a capped exponential.
+  New enums `TerminalAction` and `FailureCategory` in `rabbitkit.core.types`.
+
+- **Topology ownership.** `broker.verify_topology(management_client=None,
+  *, vhost=None)` (async on `AsyncBroker`, sync on `SyncBroker`) and
+  `rabbitkit.verify_topology(routes, management_client=..., vhost=...,
+  broker_retry=...)` check the broker's topology against the application's
+  routes through the management API's read-only endpoints: exchange
+  existence/type/durability, queue existence/type/durability and every
+  declared argument (a policy supplying the same value counts), bindings,
+  and for retry routes the source queue's dead-letter path plus each delay
+  queue and DLQ. It returns a `TopologyReport` (`ok`, `fully_verified`,
+  `failed`, `unverified`, `raise_for_failures()`); without a client every
+  check AMQP cannot make is `UNVERIFIED`, never green. It needs no AMQP
+  connection, so it can run before `start()`. Under `PASSIVE_ONLY` the
+  brokers now log at startup what was and was not verified.
+- **Public topology declaration for publish-only services:**
+  `broker.declare_exchange(RabbitExchange)`, `broker.declare_queue(RabbitQueue)`,
+  `broker.bind_queue(queue, exchange, routing_key="", arguments=None)`,
+  `broker.bind_exchange(destination, source, routing_key="", arguments=None)`
+  on both brokers. They declare exactly what is given (no retry/safety
+  arguments) and are allowed only under `TopologyMode.AUTO_DECLARE`;
+  `PASSIVE_ONLY` and `MANUAL` raise `ConfigurationError` (a `passive=True`
+  entity is still allowed under `PASSIVE_ONLY` as an existence check).
+- **Quorum options:** `RabbitQueue.quorum_initial_group_size`
+  (`x-quorum-initial-group-size`) and `RabbitQueue.dead_letter_strategy`
+  (`DeadLetterStrategy.AT_LEAST_ONCE` / `AT_MOST_ONCE`,
+  `x-dead-letter-strategy`; quorum only; `at-least-once` requires
+  `overflow="reject-publish"` and is rejected at construction otherwise,
+  since RabbitMQ silently falls back to at-most-once). For the retry chain:
+  `RetryConfig.quorum_initial_group_size` (quorum delay queues and DLQ) and
+  `RetryConfig.delay_queue_dead_letter_strategy` (quorum delay queues; also
+  sets `x-overflow=reject-publish`). Defaults add no arguments, so existing
+  topology is never re-declared differently. Verified on RabbitMQ 4.1: with
+  `at-least-once` a terminally failed message whose DLQ is missing stays on
+  the source (`messages_dlx=1`); with `at-most-once` it is dropped.
+
+- **DLQ replay audit and loop prevention.** Every replayed copy (inspector
+  and CLI) carries `x-rabbitkit-replay-count` (incremented),
+  `x-rabbitkit-replayed-at` and `x-rabbitkit-replayed-by`. A message already
+  replayed `max_replays` times (default 3) is refused and stays on the DLQ
+  (`ReplayResult.refused`; CLI `REFUSED` + exit 1) unless the limit is lifted
+  (`max_replays=None` / `--ignore-replay-limit`). Each run writes start and
+  finish records (actor, queue, target, predicate, limit, counts) to the
+  `rabbitkit.dlq.audit` logger. New: `DLQInspector.replay(...,
+  max_replays=3, actor=None)`, CLI `--max-replays`, `--ignore-replay-limit`,
+  `--actor` (env `RABBITKIT_REPLAY_ACTOR`), and helpers
+  `rabbitkit.dlq.resolve_replay_routing_key` / `prepare_replay_headers` /
+  `replay_count`. Authorization stays with RabbitMQ permissions (documented:
+  run replays as a dedicated user).
+
+### Deprecated
+
+- `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
+  `<queue>.dlq` via the default exchange); a non-empty value now emits a
+  `DeprecationWarning`. `jitter_factor` is documented as effective only with
+  `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
+  classic queue only expires its head message (head-of-line blocking).
+
+### Changed (DLQ replay)
+
+- **CLI and `DLQInspector` route replays the same way.** The CLI routed by
+  the original ROUTING KEY even to the default exchange (so a topic-routed
+  message replayed with target `""` was unroutable), while the inspector
+  routed by the original QUEUE even to a named exchange. Both now: explicit
+  routing key wins; default exchange → original queue; named exchange →
+  original routing key.
+- `reset_retry_count=True` / `--reset-retry-count` now also strips the
+  broker's `x-death` / `x-first-death-*` / `x-last-death-*` headers and
+  `x-rabbitkit-first-failed-at` (the retry middleware derives the budget from
+  them), keeping the old count as `x-rabbitkit-previous-retry-count`.
+
+### Fixed
+
+- **`RetryMiddleware` retried handler settlement signals.** With
+  `unknown_policy=TRANSIENT` (or a predicate returning `True`), a handler
+  raising `AckMessage()` ran `max_retries + 1` times, and `RejectMessage()`
+  ran every retry before landing on the DLQ. `AckMessage` / `NackMessage` /
+  `RejectMessage` now pass straight through to the pipeline regardless of
+  classifier, predicates or policy.
+- **Retry-handoff failures no longer hot-loop.** When the delay-queue publish
+  failed (queue deleted, broker alarm), the async path nacked first and slept
+  afterwards, so the redelivery ran in parallel: 9,325 handler executions in
+  10 s against a deleted delay queue. The backoff now runs while the delivery
+  is still held (bounded by `backoff_max`, cancellable, the nack is in a
+  `finally`), and once the tracker is `EXHAUSTED` every failing delivery is
+  held for the full `backoff_max` (consumption of the queue is effectively
+  paused at `prefetch` messages per `backoff_max`) with one CRITICAL log per
+  outage. The sync path still never sleeps on the I/O thread.
+- **`DeduplicationMiddleware` could lose a handler's result.** The key was
+  marked as soon as the handler returned; the pipeline then published the
+  result (`@publisher` / RPC reply) and, if that publish failed,
+  nack-requeued — and the redelivery was acked as a duplicate, so the result
+  was never published. The mark is now written when the pipeline ACKS the
+  delivery (after the result publish succeeded; mark, then ack); a
+  nack/reject writes nothing and releases a `claim`. With `mark_policy="claim",
+  store_results=True` a storable result is still written at once, and the
+  duplicate's stored-result replay is no longer acked before the pipeline
+  re-publishes it. If the handler chain settles the message itself, or the
+  transport exposes no ack hook, the mark is written immediately as before.
+- **`TopologyMode.PASSIVE_ONLY` mutated topology.** It created missing
+  bindings (bindings have no passive form, so the dispatcher performed them
+  in every mode but `MANUAL`). Bindings are now written only under
+  `AUTO_DECLARE`; `PASSIVE_ONLY` performs no writes at all. Use
+  `verify_topology` to detect a missing binding.
+- **A 406 on declare now names the conflicting argument and why rabbitkit
+  declared it** (e.g. `x-dead-letter-exchange` added for retry or the safety
+  DLX on an ops-created plain queue; `x-queue-type` quorum vs classic) and
+  points at `PASSIVE_ONLY` + `verify_topology` for infrastructure-managed
+  queues. Both transports use the shared `describe_declare_conflict`.
+- `RabbitExchange(type="topic")` / `RabbitQueue(queue_type="quorum")` with a
+  plain string failed at startup with `AttributeError: 'str' object has no
+  attribute 'value'`; the string is now coerced to the enum (an unknown
+  value raises `TopologyValidationError`).
+- **The "Terminal failure" log printed raw exception text** (e.g.
+  `password=hunter2`) while the headers were sanitized. It now uses the same
+  `ErrorSanitizer`, as does `ExceptionMiddleware`'s "Terminal exception" log.
+- **`RetryHandoffTracker` crashed after ~1,025 consecutive handoff
+  failures.** The backoff was `initial * 2 ** (n - 1)` with an uncapped
+  exponent, so a long outage of the delay queue raised
+  `OverflowError: int too large to convert to float` from the failure path
+  itself (seen as thousands of "Exception after settlement" warnings while
+  the backoff brake silently stopped working). The exponent is now capped;
+  any failure count yields a finite delay `<= backoff_max`.
 
 ## [0.19.2] — 2026-10-02
 

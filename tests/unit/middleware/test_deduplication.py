@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -161,10 +162,12 @@ class TestDuplicate:
 
         handler = MagicMock(return_value="processed")
 
-        # First call — new
+        # First call — new; the pipeline acks after the result is published,
+        # and that ack writes the mark (R-D7).
         result1 = mw.consume_scope(handler, msg)
         assert result1 == "processed"
         handler.assert_called_once()
+        msg.ack()
 
         # Reset for second message
         handler.reset_mock()
@@ -868,6 +871,7 @@ class TestOnSuccessLocalCache:
         msg1 = _make_message(message_id="cached-msg")
         msg1._ack_fn = MagicMock()
         mw.consume_scope(MagicMock(return_value=None), msg1)
+        msg1.ack()  # pipeline ack → mark (R-D7)
 
         initial_set_calls = len(redis.set_calls)
 
@@ -1867,6 +1871,7 @@ class TestIdempotentReceiver:
         msg = self._msg("m1")
 
         out = mw.consume_scope(lambda m: {"total": 42}, msg)
+        msg.ack()  # the pipeline acks after publishing the result
 
         assert out == {"total": 42}
         stored = redis._store[_DEDUP_KEY]
@@ -1884,18 +1889,23 @@ class TestIdempotentReceiver:
             calls.append(1)
             return {"total": 42}
 
-        first = mw.consume_scope(handler, self._msg("m1"))
+        first_msg = self._msg("m1")
+        first = mw.consume_scope(handler, first_msg)
+        first_msg.ack()
         dup_msg = self._msg("m1")
         replayed = mw.consume_scope(handler, dup_msg)
 
         assert replayed == first == {"total": 42}
         assert calls == [1]  # handler ran exactly once
-        assert dup_msg.disposition == "acked"
+        # Left for the pipeline: it acks only after re-publishing the result.
+        assert dup_msg.disposition == "pending"
 
     def test_none_result_stores_plain_completed_and_skips(self) -> None:
         redis = _FakeRedis()
         mw = self._mw(redis)
-        mw.consume_scope(lambda m: None, self._msg("m1"))
+        m1 = self._msg("m1")
+        mw.consume_scope(lambda m: None, m1)
+        m1.ack()
         assert redis._store[_DEDUP_KEY] == "completed"
         assert mw.consume_scope(lambda m: None, self._msg("m1")) is None
 
@@ -1904,14 +1914,18 @@ class TestIdempotentReceiver:
         mark; the duplicate skips without replay (documented degradation)."""
         redis = _FakeRedis()
         mw = self._mw(redis)
-        out = mw.consume_scope(lambda m: object(), self._msg("m1"))
+        m1 = self._msg("m1")
+        out = mw.consume_scope(lambda m: object(), m1)
+        m1.ack()
         assert out is not None
         assert redis._store[_DEDUP_KEY] == "completed"
 
     def test_oversized_result_degrades_to_plain_completed(self) -> None:
         redis = _FakeRedis()
         mw = self._mw(redis, max_result_bytes=10)
-        mw.consume_scope(lambda m: {"k": "x" * 100}, self._msg("m1"))
+        m1 = self._msg("m1")
+        mw.consume_scope(lambda m: {"k": "x" * 100}, m1)
+        m1.ack()
         assert redis._store[_DEDUP_KEY] == "completed"
 
     def test_legacy_value_reads_as_completed_without_replay(self) -> None:
@@ -1937,7 +1951,9 @@ class TestIdempotentReceiver:
     def test_store_results_off_keeps_plain_mark(self) -> None:
         redis = _FakeRedis()
         mw = self._mw(redis, store_results=False)
-        mw.consume_scope(lambda m: {"total": 42}, self._msg("m1"))
+        m1 = self._msg("m1")
+        mw.consume_scope(lambda m: {"total": 42}, m1)
+        m1.ack()
         assert redis._store[_DEDUP_KEY] == "completed"
 
     async def test_async_round_trip_replay(self) -> None:
@@ -1949,7 +1965,9 @@ class TestIdempotentReceiver:
             calls.append(1)
             return [1, 2, 3]
 
-        first = await mw.consume_scope_async(handler, self._msg("m1", sync=False))
+        first_msg = self._msg("m1", sync=False)
+        first = await mw.consume_scope_async(handler, first_msg)
+        await first_msg.ack_async()
         replayed = await mw.consume_scope_async(handler, self._msg("m1", sync=False))
         assert first == replayed == [1, 2, 3]
         assert calls == [1]
@@ -2033,3 +2051,144 @@ class TestQueueNamespacing:
         mw = DeduplicationMiddleware(redis, DeduplicationConfig(key_prefix="k"))
         mw.consume_scope(MagicMock(), _make_message(message_id="m", routing_key=""))
         assert redis.set_calls[0]["key"] == "k:unknown:m"
+
+
+class TestMarkOnlyAfterFullSuccess:
+    """R-D7: the key is written when the pipeline ACKS (i.e. after the
+    handler's result was published), never when the handler merely returns.
+    A failed result publish nack-requeues, and the redelivery must be
+    processed again rather than acked as a duplicate."""
+
+    @staticmethod
+    def _msg(message_id: str = "m1") -> RabbitMessage:
+        m = _make_message(message_id=message_id)
+        m._ack_fn = MagicMock()
+        m._nack_fn = MagicMock()
+        m._reject_fn = MagicMock()
+        return m
+
+    @pytest.mark.parametrize("policy", ["on_success", "claim"])
+    def test_nack_after_return_leaves_key_unmarked_and_redelivery_runs(self, policy: str) -> None:
+        redis = _FakeRedis()
+        redis.delete = lambda key: redis._store.pop(key, None)  # type: ignore[attr-defined]
+        mw = DeduplicationMiddleware(redis_client=redis, config=DeduplicationConfig(mark_policy=policy))
+        calls: list[int] = []
+
+        def handler(m: RabbitMessage) -> dict[str, int]:
+            calls.append(1)
+            return {"ok": 1}
+
+        first = self._msg()
+        assert mw.consume_scope(handler, first) == {"ok": 1}
+        first.nack(requeue=True)  # the pipeline's "result lost — don't ack"
+        assert redis._store.get(_DEDUP_KEY) is None  # never "completed"; claim released
+
+        redelivery = self._msg()
+        assert mw.consume_scope(handler, redelivery) == {"ok": 1}
+        assert calls == [1, 1]
+        redelivery.ack()
+        assert redis._store[_DEDUP_KEY] in ("1", "completed")
+
+    def test_mark_is_written_before_the_transport_ack(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis)
+        msg = self._msg()
+        order: list[str] = []
+        msg._ack_fn = lambda: order.append(f"ack:{_DEDUP_KEY in redis._store}")
+        mw.consume_scope(lambda m: "r", msg)
+        assert redis._store == {}
+        msg.ack()
+        assert order == ["ack:True"]
+
+    def test_mark_failure_never_breaks_the_ack(self) -> None:
+        class _FailingSet(_FakeRedis):
+            def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool | None:
+                raise ConnectionError("redis down")
+
+        mw = DeduplicationMiddleware(redis_client=_FailingSet())
+        msg = self._msg()
+        transport_ack = msg._ack_fn
+        mw.consume_scope(lambda m: "r", msg)
+        msg.ack()
+        transport_ack.assert_called_once()  # type: ignore[union-attr]
+        assert msg.disposition == "acked"
+
+    def test_already_settled_in_handler_marks_immediately(self) -> None:
+        redis = _FakeRedis()
+        mw = DeduplicationMiddleware(redis_client=redis)
+        msg = self._msg()
+
+        def handler(m: RabbitMessage) -> None:
+            m.ack()  # MANUAL-style settlement inside the chain
+
+        mw.consume_scope(handler, msg)
+        assert redis._store[_DEDUP_KEY] == "1"
+
+    def test_replayed_result_is_not_pre_acked(self) -> None:
+        redis = _FakeRedis()
+        redis._store[_DEDUP_KEY] = '{"s":"completed","v":1,"r":{"total":1}}'
+        mw = DeduplicationMiddleware(
+            redis_client=redis, config=DeduplicationConfig(mark_policy="claim", store_results=True)
+        )
+        msg = self._msg()
+        assert mw.consume_scope(lambda m: None, msg) == {"total": 1}
+        assert msg.disposition == "pending"  # the pipeline acks after re-publishing it
+
+    @pytest.mark.asyncio
+    async def test_async_mark_waits_for_ack(self) -> None:
+        redis = _FakeAsyncRedis()
+        mw = DeduplicationMiddleware(redis_client=redis)
+        msg = _make_message(message_id="m1")
+        acked: list[bool] = []
+
+        async def ack() -> None:
+            acked.append(_DEDUP_KEY in redis._store)
+
+        msg._ack_async_fn = ack
+
+        async def handler(m: RabbitMessage) -> str:
+            return "r"
+
+        async with asyncio.timeout(5):
+            await mw.consume_scope_async(handler, msg)
+            assert redis._store == {}
+            await msg.ack_async()
+        assert acked == [True]
+
+    def test_testbroker_result_publish_failure_is_not_lost(self) -> None:
+        """End to end through the pipeline (p9): first result publish fails →
+        nack → redelivery runs the handler again and publishes the result."""
+        from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
+        from rabbitkit.middleware.base import BaseMiddleware
+        from rabbitkit.testing.broker import TestBroker
+
+        class FailFirstResult(BaseMiddleware):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def publish_scope(self, call_next: Any, envelope: MessageEnvelope) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    return PublishOutcome(status=PublishStatus.ERROR, exchange="", routing_key=envelope.routing_key)
+                return call_next(envelope)
+
+        redis = _FakeRedis()
+        failer = FailFirstResult()
+        broker = TestBroker()
+        handled: list[int] = []
+
+        @broker.subscriber(queue="p9.src", middlewares=[DeduplicationMiddleware(redis_client=redis), failer])
+        @broker.publisher(routing_key="p9.results")
+        def handle(body: bytes) -> dict[str, bool]:
+            handled.append(1)
+            return {"ok": True}
+
+        broker.start()
+        broker.publish("p9.src", b"{}", message_id="p9-1")
+        first = broker.consumed_messages[0]
+        broker.assert_nacked(first, requeue=True)
+        assert redis._store == {}  # NOT marked: the result was never published
+        broker.publish("p9.src", b"{}", message_id="p9-1")  # the broker's redelivery
+        assert handled == [1, 1]
+        assert [e.routing_key for e in broker.published_messages].count("p9.results") == 1
+        broker.assert_acked(broker.consumed_messages[1])

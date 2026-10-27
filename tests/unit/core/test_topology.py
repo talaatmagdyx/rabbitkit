@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from rabbitkit.core.errors import TopologyValidationError
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import ExchangeType, QueueType
 
@@ -320,3 +321,105 @@ class TestRabbitExchangeInternalAutoDelete:
         from rabbitkit.core.types import ExchangeType
         with pytest.raises(ValueError, match="auto_delete"):
             RabbitExchange(name="x", type=ExchangeType.DIRECT, internal=True, auto_delete=True)
+
+
+# ── String enum values, quorum options, 406 messages ─────────────────────
+
+
+class TestEnumCoercion:
+    def test_exchange_type_string_is_coerced(self) -> None:
+        """p5c: RabbitExchange(type="topic") failed at startup with AttributeError."""
+        from rabbitkit.core.types import ExchangeType
+
+        assert RabbitExchange("e", type="topic").type is ExchangeType.TOPIC  # type: ignore[arg-type]
+        assert RabbitExchange("e", type="topic").to_declare_kwargs()["exchange_type"] == "topic"  # type: ignore[arg-type]
+
+    def test_queue_type_string_is_coerced(self) -> None:
+        assert RabbitQueue("q", queue_type="quorum").queue_type is QueueType.QUORUM  # type: ignore[arg-type]
+
+    def test_unknown_values_raise(self) -> None:
+        with pytest.raises(TopologyValidationError, match="unknown type"):
+            RabbitExchange("e", type="fanoutish")  # type: ignore[arg-type]
+        with pytest.raises(TopologyValidationError, match="unknown queue_type"):
+            RabbitQueue("q", queue_type="lazy")  # type: ignore[arg-type]
+
+
+class TestQuorumOptions:
+    def test_group_size_and_strategy_render(self) -> None:
+        q = RabbitQueue(
+            "q",
+            queue_type=QueueType.QUORUM,
+            quorum_initial_group_size=3,
+            dead_letter_strategy="at-least-once",  # type: ignore[arg-type]
+            overflow="reject-publish",
+        )
+        args = q.to_declare_kwargs()["arguments"]
+        assert args["x-quorum-initial-group-size"] == 3
+        assert args["x-dead-letter-strategy"] == "at-least-once"
+        assert args["x-overflow"] == "reject-publish"
+
+    def test_at_least_once_requires_reject_publish(self) -> None:
+        with pytest.raises(TopologyValidationError, match="reject-publish"):
+            RabbitQueue("q", queue_type=QueueType.QUORUM, dead_letter_strategy="at-least-once")  # type: ignore[arg-type]
+        with pytest.raises(TopologyValidationError, match="reject-publish"):
+            RabbitQueue(
+                "q", queue_type=QueueType.QUORUM, dead_letter_strategy="at-least-once", overflow="drop-head"  # type: ignore[arg-type]
+            )
+        # via the escape hatch counts too
+        RabbitQueue(
+            "q",
+            queue_type=QueueType.QUORUM,
+            dead_letter_strategy="at-least-once",  # type: ignore[arg-type]
+            arguments={"x-overflow": "reject-publish"},
+        )
+
+    def test_at_most_once_needs_nothing(self) -> None:
+        RabbitQueue("q", queue_type=QueueType.QUORUM, dead_letter_strategy="at-most-once")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("qtype", [QueueType.CLASSIC, QueueType.STREAM])
+    def test_quorum_only(self, qtype: QueueType) -> None:
+        with pytest.raises(TopologyValidationError, match="only valid for quorum"):
+            RabbitQueue("q", queue_type=qtype, quorum_initial_group_size=3)
+        with pytest.raises(TopologyValidationError, match="only valid for quorum"):
+            RabbitQueue("q", queue_type=qtype, dead_letter_strategy="at-most-once")  # type: ignore[arg-type]
+
+    def test_bad_values(self) -> None:
+        with pytest.raises(TopologyValidationError, match=">= 1"):
+            RabbitQueue("q", queue_type=QueueType.QUORUM, quorum_initial_group_size=0)
+        with pytest.raises(TopologyValidationError, match="unknown dead_letter_strategy"):
+            RabbitQueue("q", queue_type=QueueType.QUORUM, dead_letter_strategy="exactly-once")  # type: ignore[arg-type]
+
+    def test_escape_hatch_without_reject_publish_warns(self) -> None:
+        with pytest.warns(UserWarning, match="reject-publish"):
+            RabbitQueue("q", queue_type=QueueType.QUORUM, arguments={"x-dead-letter-strategy": "at-least-once"})
+
+
+class TestDescribeDeclareConflict:
+    def test_dlx_conflict_names_argument_and_cause(self) -> None:
+        from rabbitkit.core.topology import describe_declare_conflict
+
+        text = (
+            "PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange' for queue 'orders' in vhost '/': "
+            "received the value '' of type 'longstr' but current is none"
+        )
+        msg = describe_declare_conflict("queue", "orders", text)
+        assert "'orders'" in msg and "'x-dead-letter-exchange'" in msg
+        assert "the existing queue has none" in msg
+        assert "reject_without_dlx" in msg and "RetryConfig" in msg
+        assert "PASSIVE_ONLY" in msg and "verify_topology" in msg
+
+    def test_queue_type_conflict(self) -> None:
+        from rabbitkit.core.topology import describe_declare_conflict
+
+        text = (
+            "PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'q' in vhost '/': received the "
+            "value 'quorum' of type 'longstr' but current is the value 'classic' of type 'longstr'"
+        )
+        msg = describe_declare_conflict("queue", "q", text)
+        assert "rabbitkit declared 'quorum'" in msg and "has 'classic'" in msg and "quorum-migration" in msg
+
+    def test_unparseable_text_still_actionable(self) -> None:
+        from rabbitkit.core.topology import describe_declare_conflict
+
+        msg = describe_declare_conflict("exchange", "e", "PRECONDITION_FAILED - something else")
+        assert "exchange 'e'" in msg and "PASSIVE_ONLY" in msg

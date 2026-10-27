@@ -314,6 +314,7 @@ class SyncBroker:
 
         # Declare topology
         self._declare_topology()
+        self._notify_passive_only()
 
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
@@ -1189,6 +1190,12 @@ class SyncBroker:
                     )
                 )
 
+    def _notify_passive_only(self) -> None:
+        """[retry/topology hook] PASSIVE_ONLY startup notice (see topology_validation)."""
+        from rabbitkit.core.topology_validation import log_passive_only_limits
+
+        log_passive_only_limits(self._config.topology_mode, self._registry.routes)
+
     def _broker_server_version(self) -> str | None:
         version = getattr(self._transport, "server_version", None)
         return version if isinstance(version, str) else None
@@ -1293,3 +1300,58 @@ class SyncBroker:
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+    # ── Public topology API (16.6) — additive, retry/topology owner ─────
+
+    def declare_exchange(self, exchange: RabbitExchange) -> None:
+        """Declare *exchange* (``AUTO_DECLARE`` only, or a ``passive=True``
+        existence check under ``PASSIVE_ONLY``). See ``AsyncBroker.declare_exchange``."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_exchange", passive=exchange.passive)
+        self._started_transport().declare_exchange(exchange)
+
+    def declare_queue(self, queue: RabbitQueue) -> None:
+        """Declare *queue* exactly as given. Same rules as :meth:`declare_exchange`."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_queue", passive=queue.passive)
+        self._started_transport().declare_queue(queue)
+
+    def bind_queue(
+        self, queue: str, exchange: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind *queue* to *exchange*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_queue")
+        self._started_transport().bind_queue(
+            queue=queue, exchange=exchange, routing_key=routing_key, arguments=arguments
+        )
+
+    def bind_exchange(
+        self, destination: str, source: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind exchange *destination* to *source*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_exchange")
+        self._started_transport().bind_exchange(
+            destination=destination, source=source, routing_key=routing_key, arguments=arguments
+        )
+
+    def verify_topology(self, management_client: Any | None = None, *, vhost: str | None = None) -> Any:
+        """Read-only topology compatibility check — see ``AsyncBroker.verify_topology``."""
+        from rabbitkit.core.topology_validation import verify_topology
+
+        return verify_topology(
+            list(self._registry.routes),
+            management_client=management_client,
+            vhost=vhost if vhost is not None else self._config.connection.vhost,
+            broker_retry=self._config.retry,
+        )
+
+    def _started_transport(self) -> Any:
+        if self._transport is None:
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
+        return self._transport

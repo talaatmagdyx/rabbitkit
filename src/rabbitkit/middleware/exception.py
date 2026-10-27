@@ -75,10 +75,15 @@ class ExceptionMiddleware(BaseMiddleware):
         is_terminal = getattr(exc, "_rabbitkit_terminal", False)
 
         if is_terminal and not self._swallow_permanent:
+            # F30: terminal exceptions come from RetryMiddleware, whose headers
+            # and logs are sanitized; raw str(exc) routinely embeds secrets.
+            from rabbitkit.core.sanitizer import ErrorSanitizer
+
+            sanitized = ErrorSanitizer().sanitize(exc)
             logger.error(
                 "Terminal exception (permanent/exhausted): %s: %s",
-                type(exc).__name__,
-                exc,
+                sanitized.code,
+                sanitized.summary,
             )
             raise
 

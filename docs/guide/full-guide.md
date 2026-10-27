@@ -367,10 +367,16 @@ config = RabbitConfig(
 |-------|------|---------|-------------|
 | `max_retries` | int | `4` | Max retry attempts |
 | `delays` | tuple[int, ...] | `(5, 30, 120, 600)` | Delay per retry (seconds) |
-| `jitter_factor` | float | `0.1` | Jitter (±10% of delay) |
+| `jitter_factor` | float | `0.1` | TTL spread across shard queues — only with `jitter_mode="sharded"` |
 | `strict_delays` | bool | `True` | Raise if `len(delays) < max_retries` |
 | `per_queue` | bool | `True` | Per-queue delay queue naming |
 | `unknown_policy` | ErrorSeverity | `PERMANENT` | How to classify unknown errors |
+| `max_retry_age` | float \| None | `None` | Seconds since the first failure after which a failure is terminal |
+| `terminal_action` | TerminalAction | `DEAD_LETTER` | `DEAD_LETTER`: confirmed metadata-stamped DLQ copy then ack; `REJECT`: broker DLX |
+| `quorum_initial_group_size` | int \| None | `None` | Replicas for quorum delay queues / DLQ |
+| `delay_queue_dead_letter_strategy` | str \| None | `None` | `"at-least-once"` for quorum delay queues |
+
+`RetryConfig.exponential(max_retries=4, initial_delay=5, multiplier=2, max_delay=600, **kw)` builds `delays`.
 
 ### WorkerConfig (passed to `broker.start()`, NOT part of RabbitConfig)
 

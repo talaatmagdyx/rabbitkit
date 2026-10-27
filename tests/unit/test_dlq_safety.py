@@ -14,7 +14,7 @@ import contextlib
 import urllib.error
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -662,3 +662,111 @@ class TestQuorumOrder:
                              management=_management(_quorum_with(1)), max_quorum_scan=2)
         with pytest.raises(UnsafeToBrowseError, match="holding 3 messages"):
             await grown.peek_async("q")
+
+
+# ── 14.2: replay loop prevention, audit, one routing rule ─────────────────
+
+
+class TestReplayLoopPreventionAndAudit:
+    def test_replayed_copy_is_stamped(self) -> None:
+        transport = _Transport([_msg(headers={"x-rabbitkit-original-queue": "orders"})])
+        result = DLQInspector(transport).replay("orders.dlq", actor="ops-bot")
+        assert int(result) == 1
+        h = transport.published[0].headers
+        assert h["x-rabbitkit-replay-count"] == 1
+        assert h["x-rabbitkit-replayed-by"] == "ops-bot"
+        assert h["x-rabbitkit-replayed-at"]
+
+    def test_count_increments_and_limit_refuses(self) -> None:
+        over = _msg(headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 3})
+        under = _msg(headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 2})
+        transport = _Transport([over, under])
+        result = DLQInspector(transport).replay("orders.dlq")
+        assert int(result) == 1 and result.refused == 1
+        assert transport.published[0].headers["x-rabbitkit-replay-count"] == 3
+        over._nack_fn.assert_called_once_with(True)  # type: ignore[union-attr]  # stays on the DLQ
+        assert "refused=1" in repr(result)
+
+    def test_limit_can_be_lifted_explicitly(self) -> None:
+        msg = _msg(headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 9})
+        transport = _Transport([msg])
+        assert int(DLQInspector(transport).replay("orders.dlq", max_replays=None)) == 1
+
+    async def test_async_refuses_too(self) -> None:
+        msg = _msg(headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 1})
+        transport = _AsyncTransport([msg])
+        result = await DLQInspector(transport).replay_async("orders.dlq", max_replays=1)
+        assert result.refused == 1 and transport.published == []
+
+    def test_reset_retry_count_restarts_every_budget_input(self) -> None:
+        headers = {
+            "x-rabbitkit-original-queue": "orders",
+            "x-rabbitkit-retry-count": 4,
+            "x-rabbitkit-first-failed-at": "2026-01-01T00:00:00+00:00",
+            "x-death": [{"queue": "orders.retry.4", "reason": "expired"}],
+            "x-first-death-queue": "orders.retry.1",
+            "x-rabbitkit-attempts": 5,
+        }
+        transport = _Transport([_msg(headers=headers)])
+        DLQInspector(transport).replay("orders.dlq", reset_retry_count=True)
+        env = transport.published[0]
+        h = env.headers
+        assert env.routing_key == "orders"  # routed from the ORIGINAL headers
+        assert "x-rabbitkit-retry-count" not in h and "x-death" not in h and "x-first-death-queue" not in h
+        assert "x-rabbitkit-first-failed-at" not in h
+        assert h["x-rabbitkit-previous-retry-count"] == 4 and h["x-rabbitkit-attempts"] == 5
+
+    def test_audit_records(self, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        transport = _Transport([_msg(headers={"x-rabbitkit-original-queue": "orders"})])
+
+        def only_timeouts(m: RabbitMessage) -> bool:
+            return True
+
+        with caplog.at_level(logging.INFO, logger="rabbitkit.dlq.audit"):
+            DLQInspector(transport).replay("orders.dlq", predicate=only_timeouts, actor="alice", limit=5)
+        text = "\n".join(r.getMessage() for r in caplog.records if r.name == "rabbitkit.dlq.audit")
+        assert "DLQ replay started: actor=alice queue='orders.dlq'" in text
+        assert "predicate=" in text and "only_timeouts" in text and "limit=5" in text
+        assert "DLQ replay finished: actor=alice" in text and "replayed=1" in text
+
+
+class TestReplayRoutingRule:
+    """One rule for the inspector and the CLI (resolve_replay_routing_key)."""
+
+    HEADERS: ClassVar[dict[str, Any]] = {
+        "x-rabbitkit-original-queue": "orders",
+        "x-rabbitkit-original-routing-key": "orders.created",
+    }
+
+    def test_default_exchange_routes_by_original_queue(self) -> None:
+        from rabbitkit.dlq import resolve_replay_routing_key
+
+        assert resolve_replay_routing_key(self.HEADERS, "orders.dlq") == "orders"
+
+    def test_named_exchange_routes_by_original_routing_key(self) -> None:
+        from rabbitkit.dlq import resolve_replay_routing_key
+
+        assert resolve_replay_routing_key(self.HEADERS, "orders.dlq", exchange="events") == "orders.created"
+        transport = _Transport([_msg(headers=dict(self.HEADERS))])
+        DLQInspector(transport).replay("orders.dlq", target_exchange="events")
+        assert (transport.published[0].exchange, transport.published[0].routing_key) == ("events", "orders.created")
+
+    def test_explicit_routing_key_wins(self) -> None:
+        from rabbitkit.dlq import resolve_replay_routing_key
+
+        assert resolve_replay_routing_key(self.HEADERS, "x", exchange="events", routing_key="k") == "k"
+
+    def test_broker_dead_lettered_message_uses_x_death(self) -> None:
+        from rabbitkit.dlq import resolve_replay_routing_key
+
+        headers = {"x-death": [{"queue": "orders", "routing-keys": ["orders.created"]}]}
+        assert resolve_replay_routing_key(headers, "orders.dlq") == "orders"
+        assert resolve_replay_routing_key(headers, "orders.dlq", exchange="events") == "orders.created"
+
+    @pytest.mark.parametrize("raw", ["x", None, True, -1])
+    def test_malformed_replay_count_reads_as_zero(self, raw: Any) -> None:
+        from rabbitkit.dlq import replay_count
+
+        assert replay_count({"x-rabbitkit-replay-count": raw}) == 0

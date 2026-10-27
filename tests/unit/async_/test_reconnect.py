@@ -308,3 +308,49 @@ async def test_connect_robust_builds_the_subclass(monkeypatch: pytest.MonkeyPatc
     assert isinstance(conn, RabbitkitRobustConnection)
     assert built == [conn]
     assert conn.reconnect_interval == 2.0
+
+
+@pytest.mark.usefixtures("connected_ok", "no_jitter")
+class TestConnectionStateHooks:
+    """G-22: the policy reports a live drop and a recovery, per role, so the
+    connection_up / broker_connected metrics follow reconnects."""
+
+    async def test_drop_and_recovery_fire_once_each(self) -> None:
+        lost: list[tuple[str, BaseException | None]] = []
+        restored: list[str] = []
+        conn = _make(
+            ConnectionConfig(),
+            role="publisher",
+            on_lost=lambda role, error: lost.append((role, error)),
+            on_restored=restored.append,
+        )
+        await _up(conn)
+        assert lost == [] and restored == []  # the first connect is not a recovery
+        await _drop(conn)
+        await conn._on_connection_close(_failed(_refused()))  # a failed attempt is not another drop
+        assert len(lost) == 1
+        assert lost[0][0] == "publisher"
+        assert isinstance(lost[0][1], ConnectionClosed)
+        await _up(conn)
+        assert restored == ["publisher"]
+
+    async def test_a_raising_lost_hook_never_breaks_the_reconnect(self, caplog: pytest.LogCaptureFixture) -> None:
+        def boom(_role: str, _error: BaseException | None) -> None:
+            raise ValueError("hook bug")
+
+        conn = _make(ConnectionConfig(), on_lost=boom)
+        await _up(conn)
+        with caplog.at_level(logging.ERROR, logger="rabbitkit.async_.reconnect"):
+            await _drop(conn)
+        assert "on_lost hook raised" in caplog.text
+        assert conn._rk_outage_started is not None
+
+    async def test_terminal_error_carries_the_role(self) -> None:
+        hooks = _Hooks()
+        conn = _make(ConnectionConfig(reconnect_budget_attempts=1), hooks, role="consumer")
+        await _up(conn)
+        await _drop(conn)
+        await conn._on_connection_close(_failed(_refused()))
+        assert hooks.terminal[0].role == "consumer"
+        assert conn._rk_close_task is not None
+        await conn._rk_close_task

@@ -400,14 +400,17 @@ class TerminalConnectionError(ConnectionError):
     re-raised by ``AsyncBroker.run()`` when it happens after startup.
 
     ``reason`` is a short, bounded snake_case code (safe as a metric label).
-    ``endpoint`` is ``host:port`` of the node that failed. Neither the
-    message nor any attribute ever carries credentials.
+    ``endpoint`` is ``host:port`` of the node that failed. ``role`` names the
+    connection (``"publisher"`` / ``"consumer"``) when the failure happened
+    after startup, else ``""``. Neither the message nor any attribute ever
+    carries credentials.
     """
 
-    def __init__(self, message: str, *, reason: str, endpoint: str = "") -> None:
+    def __init__(self, message: str, *, reason: str, endpoint: str = "", role: str = "") -> None:
         super().__init__(message)
         self.reason = reason
         self.endpoint = endpoint
+        self.role = role
 
 
 class PermanentConnectionError(TerminalConnectionError):

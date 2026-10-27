@@ -3024,3 +3024,56 @@ class TestRecoveryWaitAfterTerminalFailure:
         started = loop.time()
         assert await transport._wait_for_recovery(timeout=5.0) is False
         assert loop.time() - started < 1.0
+
+
+# ── G-22: sampled state for the broker metrics ──────────────────────────
+
+
+class TestObservabilityState:
+    @staticmethod
+    def _live(live: bool = True) -> MagicMock:
+        conn = MagicMock()
+        conn.is_closed = False
+        conn.connected.is_set.return_value = live
+        return conn
+
+    def test_connection_states_per_role(self) -> None:
+        transport = AsyncTransportImpl()
+        assert transport.connection_states() == {"publisher": False, "consumer": False}
+        transport._connected = True
+        transport._conn_pool._publisher_connection = self._live(True)
+        transport._conn_pool._consumer_connection = self._live(False)
+        assert transport.connection_states() == {"publisher": True, "consumer": False}
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        transport._conn_pool._terminal_error = ReconnectBudgetExhaustedError("x", reason="reconnect_budget_exhausted")
+        assert transport.connection_states() == {"publisher": False, "consumer": False}
+
+    def test_channels_active_counts_open_channels_only(self) -> None:
+        from rabbitkit.async_.pool import AsyncChannelPool
+
+        transport = AsyncTransportImpl()
+        assert transport.channels_active == 0
+        pool = AsyncChannelPool(MagicMock(), pool_size=4)
+        pool._created = 2
+        pool._in_use = {object()}
+        transport._conn_pool._publisher_channel_pool = pool
+        open_channel, closed_channel = MagicMock(is_closed=False), MagicMock(is_closed=True)
+        transport._topology_channel = open_channel
+        transport._fast_publish_channel = closed_channel
+        transport._consumer_channels = {"a": MagicMock(is_closed=False), "b": MagicMock(is_closed=True)}
+        assert transport.channels_active == 4  # 2 pooled + topology + consumer "a"
+        assert transport.publish_channels_in_use == 1
+
+    def test_connection_state_hook_and_a_raising_one(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = AsyncTransportImpl()
+        seen: list[tuple[str, bool, Any]] = []
+
+        def boom(_role: str, _up: bool, _error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        transport.on_connection_state(boom)
+        transport.on_connection_state(lambda role, up, error: seen.append((role, up, error)))
+        transport._conn_pool._fire_connection_state("consumer", False, None)
+        assert seen == [("consumer", False, None)]
+        assert "connection_state callback raised" in caplog.text

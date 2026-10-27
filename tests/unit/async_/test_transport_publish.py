@@ -555,3 +555,75 @@ class TestPreSendFailures:
         transport = _transport(confirm_delivery=False)
         outcome = await transport.publish(_env(delivery_mode=7))
         assert (outcome.status, outcome.reason) == (PublishStatus.ERROR, "invalid_envelope")
+
+
+# ── G-22: publish outcome hook (confirm latency, routing failures) ───────────
+
+
+class TestPublishOutcomeHook:
+    @staticmethod
+    def _recording(transport: AsyncTransportImpl) -> list[tuple[Any, float | None]]:
+        seen: list[tuple[Any, float | None]] = []
+        transport.on_publish_outcome(lambda outcome, seconds: seen.append((outcome, seconds)))
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_a_confirm_reports_the_send_to_confirm_time(self) -> None:
+        async def slow_ack(*_: Any, **__: Any) -> Any:
+            await asyncio.sleep(0.02)
+            return Basic.Ack()
+
+        transport = _transport()
+        seen = self._recording(transport)
+        outcome = await transport._publish_on_channel(_channel(slow_ack), _env(exchange="orders"))
+        assert seen[0][0] is outcome
+        seconds = seen[0][1]
+        assert seconds is not None and 0.015 <= seconds < 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_return_is_a_broker_answer_too(self) -> None:
+        transport = _transport()
+        seen = self._recording(transport)
+        await transport._publish_on_channel(_channel(AsyncMock(return_value=_returned_message())), _env())
+        assert seen[0][0].status is PublishStatus.RETURNED
+        assert seen[0][1] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_has_no_latency(self) -> None:
+        async def never(*_: Any, **__: Any) -> None:
+            await asyncio.sleep(5)
+
+        transport = _transport(confirm_timeout=0.01)
+        seen = self._recording(transport)
+        await transport._publish_on_channel(_channel(never), _env())
+        assert seen[0][0].status is PublishStatus.TIMEOUT
+        assert seen[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_nothing_sent_is_not_reported(self) -> None:
+        transport = _transport()
+        seen = self._recording(transport)
+        await transport._publish_on_channel(_channel(), _env(), timeout=0)
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_fast_path_reports_sent_and_failures_without_latency(self) -> None:
+        transport = _transport(confirm_delivery=False)
+        seen = self._recording(transport)
+        with patch.object(transport, "_get_fast_channel", new=AsyncMock(return_value=_channel())):
+            await transport.publish(_env())
+        failing = _channel(AsyncMock(side_effect=ConnectionResetError()))
+        with patch.object(transport, "_get_fast_channel", new=AsyncMock(return_value=failing)):
+            await transport.publish(_env())
+        assert [(o.status, s) for o, s in seen] == [(PublishStatus.SENT, None), (PublishStatus.UNKNOWN, None)]
+
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_never_fails_the_publish(self, caplog: pytest.LogCaptureFixture) -> None:
+        def boom(_outcome: Any, _seconds: float | None) -> None:
+            raise RuntimeError("metrics bug")
+
+        transport = _transport()
+        transport.on_publish_outcome(boom)
+        outcome = await transport._publish_on_channel(_channel(), _env())
+        assert outcome.status is PublishStatus.CONFIRMED
+        assert "publish_outcome callback raised" in caplog.text

@@ -64,6 +64,8 @@ _SHUTDOWN_UNWIND_SECONDS = 1.0
 _REUSABLE_STATUSES = frozenset(
     {PublishStatus.CONFIRMED, PublishStatus.SENT, PublishStatus.NACKED, PublishStatus.RETURNED}
 )
+# Outcomes that are a broker answer to a confirmed publish (confirm latency).
+_BROKER_ANSWERS = frozenset({PublishStatus.CONFIRMED, PublishStatus.NACKED, PublishStatus.RETURNED})
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -194,6 +196,7 @@ class AsyncTransportImpl:
             on_connection_created=self._attach_connection_callbacks,
             on_reconnect_attempt=self._fire_reconnect_attempt,
             on_connection_failed=self._fire_connection_failed,
+            on_connection_state=self._fire_connection_state,
         )
         self._connected = False
 
@@ -251,6 +254,10 @@ class AsyncTransportImpl:
         # G-08: failed reconnect attempts and the terminal connection failure.
         self._reconnect_attempt_callbacks: list[Callable[[ReconnectAttempt], None]] = []
         self._connection_failed_callbacks: list[Callable[[TerminalConnectionError], None]] = []
+        # G-22: connection up/down per role, and publish outcomes with the
+        # send-to-broker-answer latency (metrics hooks).
+        self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
+        self._publish_outcome_callbacks: list[Callable[[PublishOutcome, float | None], None]] = []
 
         # Channel-lifecycle signal (item 3), mirroring SyncTransport:
         # channels_opened_total counts every new channel THIS transport
@@ -317,6 +324,74 @@ class AsyncTransportImpl:
                 cb(error)
             except Exception:  # never break the reconnect path
                 logger.exception("connection_failed callback raised")
+
+    def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
+        """Register ``callback(role, up, error)`` for connection state changes (G-22).
+
+        ``role`` is ``"publisher"`` or ``"consumer"``. Fired with ``up=True``
+        when a connection is created or reconnects after a drop, and with
+        ``up=False`` (and the close error, if any) the moment a live
+        connection drops. A connection that gives up for good fires
+        :meth:`on_connection_failed` instead.
+        """
+        self._connection_state_callbacks.append(callback)
+
+    def _fire_connection_state(self, role: str, up: bool, error: BaseException | None) -> None:
+        for cb in list(self._connection_state_callbacks):
+            try:
+                cb(role, up, error)
+            except Exception:  # never break the connect/reconnect path
+                logger.exception("connection_state callback raised")
+
+    def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
+        """Register ``callback(outcome, seconds)`` for every publish whose
+        frame was handed to aio-pika (G-22).
+
+        ``seconds`` is the time from handing the frame to aio-pika until the
+        broker answered (confirm, nack or return), or ``None`` when no broker
+        answer was observed (fire-and-forget ``SENT``, timeout, connection
+        loss, refusal). It excludes admission, channel acquisition and
+        serialization. Outcomes decided before anything was sent
+        (``NOT_SENT``) are not reported here. Covers every transport publish:
+        ``publish()``, the batch publisher, retry and dead-letter copies.
+        """
+        self._publish_outcome_callbacks.append(callback)
+
+    def _report_publish(self, outcome: PublishOutcome, seconds: float | None) -> None:
+        for cb in self._publish_outcome_callbacks:
+            try:
+                cb(outcome, seconds)
+            except Exception:  # never let a metrics hook fail a publish
+                logger.exception("publish_outcome callback raised")
+
+    def connection_states(self) -> dict[str, bool]:
+        """``{"publisher": up, "consumer": up}`` right now (sampled by metrics)."""
+        terminal = self._conn_pool.terminal_error is not None
+        states: dict[str, bool] = {}
+        for role, conn in (
+            ("publisher", self._conn_pool._publisher_connection),
+            ("consumer", self._conn_pool._consumer_connection),
+        ):
+            states[role] = bool(self._connected and not terminal and conn is not None and _connection_live(conn))
+        return states
+
+    @property
+    def channels_active(self) -> int:
+        """Channels this transport holds open right now: the publisher and
+        mandatory pools' channels, the topology and fast-publish channels and
+        one per consumed queue. Bounded by ``2 * channel_pool_size + 2 +
+        consumed queues``."""
+        owned, _in_use = self._conn_pool.channel_counts()
+        count = owned
+        for channel in (self._topology_channel, self._fast_publish_channel, *self._consumer_channels.values()):
+            if channel is not None and not bool(getattr(channel, "is_closed", False)):
+                count += 1
+        return count
+
+    @property
+    def publish_channels_in_use(self) -> int:
+        """Publisher channels currently checked out of the pools."""
+        return self._conn_pool.channel_counts()[1]
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -858,9 +933,14 @@ class AsyncTransportImpl:
         mine: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._inflight_message_ids[key] = mine
         try:
-            return await self._publish_on_channel_unguarded(
+            started = time.monotonic()
+            outcome = await self._publish_on_channel_unguarded(
                 channel, exchange, message, envelope, timeout=timeout, exclusive=exclusive
             )
+            if self._publish_outcome_callbacks and outcome.status is not PublishStatus.NOT_SENT:
+                answered = outcome.status in _BROKER_ANSWERS
+                self._report_publish(outcome, time.monotonic() - started if answered else None)
+            return outcome
         finally:
             if self._inflight_message_ids.get(key) is mine:
                 del self._inflight_message_ids[key]
@@ -1191,10 +1271,14 @@ class AsyncTransportImpl:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return self._classify_publish_failure(e, envelope, exclusive=False)
-        # M4: SENT, not CONFIRMED -- this channel has publisher_confirms=False,
-        # so nothing was actually acknowledged by the broker.
-        return self._outcome(envelope, PublishStatus.SENT)
+            outcome = self._classify_publish_failure(e, envelope, exclusive=False)
+        else:
+            # M4: SENT, not CONFIRMED -- this channel has publisher_confirms=False,
+            # so nothing was actually acknowledged by the broker.
+            outcome = self._outcome(envelope, PublishStatus.SENT)
+        if self._publish_outcome_callbacks:
+            self._report_publish(outcome, None)
+        return outcome
 
     async def _publish_confirmed(self, envelope: MessageEnvelope, deadline: float | None = None) -> PublishOutcome:
         """Confirmed (pooled-channel) publish path — one pool channel per

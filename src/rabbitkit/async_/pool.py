@@ -476,6 +476,7 @@ class AsyncConnectionPool:
         on_connection_created: Callable[[Any], None] | None = None,
         on_reconnect_attempt: Callable[[Any], None] | None = None,
         on_connection_failed: Callable[[TerminalConnectionError], None] | None = None,
+        on_connection_state: Callable[[str, bool, BaseException | None], None] | None = None,
     ) -> None:
         self._connection_config = connection_config
         self._security_config = security_config
@@ -494,6 +495,9 @@ class AsyncConnectionPool:
         # terminal failure (TerminalConnectionError) of any connection.
         self._on_reconnect_attempt = on_reconnect_attempt
         self._on_connection_failed = on_connection_failed
+        # G-22: ``(role, up, error)`` whenever a connection comes up (created
+        # or reconnected) or a live one drops; the metrics follow it.
+        self._on_connection_state = on_connection_state
         # Set once a connection gives up for good (permanent failure or spent
         # reconnect budget) after startup. Sticky: every later connect raises
         # it instead of retrying, so the transport stays "not connected".
@@ -525,6 +529,33 @@ class AsyncConnectionPool:
                 self._on_connection_failed(error)
             except Exception:  # never let a hook break the reconnect path
                 logger.exception("on_connection_failed callback raised")
+
+    def _fire_connection_state(self, role: str, up: bool, error: BaseException | None) -> None:
+        if self._on_connection_state is None:
+            return
+        try:
+            self._on_connection_state(role, up, error)
+        except Exception:  # never let a hook break a connect or the reconnect path
+            logger.exception("on_connection_state callback raised")
+
+    def _connection_lost(self, role: str, error: BaseException | None) -> None:
+        self._fire_connection_state(role, False, error)
+
+    def _connection_restored(self, role: str) -> None:
+        self._fire_connection_state(role, True, None)
+
+    def channel_counts(self) -> tuple[int, int]:
+        """``(owned, in_use)`` publisher channels across both publisher pools.
+
+        *owned* counts channels a pool holds (idle, checked out or opening),
+        bounded by ``channel_pool_size`` per pool; *in_use* the checked-out ones.
+        """
+        owned = in_use = 0
+        for pool in (self._publisher_channel_pool, self._mandatory_channel_pool):
+            if pool is not None and not pool.closed:
+                owned += pool.created_count
+                in_use += pool.in_use_count
+        return owned, in_use
 
     async def connect(self) -> None:
         """Establish publisher and consumer connections eagerly.
@@ -865,6 +896,8 @@ class AsyncConnectionPool:
                 on_attempt=self._on_reconnect_attempt,
                 on_terminal=self._record_terminal,
                 on_instance=built.append,
+                on_lost=self._connection_lost,
+                on_restored=self._connection_restored,
             )
             kwargs["connection_class"] = functools.partial(RabbitkitRobustConnection, rk_policy=policy)
             try:
@@ -882,6 +915,7 @@ class AsyncConnectionPool:
                 permanent = permanent_connection_error(e, endpoint=f"{host}:{port}", vhost=vhost)
                 if permanent is not None:
                     if self._connected_once:
+                        permanent.role = role
                         self._record_terminal(permanent)
                     raise permanent from e
                 if not isinstance(e, connection_errors) or attempt == max_attempts:
@@ -901,5 +935,6 @@ class AsyncConnectionPool:
                         self._on_connection_created(connection)
                     except Exception:  # pragma: no cover — never fail a connect on a hook
                         logger.exception("on_connection_created callback raised")
+                self._fire_connection_state(role, True, None)
                 return connection
         raise RuntimeError("unreachable")  # pragma: no cover

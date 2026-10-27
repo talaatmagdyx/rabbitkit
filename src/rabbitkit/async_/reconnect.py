@@ -105,6 +105,8 @@ class ReconnectPolicy:
         on_terminal: Called once when the connection gives up for good.
         on_instance: Called with each connection object as it is built, so the
             caller can close one whose initial connect it abandons.
+        on_lost: Called with ``(role, error)`` when a live connection drops.
+        on_restored: Called with ``role`` when a reconnect after a drop succeeds.
     """
 
     def __init__(
@@ -116,6 +118,8 @@ class ReconnectPolicy:
         on_attempt: Callable[[ReconnectAttempt], None] | None = None,
         on_terminal: Callable[[TerminalConnectionError], None] | None = None,
         on_instance: Callable[[Any], None] | None = None,
+        on_lost: Callable[[str, BaseException | None], None] | None = None,
+        on_restored: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
         self.role = role
@@ -124,6 +128,8 @@ class ReconnectPolicy:
         self.on_attempt = on_attempt
         self.on_terminal = on_terminal
         self.on_instance = on_instance
+        self.on_lost = on_lost
+        self.on_restored = on_restored
 
 
 def _closing_error(closing: Any) -> BaseException | None:
@@ -178,18 +184,22 @@ class RabbitkitRobustConnection(RobustConnection):
         # Raises if aio-pika could not restore the channels; that close goes
         # through _on_connection_close as a failed attempt.
         await super()._on_connected()
-        if self._rk_outage_started is not None:
+        outage_started = self._rk_outage_started
+        restored = outage_started is not None
+        if outage_started is not None:
             logger.info(
                 "Reconnected %s connection to %s after %d failed attempt(s) in %.1fs",
                 self._rk_policy.role,
                 self.current_endpoint,
                 self._rk_failures,
-                time.monotonic() - self._rk_outage_started,
+                time.monotonic() - outage_started,
             )
         self._rk_connected_once = True
         self._rk_outage_started = None
         self._rk_failures = 0
         self.reconnect_interval = self._rk_steady_interval
+        if restored:
+            _fire(self._rk_policy.on_restored, self._rk_policy.role, "on_restored")
 
     async def _on_connection_close(self, closing: Any) -> None:
         # Runs on the loss of a live connection AND after every failed connect
@@ -209,6 +219,12 @@ class RabbitkitRobustConnection(RobustConnection):
                 "%s connection to %s lost (%r); reconnecting", self._rk_policy.role, self.current_endpoint, error
             )
             self._rk_prepare_attempt(advance=False)
+            on_lost = self._rk_policy.on_lost
+            if on_lost is not None:
+                try:
+                    on_lost(self._rk_policy.role, error)
+                except Exception:  # never let a hook break aio-pika's reconnect loop
+                    logger.exception("on_lost hook raised")
             return
 
         self._rk_failures += 1
@@ -282,6 +298,7 @@ class RabbitkitRobustConnection(RobustConnection):
 
     def _rk_give_up(self, error: TerminalConnectionError, cause: BaseException | None) -> None:
         error.__cause__ = cause
+        error.role = self._rk_policy.role
         self._rk_terminal = error
         logger.error("Giving up on the %s connection to RabbitMQ: %s", self._rk_policy.role, error)
         # This hook can run inside aio-pika's reconnect task, which close()

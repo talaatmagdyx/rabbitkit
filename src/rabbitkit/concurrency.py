@@ -315,6 +315,11 @@ class SyncWorkerPool:
             return len(self._futures)
 
 
+#: How long AsyncWorkerPool.stop() waits for cancelled tasks to unwind after
+#: its deadline before abandoning them (keeps stop() bounded).
+_CANCEL_JOIN_TIMEOUT = 1.0
+
+
 class AsyncWorkerPool:
     """Semaphore-based concurrent async message processing.
 
@@ -354,12 +359,10 @@ class AsyncWorkerPool:
     async def stop(self, timeout: float | None = None) -> None:
         """Stop the worker pool, waiting for in-flight tasks.
 
-        R-TaskGroup: rather than ``asyncio.wait`` + a manual ``task.cancel()``
-        loop, we ``gather(*tasks, return_exceptions=True)`` bounded by
-        ``asyncio.timeout`` (the 3.11+ idiom). Tasks that don't finish before
-        the deadline are cancelled and awaited once more so their
-        ``CancelledError`` is consumed rather than leaking as "Task was
-        destroyed but it is pending" warnings.
+        Waits up to *timeout* for in-flight tasks, then cancels the rest and
+        waits at most ``_CANCEL_JOIN_TIMEOUT`` more for them to unwind. A
+        handler that swallows ``CancelledError`` is abandoned (logged) rather
+        than allowed to hold ``stop()`` open past its deadline.
 
         H12: a task cancelled by the deadline is *not* guaranteed to have
         reached its own ``ack``/``nack`` — ``CancelledError`` is a
@@ -378,23 +381,27 @@ class AsyncWorkerPool:
         tasks = list(self._tasks)
         task_messages = dict(self._task_messages)
         try:
-            async with asyncio.timeout(effective):
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except TimeoutError:
-            # Deadline elapsed: cancel any still-running tasks and drain them
-            # so cancellation propagates cleanly (no pending-task warnings).
-            # In practice `asyncio.timeout` firing cancels this method's own
-            # await of gather(), and gather's cancellation handling already
-            # cancels + drains every task before re-raising -- so `not_done`
-            # is normally empty by the time we get here; this loop is a
-            # defensive backstop, not the primary abandonment path.
-            not_done = [t for t in tasks if not t.done()]
-            for task in not_done:  # pragma: no cover — gather already drains before raising
-                task.cancel()  # pragma: no cover
-            if not_done:  # pragma: no cover
-                await asyncio.gather(*not_done, return_exceptions=True)  # pragma: no cover
-            for message in task_messages.values():
-                if message.is_settled:
+            # asyncio.wait, not gather: a cancelled gather only completes once
+            # every child has finished, so one handler that swallows
+            # CancelledError made stop() unbounded (INV-008).
+            _done, pending = await asyncio.wait(tasks, timeout=effective)
+            if not pending:
+                return
+            for task in pending:
+                task.cancel()
+            _done, stuck = await asyncio.wait(pending, timeout=_CANCEL_JOIN_TIMEOUT)
+            for task in stuck:
+                message = task_messages.get(task)
+                logger.error(
+                    "AsyncWorkerPool: handler for delivery_tag=%s message_id=%s ignored cancellation "
+                    "for %.1fs; abandoning it (it may still run, and its side effects may still happen)",
+                    getattr(message, "delivery_tag", None),
+                    getattr(message, "message_id", None),
+                    _CANCEL_JOIN_TIMEOUT,
+                )
+            for task in pending:
+                message = task_messages.get(task)
+                if message is None or message.is_settled:
                     continue  # handler reached its own ack/nack before being cut off
                 logger.warning(
                     "AsyncWorkerPool: handler for delivery_tag=%s message_id=%s did not "
@@ -406,13 +413,11 @@ class AsyncWorkerPool:
                 try:
                     await message.nack_async(requeue=True)
                 except Exception:
-                    logger.warning(
-                        "nack on abandoned handler's message raised", exc_info=True
-                    )
+                    logger.warning("nack on abandoned handler's message raised", exc_info=True)
         finally:
             self._tasks.clear()
             self._task_messages.clear()
-        logger.info("AsyncWorkerPool stopped")
+            logger.info("AsyncWorkerPool stopped")
 
     async def submit(
         self,

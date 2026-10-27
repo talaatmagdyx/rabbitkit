@@ -2507,3 +2507,44 @@ class TestUserSuppliedRetryMiddlewareWiring:
             await broker.start()
 
         assert user_mw._publish_async_fn is not None
+
+
+class TestAsyncWaitInFlightIsBounded:
+    """INV-008: a handler that swallows CancelledError must not hold stop()
+    open past the graceful deadline plus the short cancel-join bound."""
+
+    async def test_cancellation_swallowing_handler_is_abandoned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        import rabbitkit.async_.broker as broker_mod
+        from rabbitkit.core.message import RabbitMessage
+
+        monkeypatch.setattr(broker_mod, "_CANCEL_JOIN_TIMEOUT", 0.05)
+        broker = AsyncBroker()
+        message = RabbitMessage(body=b"", delivery_tag=9, message_id="stuck")
+        nacked: list[bool] = []
+
+        async def nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = nack
+        release = asyncio.Event()
+
+        async def misbehaving() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await release.wait()  # swallows cancellation
+
+        task = asyncio.create_task(misbehaving())
+        await asyncio.sleep(0)
+        broker._inflight_tasks[task] = message
+        broker._in_flight = 1
+        t0 = time.monotonic()
+        with patch("rabbitkit.async_.broker.logger") as mock_logger:
+            await broker._wait_in_flight(time.monotonic() - 1.0)
+        assert time.monotonic() - t0 < 1.0
+        assert nacked == [True]
+        assert any("ignored cancellation" in str(c.args[0]) for c in mock_logger.error.call_args_list)
+        release.set()
+        await task

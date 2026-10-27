@@ -884,3 +884,37 @@ class TestSyncWorkerPoolPump:
         mock_logger.warning.assert_called_once()
         assert "did not complete" in mock_logger.warning.call_args[0][0]
         future.cancel()
+
+
+class TestAsyncWorkerPoolStopIsBounded:
+    async def test_cancellation_swallowing_task_does_not_hold_stop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        import rabbitkit.concurrency as concurrency_mod
+
+        monkeypatch.setattr(concurrency_mod, "_CANCEL_JOIN_TIMEOUT", 0.05)
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        message = _make_message(delivery_tag=5, message_id="stuck")
+        nacked: list[bool] = []
+
+        async def nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = nack
+        release = asyncio.Event()
+
+        async def misbehaving(msg: RabbitMessage) -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await release.wait()
+
+        await pool.submit(misbehaving, message)
+        await asyncio.sleep(0.01)
+        t0 = time.monotonic()
+        await pool.stop(timeout=0.05)
+        assert time.monotonic() - t0 < 1.0
+        assert nacked == [True]
+        release.set()
+        await asyncio.sleep(0.01)

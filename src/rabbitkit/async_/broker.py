@@ -68,6 +68,12 @@ if TYPE_CHECKING:
 logger = structlog.stdlib.get_logger(__name__)
 
 
+#: How long stop() waits for cancelled in-flight handlers to unwind after the
+#: graceful deadline. A handler that swallows CancelledError is abandoned
+#: after this, so stop() stays bounded (graceful_timeout + this).
+_CANCEL_JOIN_TIMEOUT = 1.0
+
+
 class AsyncBroker:
     """Async broker — wires registry + pipeline + AsyncTransportImpl.
 
@@ -661,7 +667,20 @@ class AsyncBroker:
             for task in tasks:
                 task.cancel()
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # INV-008: bounded even when a handler swallows CancelledError
+                # (an unbounded gather here let stop() overrun graceful_timeout
+                # by however long the misbehaving handler kept running).
+                _done, still_running = await asyncio.wait(tasks, timeout=_CANCEL_JOIN_TIMEOUT)
+                for task in still_running:
+                    stuck = tasks[task]
+                    logger.error(
+                        "AsyncBroker.stop: handler for delivery_tag=%s message_id=%s ignored cancellation "
+                        "for %.1fs; abandoning it (it may still run, and its side effects may still "
+                        "happen). The delivery is nacked for redelivery below.",
+                        stuck.delivery_tag,
+                        stuck.message_id,
+                        _CANCEL_JOIN_TIMEOUT,
+                    )
             for message in tasks.values():
                 if message.is_settled:
                     continue  # handler reached its own ack/nack before being cut off

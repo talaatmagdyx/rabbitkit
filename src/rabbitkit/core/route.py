@@ -289,11 +289,31 @@ class RouteDefinition:
                 f"'auto_provision', 'error', 'discard'; got {self.reject_without_dlx!r}."
             )
 
+    def validate_prefetch_count(self) -> None:
+        """Validate the per-route prefetch override (CONSUMER-005).
+
+        ``None`` inherits ``ConsumerConfig.prefetch_count``. ``0`` used to
+        fall through to the global value silently (``route.prefetch_count or
+        global``), and a negative value was sent to the broker as a QoS
+        argument. Both are configuration mistakes; ``0`` would mean
+        UNLIMITED prefetch in AMQP, which ``ConsumerConfig`` already refuses.
+        """
+        value = self.prefetch_count
+        if value is None:
+            return
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigurationError(
+                f"Route '{self.name}': prefetch_count must be None (inherit "
+                f"ConsumerConfig.prefetch_count) or an int >= 1, got {value!r} "
+                "(0 would mean UNLIMITED prefetch in AMQP)."
+            )
+
     def validate(self, broker_retry: RetryConfig | None = None) -> None:
         """Run all route validations.
 
         Called at registration time — fail fast on conflicts.
         """
+        self.validate_prefetch_count()
         self.validate_retry_ack_compatibility(broker_retry)
         self.validate_retry_dlx_conflict(broker_retry)
         self.validate_headers_binding()

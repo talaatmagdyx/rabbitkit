@@ -504,6 +504,7 @@ class TestDLXCycleDetection:
             pass
 
         with pytest.raises(ConfigurationError, match="Dead-letter-exchange cycle"):
+
             @reg.subscriber(
                 queue=RabbitQueue(name="qb", dead_letter_exchange="xa"),
                 exchange=RabbitExchange(name="xb"),
@@ -530,9 +531,23 @@ class TestDLXCycleDetection:
         reg = _make_registry()
 
         with pytest.raises(ConfigurationError, match="Dead-letter-exchange cycle"):
+
             @reg.subscriber(
                 queue=RabbitQueue(name="qa", dead_letter_exchange="xa"),
                 exchange=RabbitExchange(name="xa"),
             )
             def handle_a(msg: object) -> None:
                 pass
+
+
+class TestPrefetchOverride:
+    @pytest.mark.parametrize("value", [0, -5])
+    def test_invalid_prefetch_fails_at_registration(self, value: int) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="prefetch_count"):
+
+            @reg.subscriber(queue="orders", prefetch_count=value)
+            def handle(msg: object) -> None:
+                pass
+
+        assert reg.routes == []

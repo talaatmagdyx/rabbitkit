@@ -268,13 +268,13 @@ async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: di
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
     user = await _new_user(own_rabbit)
-    secret = {"password": _PW1}
+    current = [_PW1]  # what the credentials_provider hands out
     queue = f"q-{uuid.uuid4().hex[:8]}"
     config = RabbitConfig(
         connection=ConnectionConfig(
             host=own_rabbit["host"],
             port=own_rabbit["port"],
-            credentials_provider=lambda: (user, secret["password"]),
+            credentials_provider=lambda: (user, current[0]),
             reconnect_backoff_base=0.1,
             reconnect_backoff_max=0.5,
             socket_timeout=5,
@@ -293,7 +293,7 @@ async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: di
         await broker.publish(MessageEnvelope(routing_key=queue, body=b"before"))
         assert await received.get() == b"before"
 
-        secret["password"] = _PW2
+        current[0] = _PW2
         await actl(own_rabbit, "change_password", user, _PW2)
         await actl(own_rabbit, "close_all_connections", "rotate")
         await _wait_until(lambda: _true(broker._transport.is_connected()), 30, "the reconnect")

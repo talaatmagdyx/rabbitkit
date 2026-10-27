@@ -228,12 +228,16 @@ async def test_connection_lost_after_send_is_unknown_and_never_republished(rabbi
     """G-03: a connection error after the frame left was retried once after
     recovery; the message reached the queue twice and the call said
     CONFIRMED."""
+    from rabbitkit.core.config import PublisherConfig
     from rabbitkit.core.types import MessageEnvelope, PublishStatus
 
     queue = _name("unknown")
     connection_name = _name("conn")
     await _declare(rabbit["url"], queue)
-    async with _broker(_config(rabbit["url"], connection_name=connection_name)) as broker:
+    # The kill waits for the management API to list the connection (stats lag
+    # ~5 s), so the confirm wait must outlast it or the outcome races to TIMEOUT.
+    publisher = PublisherConfig(confirm_timeout=60.0)
+    async with _broker(_config(rabbit["url"], connection_name=connection_name, publisher=publisher)) as broker:
         with _dropping_confirms():
             task = asyncio.create_task(broker.publish(MessageEnvelope(routing_key=queue, body=b"x")))
             assert await _await_ready(rabbit["url"], queue, 1) == 1  # the frames reached the broker

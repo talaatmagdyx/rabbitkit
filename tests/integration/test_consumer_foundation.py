@@ -34,10 +34,15 @@ def rabbit(rabbit_container: dict[str, Any]) -> dict[str, Any]:
     return rabbit_container
 
 
-def _config(url: str, **kw: Any) -> Any:
+def _config(url: str, *, connection_name: str | None = None, **kw: Any) -> Any:
+    from dataclasses import replace
+
     from rabbitkit.core.config import ConnectionConfig, RabbitConfig
 
-    return RabbitConfig(connection=ConnectionConfig.from_url(url), **kw)
+    connection = ConnectionConfig.from_url(url)
+    if connection_name is not None:
+        connection = replace(connection, connection_name=connection_name)
+    return RabbitConfig(connection=connection, **kw)
 
 
 def _name(prefix: str) -> str:
@@ -75,11 +80,11 @@ async def _await_probe(url: str, queue: str, *, ready: int | None = None, consum
     raise AssertionError(f"{queue}: expected ready={ready} consumers={consumers}, last saw {seen}")
 
 
-def _kill_connections(rabbit: dict[str, Any], *, at_least: int = 2) -> int:
-    """Force-close every AMQP connection on the node (this suite is serial).
+def _kill_connections(rabbit: dict[str, Any], connection_name: str, *, at_least: int = 2) -> int:
+    """Force-close only this broker's AMQP connections (the container is shared).
 
     The management API lists a new connection only after its next stats
-    refresh, so poll until at least *at_least* connections are visible."""
+    refresh, so poll until at least *at_least* of them are visible."""
     import time
 
     from rabbitkit.management import ManagementConfig, RabbitManagementClient
@@ -88,7 +93,11 @@ def _kill_connections(rabbit: dict[str, Any], *, at_least: int = 2) -> int:
     deadline = time.monotonic() + 15
     names: list[str] = []
     while time.monotonic() < deadline:
-        names = [str(c.get("name")) for c in client.list_connections() if c.get("name")]
+        names = [
+            str(c.get("name"))
+            for c in client.list_connections()
+            if (c.get("client_properties") or {}).get("connection_name") == connection_name
+        ]
         if len(names) >= at_least:
             break
         time.sleep(0.25)
@@ -323,7 +332,10 @@ async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(
     from rabbitkit.core.config import ConsumerConfig, WorkerConfig
 
     queue = _name("c007")
-    broker = AsyncBroker(_config(rabbit["url"], consumer=ConsumerConfig(graceful_timeout=30)))
+    connection_name = _name("conn")
+    broker = AsyncBroker(
+        _config(rabbit["url"], connection_name=connection_name, consumer=ConsumerConfig(graceful_timeout=30))
+    )
     started = asyncio.Event()
     release = asyncio.Event()
     calls: list[str] = []
@@ -345,7 +357,7 @@ async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(
         await _await_probe(rabbit["url"], queue, consumers=0)
         await _publish_raw(rabbit["url"], queue, ["during-drain"])
 
-        assert await asyncio.to_thread(_kill_connections, rabbit) > 0
+        assert await asyncio.to_thread(_kill_connections, rabbit, connection_name) > 0
         await _await_reconnected(broker)
         await asyncio.sleep(3.0)  # aio-pika restores consumers right after reconnecting
 
@@ -373,7 +385,8 @@ async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> 
     from rabbitkit import AsyncBroker
 
     queue = _name("qos")
-    broker = AsyncBroker(_config(rabbit["url"]))
+    connection_name = _name("conn")
+    broker = AsyncBroker(_config(rabbit["url"], connection_name=connection_name))
     release = asyncio.Event()
     cancelled: list[str] = []
 
@@ -391,7 +404,7 @@ async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> 
         await _publish_raw(rabbit["url"], queue, [str(i) for i in range(8)])
         await await_counts(rabbit, queue, (6, 2), timeout=20)
 
-        assert await asyncio.to_thread(_kill_connections, rabbit) > 0
+        assert await asyncio.to_thread(_kill_connections, rabbit, connection_name) > 0
         await _await_reconnected(broker)
         await await_consumers(rabbit["url"], queue, timeout=30)
         await await_counts(rabbit, queue, (6, 2), timeout=20)

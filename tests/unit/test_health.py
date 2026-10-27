@@ -1097,3 +1097,34 @@ class TestBrokerReadinessConnectedFalse:
             result = await broker_readiness_async(broker)
 
         assert result is False
+
+
+class TestTerminalConnectionFailure:
+    """G-08: a connection that stopped reconnecting for good fails liveness,
+    readiness and health, with the reason in the details."""
+
+    @staticmethod
+    def _broker() -> SimpleNamespace:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        broker = _make_broker(connected=False, routes=[_make_route()])
+        broker._transport.connection_failure = AuthenticationFailedError("refused", reason="authentication_failed")
+        return broker
+
+    def test_liveness_fails(self) -> None:
+        assert not broker_liveness(self._broker())
+
+    def test_readiness_fails(self) -> None:
+        assert not broker_readiness(self._broker())
+
+    def test_health_names_the_reason(self) -> None:
+        result = broker_health_check(self._broker())
+        assert result.status == HealthStatus.UNHEALTHY
+        assert "authentication_failed" in result.details["reason"]
+        assert "restart required" in result.details["reason"]
+
+    def test_a_transient_disconnect_stays_alive(self) -> None:
+        broker = _make_broker(connected=False)
+        broker._transport.connection_failure = None
+        assert broker_liveness(broker)
+        assert broker_health_check(broker).details["reason"] == "transport not connected"

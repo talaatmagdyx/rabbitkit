@@ -117,6 +117,12 @@ def _get_transport(broker: Any) -> Any:
     return getattr(broker, "_transport", None)
 
 
+def _get_connection_failure(transport: Any) -> BaseException | None:
+    """The transport's terminal connection failure (G-08), if it gave up for good."""
+    failure = getattr(transport, "connection_failure", None) if transport is not None else None
+    return failure if isinstance(failure, BaseException) else None
+
+
 def _get_consumer_count(broker: Any, transport: Any) -> int:
     """Count routes with an active consumer, cross-checked against transport liveness."""
     consumer_count = _get(broker, "consumer_count", "_consumer_count", _MISSING)
@@ -210,11 +216,17 @@ def _local_broker_health_check(
     transport = _get_transport(broker)
     connected = _get_connected(broker)
     if not connected:
+        failure = _get_connection_failure(transport)
+        if failure is not None:
+            reason = getattr(failure, "reason", type(failure).__name__)
+            details: dict[str, Any] = {"reason": f"connection failed for good ({reason}); restart required"}
+        else:
+            details = {"reason": "transport not connected"}
         return BrokerHealthResult(
             status=HealthStatus.UNHEALTHY,
             started=True,
             connected=False,
-            details={"reason": "transport not connected"},
+            details=details,
         )
 
     # L15: a connection can be blocked (broker memory/disk alarm pausing
@@ -232,9 +244,7 @@ def _local_broker_health_check(
     # Determine status
     if blocked:
         status = HealthStatus.DEGRADED
-        details: dict[str, Any] = {
-            "reason": "connection blocked by broker flow control (memory/disk alarm); publishes will stall"
-        }
+        details = {"reason": "connection blocked by broker flow control (memory/disk alarm); publishes will stall"}
     elif consumer_count < route_count:
         status = HealthStatus.DEGRADED
         details = {"reason": f"only {consumer_count}/{route_count} consumers active"}
@@ -408,7 +418,10 @@ def broker_liveness(broker: HealthProvider | Any, wedged_timeout: float = 60.0) 
       set this on a hard fault), OR
     - a ``last_heartbeat`` is present and ``now - last_heartbeat >
       wedged_timeout`` (a heartbeat was recorded via :func:`mark_heartbeat`
-      but has gone stale, meaning the I/O loop is wedged).
+      but has gone stale, meaning the I/O loop is wedged), OR
+    - the transport's ``connection_failure`` is set: a connection stopped
+      reconnecting for good (refused credentials or vhost, TLS verification,
+      spent reconnect budget; G-08). Only a restart can recover from that.
 
     A transient broker/transport disconnect is *not* a liveness failure: the
     process is still running and can recover. Use :func:`broker_readiness` to
@@ -421,6 +434,8 @@ def broker_liveness(broker: HealthProvider | Any, wedged_timeout: float = 60.0) 
     if not started:
         return False
     if _get(broker, "wedged", "_wedged", False):
+        return False
+    if _get_connection_failure(_get_transport(broker)) is not None:
         return False
     last_heartbeat = _get_last_heartbeat(broker)
     if last_heartbeat is not None:

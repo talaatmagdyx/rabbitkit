@@ -20,12 +20,12 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rabbitkit.async_.connection import get_connection_errors
 from rabbitkit.async_.pool import AsyncConnectionPool
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
-from rabbitkit.core.errors import ConfigurationError
+from rabbitkit.core.errors import ConfigurationError, TerminalConnectionError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
@@ -36,6 +36,9 @@ from rabbitkit.core.types import (
     PublishStatus,
     TopologyMode,
 )
+
+if TYPE_CHECKING:
+    from rabbitkit.async_.reconnect import ReconnectAttempt
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +146,8 @@ class AsyncTransportImpl:
             on_channel_opened=self._fire_channel_opened,
             on_channel_rebuilt=self._fire_channel_rebuilt,
             on_connection_created=self._attach_connection_callbacks,
+            on_reconnect_attempt=self._fire_reconnect_attempt,
+            on_connection_failed=self._fire_connection_failed,
         )
         self._connected = False
 
@@ -193,6 +198,9 @@ class AsyncTransportImpl:
         # Connection-churn metric hook (see on_reconnect) -- adapted from
         # aio-pika's RobustConnection.reconnect_callbacks.
         self._reconnect_callbacks: list[Callable[[], None]] = []
+        # G-08: failed reconnect attempts and the terminal connection failure.
+        self._reconnect_attempt_callbacks: list[Callable[[ReconnectAttempt], None]] = []
+        self._connection_failed_callbacks: list[Callable[[TerminalConnectionError], None]] = []
 
         # Channel-lifecycle signal (item 3), mirroring SyncTransport:
         # channels_opened_total counts every new channel THIS transport
@@ -220,6 +228,45 @@ class AsyncTransportImpl:
         counted, so a flapping broker/network was invisible to metrics
         alerting."""
         self._reconnect_callbacks.append(callback)
+
+    def on_reconnect_attempt(self, callback: Callable[[ReconnectAttempt], None]) -> None:
+        """Register a callback fired after every FAILED reconnect attempt of a
+        connection that had been up (G-08).
+
+        It receives a :class:`~rabbitkit.async_.reconnect.ReconnectAttempt`:
+        the attempt number within the outage, the backoff delay chosen before
+        the next attempt, the time since the connection was lost, the endpoint
+        and the error. A successful reconnect fires :meth:`on_reconnect`.
+        """
+        self._reconnect_attempt_callbacks.append(callback)
+
+    def on_connection_failed(self, callback: Callable[[TerminalConnectionError], None]) -> None:
+        """Register a callback fired once when a connection stops reconnecting
+        for good after startup (G-08): a permanent failure (refused login or
+        vhost, TLS verification) or a spent reconnect budget. From then on
+        :meth:`is_connected` is False, :attr:`connection_failure` holds the
+        error, and no connect is attempted again.
+        """
+        self._connection_failed_callbacks.append(callback)
+
+    @property
+    def connection_failure(self) -> TerminalConnectionError | None:
+        """The terminal connection failure, if a connection gave up for good."""
+        return self._conn_pool.terminal_error
+
+    def _fire_reconnect_attempt(self, attempt: ReconnectAttempt) -> None:
+        for cb in list(self._reconnect_attempt_callbacks):
+            try:
+                cb(attempt)
+            except Exception:  # never break the reconnect path
+                logger.exception("reconnect_attempt callback raised")
+
+    def _fire_connection_failed(self, error: TerminalConnectionError) -> None:
+        for cb in list(self._connection_failed_callbacks):
+            try:
+                cb(error)
+            except Exception:  # never break the reconnect path
+                logger.exception("connection_failed callback raised")
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -413,10 +460,33 @@ class AsyncTransportImpl:
                 logger.exception("unblocked callback raised")
 
     async def connect(self) -> None:
-        """Establish publisher and consumer connections."""
+        """Establish publisher and consumer connections.
+
+        All or nothing (G-10): if any step fails (or is cancelled), every
+        connection, channel and monitor it created is closed before the error
+        propagates, so a failed connect leaks nothing and can be retried.
+        """
         if self._connected:
             return
+        try:
+            await self._connect_unguarded()
+        except BaseException:
+            await self._discard_partial_connect()
+            raise
 
+    async def _discard_partial_connect(self) -> None:
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(self._connection_config.socket_timeout):
+                for monitor in self._blocked_monitors:
+                    await monitor.stop()
+                self._blocked_monitors.clear()
+                self._blocked_state = False
+                channel, self._topology_channel = self._topology_channel, None
+                if channel is not None and not channel.is_closed:
+                    await channel.close()
+                await self._conn_pool.close_all()
+
+    async def _connect_unguarded(self) -> None:
         # aio-pika 9's pamqp can't encode field-table ints from -128 to -1
         # (queue/consume/bind arguments, publish headers); fix it before any
         # frame is built. A no-op on pamqp 4.
@@ -521,7 +591,7 @@ class AsyncTransportImpl:
         drops and sets again once the reconnect completes. Both the publisher
         and the consumer connection must be up.
         """
-        if not self._connected:
+        if not self._connected or self._conn_pool.terminal_error is not None:
             return False
         pub = self._conn_pool._publisher_connection
         if pub is None:
@@ -1116,7 +1186,21 @@ class AsyncTransportImpl:
         for queue_name, tag in list(self._consumer_tags.items()):
             if tag == consumer_tag:
                 channel = self._consumer_channels.get(queue_name)
-                if channel is not None:
+                consumer_conn = self._conn_pool._consumer_connection
+                if consumer_conn is not None and (
+                    isinstance(getattr(consumer_conn, "terminal_error", None), BaseException)
+                    or bool(getattr(consumer_conn, "is_closed", False))
+                ):
+                    # G-08: the connection is closed for good (terminal
+                    # failure). The broker dropped the consumer with it, and
+                    # an AMQP cancel would wait forever for a reconnect.
+                    # (aio-pika 9.1 never sets is_closed on a connection that
+                    # is closed without a transport, hence terminal_error.)
+                    del self._consumer_tags[queue_name]
+                    self._consumer_channels.pop(queue_name, None)
+                    if channel is not None and channel is self._reply_to_channel:
+                        self._reply_to_channel = None
+                elif channel is not None:
                     try:
                         q = await channel.get_queue(queue_name, ensure=False)
                         await q.cancel(consumer_tag)

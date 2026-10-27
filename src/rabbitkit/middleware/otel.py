@@ -20,10 +20,16 @@ from dataclasses import replace
 from typing import Any
 
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope
+from rabbitkit.core.types import MessageEnvelope, PublishOutcome
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
+
+#: ``consumer_context`` values: make the producer's span the CONSUMER span's
+#: parent (one trace, the default) or start a new trace that LINKS to it.
+CONSUMER_CONTEXT_PARENT = "parent"
+CONSUMER_CONTEXT_LINK = "link"
+_CONSUMER_CONTEXTS = frozenset({CONSUMER_CONTEXT_PARENT, CONSUMER_CONTEXT_LINK})
 
 
 def _get_otel() -> Any:
@@ -47,10 +53,37 @@ class OTelTracingMiddleware(BaseMiddleware):
 
     Span names follow the OTel messaging convention: ``{destination} receive``
     / ``{destination} send``.
+
+    Publish outcomes (G-22): ``broker.publish()`` returns a
+    :class:`~rabbitkit.core.types.PublishOutcome` instead of raising, so the
+    PRODUCER span records it: ``messaging.rabbitmq.publish.status`` (always)
+    and ``messaging.rabbitmq.publish.reason`` (when set), and a status of
+    ``ERROR`` (with ``error.type`` set to the reason, or the status) for every
+    outcome that is not ``ok`` (NOT_SENT, UNKNOWN, TIMEOUT, RETURNED,
+    NACKED, ERROR).
+
+    Args:
+        service_name: Kept for compatibility (the tracer is named
+            ``rabbitkit``; set the service name on your ``Resource``).
+        consumer_context: How the CONSUMER span relates to the producer's
+            context carried in the headers. ``"parent"`` (default, the old
+            behaviour): it becomes the parent, so producer and consumer share
+            one trace. ``"link"``: the consumer span starts from the context
+            current in the consumer (a new trace when there is none) and
+            carries a span link to the producer, as the OpenTelemetry
+            messaging conventions suggest when consumption is decoupled from
+            production (batch, long queues, replays).
+
+    Retry and dead-letter copies are published by ``RetryMiddleware`` with
+    the failed message's headers, so they carry the ORIGINAL producer's trace
+    context: every attempt's CONSUMER span belongs to the producer's trace.
     """
 
-    def __init__(self, service_name: str = "rabbitkit") -> None:
+    def __init__(self, service_name: str = "rabbitkit", *, consumer_context: str = CONSUMER_CONTEXT_PARENT) -> None:
+        if consumer_context not in _CONSUMER_CONTEXTS:
+            raise ValueError(f"consumer_context must be 'parent' or 'link', got {consumer_context!r}")
         self._service_name = service_name
+        self._consumer_context = consumer_context
         otel = _get_otel()
         if otel is None:
             self._trace: Any = None
@@ -115,6 +148,15 @@ class OTelTracingMiddleware(BaseMiddleware):
     def _consume_span(self, message: RabbitMessage) -> Any:
         ctx = self._propagate.extract(self._str_carrier(message.headers))
         name = f"{message.headers.get('x-rabbitkit-original-queue', message.routing_key) or 'queue'} receive"
+        if self._consumer_context == CONSUMER_CONTEXT_LINK:
+            producer = self._trace.get_current_span(ctx).get_span_context()
+            links = [self._trace.Link(producer)] if producer.is_valid else []
+            return self._tracer.start_as_current_span(
+                name,
+                kind=self._trace.SpanKind.CONSUMER,
+                attributes=self._consume_attributes(message),
+                links=links,
+            )
         return self._tracer.start_as_current_span(
             name,
             context=ctx,
@@ -133,6 +175,18 @@ class OTelTracingMiddleware(BaseMiddleware):
     def _record_failure(self, span: Any, exc: BaseException) -> None:
         span.record_exception(exc)
         span.set_status(self._trace.Status(self._trace.StatusCode.ERROR, str(exc)))
+
+    def _record_outcome(self, span: Any, result: Any) -> None:
+        """Put a returned :class:`PublishOutcome` on the PRODUCER span; a
+        non-ok outcome marks the span as an error (it does not raise)."""
+        if not isinstance(result, PublishOutcome):
+            return
+        span.set_attribute("messaging.rabbitmq.publish.status", result.status.value)
+        if result.reason is not None:
+            span.set_attribute("messaging.rabbitmq.publish.reason", result.reason)
+        if not result.ok:
+            span.set_attribute("error.type", result.reason or result.status.value)
+            span.set_status(self._trace.Status(self._trace.StatusCode.ERROR, f"publish {result.status.value}"))
 
     def _envelope_with_context(self, envelope: MessageEnvelope) -> MessageEnvelope:
         """Copy of *envelope* with the CURRENT trace context injected."""
@@ -183,10 +237,12 @@ class OTelTracingMiddleware(BaseMiddleware):
             return call_next(envelope)
         with self._publish_span(envelope) as span:
             try:
-                return call_next(self._envelope_with_context(envelope))
+                result = call_next(self._envelope_with_context(envelope))
             except BaseException as exc:
                 self._record_failure(span, exc)
                 raise
+            self._record_outcome(span, result)
+            return result
 
     async def publish_scope_async(
         self,
@@ -197,7 +253,9 @@ class OTelTracingMiddleware(BaseMiddleware):
             return await call_next(envelope)
         with self._publish_span(envelope) as span:
             try:
-                return await call_next(self._envelope_with_context(envelope))
+                result = await call_next(self._envelope_with_context(envelope))
             except BaseException as exc:
                 self._record_failure(span, exc)
                 raise
+            self._record_outcome(span, result)
+            return result

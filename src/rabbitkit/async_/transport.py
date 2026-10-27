@@ -1054,15 +1054,9 @@ class AsyncTransportImpl:
                 kind,
             )
             return
-        raise ConfigurationError(
-            f"Cannot declare {kind} {name!r}: it already exists with incompatible "
-            f"arguments (broker said: {exc}). This usually means it was created "
-            f"outside rabbitkit (e.g. ops tooling) with different arguments (e.g. "
-            f"quorum vs classic queue type, a different TTL, or a different "
-            f"dead-letter exchange). Either delete/reconcile the existing {kind}, "
-            f"adjust its rabbitkit definition to match, or use "
-            f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
-        ) from exc
+        from rabbitkit.core.topology import describe_declare_conflict  # [retry/topology hook]
+
+        raise ConfigurationError(describe_declare_conflict(kind, name, str(exc))) from exc
 
     async def bind_queue(
         self,

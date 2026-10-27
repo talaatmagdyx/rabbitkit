@@ -903,7 +903,9 @@ class RetryMiddleware(BaseMiddleware):
         raise exc
 
 
-def dlq_queue_definition(name: str, *, quorum: bool, broker_version: str | None) -> RabbitQueue:
+def dlq_queue_definition(
+    name: str, *, quorum: bool, broker_version: str | None, initial_group_size: int | None = None
+) -> RabbitQueue:
     """The DLQ declaration both the retry router and the safety DLX use.
 
     A quorum DLQ on RabbitMQ 4.x gets ``x-delivery-limit: -1``. Without it
@@ -923,6 +925,7 @@ def dlq_queue_definition(name: str, *, quorum: bool, broker_version: str | None)
         durable=True,
         queue_type=QueueType.QUORUM,
         delivery_limit=dlq_delivery_limit(broker_version),
+        quorum_initial_group_size=initial_group_size,
     )
 
 
@@ -1009,28 +1012,29 @@ class RetryRouter:
             delay_ms = self._get_delay_ms(attempt - 1)
 
             # Always per-queue (shared mode is rejected by RetryConfig — H3).
+            delay_type = self._resolve_queue_type(self._config.delay_queue_type, source_queue_type, default="classic")
             for shard, mult in enumerate(multipliers):
-                queue = RabbitQueue(
-                    name=_shard_queue_name(source_queue_name, attempt, shard),
-                    durable=True,
-                    arguments={
-                        # Uniform per-queue TTL (head-of-line safety); shards
-                        # stagger TTLs ACROSS queues, never within one (F4).
-                        "x-message-ttl": max(1, int(delay_ms * mult)),
-                        "x-dead-letter-exchange": "",  # default exchange (M5)
-                        "x-dead-letter-routing-key": source_queue_name,
-                        # Plan §5.1: configurable. The legacy default is
-                        # CLASSIC (delay queues hold messages only for the
-                        # delay window, have no consumers, and quorum queues
-                        # historically had weaker per-message TTL behavior).
-                        # "quorum" makes the whole retry chain replicated for
-                        # critical work; "inherit" follows the source queue.
-                        "x-queue-type": self._resolve_queue_type(
-                            self._config.delay_queue_type, source_queue_type, default="classic"
-                        ),
-                    },
+                arguments: dict[str, Any] = {
+                    # Uniform per-queue TTL (head-of-line safety); shards
+                    # stagger TTLs ACROSS queues, never within one (F4).
+                    "x-message-ttl": max(1, int(delay_ms * mult)),
+                    "x-dead-letter-exchange": "",  # default exchange (M5)
+                    "x-dead-letter-routing-key": source_queue_name,
+                    # Plan §5.1: configurable. The legacy default is
+                    # CLASSIC (delay queues hold messages only for the
+                    # delay window, have no consumers, and quorum queues
+                    # historically had weaker per-message TTL behavior).
+                    # "quorum" makes the whole retry chain replicated for
+                    # critical work; "inherit" follows the source queue.
+                    "x-queue-type": delay_type,
+                }
+                if delay_type == "quorum":
+                    arguments.update(self._quorum_delay_arguments())
+                queues.append(
+                    RabbitQueue(
+                        name=_shard_queue_name(source_queue_name, attempt, shard), durable=True, arguments=arguments
+                    )
                 )
-                queues.append(queue)
 
         # DLQ — declared as a plain durable queue.
         # The source queue's x-dead-letter-exchange (set via
@@ -1043,9 +1047,29 @@ class RetryRouter:
         # inherited: basic_get-based DLQ inspection/replay doesn't apply to
         # stream semantics.)
         dlq_type = self._resolve_queue_type(self._config.dlq_queue_type, source_queue_type, default="classic")
-        queues.append(dlq_queue_definition(dlq_name, quorum=dlq_type == "quorum", broker_version=broker_version))
+        queues.append(
+            dlq_queue_definition(
+                dlq_name,
+                quorum=dlq_type == "quorum",
+                broker_version=broker_version,
+                initial_group_size=self._config.quorum_initial_group_size,
+            )
+        )
 
         return queues
+
+    def _quorum_delay_arguments(self) -> dict[str, Any]:
+        """Optional quorum arguments for delay queues (none by default, so an
+        existing topology is never re-declared with different arguments)."""
+        extra: dict[str, Any] = {}
+        if self._config.quorum_initial_group_size is not None:
+            extra["x-quorum-initial-group-size"] = self._config.quorum_initial_group_size
+        strategy = self._config.delay_queue_dead_letter_strategy
+        if strategy is not None:
+            extra["x-dead-letter-strategy"] = strategy
+            if strategy == "at-least-once":
+                extra["x-overflow"] = "reject-publish"
+        return extra
 
     @staticmethod
     def _resolve_queue_type(setting: str, source_queue_type: QueueType | None, *, default: str) -> str:

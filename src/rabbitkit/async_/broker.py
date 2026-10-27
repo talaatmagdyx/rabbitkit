@@ -447,6 +447,7 @@ class AsyncBroker:
 
         # Declare topology
         await self._declare_topology()
+        self._notify_passive_only()
 
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
@@ -1365,6 +1366,12 @@ class AsyncBroker:
                     )
                 )
 
+    def _notify_passive_only(self) -> None:
+        """[retry/topology hook] PASSIVE_ONLY startup notice (see topology_validation)."""
+        from rabbitkit.core.topology_validation import log_passive_only_limits
+
+        log_passive_only_limits(self._config.topology_mode, self._registry.routes)
+
     def _broker_server_version(self) -> str | None:
         version = getattr(self._transport, "server_version", None)
         return version if isinstance(version, str) else None
@@ -1448,3 +1455,74 @@ class AsyncBroker:
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+
+    # ── Public topology API (16.6) — additive, retry/topology owner ─────
+
+    async def declare_exchange(self, exchange: RabbitExchange) -> None:
+        """Declare *exchange* — for publish-only services that own their exchange.
+
+        Allowed only under ``TopologyMode.AUTO_DECLARE`` (or, under
+        ``PASSIVE_ONLY``, a ``passive=True`` existence check); otherwise
+        raises :class:`~rabbitkit.core.errors.ConfigurationError`. A conflicting
+        existing exchange raises with the conflicting argument named.
+        """
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_exchange", passive=exchange.passive)
+        await self._started_transport().declare_exchange(exchange)
+
+    async def declare_queue(self, queue: RabbitQueue) -> None:
+        """Declare *queue* exactly as given (no retry/safety arguments added).
+
+        Same topology-mode rules as :meth:`declare_exchange`."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_queue", passive=queue.passive)
+        await self._started_transport().declare_queue(queue)
+
+    async def bind_queue(
+        self, queue: str, exchange: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind *queue* to *exchange*. ``AUTO_DECLARE`` only (a binding is always a write)."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_queue")
+        await self._started_transport().bind_queue(
+            queue=queue, exchange=exchange, routing_key=routing_key, arguments=arguments
+        )
+
+    async def bind_exchange(
+        self, destination: str, source: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind exchange *destination* to *source*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_exchange")
+        await self._started_transport().bind_exchange(
+            destination=destination, source=source, routing_key=routing_key, arguments=arguments
+        )
+
+    async def verify_topology(self, management_client: Any | None = None, *, vhost: str | None = None) -> Any:
+        """Check the broker's topology against this application's routes
+        (type, durability, arguments, dead-letter path, bindings). Read-only
+        in every mode; runs the management client off the event loop. Without
+        a client, every check AMQP cannot make is reported ``UNVERIFIED``.
+
+        Returns a :class:`~rabbitkit.core.topology_validation.TopologyReport`;
+        call ``report.raise_for_failures()`` to fail startup on drift.
+        """
+        from rabbitkit.core.topology_validation import verify_topology
+
+        return await asyncio.to_thread(
+            verify_topology,
+            list(self._registry.routes),
+            management_client=management_client,
+            vhost=vhost if vhost is not None else self._config.connection.vhost,
+            broker_retry=self._config.retry,
+        )
+
+    def _started_transport(self) -> Any:
+        if self._transport is None:
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
+        return self._transport

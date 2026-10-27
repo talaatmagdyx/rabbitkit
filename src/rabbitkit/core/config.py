@@ -548,6 +548,13 @@ class RetryConfig:
     handoff: RetryHandoffConfig = field(default_factory=RetryHandoffConfig)
     max_retry_age: float | None = None
     terminal_action: TerminalAction = TerminalAction.DEAD_LETTER
+    # Quorum options for the retry chain (applied only to the delay queues /
+    # DLQ that resolve to quorum). None = broker defaults = legacy topology.
+    quorum_initial_group_size: int | None = None
+    # x-dead-letter-strategy for QUORUM delay queues: "at-least-once" keeps an
+    # expired message on the delay queue until the source queue confirms it
+    # (also sets x-overflow=reject-publish on them, which RabbitMQ requires).
+    delay_queue_dead_letter_strategy: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
@@ -559,6 +566,20 @@ class RetryConfig:
                 f"RetryConfig.terminal_action must be one of {[a.value for a in TerminalAction]}, "
                 f"got {self.terminal_action!r}"
             ) from None
+        if self.quorum_initial_group_size is not None and self.quorum_initial_group_size < 1:
+            raise ConfigValidationError(
+                f"RetryConfig.quorum_initial_group_size must be >= 1, got {self.quorum_initial_group_size}"
+            )
+        if self.delay_queue_dead_letter_strategy not in (None, "at-most-once", "at-least-once"):
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy must be None, 'at-most-once' or "
+                f"'at-least-once', got {self.delay_queue_dead_letter_strategy!r}"
+            )
+        if self.delay_queue_dead_letter_strategy is not None and self.delay_queue_type == "classic":
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy needs quorum delay queues "
+                "(delay_queue_type='quorum' or 'inherit'); classic queues have no dead-letter strategy"
+            )
         if self.max_retry_age is not None and self.max_retry_age <= 0:
             raise ConfigValidationError(f"RetryConfig.max_retry_age must be > 0 seconds, got {self.max_retry_age}")
         if any(d < 0 for d in self.delays):

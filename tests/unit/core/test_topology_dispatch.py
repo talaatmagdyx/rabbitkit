@@ -68,10 +68,12 @@ class TestBindingAction:
         d = TopologyDispatcher(TopologyMode.MANUAL)
         assert d.binding_action() is TopoAction.SKIP
 
-    @pytest.mark.parametrize("mode", [TopologyMode.AUTO_DECLARE, TopologyMode.PASSIVE_ONLY])
-    def test_non_manual_declares(self, mode: TopologyMode) -> None:
-        d = TopologyDispatcher(mode)
-        assert d.binding_action() is TopoAction.DECLARE
+    def test_auto_declare_declares(self) -> None:
+        assert TopologyDispatcher(TopologyMode.AUTO_DECLARE).binding_action() is TopoAction.DECLARE
+
+    def test_passive_only_never_writes_bindings(self) -> None:
+        """R-D8: PASSIVE_ONLY used to create missing bindings."""
+        assert TopologyDispatcher(TopologyMode.PASSIVE_ONLY).binding_action() is TopoAction.SKIP
 
 
 # ── mode property ─────────────────────────────────────────────────────────
@@ -81,3 +83,29 @@ class TestModeProperty:
     @pytest.mark.parametrize("mode", list(TopologyMode))
     def test_mode_echoed(self, mode: TopologyMode) -> None:
         assert TopologyDispatcher(mode).mode is mode
+
+
+# ── public declare API gate (16.6) ────────────────────────────────────────
+
+
+class TestPublicTopologyWriteGate:
+    def test_auto_declare_allows(self) -> None:
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(TopologyMode.AUTO_DECLARE, "declare_queue")
+
+    @pytest.mark.parametrize("mode", [TopologyMode.PASSIVE_ONLY, TopologyMode.MANUAL])
+    def test_non_owner_modes_refuse_writes(self, mode: TopologyMode) -> None:
+        from rabbitkit.core.errors import ConfigurationError
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        with pytest.raises(ConfigurationError, match="refused"):
+            check_public_topology_write(mode, "bind_queue")
+
+    def test_passive_only_allows_passive_existence_checks(self) -> None:
+        from rabbitkit.core.errors import ConfigurationError
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(TopologyMode.PASSIVE_ONLY, "declare_queue", passive=True)
+        with pytest.raises(ConfigurationError):
+            check_public_topology_write(TopologyMode.MANUAL, "declare_queue", passive=True)

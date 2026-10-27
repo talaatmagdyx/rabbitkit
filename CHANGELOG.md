@@ -59,6 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   max_delay=, **kwargs)` which builds `delays` as a capped exponential.
   New enums `TerminalAction` and `FailureCategory` in `rabbitkit.core.types`.
 
+- **Topology ownership.** `broker.verify_topology(management_client=None,
+  *, vhost=None)` (async on `AsyncBroker`, sync on `SyncBroker`) and
+  `rabbitkit.verify_topology(routes, management_client=..., vhost=...,
+  broker_retry=...)` check the broker's topology against the application's
+  routes through the management API's read-only endpoints: exchange
+  existence/type/durability, queue existence/type/durability and every
+  declared argument (a policy supplying the same value counts), bindings,
+  and for retry routes the source queue's dead-letter path plus each delay
+  queue and DLQ. It returns a `TopologyReport` (`ok`, `fully_verified`,
+  `failed`, `unverified`, `raise_for_failures()`); without a client every
+  check AMQP cannot make is `UNVERIFIED`, never green. It needs no AMQP
+  connection, so it can run before `start()`. Under `PASSIVE_ONLY` the
+  brokers now log at startup what was and was not verified.
+- **Public topology declaration for publish-only services:**
+  `broker.declare_exchange(RabbitExchange)`, `broker.declare_queue(RabbitQueue)`,
+  `broker.bind_queue(queue, exchange, routing_key="", arguments=None)`,
+  `broker.bind_exchange(destination, source, routing_key="", arguments=None)`
+  on both brokers. They declare exactly what is given (no retry/safety
+  arguments) and are allowed only under `TopologyMode.AUTO_DECLARE`;
+  `PASSIVE_ONLY` and `MANUAL` raise `ConfigurationError` (a `passive=True`
+  entity is still allowed under `PASSIVE_ONLY` as an existence check).
+- **Quorum options:** `RabbitQueue.quorum_initial_group_size`
+  (`x-quorum-initial-group-size`) and `RabbitQueue.dead_letter_strategy`
+  (`DeadLetterStrategy.AT_LEAST_ONCE` / `AT_MOST_ONCE`,
+  `x-dead-letter-strategy`; quorum only; `at-least-once` requires
+  `overflow="reject-publish"` and is rejected at construction otherwise,
+  since RabbitMQ silently falls back to at-most-once). For the retry chain:
+  `RetryConfig.quorum_initial_group_size` (quorum delay queues and DLQ) and
+  `RetryConfig.delay_queue_dead_letter_strategy` (quorum delay queues; also
+  sets `x-overflow=reject-publish`). Defaults add no arguments, so existing
+  topology is never re-declared differently. Verified on RabbitMQ 4.1: with
+  `at-least-once` a terminally failed message whose DLQ is missing stays on
+  the source (`messages_dlx=1`); with `at-most-once` it is dropped.
+
 ### Deprecated
 
 - `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
@@ -95,6 +129,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate's stored-result replay is no longer acked before the pipeline
   re-publishes it. If the handler chain settles the message itself, or the
   transport exposes no ack hook, the mark is written immediately as before.
+- **`TopologyMode.PASSIVE_ONLY` mutated topology.** It created missing
+  bindings (bindings have no passive form, so the dispatcher performed them
+  in every mode but `MANUAL`). Bindings are now written only under
+  `AUTO_DECLARE`; `PASSIVE_ONLY` performs no writes at all. Use
+  `verify_topology` to detect a missing binding.
+- **A 406 on declare now names the conflicting argument and why rabbitkit
+  declared it** (e.g. `x-dead-letter-exchange` added for retry or the safety
+  DLX on an ops-created plain queue; `x-queue-type` quorum vs classic) and
+  points at `PASSIVE_ONLY` + `verify_topology` for infrastructure-managed
+  queues. Both transports use the shared `describe_declare_conflict`.
+- `RabbitExchange(type="topic")` / `RabbitQueue(queue_type="quorum")` with a
+  plain string failed at startup with `AttributeError: 'str' object has no
+  attribute 'value'`; the string is now coerced to the enum (an unknown
+  value raises `TopologyValidationError`).
 - **The "Terminal failure" log printed raw exception text** (e.g.
   `password=hunter2`) while the headers were sanitized. It now uses the same
   `ErrorSanitizer`.

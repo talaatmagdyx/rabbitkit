@@ -418,8 +418,8 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   hand-built CRITICAL config that was compliant reports one more violation.
   Under CRITICAL a delivery over `max_body_bytes` therefore reaches the DLQ
   as a metadata-stamped copy (`x-rabbitkit-error-category: invalid_message`,
-  no `x-death`), superseding changelog.d/profile.md's "The DLQ copy carries
-  `x-death` only" for that profile.
+  no `x-death`) rather than the broker-dead-lettered message described under
+  `ConsumerConfig.max_body_bytes` in Added.
 - `rabbitkit_messages_dead_lettered_total` counts completed dead-letters
   only: a confirmed DLQ copy, or the dead-lettering reject the pipeline
   actually sent. It used to be recorded when `RetryMiddleware` handed a
@@ -657,8 +657,10 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   without requeue (the source's DLX moves it to the DLQ; the async broker
   checks the DLQ exists first) before the filter, any middleware, decode or
   the handler runs, under every `AckPolicy`. New
-  `rabbitkit.InboundMessageTooLargeError`. The DLQ copy carries `x-death`
-  only, not rabbitkit's failure headers.
+  `rabbitkit.InboundMessageTooLargeError`. Without
+  `SafetyConfig.dead_letter_with_metadata` the broker dead-letters it, so the
+  DLQ entry carries `x-death` only; with it (on under CRITICAL) the DLQ entry
+  is a metadata-stamped copy.
 - `PublisherConfig.strip_reserved_headers` (G-19, default `False`):
   `broker.publish()` (sync and async, and `publish_many` / `iter_publish`)
   drops rabbitkit's retry/DLQ/replay bookkeeping headers

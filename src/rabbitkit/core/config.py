@@ -1088,6 +1088,84 @@ class MetricsConfig:
         """Number of consumers attached to the queue (0 = nothing draining)."""
         return f"{self.namespace}_queue_consumers"
 
+    # ── Broker/transport metrics (G-22, §19). Emitted by the broker itself
+    # whenever any MetricsMiddleware with a collector is configured (publish
+    # middlewares or any route), so publish-only brokers get them too. ──
+
+    @property
+    def messages_failed_total(self) -> str:
+        """Handler failures labeled by ``queue`` and ``category`` (one of the
+        six ``ErrorCategory`` values)."""
+        return f"{self.namespace}_messages_failed_total"
+
+    @property
+    def publish_in_flight(self) -> str:
+        """Gauge: async publishes between admission and their outcome (sampled)."""
+        return f"{self.namespace}_publish_in_flight"
+
+    @property
+    def publish_in_flight_bytes(self) -> str:
+        """Gauge: body bytes held by the ``max_in_flight_bytes`` budget (sampled;
+        only emitted when that budget is configured)."""
+        return f"{self.namespace}_publish_in_flight_bytes"
+
+    @property
+    def publish_channels_in_use(self) -> str:
+        """Gauge: publisher channels checked out of the async pools (sampled)."""
+        return f"{self.namespace}_publish_channels_in_use"
+
+    @property
+    def publish_routing_failures_total(self) -> str:
+        """Publishes the broker could not route, labeled by ``exchange`` and
+        ``reason`` (``returned`` / ``exchange_not_found``). Counts every
+        transport publish, including retry and dead-letter copies."""
+        return f"{self.namespace}_publish_routing_failures_total"
+
+    @property
+    def connection_up(self) -> str:
+        """Gauge: 1 while the connection of ``role`` is up, else 0."""
+        return f"{self.namespace}_connection_up"
+
+    @property
+    def connections_active(self) -> str:
+        """Gauge: connections currently up."""
+        return f"{self.namespace}_connections_active"
+
+    @property
+    def channels_active(self) -> str:
+        """Gauge: channels the transport currently holds open (sampled)."""
+        return f"{self.namespace}_channels_active"
+
+    @property
+    def connection_failures_total(self) -> str:
+        """Connection failures labeled by ``role`` and a bounded ``reason``:
+        a live connection lost, a failed reconnect attempt, or a terminal
+        give-up (its ``TerminalConnectionError.reason``)."""
+        return f"{self.namespace}_connection_failures_total"
+
+    @property
+    def reconnect_attempts_total(self) -> str:
+        """FAILED reconnect attempts labeled by ``role``. A successful
+        reconnect increments ``reconnects_total`` instead."""
+        return f"{self.namespace}_reconnect_attempts_total"
+
+    @property
+    def connection_blocked(self) -> str:
+        """Gauge: 1 while RabbitMQ has the connection blocked
+        (``connection.blocked``: a memory or disk alarm), else 0."""
+        return f"{self.namespace}_connection_blocked"
+
+    @property
+    def consumer_cancelled_total(self) -> str:
+        """Consumers the BROKER cancelled (``basic.cancel``), labeled by ``queue``."""
+        return f"{self.namespace}_consumer_cancelled_total"
+
+    @property
+    def route_consuming(self) -> str:
+        """Gauge per ``queue``: 1 while the route's consumer is subscribed, 0
+        while it is not (stopped, or cancelled by the broker)."""
+        return f"{self.namespace}_route_consuming"
+
 
 # ── Health Check ──────────────────────────────────────────────────────────
 

@@ -60,6 +60,7 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.middleware.metrics import BrokerMetrics
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
@@ -130,6 +131,9 @@ class SyncBroker:
             )
 
         self._transport: SyncTransport | None = None
+        # G-22: connection/channel/flow-control metrics (see AsyncBroker).
+        self._broker_metrics: BrokerMetrics | None = None
+        self._metrics_sampled_at = 0.0
         self._worker_pool: SyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
@@ -288,7 +292,7 @@ class SyncBroker:
         if self._config.logging is not None:
             from rabbitkit.core.logging import configure_structlog
 
-            configure_structlog(self._config.logging)
+            configure_structlog(self._config.logging, override_existing=self._config.logging.override_existing)
 
         # Create transport
         self._transport = SyncTransport(
@@ -303,9 +307,12 @@ class SyncBroker:
         # Reconnect-attempts bound: previously hardcoded on the transport
         # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
         self._transport.max_reconnect_attempts = self._config.connection.reconnect_max_attempts
+        # Before connect(), so the first connection and channel count (G-22).
+        self._wire_reconnect_metric()
 
         self._transport.connect()
         self._transport.on_io_tick(self._mark_heartbeat)
+        self._transport.on_io_tick(self._sample_metrics_throttled)
 
         # Wire an opt-in FlowController's blocked/unblocked callbacks to the
         # transport now that it exists (C-6).
@@ -328,9 +335,6 @@ class SyncBroker:
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
-
-        # Connection-churn counter: reconnects were logged but never counted.
-        self._wire_reconnect_metric()
 
         # H2: single-worker sync consumers run the handler INLINE on the pika
         # I/O thread, so nothing services heartbeat frames while a handler
@@ -553,7 +557,7 @@ class SyncBroker:
                     break
                 except connection_errors as exc:
                     logger.warning("consumer connection lost; recovering", error=str(exc))
-                    self._recover_consumers()
+                    self._recover_consumers(exc)
         finally:
             self._restore_signal_handlers()
             self.stop()
@@ -762,6 +766,43 @@ class SyncBroker:
         set_gauge(cfg.consumer_active, {}, float(len(self._registry.routes)) if connected else 0.0)
         pool = self._worker_pool
         set_gauge(cfg.worker_pool_pending, {}, float(pool.pending_count) if pool is not None else 0.0)
+        metrics = self._broker_metrics
+        if metrics is None:
+            return
+        if connected:
+            self._sample_metrics()
+        else:
+            metrics.stopped(route.queue.name for route in self._registry.routes)
+
+    _METRICS_SAMPLE_INTERVAL: float = 5.0
+
+    def _sample_metrics_throttled(self) -> None:
+        """I/O-tick hook: sample at most every ``_METRICS_SAMPLE_INTERVAL``."""
+        if self._broker_metrics is None:
+            return
+        now = time.monotonic()
+        if now - self._metrics_sampled_at >= self._METRICS_SAMPLE_INTERVAL:
+            self._metrics_sampled_at = now
+            self._sample_metrics()
+
+    def _sample_metrics(self) -> None:
+        """Refresh the sampled broker gauges (G-22): connection state, open
+        channels, blocked state, per-route consuming, worker-pool backlog."""
+        metrics, transport = self._broker_metrics, self._transport
+        if metrics is None or transport is None:
+            return
+        try:
+            metrics.set_states({"shared": transport.is_connected()})
+            metrics.sample(
+                channels_active=transport.channels_active,
+                connection_blocked=transport.is_blocked,
+                consuming={route.queue.name: bool(route.consumer_tag) for route in self._registry.routes},
+            )
+            pool = self._worker_pool
+            if pool is not None:
+                metrics.sample_worker_pool(pool.pending_count)
+        except Exception:  # a metrics sample must never break the I/O loop
+            logger.warning("Sampling broker metrics failed", exc_info=True)
 
     def preflight(
         self,
@@ -964,11 +1005,11 @@ class SyncBroker:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _recover_consumers(self) -> None:
+    def _recover_consumers(self, cause: BaseException | None = None) -> None:
         """Reconnect and re-establish topology + subscriptions after a drop."""
         if self._transport is None:
             return
-        self._transport.reconnect()
+        self._transport.reconnect(cause)
         self._declare_topology()
         for route in self._registry.routes:
             self._start_consumer(route)
@@ -1057,35 +1098,33 @@ class SyncBroker:
             self._pipeline.clear_caches()
 
     def _wire_reconnect_metric(self) -> None:
-        """Count transport reconnects (connection churn) via the first route
-        ``MetricsMiddleware``'s collector, if any. Reconnects were logged but
-        never counted, so a flapping broker/network was invisible to
-        metrics-based alerting. No-op when no route carries metrics."""
-        if self._transport is None:
+        """Wire the broker metrics (:class:`BrokerMetrics`) to the transport's
+        hooks via the first ``MetricsMiddleware`` with a collector: publish
+        middlewares first, then any route (G-22: a publish-only broker gets
+        connection and channel metrics too). No-op without metrics. The sync
+        broker has one connection, reported as role ``"shared"``.
+        """
+        self._broker_metrics = None
+        transport = self._transport
+        if transport is None:
             return
-        from rabbitkit.middleware.metrics import MetricsMiddleware
-
-        metrics_mw = next(
-            (
-                mw
-                for route in self._registry.routes
-                for mw in route.route_middlewares
-                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
-            ),
-            None,
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        metrics = BrokerMetrics(collector, cfg, roles=("shared",))
+        self._broker_metrics = metrics
+        transport.on_reconnect(metrics.reconnected)
+        transport.on_channel_opened(metrics.channel_opened)
+        transport.on_channel_rebuilt(metrics.channel_rebuilt)
+        transport.on_connection_state(metrics.connection_state)
+        transport.on_reconnect_attempt(lambda _attempt, error: metrics.reconnect_failed("shared", error))
+        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_unblocked(lambda: metrics.blocked(False))
+        transport.on_publish_outcome(metrics.publish_outcome)
+        metrics.take_over_confirm_latency(
+            [*self._publish_middlewares, *(mw for route in self._registry.routes for mw in route.route_middlewares)]
         )
-        if metrics_mw is None or metrics_mw.collector is None:
-            return
-        collector = metrics_mw.collector
-        metric_name = metrics_mw.config.reconnects_total
-        self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
-
-        # Item 3: channel open/rebuild counters — same collector, same
-        # no-route-metrics no-op behavior as the reconnect hook above.
-        opened_name = metrics_mw.config.channels_opened_total
-        rebuilt_name = metrics_mw.config.channel_rebuilds_total
-        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
-        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
 
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""

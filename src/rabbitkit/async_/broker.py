@@ -67,6 +67,7 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.middleware.metrics import BrokerMetrics
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
 
@@ -90,6 +91,8 @@ def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = N
         error=error,
         reason=reason,
     )
+
+
 def _is_loop_signal_handler(handler: Any) -> bool:
     """True if *handler* is the placeholder an event loop installs for
     ``loop.add_signal_handler`` (asyncio's and uvloop's ``_sighandler_noop``)."""
@@ -197,6 +200,9 @@ class AsyncBroker:
         self.on_consumer_cancelled: Callable[[str], None] | None = None
         self.on_consumer_resumed: Callable[[str], None] | None = None
         self._consumer_state_wired: Any = None  # the transport the state callbacks are on
+        # G-22: connection/channel/flow-control metrics, built at start() from
+        # the first MetricsMiddleware with a collector (None = no metrics).
+        self._broker_metrics: BrokerMetrics | None = None
 
         # Bounded graceful drain (C-2): inline in-flight counter guarded by an
         # asyncio.Condition (R-Condition). ``_in_flight`` stays a plain int so
@@ -276,6 +282,7 @@ class AsyncBroker:
             while True:
                 await asyncio.sleep(self._HEARTBEAT_INTERVAL)
                 self._mark_heartbeat()
+                self._sample_metrics()
         except asyncio.CancelledError:
             pass
 
@@ -473,7 +480,7 @@ class AsyncBroker:
         if self._config.logging is not None:
             from rabbitkit.core.logging import configure_structlog
 
-            configure_structlog(self._config.logging)
+            configure_structlog(self._config.logging, override_existing=self._config.logging.override_existing)
 
         # SocketConfig is sync-only: pika accepts tcp_options, but
         # aio-pika/aiormq exposes no socket-tuning knobs, and applying
@@ -507,6 +514,9 @@ class AsyncBroker:
         )
         self._publish_closed = False
         self._transport.on_connection_failed(self._on_connection_failed)
+        # Before connect(), so the connection-up events and the first
+        # channels are counted too (G-22).
+        self._wire_reconnect_metric()
 
         await self._transport.connect()
 
@@ -578,9 +588,6 @@ class AsyncBroker:
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
-
-        # Connection-churn counter: reconnects were logged but never counted.
-        self._wire_reconnect_metric()
 
         # Create worker pool if requested
         if worker_config is not None and worker_config.worker_count > 1:
@@ -1161,7 +1168,13 @@ class AsyncBroker:
 
     def _set_lifecycle_gauges(self, *, connected: bool) -> None:
         """Emit the declared-but-previously-missing lifecycle gauges:
-        ``broker_connected``, ``consumer_active`` and ``worker_pool_pending``."""
+        ``broker_connected``, ``consumer_active`` and ``worker_pool_pending``.
+
+        ``connected=True`` (start) then samples every broker gauge, so
+        ``broker_connected`` reflects the connections' real state; it follows
+        drops and reconnects from then on (G-22). ``connected=False`` (stop,
+        failed start, terminal failure) zeroes the sampled gauges.
+        """
         found = self._bulk_metrics()
         if found is None:
             return
@@ -1173,6 +1186,42 @@ class AsyncBroker:
         set_gauge(cfg.consumer_active, {}, float(len(self._registry.routes)) if connected else 0.0)
         pool = self._worker_pool
         set_gauge(cfg.worker_pool_pending, {}, float(pool.pending_count) if pool is not None else 0.0)
+        metrics = self._broker_metrics
+        if metrics is None:
+            return
+        if connected:
+            self._sample_metrics()
+        else:
+            metrics.stopped(route.queue.name for route in self._registry.routes)
+
+    def _sample_metrics(self) -> None:
+        """Refresh the sampled broker gauges (G-22): connection state, open
+        channels, publishes and bytes in flight, publisher channels in use,
+        blocked state, per-route consuming and the worker-pool backlog. Runs
+        at start and on every heartbeat tick (``_HEARTBEAT_INTERVAL``), never
+        on the publish or consume hot path."""
+        metrics, transport = self._broker_metrics, self._transport
+        if metrics is None or transport is None:
+            return
+        try:
+            metrics.set_states(transport.connection_states())
+            limiter = transport.byte_limiter
+            metrics.sample(
+                channels_active=transport.channels_active,
+                publish_in_flight=transport.publishes_in_flight,
+                publish_in_flight_bytes=limiter.used if limiter is not None else None,
+                publish_channels_in_use=transport.publish_channels_in_use,
+                connection_blocked=transport.is_blocked,
+                consuming={
+                    route.queue.name: bool(route.consumer_tag) and not route.runtime_state.consumer_cancelled
+                    for route in self._registry.routes
+                },
+            )
+            pool = self._worker_pool
+            if pool is not None:
+                metrics.sample_worker_pool(pool.pending_count)
+        except Exception:  # a metrics sample must never stop the heartbeat loop
+            logger.warning("Sampling broker metrics failed", exc_info=True)
 
     def preflight(
         self,
@@ -1464,8 +1513,10 @@ class AsyncBroker:
             self._pipeline.clear_caches()
 
     def _wire_reconnect_metric(self) -> None:
-        """Wire the channel-churn counters via the first route
-        ``MetricsMiddleware``'s collector, if any. No-op without metrics.
+        """Wire the broker metrics (:class:`BrokerMetrics`) to the transport's
+        hooks via the first ``MetricsMiddleware`` with a collector: publish
+        middlewares first, then any route (G-22: a publish-only broker gets
+        connection and channel metrics too). No-op without metrics.
 
         Wires ``reconnects_total`` like the sync broker (G-08). 0.14 removed
         it on a measurement that said aio-pika never fires
@@ -1477,31 +1528,28 @@ class AsyncBroker:
         rabbitkit REPLACES a connection (a rebuilt publisher connection, a
         lazy re-create).
         """
-        if self._transport is None:
+        self._broker_metrics = None
+        transport = self._transport
+        if transport is None:
             return
-        from rabbitkit.middleware.metrics import MetricsMiddleware
-
-        metrics_mw = next(
-            (
-                mw
-                for route in self._registry.routes
-                for mw in route.route_middlewares
-                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
-            ),
-            None,
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        metrics = BrokerMetrics(collector, cfg, roles=("publisher", "consumer"))
+        self._broker_metrics = metrics
+        transport.on_reconnect(metrics.reconnected)
+        transport.on_channel_opened(metrics.channel_opened)
+        transport.on_channel_rebuilt(metrics.channel_rebuilt)
+        transport.on_connection_state(metrics.connection_state)
+        transport.on_reconnect_attempt(lambda attempt: metrics.reconnect_failed(attempt.role, attempt.error))
+        transport.on_connection_failed(metrics.connection_failed)
+        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_unblocked(lambda: metrics.blocked(False))
+        transport.on_publish_outcome(metrics.publish_outcome)
+        metrics.take_over_confirm_latency(
+            [*self._publish_middlewares, *(mw for route in self._registry.routes for mw in route.route_middlewares)]
         )
-        if metrics_mw is None or metrics_mw.collector is None:
-            return
-        collector = metrics_mw.collector
-        reconnects_name = metrics_mw.config.reconnects_total
-        self._transport.on_reconnect(lambda: collector.inc_counter(reconnects_name, {}))
-
-        # Item 3: channel open/rebuild counters — same collector, same
-        # no-route-metrics no-op behavior.
-        opened_name = metrics_mw.config.channels_opened_total
-        rebuilt_name = metrics_mw.config.channel_rebuilds_total
-        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
-        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
 
     async def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -1740,6 +1788,12 @@ class AsyncBroker:
         for route in self._registry.routes:
             if route.queue.name == queue:
                 route.runtime_state.consumer_cancelled = cancelled
+        metrics = self._broker_metrics
+        if metrics is not None:
+            if cancelled:
+                metrics.consumer_cancelled(queue)
+            else:
+                metrics.consumer_resumed(queue)
         hook = self.on_consumer_cancelled if cancelled else self.on_consumer_resumed
         if hook is None:
             return

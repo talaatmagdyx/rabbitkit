@@ -596,7 +596,7 @@ class TestLoggingConfig:
 
         with patch("rabbitkit.core.logging.configure_structlog") as mock_cfg:
             self._start_broker_with_logging(broker)
-            mock_cfg.assert_called_once_with(config.logging)
+            mock_cfg.assert_called_once_with(config.logging, override_existing=False)
 
     def test_start_no_configure_structlog_when_logging_none(self) -> None:
         """start() does not call configure_structlog when config.logging is None."""
@@ -927,9 +927,9 @@ class TestDeclareTopologyEdgeCases:
                 with _warnings.catch_warnings(record=True) as caught:
                     _warnings.simplefilter("always")
                     broker.start()
-        assert not any(
-            "confirm_delivery=False" in str(w.message) for w in caught
-        ), "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        assert not any("confirm_delivery=False" in str(w.message) for w in caught), (
+            "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        )
 
     def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
         """M4: confirm_delivery=True (the default) must not trigger the warning."""
@@ -2185,9 +2185,7 @@ class TestQuorumDeliveryLimitBackstop:
 
         broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
 
-        @broker.subscriber(
-            queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=10)
-        )
+        @broker.subscriber(queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=10))
         def handle(body: bytes) -> None:
             pass
 
@@ -2415,9 +2413,7 @@ class TestFlowControlledInternalPublish:
         broker._transport = MagicMock()
         broker._wire_retry_middleware()
 
-        retry_mw = next(
-            mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware)
-        )
+        retry_mw = next(mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware))
         assert retry_mw._publish_fn == broker._flow_controlled_internal_publish
 
     def test_result_publish_uses_flow_controlled_publish(self) -> None:

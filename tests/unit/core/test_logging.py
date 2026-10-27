@@ -89,9 +89,7 @@ class TestRedactProcessor:
         """A header dict using x-prefixed/hyphenated AMQP convention still
         matches the Python-style snake_case default entry."""
         processor = _redact_processor(DEFAULT_REDACT_KEYS)
-        event_dict = {
-            "headers": {"x-api-key": "abc123", "x-tenant": "acme", "Authorization": "Bearer xyz"}
-        }
+        event_dict = {"headers": {"x-api-key": "abc123", "x-tenant": "acme", "Authorization": "Bearer xyz"}}
         result = processor(None, "info", event_dict)
         assert result["headers"]["x-api-key"] == "***REDACTED***"
         assert result["headers"]["Authorization"] == "***REDACTED***"
@@ -276,3 +274,60 @@ class TestRabbitConfigLogging:
         cfg = RabbitConfig(logging=log_cfg)
         assert cfg.logging is not None
         assert cfg.logging.render_json is True
+
+
+class TestDoesNotClobberAnApplicationsConfiguration:
+    """§19 / ADR-M6: an embedding application (obskit) configures structlog
+    itself; the broker's call must not replace it unless asked."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_structlog(self) -> object:
+        import logging
+
+        saved = structlog.get_config()
+        structlog.reset_defaults()
+        yield
+        structlog.configure(**saved)
+        logging.captureWarnings(False)
+
+    @staticmethod
+    def _app_configures() -> list[object]:
+        processors: list[object] = [structlog.processors.JSONRenderer()]
+        structlog.configure(processors=processors)  # type: ignore[arg-type]  # one processor is enough here
+        return processors
+
+    def test_a_direct_call_still_replaces_it(self) -> None:
+        app = self._app_configures()
+        assert configure_structlog(LoggingConfig()) is True
+        assert structlog.get_config()["processors"] is not app
+
+    def test_the_broker_call_keeps_it_and_only_adds_redaction(self) -> None:
+        import logging
+
+        from rabbitkit.core.logging import SecretRedactingFilter
+
+        app = self._app_configures()
+        logging.captureWarnings(False)
+        assert configure_structlog(LoggingConfig(), override_existing=False) is False
+        assert structlog.get_config()["processors"] is app
+        assert any(isinstance(f, SecretRedactingFilter) for f in logging.getLogger("rabbitkit").filters)
+        assert getattr(logging, "_warnings_showwarning", None) is None  # captureWarnings left off
+
+    def test_the_broker_call_without_redaction_touches_nothing(self) -> None:
+        app = self._app_configures()
+        assert configure_structlog(LoggingConfig(redact_keys=None), override_existing=False) is False
+        assert structlog.get_config()["processors"] is app
+
+    def test_the_broker_call_configures_when_nobody_did(self) -> None:
+        assert configure_structlog(LoggingConfig(), override_existing=False) is True
+        assert structlog.is_configured()
+
+    def test_the_broker_call_reconfigures_its_own_configuration(self) -> None:
+        from rabbitkit.core.logging import structlog_configured_elsewhere
+
+        configure_structlog(LoggingConfig())
+        assert structlog_configured_elsewhere() is False
+        assert configure_structlog(LoggingConfig(render_json=True), override_existing=False) is True
+
+    def test_override_existing_defaults_to_false_in_the_config(self) -> None:
+        assert LoggingConfig().override_existing is False

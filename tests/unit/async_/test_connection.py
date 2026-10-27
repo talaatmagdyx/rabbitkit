@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import ssl
 from typing import Any
 from unittest.mock import patch
@@ -913,6 +914,6 @@ class TestPermanentConnectionError:
         assert "SSLV3_ALERT_BAD_CERTIFICATE" in str(error)
 
     def test_never_carries_credentials(self) -> None:
-        cfg = ConnectionConfig(host="rabbit", username="svc-user", password="s3cr3t")
+        cfg = ConnectionConfig(host="rabbit", username="svc-user", password=secrets.token_urlsafe(12))
         error = self._build(aiormq_exc.ProbableAuthenticationError("ACCESS_REFUSED"))
         assert cfg.password not in str(error) and cfg.username not in str(error)

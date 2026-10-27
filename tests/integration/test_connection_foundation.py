@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -33,7 +34,9 @@ from tests.integration.test_tls import tls_rabbit  # noqa: F401 — module fixtu
 
 pytestmark = pytest.mark.integration
 
-_PW1 = "pw-1"  # a throwaway user on a throwaway broker
+# Throwaway users on a throwaway broker; generated so no literal credential is committed.
+_PW1 = secrets.token_urlsafe(12)
+_PW2 = secrets.token_urlsafe(12)
 
 
 @pytest.fixture(scope="module")
@@ -128,7 +131,7 @@ async def test_wrong_password_fails_start_fast(own_rabbit: dict[str, Any]) -> No
     from rabbitkit import AsyncBroker, AuthenticationFailedError
 
     user = await _new_user(own_rabbit)
-    broker = AsyncBroker(_config(own_rabbit, user, password="wrong"))
+    broker = AsyncBroker(_config(own_rabbit, user, password=secrets.token_urlsafe(12)))
     started = time.monotonic()
     async with asyncio.timeout(20):
         with pytest.raises(AuthenticationFailedError) as caught:
@@ -221,7 +224,7 @@ async def test_password_changed_after_start_is_terminal(own_rabbit: dict[str, An
 
     async with asyncio.timeout(60), _started(broker):
         events = _Events(broker._transport)
-        await actl(own_rabbit, "change_password", user, "pw-2")
+        await actl(own_rabbit, "change_password", user, _PW2)
         await actl(own_rabbit, "close_all_connections", "rotate")
         await _assert_terminal(own_rabbit, broker, events, user, AuthenticationFailedError)
 
@@ -246,7 +249,7 @@ async def test_terminal_failure_ends_run_with_the_error(own_rabbit: dict[str, An
     async with asyncio.timeout(60):
         run = asyncio.create_task(broker.run())
         await _wait_until(lambda: _true(broker.started), 20, "start")
-        await actl(own_rabbit, "change_password", user, "pw-2")
+        await actl(own_rabbit, "change_password", user, _PW2)
         await actl(own_rabbit, "close_all_connections", "rotate")
         with pytest.raises(AuthenticationFailedError):
             await run
@@ -265,7 +268,7 @@ async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: di
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
     user = await _new_user(own_rabbit)
-    secret = {"password": "pw-1"}
+    secret = {"password": _PW1}
     queue = f"q-{uuid.uuid4().hex[:8]}"
     config = RabbitConfig(
         connection=ConnectionConfig(
@@ -290,8 +293,8 @@ async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: di
         await broker.publish(MessageEnvelope(routing_key=queue, body=b"before"))
         assert await received.get() == b"before"
 
-        secret["password"] = "pw-2"
-        await actl(own_rabbit, "change_password", user, "pw-2")
+        secret["password"] = _PW2
+        await actl(own_rabbit, "change_password", user, _PW2)
         await actl(own_rabbit, "close_all_connections", "rotate")
         await _wait_until(lambda: _true(broker._transport.is_connected()), 30, "the reconnect")
         await await_consumers(own_rabbit["url"], queue, timeout=30)

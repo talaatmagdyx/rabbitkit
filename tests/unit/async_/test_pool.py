@@ -1179,7 +1179,7 @@ class TestPoolConnectionFoundation:
                 with pytest.raises(ConnectionRefusedError):
                     await pool._create_connection()
         assert len(built) == 30
-        assert all(conn.is_closed for conn in built)
+        assert all(conn._close_called for conn in built)  # is_closed stays False on aio-pika 9 without a transport
 
     @pytest.mark.asyncio
     async def test_cancelled_connect_closes_the_abandoned_connection(self) -> None:
@@ -1196,7 +1196,7 @@ class TestPoolConnectionFoundation:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        assert built and built[0].is_closed
+        assert built and built[0]._close_called
 
     @pytest.mark.asyncio
     async def test_permanent_failure_after_startup_is_terminal_and_sticky(self) -> None:

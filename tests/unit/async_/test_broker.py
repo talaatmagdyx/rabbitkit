@@ -2637,3 +2637,138 @@ class TestConsumerCancelledByBroker:
         assert "on_consumer_resumed hook raised" in caplog.text
         assert all(not r.runtime_state.consumer_cancelled for r in broker.routes)
         await broker.stop()
+
+
+# ── G-24: signal handlers of an embedding application survive start()/stop() ──
+
+
+class TestEmbeddingAppSignalHandlers:
+    @pytest.fixture(autouse=True)
+    async def _restore_process_handlers(self) -> Any:
+        import contextlib
+        import signal
+
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        yield
+        loop = asyncio.get_running_loop()
+        for sig, handler in saved.items():
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)
+
+    @staticmethod
+    def _logged(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> str:
+        return caplog.text + capsys.readouterr().out  # stdlib or structlog rendering
+
+    async def test_default_handlers_are_put_back(self) -> None:
+        import signal
+
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        assert broker._installed_loop_handlers is True
+        assert getattr(signal.getsignal(signal.SIGTERM), "__name__", "") == "_sighandler_noop"
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert broker._installed_loop_handlers is False
+
+    async def test_custom_python_handler_is_replaced_with_a_warning_and_restored(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import signal
+
+        def app_handler(signum: int, frame: Any) -> None:
+            pass
+
+        signal.signal(signal.SIGTERM, app_handler)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "replacing the existing SIGTERM handler" in self._logged(caplog, capsys)
+        assert signal.getsignal(signal.SIGTERM) is not app_handler
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGTERM) is app_handler
+
+    async def test_existing_asyncio_handler_is_left_alone(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import os
+        import signal
+
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        loop.add_signal_handler(signal.SIGTERM, fired.set)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "asyncio handler for SIGTERM is already installed" in self._logged(caplog, capsys)
+        assert signal.SIGTERM not in broker._signal_prev
+        broker._restore_signal_handlers()
+
+        os.kill(os.getpid(), signal.SIGTERM)  # still the application's handler
+        async with asyncio.timeout(5):
+            await fired.wait()
+        assert not broker._shutdown_event.is_set()
+
+    async def test_handler_installed_by_the_app_after_start_is_not_removed(self) -> None:
+        import os
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        loop.add_signal_handler(signal.SIGTERM, fired.set)  # the app takes over after start()
+        broker._restore_signal_handlers()
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        async with asyncio.timeout(5):
+            await fired.wait()
+
+    async def test_asyncio_run_sigint_handler_is_default_and_restored(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import functools
+        import signal
+
+        class Runner:
+            def _on_sigint(self, signum: int, frame: Any, main_task: Any) -> None:
+                pass
+
+        runner_handler = functools.partial(Runner()._on_sigint, main_task=None)
+        signal.signal(signal.SIGINT, runner_handler)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "SIGINT" not in self._logged(caplog, capsys)
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGINT) is runner_handler
+
+    async def test_install_is_idempotent(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        first = dict(broker._signal_prev)
+        broker._install_signal_handlers()  # must not capture its own handler as "previous"
+        assert broker._signal_prev == first
+        broker._restore_signal_handlers()
+        assert not getattr(signal.getsignal(signal.SIGTERM), "__name__", "").endswith("noop")
+
+    async def test_unrestorable_previous_handler_is_skipped(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        broker._signal_prev[signal.SIGTERM] = None  # installed outside Python
+        broker._signal_prev[signal.SIGINT] = "not-a-handler"
+        broker._restore_signal_handlers()  # logs, does not raise
+        assert broker._signal_prev == {}
+
+    def test_loop_without_a_handler_table_is_assumed_ours(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        assert broker._owns_loop_signal(MagicMock(spec=[]), signal.SIGTERM) is True

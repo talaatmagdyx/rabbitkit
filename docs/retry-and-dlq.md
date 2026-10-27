@@ -16,8 +16,9 @@ defaults preserve the legacy topology, so upgrading never re-declares a queue:
 | `error_detail` | `sanitized` (redacted + capped), `omit`, `raw` (legacy) | `sanitized` |
 | `handoff` | `RetryHandoffConfig(...)` — bounded backoff when the **retry publish** itself fails | bounded |
 
-The DLQ triage headers carry `x-rabbitkit-error-category`
-(`transient`/`permanent`) alongside `x-rabbitkit-error-type`, and
+The DLQ triage headers carry `x-rabbitkit-error-category` (the failure
+category, see [Error Classification](#error-classification)) alongside
+`x-rabbitkit-error-type`, and
 `x-rabbitkit-error-message` is redacted (URL passwords, `password=`/`token=`
 pairs, bearer tokens, long opaque tokens) and length-capped. A failed
 delay-queue handoff never acks the source; it is nack-requeued and counted in
@@ -120,6 +121,14 @@ dead-letter *exchange* with its own bindings is not verified. A positive
 check is cached for 5 s, so a DLQ deleted inside that window can still drop
 a message. The sync broker does not run the check yet.
 
+A quorum source declared with `dead_letter_strategy="at-least-once"` is not
+probed: the broker itself keeps a dead-lettered message on the source until
+the DLQ exists again (`messages_dlx` in the management API), so the message
+is rejected at once and the handler is not run again. Every other source
+gets the requeue-with-backoff above; once the DLQ is back, the next failure
+lands there with the full metadata. Verified on RabbitMQ 4.1 for both
+strategies.
+
 ---
 
 ## Full Topology Example
@@ -199,15 +208,27 @@ Headers are preserved across re-deliveries. If `x-rabbitkit-retry-count` is abse
 | `x-rabbitkit-original-message-id` | the id every copy carries; an id-less message gets one on its first handoff |
 | `x-rabbitkit-original-queue` / `-exchange` / `-routing-key` | where the message was consumed / originally published |
 | `x-rabbitkit-first-failed-at` / `-last-failed-at` | ISO-8601; first is set once (the `max_retry_age` clock) |
-| `x-rabbitkit-error-class` / `-error-type` / `-error-category` / `-error-message` | the CURRENT attempt's exception class, severity and sanitized message |
+| `x-rabbitkit-error-class` / `-error-type` / `-error-message` | the CURRENT attempt's exception class and sanitized message |
+| `x-rabbitkit-error-category` | the CURRENT attempt's failure category: `retryable`, `permanent`, `invalid_message`, `unknown_outcome`, `infrastructure` (see [Error Classification](#error-classification)) |
 | `x-rabbitkit-failure-category` | `transient` / `timeout-unknown` on a retry copy; `permanent` / `exhausted` / `retry-age-exceeded` on a DLQ copy |
 | `x-rabbitkit-dead-lettered-at` | DLQ copies only |
 | `x-rabbitkit-original-expiration` | the producer's `expiration`, which is not copied onto delay/DLQ copies |
 
 The AMQP properties are preserved too: `message_id`, `correlation_id`,
 `timestamp`, `type`, `app_id`, `user_id`, `priority`, `reply_to`,
-`content_type`/`content_encoding`, `delivery_mode`, and every application
-header (trace context such as `traceparent`, idempotency keys).
+`content_type`, `delivery_mode`, and every application header (trace context
+such as `traceparent`, idempotency keys).
+
+**The body and `content_encoding` are the ones that came off the wire.**
+`CompressionMiddleware` decompresses `message.body` in place (and leaves
+`content_encoding` as delivered), so a copy built from `message.body` would
+carry a decoded body labelled `gzip`; before this was fixed every retried
+compressed message failed to decompress on its next delivery and went to the
+DLQ. Every retry and DLQ copy is built from `RabbitMessage.wire_body` /
+`wire_content_encoding`, which an `on_receive` hook cannot change, so the copy
+decodes exactly like the original (verified on a real broker: a compressed
+message that fails once succeeds on attempt 2, and its terminal DLQ copy is
+still gzip).
 `expiration` is the one exception: on a delay queue it would expire the copy
 early and collapse the backoff; on the DLQ it would delete the failure
 record.
@@ -216,6 +237,15 @@ record.
 them and clamps the count to `max_retries`, but a producer that strips every
 header (including `x-death`) restarts the budget. Bound that case with
 `max_retry_age` and, against crash loops, a quorum `x-delivery-limit`.
+
+A producer that sets `x-rabbitkit-retry-count` HIGH skips the retries. With
+`RetryConfig(trust_retry_header=False)` the header is not read at all: the
+count comes only from the `x-death` entries RabbitMQ adds when a copy expires
+out of `<queue>.retry.<n>`, so a forged count changes nothing (verified on a
+real broker: a message published with `x-rabbitkit-retry-count: 99` still
+gets every retry). The header is still written for observability. The
+default stays `True` because `TestBroker` writes no `x-death`, and suites
+that simulate a later attempt by setting the header rely on it.
 
 ---
 
@@ -292,13 +322,20 @@ exception is re-raised tagged `_rabbitkit_terminal` (so an outer
 tells the pipeline the message is already settled.
 
 If that DLQ publish fails (DLQ missing, returned, nacked, timed out), the
-middleware falls back to the legacy path: the pipeline rejects the message
-(`requeue=False`) and RabbitMQ moves it via the `x-dead-letter-exchange` /
-`x-dead-letter-routing-key` arguments on the source queue. That copy carries
-only the broker's `x-death` and the previous attempt's headers — and on a
-quorum source with `dead_letter_strategy="at-least-once"` it is kept on the
-source until the DLQ is back (see *Quorum DLQs* below).
-`terminal_action="reject"` always takes the legacy path.
+middleware hands the delivery back to the pipeline, which settles it exactly
+once:
+
+| DLQ | Source | What happens |
+|---|---|---|
+| exists (publish failed for another reason) | any | reject; RabbitMQ moves it via the source's `x-dead-letter-*` arguments (only `x-death`, not the terminal metadata) |
+| missing | quorum, `dead_letter_strategy="at-least-once"` | reject; the broker keeps it on the source until the DLQ is back; the handler is not run again |
+| missing | anything else (async broker) | requeued after a 0.5 s to 5 s backoff (see *A missing DLQ never swallows a message*); once the DLQ is back the next failure lands there with metadata |
+
+The exception carries `_rabbitkit_dead_letter_failed`: an outer
+`ExceptionMiddleware` re-raises it even with `swallow_permanent=True` or a
+matching fallback handler, because recovering it would ack a message that
+exists nowhere else. `terminal_action="reject"` always takes the broker
+path.
 
 Note for `TestBroker` users: on the default path the consumed message's
 disposition is `acked` (the DLQ copy is in `broker.published_messages`), not
@@ -364,29 +401,64 @@ With this configuration:
 
 ## Error Classification
 
-Not all errors should be retried. RabbitKit distinguishes transient errors (infrastructure problems that may resolve) from permanent errors (data problems that will always fail).
+Every handler failure is classified into a **category**. The category's
+severity decides retry versus DLQ; the category itself is written to
+`x-rabbitkit-error-category` on every retry and DLQ copy, labels
+`rabbitkit_messages_retried_total` / `rabbitkit_messages_dead_lettered_total`
+(`category="..."`), and appears in the pipeline's failure log line.
 
-| Exception | Class | Action |
-|---|---|---|
-| `TimeoutError` | Transient | Retry |
-| `OSError` | Transient | Retry |
-| `ConnectionError` | Transient | Retry |
-| `aio_pika.exceptions.AMQPConnectionError` | Transient | Retry |
-| `json.JSONDecodeError` | Permanent | DLQ |
-| `pydantic.ValidationError` | Permanent | DLQ |
-| `ValueError` (schema mismatch) | Permanent | DLQ |
-| `KeyError` (missing required field) | Permanent | DLQ |
+| Category | Severity | Default examples | What happens (with `RetryConfig`) |
+|---|---|---|---|
+| `retryable` | transient | `TimeoutError`, `ConnectionError` / `OSError`, `EOFError` | delayed retry |
+| `infrastructure` | transient | aio-pika/aiormq `AMQPConnectionError`, `ChannelClosed`, `ChannelInvalidStateError`; pika's connection/channel errors; `InfrastructureError` | delayed retry, labelled separately |
+| `unknown_outcome` | transient | `HandlerTimeoutError` (a processing deadline expired) | delayed retry; the handler must be idempotent |
+| `permanent` | permanent | `ValueError`, `KeyError`, `TypeError`, ..., and **any unclassified exception** | DLQ on the first attempt |
+| `invalid_message` | permanent | body decode/validation failures, `on_receive` failures (bad gzip, bad signature), `MissingDependencyError`, `InvalidMessageError` | DLQ on the first attempt |
+| `shutdown` | — | `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit` | never retried: requeued, and the cancellation propagates |
 
-To mark an exception as permanent and route directly to DLQ without retrying, raise `rabbitkit.core.errors.PermanentError` (or a subclass) from your handler:
+Evaluation order: shutdown; a category the exception declares itself
+(`rabbitkit_error_category` on the class or instance, which the typed
+exceptions below and rabbitkit's decode/`on_receive` tagging set); your
+`predicates`; the registered infrastructure errors; the transient and
+permanent type tuples; `unknown_policy` (default `PERMANENT`). A declared
+category wins over predicates, so a decode failure stays terminal even with
+a catch-all predicate or `unknown_policy=TRANSIENT`.
+
+`core/` imports no transport, so the client-library errors are registered by
+the brokers when they are constructed
+(`rabbitkit.core.errors.register_infrastructure_errors`). aiormq's
+`ChannelClosed` is the base of every channel-level close, so a 403/404/406
+raised inside a handler is retried too, bounded by `max_retries`.
+
+Classify your own errors with typed exceptions or predicates:
 
 ```python
-from rabbitkit.core.errors import PermanentError
+from rabbitkit import ErrorCategory, InfrastructureError, InvalidMessageError, RetryConfig
 
-async def handle_order(payload: dict) -> None:
+
+def handle_order(payload: dict) -> None:
     if "order_id" not in payload:
-        raise PermanentError("Missing order_id — cannot process")
-    ...
+        raise InvalidMessageError("missing order_id")  # DLQ, category invalid_message
+    try:
+        save(payload)
+    except DatabaseUnavailable as exc:
+        raise InfrastructureError("orders DB unavailable") from exc  # retried
+
+
+def by_http_status(exc: BaseException) -> bool | ErrorCategory | None:
+    status = getattr(exc, "status", None)
+    if status in (502, 503, 504):
+        return ErrorCategory.INFRASTRUCTURE
+    if status is not None and 400 <= status < 500:
+        return ErrorCategory.PERMANENT
+    return None  # no opinion
+
+
+retry = RetryConfig(max_retries=3, delays=(5, 30, 120))
+# RetryMiddleware(retry, predicates=[by_http_status])
 ```
+
+A predicate may still return `True` (transient) / `False` (permanent).
 
 ---
 
@@ -447,9 +519,34 @@ limit, reset flag, replay limit) and a finish record with the counts
 logger; route it to your audit sink. `--actor` / `actor=` (default: the OS
 user) names who ran it.
 
-**Authorization** is RabbitMQ's job: run replays as a dedicated user with
-`read` on the DLQs and `write` on the replay targets only. rabbitkit adds no
-authorization layer of its own.
+**Authorization.** The hard boundary is RabbitMQ's: run replays as a
+dedicated user with `read` on the DLQs and `write` on the replay targets
+only. On top of that:
+
+- `DLQInspector(transport, authorizer=fn)` calls `fn(ReplayRequest)` before
+  every `replay` and `purge`. The request carries the operation, the actor,
+  whether the actor was passed explicitly, the queue, the target and the
+  options (`max_replays=None` shows a lifted loop limit). `False` or an
+  exception raises `DLQOperationDeniedError` before anything is read, and a
+  `DLQ replay DENIED` record goes to the audit logger. `purge(queue,
+  actor=...)` is audited too.
+- The CLI's `--require-actor` (or `RABBITKIT_REPLAY_REQUIRE_ACTOR=1` in a
+  shared ops environment) refuses, audited, a replay that does not name its
+  `--actor`.
+
+```python
+from rabbitkit import DLQInspector, ReplayRequest
+
+ALLOWED = {"alice", "ops-bot"}
+
+
+def only_named_operators(request: ReplayRequest) -> bool:
+    return request.actor_explicit and request.actor in ALLOWED and request.operation == "replay"
+
+
+def make_inspector(transport: object) -> DLQInspector:
+    return DLQInspector(transport, authorizer=only_named_operators)
+```
 
 To replay only a subset:
 

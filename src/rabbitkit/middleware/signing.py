@@ -756,9 +756,15 @@ def check_signing_retry_conflict(route_name: str, route_middlewares: list[Any]) 
     ``RetryMiddleware`` re-enters a retried message via the default exchange
     with ``routing_key=<queue-name>`` — so verification fails on every
     post-delay redelivery and the message dead-letters instead of retrying.
-    (The nonce would also be freshly re-checked.) There is no correct
-    behavior for the combination, so fail fast at startup with a clear
-    message rather than silently destroying every retried signed message.
+    (The nonce would also be freshly re-checked, and the delay can exceed
+    ``max_skew``.) Retry copies do carry the original WIRE body and
+    ``content_encoding`` (``RabbitMessage.wire_body``), so the body part of
+    the signature would still match; the routing metadata cannot, because
+    the consumer must take exchange and routing key from the broker, not
+    from the copy's (unauthenticated) ``x-rabbitkit-original-*`` headers.
+    There is no correct behavior for the combination, so fail fast at
+    startup with a clear message rather than silently destroying every
+    retried signed message.
 
     Called by the brokers for any route that has retry enabled. ``on_receive``
     verification failures on signed routes should be given a dead-letter path

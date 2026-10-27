@@ -320,8 +320,15 @@ async def test_oversized_delivery_is_dead_lettered_without_running_the_handler(r
         assert seen == [b"ok"]
         ((props, body),) = _drain(rabbit, f"{q}.dlq")
         assert props.message_id == "big-1" and len(body) == 4096
-        (death,) = props.headers["x-death"]
-        assert death["reason"] == "rejected" and death["queue"] == q
+        # CRITICAL sets safety.dead_letter_with_metadata (G-17): a confirmed
+        # copy with rabbitkit's failure metadata, not a broker dead-letter.
+        headers = props.headers
+        assert headers["x-rabbitkit-error-category"] == "invalid_message"
+        assert headers["x-rabbitkit-error-class"] == "InboundMessageTooLargeError"
+        assert headers["x-rabbitkit-failure-category"] == "permanent"
+        assert headers["x-rabbitkit-original-queue"] == q
+        assert headers["x-rabbitkit-original-message-id"] == "big-1"
+        assert "x-death" not in headers
     finally:
         with contextlib.suppress(Exception):
             await broker.stop()

@@ -11,8 +11,8 @@ Mechanism: TTL + DLX (dead-letter exchange)
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
-import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -20,6 +20,18 @@ from typing import Any
 
 from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.errors import ErrorPredicate
+from rabbitkit.core.failure_copy import (
+    ERROR_MESSAGE_MAX_LEN,
+    H_FIRST_FAILED_AT,
+    H_ORIGINAL_QUEUE,
+    copy_envelope,
+    dead_letter_envelope,
+    header_int,
+    header_text,
+    parse_iso,
+    stable_message_id,
+    stamp_failure,
+)
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.retry_handoff import RetryHandoffTracker
@@ -41,62 +53,18 @@ from rabbitkit.middleware.error_classifier import ErrorClassifierMiddleware
 
 logger = logging.getLogger(__name__)
 
-# Item 7: DLQ-triage headers. error-message is length-capped (matching the
-# item-8 client_properties precedent) so an exception with a huge/binary
-# str() (e.g. wrapping a stack-trace-like payload) can't bloat every retry
-# republish indefinitely.
-_ERROR_MESSAGE_MAX_LEN = 512
-
 # Handler-raised settlement signals: control flow, never retried (R-D1).
 _SETTLEMENT_SIGNALS = (AckMessage, NackMessage, RejectMessage)
 
-# Retry/DLQ metadata headers (spec §13.4 / §14.1).
-_H_ORIGINAL_QUEUE = "x-rabbitkit-original-queue"
-_H_ORIGINAL_MESSAGE_ID = "x-rabbitkit-original-message-id"
-_H_ORIGINAL_EXPIRATION = "x-rabbitkit-original-expiration"
-_H_FIRST_FAILED_AT = "x-rabbitkit-first-failed-at"
-_H_ATTEMPTS = "x-rabbitkit-attempts"
-_H_ERROR_CLASS = "x-rabbitkit-error-class"
-_H_FAILURE_CATEGORY = "x-rabbitkit-failure-category"
-_H_DEAD_LETTERED_AT = "x-rabbitkit-dead-lettered-at"
-_H_ERROR_CATEGORY = "x-rabbitkit-error-category"
-
-
-def _header_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        value = value.decode(errors="replace")
-    return value if isinstance(value, str) else ""
-
-
-def _header_int(value: Any) -> int:
-    """A header as a non-negative int; malformed values read as 0."""
-    if isinstance(value, bool):
-        return 0
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _parse_iso(value: Any) -> datetime | None:
-    """An ISO-8601 header as an aware UTC datetime, or ``None``.
-
-    A future timestamp is clamped to now (clock skew or a hostile producer
-    must not create negative ages)."""
-    text = _header_text(value)
-    if isinstance(value, datetime):
-        parsed = value
-    elif not text:
-        return None
-    else:
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    now = datetime.now(UTC)
-    return min(parsed, now)
+# Item 7: DLQ-triage headers (error-message is length-capped) and the
+# retry/DLQ metadata header names (spec §13.4 / §14.1) live in
+# core/failure_copy.py, shared with the pipeline's DLQ copy (G-17).
+_ERROR_MESSAGE_MAX_LEN = ERROR_MESSAGE_MAX_LEN
+_H_ORIGINAL_QUEUE = H_ORIGINAL_QUEUE
+_H_FIRST_FAILED_AT = H_FIRST_FAILED_AT
+_header_text = header_text
+_header_int = header_int
+_parse_iso = parse_iso
 
 
 def _xdeath_retry_floor(headers: dict[str, Any], source_queue: str) -> int:
@@ -542,19 +510,8 @@ class RetryMiddleware(BaseMiddleware):
     # ── envelope construction ─────────────────────────────────────────────
 
     def _stable_message_id(self, message: RabbitMessage, headers: dict[str, Any]) -> str:
-        """The message id every copy (retry and DLQ) carries.
-
-        Recorded once, on the first handoff, as
-        ``x-rabbitkit-original-message-id``. A message published without a
-        ``message_id`` gets a fresh one at that point — otherwise the client
-        library stamps a random id on EVERY republish and the attempts of one
-        logical message can't be correlated (12.2).
-        """
-        original = _header_text(headers.get(_H_ORIGINAL_MESSAGE_ID))
-        if not original:
-            original = message.message_id or uuid.uuid4().hex
-            headers[_H_ORIGINAL_MESSAGE_ID] = original
-        return message.message_id or original
+        """See :func:`rabbitkit.core.failure_copy.stable_message_id`."""
+        return stable_message_id(message, headers)
 
     def _stamp_failure(
         self,
@@ -566,87 +523,15 @@ class RetryMiddleware(BaseMiddleware):
         attempts: int,
         now: str,
     ) -> None:
-        """Write the CURRENT attempt's failure metadata onto *headers*."""
-        if "x-rabbitkit-original-exchange" not in headers:
-            headers["x-rabbitkit-original-exchange"] = message.exchange
-        if "x-rabbitkit-original-routing-key" not in headers:
-            headers["x-rabbitkit-original-routing-key"] = message.routing_key
-        if _H_ORIGINAL_QUEUE not in headers:
-            headers[_H_ORIGINAL_QUEUE] = ""  # set by broker at consume time
-        # Item 7 / plan §5.3: allowlisted category/code + bounded, REDACTED
-        # summary. ``error_detail="omit"`` writes no message text at all;
-        # ``"raw"`` is the legacy opt-in. A previous attempt's message header
-        # is dropped so a sanitized copy cannot carry forward stale raw text.
-        headers.pop("x-rabbitkit-error-message", None)
-        sanitized = self._sanitizer.sanitize(exc, classified.severity)
-        headers.update(sanitized.as_headers())
-        # The failure taxonomy (retryable / permanent / invalid_message /
-        # unknown_outcome / infrastructure / shutdown), not just the severity.
-        headers[_H_ERROR_CATEGORY] = classified.category.value
-        headers[_H_ERROR_CLASS] = sanitized.code
-        headers[_H_FAILURE_CATEGORY] = category.value
-        # Attempts = handler executions so far, including this one. Never
-        # lowered: a copy that already claims more keeps its claim.
-        headers[_H_ATTEMPTS] = max(attempts, _header_int(headers.get(_H_ATTEMPTS, 0)))
-        # first-failed-at is set once and preserved across every retry;
-        # last-failed-at is overwritten on every failure.
-        if _parse_iso(headers.get(_H_FIRST_FAILED_AT)) is None:
-            headers[_H_FIRST_FAILED_AT] = now
-        headers["x-rabbitkit-last-failed-at"] = now
-        if message.expiration and _H_ORIGINAL_EXPIRATION not in headers:
-            headers[_H_ORIGINAL_EXPIRATION] = message.expiration
+        """Write the CURRENT attempt's failure metadata onto *headers*
+        (:func:`rabbitkit.core.failure_copy.stamp_failure`)."""
+        stamp_failure(headers, message, exc, classified, category, attempts, now, self._sanitizer)
 
     def _copy_envelope(
         self, message: RabbitMessage, *, routing_key: str, headers: dict[str, Any], message_id: str
     ) -> MessageEnvelope:
-        """A republish of *message* that keeps every AMQP property except
-        ``expiration`` (see the note in the body).
-
-        The body and ``content_encoding`` are the WIRE values (G-07): an
-        ``on_receive`` hook may have rewritten ``message.body`` in place
-        (``CompressionMiddleware`` decompresses it but leaves
-        ``content_encoding="gzip"``). Republishing that decoded body under
-        the original encoding made every retried compressed message
-        undecodable on its next delivery, so it was dead-lettered instead of
-        retried. The wire bytes are also what a signature covers.
-        """
-        return MessageEnvelope(
-            routing_key=routing_key,
-            body=message.wire_body,
-            exchange="",  # direct to the queue by name
-            headers=headers,
-            message_id=message_id,
-            correlation_id=message.correlation_id,
-            content_type=message.content_type or "application/octet-stream",
-            content_encoding=message.wire_content_encoding,
-            # Preserve the remaining original message properties -- these used
-            # to be silently dropped on every retry republish, so e.g. a
-            # priority-queue message lost its priority on its first retry, and
-            # an RPC request's reply_to/type/app_id/user_id never survived
-            # long enough for the eventual (retried) reply to route back.
-            reply_to=message.reply_to,
-            priority=message.priority,
-            # The producer's timestamp is the event time; a consumer that
-            # orders or ages messages by it must see the original (R-D5).
-            timestamp=message.timestamp,
-            # A known transient (1) stays transient; unknown stays persistent.
-            delivery_mode=message.delivery_mode if message.delivery_mode in (1, 2) else 2,
-            # expiration is deliberately NOT preserved: a producer-set
-            # per-message TTL shorter than the delay tier's x-message-ttl
-            # would expire the message INSIDE the delay queue and dead-letter
-            # it back to the source early, collapsing the whole backoff
-            # ladder into a fast retry storm (and on the DLQ it would silently
-            # delete the failure record). The original value is kept in the
-            # x-rabbitkit-original-expiration header.
-            type=message.type,
-            app_id=message.app_id,
-            user_id=message.user_id,
-            # M4: mandatory so a runtime-deleted/missing queue comes back as
-            # RETURNED (outcome not-ok) instead of being broker-confirmed into
-            # the void. Requires publisher confirms + basic.return handling,
-            # which both transports wire up.
-            mandatory=True,
-        )
+        """See :func:`rabbitkit.core.failure_copy.copy_envelope` (wire body, G-07)."""
+        return copy_envelope(message, routing_key=routing_key, headers=headers, message_id=message_id)
 
     def _build_retry_envelope(
         self,
@@ -693,12 +578,15 @@ class RetryMiddleware(BaseMiddleware):
         source_queue = _header_text(message.headers.get(_H_ORIGINAL_QUEUE))
         if not source_queue:
             return None
-        headers = dict(message.headers)
-        message_id = self._stable_message_id(message, headers)
-        now = datetime.now(UTC).isoformat()
-        self._stamp_failure(headers, message, exc, classified, category, retry_count + 1, now)
-        headers[_H_DEAD_LETTERED_AT] = now
-        return self._copy_envelope(message, routing_key=f"{source_queue}.dlq", headers=headers, message_id=message_id)
+        return dead_letter_envelope(
+            message,
+            dlq=f"{source_queue}.dlq",
+            exc=exc,
+            classified=classified,
+            category=category,
+            attempts=retry_count + 1,
+            sanitizer=self._sanitizer,
+        )
 
     # ── retry handoff ─────────────────────────────────────────────────────
 
@@ -925,11 +813,13 @@ class RetryMiddleware(BaseMiddleware):
     ) -> None:
         """Mark exception as terminal and re-raise.
 
-        M2: this is the point where a message is committed to being
-        dead-lettered -- permanent errors dead-letter on the first attempt,
-        exhausted-retry errors dead-letter after ``max_retries`` -- so
-        ``messages_dead_lettered_total`` is recorded here (labelled with the
-        error category).
+        M2: ``messages_dead_lettered_total`` (labelled with the error
+        category) counts COMPLETED dead-letters only: here when the confirmed
+        DLQ copy exists (``dead_lettered=True``); otherwise through the
+        ``_rabbitkit_on_dead_lettered`` hook, which the pipeline runs once it
+        has actually sent the dead-lettering reject. A delivery requeued
+        because the DLQ is missing is not counted (it used to be counted on
+        every redelivery).
 
         With ``dead_lettered=True`` the confirmed DLQ copy exists and the
         source is already acked: ``_rabbitkit_dead_lettered`` tells the
@@ -950,7 +840,13 @@ class RetryMiddleware(BaseMiddleware):
         exc._rabbitkit_dead_lettered = dead_lettered  # type: ignore[attr-defined]
         exc._rabbitkit_dead_letter_failed = handoff_failed  # type: ignore[attr-defined]
         if self._metrics_config is not None:
-            self._record_metric(self._metrics_config.messages_dead_lettered_total, message, classified.category)
+            metric = self._metrics_config.messages_dead_lettered_total
+            if dead_lettered:
+                self._record_metric(metric, message, classified.category)
+            else:
+                exc._rabbitkit_on_dead_lettered = functools.partial(  # type: ignore[attr-defined]  # tag like above
+                    self._record_metric, metric, message, classified.category
+                )
         sanitized = self._sanitizer.sanitize(exc, classified.severity)
         logger.warning(
             "Terminal failure (%s, category=%s, attempts=%d, retries=%d/%d, %s): %s: %s",

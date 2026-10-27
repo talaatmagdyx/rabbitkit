@@ -543,16 +543,32 @@ async def test_one_inspections_channel_error_spares_another(rabbit: dict[str, An
 
 async def test_is_connected_is_false_while_reconnecting(rabbit: dict[str, Any]) -> None:
     transport = await _async_transport(rabbit, reconnect_backoff_base=2.0, reconnect_backoff_max=2.0)
+    seen_down = asyncio.Event()
+
+    async def watch() -> None:
+        # The first reconnect after a loss is immediate, so the outage lasts
+        # only a few ms on a local broker, often less than the docker exec
+        # that causes it. Watch from before the kill, yielding at every
+        # event-loop step: the reconnect needs network round trips, so a
+        # cleared connected-state is always observable here.
+        while not seen_down.is_set():
+            if not transport.is_connected():
+                seen_down.set()
+            await asyncio.sleep(0)
+
     try:
         assert transport.is_connected()
+        watcher = asyncio.create_task(watch())
         await asyncio.to_thread(
             rabbit["container"].get_wrapped_container().exec_run,
             ["rabbitmqctl", "close_all_connections", "rabbitkit test outage"],
         )
-        deadline = asyncio.get_running_loop().time() + 10
-        while transport.is_connected():
-            assert asyncio.get_running_loop().time() < deadline, "is_connected() stayed True during the outage"
-            await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(seen_down.wait(), timeout=10)
+        except TimeoutError:
+            raise AssertionError("is_connected() stayed True during the outage") from None
+        finally:
+            watcher.cancel()
         deadline = asyncio.get_running_loop().time() + 30
         while not transport.is_connected():
             assert asyncio.get_running_loop().time() < deadline, "never reconnected"

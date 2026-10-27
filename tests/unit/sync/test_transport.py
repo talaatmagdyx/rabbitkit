@@ -1208,13 +1208,14 @@ class TestPublishConfirmTimeout:
     """I-10: a publish whose confirm never arrives (stalled I/O loop) raises
     within ~confirm_timeout instead of hanging the worker forever."""
 
-    def test_publish_raises_within_confirm_timeout(self) -> None:
+    def test_publish_never_picked_up_by_the_io_loop_is_not_sent(self) -> None:
+        """The marshalled publish never ran (the I/O loop did not drain it in
+        time, and it is cancelled so it never will): nothing left the
+        client, so NOT_SENT, bounded by ~confirm_timeout."""
         pytest.importorskip("pika")
         import time
 
         transport = _make_transport(confirm_timeout=0.1)
-        # Make the transport appear connected and force the cross-thread path
-        # so the publish marshal is bounded by confirm_timeout.
         transport._connected = True
         transport._consuming = True
         transport._ever_consumed = True
@@ -1226,22 +1227,52 @@ class TestPublishConfirmTimeout:
 
         conn = MagicMock()
         conn.is_open = True
-        # The I/O loop never drains the callback -> publish marshal times out.
-        conn.add_callback_threadsafe.side_effect = lambda cb: None
+        drained: list[object] = []
+        conn.add_callback_threadsafe.side_effect = drained.append  # never drained
         transport._connection = conn
 
-        env = MessageEnvelope(routing_key="rk", body=b"x")
         start = time.monotonic()
-        outcome = transport.publish(env)
+        outcome = transport.publish(MessageEnvelope(routing_key="rk", body=b"x"))
         elapsed = time.monotonic() - start
 
-        # A confirm that never arrives is exactly the documented TIMEOUT case
-        # (docs/message-safety.md), matching the async transport's equivalent
-        # asyncio.timeout(confirm_timeout) branch -- not a generic ERROR.
-        assert outcome.status == PublishStatus.TIMEOUT
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "admission_timeout"
         assert isinstance(outcome.error, TimeoutError)
-        # Bounded by ~confirm_timeout (allow scheduling slack, but well under 30s).
         assert elapsed < 1.0
+        drained[0]()  # a late drain is a no-op
+        channel.basic_publish.assert_not_called()
+
+    def test_marshalled_publish_that_started_but_got_no_confirm_is_timeout(self) -> None:
+        """The I/O loop ran basic_publish but the confirm did not come within
+        confirm_timeout: the message may be on the broker -> TIMEOUT."""
+        pytest.importorskip("pika")
+        import threading
+
+        transport = _make_transport(confirm_timeout=0.1)
+        transport._connected = True
+        transport._consuming = True
+        transport._ever_consumed = True
+        transport._owner_ident = -99999
+
+        release = threading.Event()
+        channel = MagicMock()
+        channel.is_open = True
+        channel.basic_publish.side_effect = lambda **kw: release.wait(5)
+        transport._channel = channel
+
+        conn = MagicMock()
+        conn.is_open = True
+        conn.add_callback_threadsafe.side_effect = lambda cb: threading.Thread(target=cb, daemon=True).start()
+        transport._connection = conn
+
+        try:
+            outcome = transport.publish(MessageEnvelope(routing_key="rk", body=b"x"))
+        finally:
+            release.set()
+
+        assert outcome.status is PublishStatus.TIMEOUT
+        assert outcome.reason == "confirm_timeout"
+        assert outcome.is_unknown
 
     def test_confirm_timeout_kwarg_stored(self) -> None:
         transport = _make_transport(confirm_timeout=7.5)
@@ -2470,40 +2501,453 @@ class TestWarnContinueConfirmRecovery:
             )
 
 
-class TestIdlePublishRetryOnce:
-    """M4 (transport review): the FIRST publish after an idle heartbeat
-    death must reconnect and retry exactly once (owner/pure-producer only)
-    instead of returning ERROR for a message that was never sent."""
+class TestNoRepublishAfterConnectionLoss:
+    """A connection lost after basic_publish wrote the frames is UNKNOWN and
+    never republished (the old retry-once delivered the message twice when
+    the first copy had reached the broker, and still said CONFIRMED). A dead
+    IDLE connection is noticed before sending instead (M4)."""
 
-    def test_pure_producer_retries_once_after_connection_error(self) -> None:
-        transport = _make_transport()
+    def _live(self, transport: SyncTransport) -> tuple[MagicMock, MagicMock]:
+        conn = MagicMock()
+        conn.is_open = True
+        channel = MagicMock()
+        channel.is_open = True
         transport._connected = True
-        transport._connection = MagicMock()
-        transport._connection.is_open = True
-        transport._channel = MagicMock()
-        transport._channel.is_open = True
+        transport._connection = conn
+        transport._channel = channel
+        return conn, channel
 
-        from rabbitkit.core.types import PublishOutcome
-        from rabbitkit.sync.connection import get_connection_errors
+    def test_connection_lost_after_send_is_unknown_and_sent_once(self) -> None:
+        import pika.exceptions
 
-        conn_err = get_connection_errors()[0]("socket died")
-        attempts: list[str] = []
+        transport = _make_transport()
+        _, channel = self._live(transport)
+        channel.basic_publish.side_effect = pika.exceptions.StreamLostError("socket died")
+        connects: list[bool] = []
+        transport.connect = lambda: connects.append(True)  # type: ignore[method-assign]
 
-        def fake_publish_on_channel(channel, envelope):
-            attempts.append("try")
-            if len(attempts) == 1:
-                return PublishOutcome(status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err)
-            return PublishOutcome(status=PublishStatus.CONFIRMED, routing_key=envelope.routing_key)
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
 
-        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
-        reconnects: list[bool] = []
-        transport._ensure_connected = lambda: reconnects.append(True)  # type: ignore[method-assign]
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "connection_lost"
+        assert outcome.is_unknown
+        assert channel.basic_publish.call_count == 1
+        assert connects == []
+
+    def test_broker_closed_connection_after_send_is_unknown(self) -> None:
+        import pika.exceptions
+
+        transport = _make_transport()
+        _, channel = self._live(transport)
+        channel.basic_publish.side_effect = pika.exceptions.ConnectionClosedByBroker(320, "CONNECTION_FORCED")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "connection_lost"
+
+    def test_idle_connection_closed_by_broker_is_replaced_before_sending(self) -> None:
+        import pika.exceptions
+
+        transport = _make_transport()
+        old_conn, old_channel = self._live(transport)
+        old_conn.process_data_events.side_effect = pika.exceptions.StreamLostError("closed while idle")
+        new_channel = MagicMock()
+        new_channel.is_open = True
+
+        def reconnect() -> None:
+            conn = MagicMock()
+            conn.is_open = True
+            transport._connection = conn
+            transport._channel = new_channel
+            transport._connected = True
+
+        transport.connect = reconnect  # type: ignore[method-assign]
 
         outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
 
         assert outcome.status is PublishStatus.CONFIRMED
-        assert len(attempts) == 2
-        assert len(reconnects) >= 1
+        old_conn.process_data_events.assert_called_once_with(time_limit=0)
+        old_channel.basic_publish.assert_not_called()
+        new_channel.basic_publish.assert_called_once()
+
+    def test_idle_probe_skipped_once_a_consume_loop_ran(self) -> None:
+        import threading
+
+        transport = _make_transport()
+        conn, _channel = self._live(transport)
+        transport._ever_consumed_any = True
+        transport._owner_ident = threading.get_ident()
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        conn.process_data_events.assert_not_called()
+
+    def test_idle_probe_skipped_once_a_consumer_is_registered(self) -> None:
+        """start() registers consumers before any consume loop runs: pumping
+        then would dispatch deliveries to worker threads that settle inline."""
+        transport = _make_transport()
+        conn, _channel = self._live(transport)
+        transport._consumer_channels["orders"] = MagicMock()
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        conn.process_data_events.assert_not_called()
+
+    def test_idle_probe_skipped_with_a_reply_consumer(self) -> None:
+        transport = _make_transport()
+        conn, _channel = self._live(transport)
+        transport._reply_to_channel = MagicMock()
+
+        transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        conn.process_data_events.assert_not_called()
+
+    def test_reconnect_failure_is_not_sent(self) -> None:
+        import pika.exceptions
+
+        transport = _make_transport()
+        transport._ensure_connected = MagicMock(  # type: ignore[method-assign]
+            side_effect=pika.exceptions.AMQPConnectionError("refused")
+        )
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
+
+    def test_owner_handler_does_not_reconnect_while_its_loop_runs(self) -> None:
+        """A handler running inline on the I/O thread finds the connection
+        dead: reconnecting there would leave the consume loop pumping a fresh
+        connection without its consumers, so the publish is NOT_SENT."""
+        import threading
+
+        transport = _make_transport()
+        transport._ever_consumed = True
+        transport._ever_consumed_any = True
+        transport._consuming = True
+        transport._owner_ident = threading.get_ident()
+        transport._connected = False
+        connects: list[bool] = []
+        transport.connect = lambda: connects.append(True)  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
+        assert connects == []
+
+
+class TestPublishOutcomeClassification:
+    """Sync outcomes follow the async contract (docs/reliable-messaging.md)."""
+
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _transport(self, **kw: object) -> tuple[SyncTransport, MagicMock, MagicMock]:
+        transport = _make_transport(**kw)
+        conn = MagicMock()
+        conn.is_open = True
+        conn.is_closed = False
+        channel = MagicMock()
+        channel.is_open = True
+        transport._connected = True
+        transport._connection = conn
+        transport._channel = channel
+        return transport, conn, channel
+
+    @pytest.mark.parametrize(
+        ("code", "reason"),
+        [(404, "exchange_not_found"), (403, "access_refused"), (406, "precondition_failed")],
+    )
+    def test_broker_refusal_is_error_with_reply_code(self, code: int, reason: str) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        text = "NOT_FOUND - no exchange 'missing' in vhost '/'"
+        channel.basic_publish.side_effect = pika.exceptions.ChannelClosedByBroker(code, text)
+
+        outcome = transport.publish(MessageEnvelope(exchange="missing", routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.ERROR
+        assert outcome.reason == reason
+        assert outcome.reply_code == code
+        assert outcome.reply_text == text
+        assert channel.basic_publish.call_count == 1
+
+    def test_other_channel_close_after_send_is_unknown(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = pika.exceptions.ChannelClosedByBroker(504, "CHANNEL_ERROR")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "channel_closed"
+
+    def test_channel_wrong_state_after_the_check_is_unknown(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = pika.exceptions.ChannelWrongStateError("closed")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "channel_closed"
+
+    def test_closed_channel_before_send_is_not_sent(self) -> None:
+        transport, _, channel = self._transport()
+        channel.is_open = False
+
+        outcome = transport._publish_on_channel(channel, MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "channel_unavailable"
+        channel.basic_publish.assert_not_called()
+
+    def test_closed_connection_before_send_is_not_sent(self) -> None:
+        transport, conn, channel = self._transport()
+        conn.is_open = False
+
+        outcome = transport._publish_on_channel(channel, MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
+        channel.basic_publish.assert_not_called()
+
+    def test_confirm_select_failure_is_not_sent(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport(confirm_delivery=False)
+        channel.confirm_delivery.side_effect = pika.exceptions.ChannelWrongStateError("closed")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x", mandatory=True))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "channel_unavailable"
+        channel.basic_publish.assert_not_called()
+
+    def test_unroutable_carries_the_return_reply(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        method = MagicMock(reply_code=312, reply_text="NO_ROUTE")
+        channel.basic_publish.side_effect = pika.exceptions.UnroutableError([MagicMock(method=method)])
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x", mandatory=True))
+
+        assert outcome.status is PublishStatus.RETURNED
+        assert outcome.reason == "returned"
+        assert (outcome.reply_code, outcome.reply_text) == (312, "NO_ROUTE")
+
+    def test_unroutable_without_messages(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = pika.exceptions.UnroutableError([])
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x", mandatory=True))
+
+        assert outcome.status is PublishStatus.RETURNED
+        assert outcome.reply_code is None
+
+    def test_nack_reason(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = pika.exceptions.NackError([])
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NACKED
+        assert outcome.reason == "nacked"
+
+    def test_invalid_properties_are_invalid_envelope(self) -> None:
+        transport, _, channel = self._transport()
+
+        with patch("pika.BasicProperties", side_effect=TypeError("bad property")):
+            outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.ERROR
+        assert outcome.reason == "invalid_envelope"
+        channel.basic_publish.assert_not_called()
+
+    @pytest.mark.parametrize("exc", [TypeError("body"), ValueError("bad value")])
+    def test_encoding_errors_are_invalid_envelope(self, exc: Exception) -> None:
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = exc
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.ERROR
+        assert outcome.reason == "invalid_envelope"
+
+    def test_unsupported_header_value_is_invalid_envelope(self) -> None:
+        import pika.exceptions
+
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = pika.exceptions.UnsupportedAMQPFieldException("x", object())
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.reason == "invalid_envelope"
+
+    def test_ioloop_timeout_valueerror_is_connection_lost(self) -> None:
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = ValueError("Timeout closed before call")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "connection_lost"
+
+    def test_valueerror_on_a_closed_connection_is_connection_lost(self) -> None:
+        transport, conn, channel = self._transport()
+
+        def fail(**kw: object) -> None:
+            conn.is_closed = True
+            raise ValueError("anything")
+
+        channel.basic_publish.side_effect = fail
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.UNKNOWN
+        assert outcome.reason == "connection_lost"
+
+    def test_unclassified_failure_is_publish_error(self) -> None:
+        transport, _, channel = self._transport()
+        channel.basic_publish.side_effect = RuntimeError("boom")
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.ERROR
+        assert outcome.reason == "publish_error"
+
+    def test_connection_died_without_a_connection(self) -> None:
+        transport = _make_transport()
+        assert transport._connection_died(ValueError("x")) is True
+
+
+class TestPublisherChannelReopen:
+    """A broker refusal closes only the publisher channel. The next publish
+    reopens that channel on the same connection instead of building a new
+    connection (which left the old one, and its consumers, behind)."""
+
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    def _closed_channel_transport(self) -> tuple[SyncTransport, MagicMock, MagicMock]:
+        transport = _make_transport()
+        conn = MagicMock()
+        conn.is_open = True
+        new_channel = MagicMock()
+        new_channel.is_open = True
+        conn.channel.return_value = new_channel
+        dead = MagicMock()
+        dead.is_open = False
+        transport._connected = True
+        transport._connection = conn
+        transport._channel = dead
+        return transport, conn, new_channel
+
+    def test_publish_reopens_the_channel_on_the_same_connection(self) -> None:
+        transport, conn, new_channel = self._closed_channel_transport()
+        opened: list[int] = []
+        rebuilt: list[int] = []
+        transport.on_channel_opened(lambda: opened.append(1))
+        transport.on_channel_rebuilt(lambda: rebuilt.append(1))
+        connects: list[bool] = []
+        transport.connect = lambda: connects.append(True)  # type: ignore[method-assign]
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        assert transport._connection is conn
+        assert transport._channel is new_channel
+        new_channel.confirm_delivery.assert_called_once()
+        new_channel.basic_publish.assert_called_once()
+        assert (opened, rebuilt, connects) == ([1], [1], [])
+
+    def test_reopen_without_confirms(self) -> None:
+        transport, _, new_channel = self._closed_channel_transport()
+        transport._confirm_delivery = False
+
+        assert transport._reopen_publisher_channel() is True
+        new_channel.confirm_delivery.assert_not_called()
+
+    def test_reopen_failure_falls_back_to_a_reconnect(self) -> None:
+        import pika.exceptions
+
+        transport, conn, _ = self._closed_channel_transport()
+        conn.channel.side_effect = pika.exceptions.StreamLostError("gone")
+        connects: list[bool] = []
+
+        def fake_connect() -> None:
+            connects.append(True)
+            fresh = MagicMock()
+            fresh.is_open = True
+            transport._connection = fresh
+            transport._channel = fresh.channel.return_value
+            transport._channel.is_open = True
+            transport._connected = True
+
+        transport.connect = fake_connect  # type: ignore[method-assign]
+
+        transport._ensure_connected()
+
+        assert connects == [True]
+
+    def test_reopen_is_a_noop_when_another_caller_reopened_it(self) -> None:
+        transport, conn, _ = self._closed_channel_transport()
+        live = MagicMock()
+        live.is_open = True
+        transport._channel = live
+
+        assert transport._reopen_publisher_channel() is True
+        conn.channel.assert_not_called()
+
+    def test_worker_thread_reopens_via_the_io_thread(self) -> None:
+        transport, conn, new_channel = self._closed_channel_transport()
+        transport._ever_consumed = True
+        transport._ever_consumed_any = True
+        transport._owner_ident = -1
+        conn.add_callback_threadsafe.side_effect = lambda cb: cb()
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        assert transport._channel is new_channel
+
+    def test_worker_thread_gets_not_sent_when_the_io_loop_does_not_reopen(self) -> None:
+        transport, conn, _ = self._closed_channel_transport()
+        transport._ever_consumed = True
+        transport._ever_consumed_any = True
+        transport._owner_ident = -1
+        transport._confirm_timeout = 0.05
+        conn.add_callback_threadsafe.side_effect = lambda cb: None
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
+
+    def test_worker_thread_never_reopens_on_a_dead_connection(self) -> None:
+        transport, conn, _ = self._closed_channel_transport()
+        conn.is_open = False
+        transport._ever_consumed_any = True
+        transport._owner_ident = -1
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.NOT_SENT
+        conn.add_callback_threadsafe.assert_not_called()
 
 
 class TestReconnectBackoffLiveness:
@@ -2643,39 +3087,6 @@ class TestEnsureConnectedOwnership:
         transport.connect = fake_connect  # type: ignore[method-assign]
         transport._ensure_connected()
         assert transport.is_connected()
-
-
-class TestIdlePublishRetryDeniedForNonOwner:
-    """Verification gap 3: the retry-once path's False branch — a non-owner
-    thread (post-consume) gets the ERROR outcome back verbatim, with no
-    reconnect attempt."""
-
-    def test_non_owner_gets_error_without_retry(self) -> None:
-        from rabbitkit.core.types import PublishOutcome
-        from rabbitkit.sync.connection import get_connection_errors
-
-        transport = _make_transport()
-        transport._connected = True
-        transport._connection = MagicMock()
-        transport._connection.is_open = True
-        transport._channel = MagicMock()
-        transport._channel.is_open = True
-        transport._ever_consumed = True
-        transport._owner_ident = -12345  # another thread owns the loop
-        transport._owner_ident_any = -12345
-
-        conn_err = get_connection_errors()[0]("socket died")
-        attempts: list[str] = []
-
-        def fake_publish_on_channel(channel, envelope):
-            attempts.append("try")
-            return PublishOutcome(status=PublishStatus.ERROR, routing_key=envelope.routing_key, error=conn_err)
-
-        transport._publish_on_channel = fake_publish_on_channel  # type: ignore[method-assign]
-
-        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
-        assert outcome.status is PublishStatus.ERROR
-        assert attempts == ["try"]  # exactly one attempt, no retry
 
 
 class TestBuildMessageChannelLiveness:

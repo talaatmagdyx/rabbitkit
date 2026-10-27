@@ -204,8 +204,8 @@ instead of discovering it.
     every I/O tick.
   - *Sync, publish-only:* **nothing** services them between publishes —
     call `broker.pump_idle()` from your idle loop, or accept that the
-    first publish after an idle gap hits a dead socket (it reconnects and
-    retries once automatically, but proactive pumping avoids the hiccup).
+    first publish after an idle gap finds a dead socket (it notices that
+    before sending and reconnects, but proactive pumping avoids the hiccup).
   - *Sync, single worker:* a handler longer than ~2x the heartbeat starves
     the loop → broker kills the connection mid-handler → redelivery +
     duplicate side effects. Warned at startup; fix with `worker_count > 1`.

@@ -13,6 +13,7 @@ Decompression operates on message.body before deserialize.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import threading
@@ -204,6 +205,7 @@ class _WindowedLog:
 #: Settlement actions recorded by the failure path (bounded, log/metric safe).
 _ACTION_REQUEUE = "nack_requeue"
 _ACTION_DEAD_LETTER = "dead_letter"
+_ACTION_DEAD_LETTER_COPY = "dead_letter_copy_with_metadata"
 _ACTION_DLQ_MISSING_REQUEUE = "requeue_dead_letter_target_missing"
 _ACTION_LEFT_UNSETTLED = "left_unsettled"
 
@@ -220,6 +222,22 @@ _DLQ_MISSING_BACKOFF_MAX = 5.0
 # ponytail: fixed 256 KiB threshold — make it configurable only if a workload
 # proves the cutoff wrong.
 _DECODE_OFFLOAD_THRESHOLD_BYTES = 256 * 1024
+
+
+def _note_dead_lettered(exc: BaseException) -> None:
+    """Run the hook RetryMiddleware attaches to a terminal exception it handed
+    back unconfirmed (``_rabbitkit_on_dead_lettered``), once the pipeline has
+    actually sent the dead-lettering settlement: the dead-letter is complete
+    only now (a requeue because the DLQ is missing is not one)."""
+    hook = getattr(exc, "_rabbitkit_on_dead_lettered", None)
+    if hook is None:
+        return
+    with contextlib.suppress(AttributeError):
+        delattr(exc, "_rabbitkit_on_dead_lettered")  # run it once
+    try:
+        hook()
+    except Exception:  # an observability hook never changes settlement
+        logger.exception("dead-letter hook raised")
 
 
 def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> None:
@@ -514,6 +532,7 @@ class HandlerPipeline:
         processing_timeout: float | None = None,
         dead_letter_check: Callable[[RouteDefinition], Awaitable[bool]] | None = None,
         max_body_bytes: int | None = None,
+        dead_letter_copy: Callable[[RouteDefinition, RabbitMessage, BaseException, str], Awaitable[bool]] | None = None,
     ) -> None:
         self._serializer = serializer
         self._di_resolver = di_resolver
@@ -528,6 +547,10 @@ class HandlerPipeline:
         self._dead_letter_check = dead_letter_check
         # §15.6: raw-body cap (ConsumerConfig.max_body_bytes); None = no cap.
         self._max_body_bytes = max_body_bytes
+        # G-17 (async): publish a confirmed, metadata-stamped DLQ copy before
+        # a dead-lettering settlement that RetryMiddleware never saw; True =
+        # the copy is confirmed and the delivery may be acked.
+        self._dead_letter_copy = dead_letter_copy
         self._dlq_missing_streak: dict[str, int] = {}
         self._failure_log = _WindowedLog()
         # Counters a metrics exporter can read (also emitted through a
@@ -1605,6 +1628,8 @@ class HandlerPipeline:
             message.reject(requeue=requeue)
         else:
             message.nack(requeue=requeue)
+        if not requeue:
+            _note_dead_lettered(exc)
 
     # ── Internal: failure policy (shared by both pipelines) ──────────────
 
@@ -1759,7 +1784,27 @@ class HandlerPipeline:
         queues dead-letter at most once). It is requeued instead, after a
         capped backoff that keeps a missing DLQ from becoming a hot loop,
         and an ERROR is logged every window until the DLQ is restored.
+
+        G-17: a failure RetryMiddleware never handled (an ``on_receive``
+        failure, a body over ``max_body_bytes``, a route without retry, a
+        transient failure on redelivery) first gets a confirmed DLQ copy with
+        rabbitkit's failure metadata, and only then is the delivery acked.
+        If the copy is not confirmed (or the DLQ cannot be addressed), the
+        reject/requeue path below runs as before: the delivery is never acked
+        without a confirmed copy. Handler-requested rejects (no exception)
+        and RetryMiddleware's own terminal hand-backs are not copied.
         """
+        if (
+            not requeue
+            and exc is not None
+            and reason != "retry_terminal"
+            and self._dead_letter_copy is not None
+            and await self._dead_letter_copy(route, message, exc, reason)
+        ):
+            self._dlq_missing_streak.pop(route.queue.name, None)
+            self._log_failure(route, message, exc, _ACTION_DEAD_LETTER_COPY, reason)
+            await message.ack_async()
+            return
         if not requeue and self._dead_letter_check is not None:
             if await self._dead_letter_check(route):
                 self._dlq_missing_streak.pop(route.queue.name, None)
@@ -1789,6 +1834,8 @@ class HandlerPipeline:
             await message.reject_async(requeue=requeue)
         else:
             await message.nack_async(requeue=requeue)
+        if not requeue and exc is not None:
+            _note_dead_lettered(exc)
 
     async def _handle_async_exception(
         self,

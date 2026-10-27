@@ -109,19 +109,34 @@ def _kill_connections(rabbit: dict[str, Any], connection_name: str, *, at_least:
     return killed
 
 
-async def _await_reconnected(broker: Any, timeout: float = 20.0) -> None:
-    """Wait until the broker's connections dropped and came back."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    transport = broker._transport
-    while transport.is_connected():
-        if loop.time() > deadline:
-            raise AssertionError("connections were never seen dropping")
-        await asyncio.sleep(0.02)
-    while not transport.is_connected():
-        if loop.time() > deadline:
-            raise AssertionError("connections never came back")
-        await asyncio.sleep(0.05)
+class _ReconnectWatch:
+    """Counts the broker transport's reconnects, from before a kill.
+
+    A killed connection is restored within a few milliseconds on a local
+    broker (the first reconnect attempt after a loss is immediate), often
+    before the management API call that killed it has even returned, so
+    polling ``is_connected()`` for the drop afterwards misses it. The
+    ``on_reconnect`` hook fires once per restored connection (publisher and
+    consumer), so counting it cannot miss the outage."""
+
+    def __init__(self, broker: Any) -> None:
+        self.transport = broker._transport
+        self.count = 0
+        self.transport.on_reconnect(self._on_reconnect)
+
+    def _on_reconnect(self) -> None:
+        self.count += 1
+
+    async def wait(self, reconnects: int, timeout: float = 20.0) -> None:
+        """Wait until *reconnects* connections were restored and all are up."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.count < reconnects or not self.transport.is_connected():
+            if loop.time() > deadline:
+                raise AssertionError(
+                    f"expected {reconnects} reconnects, saw {self.count}; connected={self.transport.is_connected()}"
+                )
+            await asyncio.sleep(0.02)
 
 
 async def _delete_queue(url: str, queue: str) -> None:
@@ -357,8 +372,10 @@ async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(
         await _await_probe(rabbit["url"], queue, consumers=0)
         await _publish_raw(rabbit["url"], queue, ["during-drain"])
 
-        assert await asyncio.to_thread(_kill_connections, rabbit, connection_name) > 0
-        await _await_reconnected(broker)
+        watch = _ReconnectWatch(broker)
+        killed = await asyncio.to_thread(_kill_connections, rabbit, connection_name)
+        assert killed > 0
+        await watch.wait(killed)
         await asyncio.sleep(3.0)  # aio-pika restores consumers right after reconnecting
 
         ready, consumers = await asyncio.to_thread(_probe, rabbit["url"], queue)
@@ -404,8 +421,10 @@ async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> 
         await _publish_raw(rabbit["url"], queue, [str(i) for i in range(8)])
         await await_counts(rabbit, queue, (6, 2), timeout=20)
 
-        assert await asyncio.to_thread(_kill_connections, rabbit, connection_name) > 0
-        await _await_reconnected(broker)
+        watch = _ReconnectWatch(broker)
+        killed = await asyncio.to_thread(_kill_connections, rabbit, connection_name)
+        assert killed > 0
+        await watch.wait(killed)
         await await_consumers(rabbit["url"], queue, timeout=30)
         await await_counts(rabbit, queue, (6, 2), timeout=20)
         await asyncio.sleep(1.0)

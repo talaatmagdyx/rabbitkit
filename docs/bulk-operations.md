@@ -301,7 +301,8 @@ form) for the cluster owner to apply; rabbitkit never mutates policies.
 * `RetryConfig.error_detail` controls the DLQ triage headers: `sanitized`
   (default: credentials, tokens, URL passwords redacted; length-capped),
   `omit`, or `raw` (legacy). A new `x-rabbitkit-error-category` header
-  carries `transient` / `permanent`.
+  carries the failure category (`retryable`, `permanent`, `invalid_message`,
+  `unknown_outcome`, `infrastructure`).
 * `RetryConfig.handoff` (`RetryHandoffConfig`) bounds what happens when the
   **retry publish itself** fails (returned, nacked, timed out, connection
   drop). The source is nack-requeued, never acked; consecutive failures get

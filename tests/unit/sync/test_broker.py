@@ -2632,3 +2632,12 @@ class TestPublishMessageIdKwarg:
         broker, _ = self._broker()
         with pytest.raises(ValueError, match="message_id"):
             broker.publish(MessageEnvelope(routing_key="q", body=b"x"), message_id="m")
+
+
+class TestDeadLetterWithMetadataIsAsyncOnly:
+    def test_sync_broker_logs_that_it_ignores_the_setting(self) -> None:
+        from rabbitkit.core.config import RabbitConfig, SafetyConfig
+
+        with patch("rabbitkit.sync.broker.logger") as log:
+            SyncBroker(RabbitConfig(safety=SafetyConfig(dead_letter_with_metadata=True)))
+        assert any("dead_letter_with_metadata" in str(c.args[0]) for c in log.warning.call_args_list)

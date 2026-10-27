@@ -10,12 +10,15 @@ import pytest
 
 from rabbitkit.core.config import (
     RETRY_DISABLED,
+    ConnectionConfig,
     ConsumerConfig,
     PublisherConfig,
     RabbitConfig,
     RetryConfig,
     RetryDisabled,
     SafetyConfig,
+    SecurityConfig,
+    SSLConfig,
 )
 from rabbitkit.core.errors import ConfigValidationError
 from rabbitkit.core.profiles import (
@@ -78,6 +81,7 @@ def _critical_ok_config() -> RabbitConfig:
         ),
         consumer=ConsumerConfig(processing_timeout=30.0),
         retry=_critical_retry(),
+        safety=SafetyConfig(dead_letter_with_metadata=True),
     )
 
 
@@ -201,6 +205,68 @@ class TestValidateProfile:
         assert "queue[orders].dlq" in settings
 
 
+class TestCriticalConnection:
+    """CRITICAL requires heartbeats; the reconnect budget and TLS stay the
+    deployment's choice, checked only for consistency (warnings)."""
+
+    @staticmethod
+    def _with(connection: ConnectionConfig | None = None, security: SecurityConfig | None = None) -> RabbitConfig:
+        cfg = _critical_ok_config()
+        if connection is not None:
+            cfg = dataclasses.replace(cfg, connection=connection)
+        if security is not None:
+            cfg = dataclasses.replace(cfg, security=security)
+        return cfg
+
+    def test_defaults_meet_the_connection_requirements(self) -> None:
+        assert validate_profile(self._with(), "critical") == []
+
+    def test_heartbeat_off_is_an_error(self) -> None:
+        with pytest.warns(UserWarning, match="heartbeat=0"):
+            conn = ConnectionConfig(heartbeat=0)
+        v = validate_profile(self._with(conn), "critical")
+        assert [(x.setting, x.severity) for x in v] == [("connection.heartbeat", "error")]
+
+    def test_apply_refuses_heartbeat_off(self) -> None:
+        with pytest.warns(UserWarning, match="heartbeat=0"):
+            conn = ConnectionConfig(heartbeat=0)
+        base = dataclasses.replace(_TIMEOUT, connection=conn)
+        with pytest.raises(ConfigValidationError, match=r"connection.heartbeat=0"):
+            critical_config(base)
+
+    def test_standard_does_not_require_heartbeats(self) -> None:
+        with pytest.warns(UserWarning, match="heartbeat=0"):
+            conn = ConnectionConfig(heartbeat=0)
+        assert standard_config(RabbitConfig(connection=conn)).connection.heartbeat == 0
+
+    def test_unlimited_reconnect_budget_is_the_default_and_compliant(self) -> None:
+        cfg = critical_config(_TIMEOUT)
+        assert cfg.connection.reconnect_budget_attempts is None
+        assert cfg.connection.reconnect_budget_seconds is None
+
+    def test_budget_shorter_than_the_backoff_cap_warns(self) -> None:
+        conn = ConnectionConfig(reconnect_backoff_max=30.0, reconnect_budget_seconds=10.0)
+        v = validate_profile(self._with(conn), "critical")
+        assert [(x.setting, x.severity) for x in v] == [("connection.reconnect_budget_seconds", "warning")]
+        assert critical_config(dataclasses.replace(_TIMEOUT, connection=conn)).connection == conn
+
+    def test_bounded_budgets_that_cover_the_backoff_are_compliant(self) -> None:
+        conn = ConnectionConfig(reconnect_budget_attempts=20, reconnect_budget_seconds=300.0)
+        assert validate_profile(self._with(conn), "critical") == []
+
+    def test_tls_is_not_required(self) -> None:
+        assert validate_profile(self._with(security=SecurityConfig(ssl=SSLConfig(enabled=False))), "critical") == []
+
+    def test_tls_without_certificate_verification_warns(self) -> None:
+        security = SecurityConfig(ssl=SSLConfig(enabled=True, cert_reqs="CERT_NONE"))
+        v = validate_profile(self._with(security=security), "critical")
+        assert [(x.setting, x.severity) for x in v] == [("security.ssl.cert_reqs", "warning")]
+
+    def test_tls_with_verification_is_compliant(self) -> None:
+        security = SecurityConfig(ssl=SSLConfig(enabled=True))
+        assert validate_profile(self._with(security=security), "critical") == []
+
+
 class TestApplyProfile:
     def test_standard_fills_in_guardrails(self) -> None:
         cfg = standard_config()
@@ -219,7 +285,14 @@ class TestApplyProfile:
         assert cfg.retry.terminal_action is TerminalAction.DEAD_LETTER
         assert cfg.retry.trust_retry_header is False
         assert cfg.consumer.reject_transient_on_redelivery and cfg.consumer.manual_settle_on_error
+        assert cfg.safety.dead_letter_with_metadata is True
         assert validate_profile(cfg, ReliabilityProfile.CRITICAL) == []
+
+    def test_critical_requires_dead_letter_metadata_copies(self) -> None:
+        cfg = dataclasses.replace(_critical_ok_config(), safety=SafetyConfig())
+        v = validate_profile(cfg, ReliabilityProfile.CRITICAL)
+        assert [(x.setting, x.severity) for x in v] == [("safety.dead_letter_with_metadata", "error")]
+        assert validate_profile(cfg, ReliabilityProfile.STANDARD) == []
 
     def test_critical_requires_a_processing_timeout(self) -> None:
         with pytest.raises(ConfigValidationError, match=r"processing_timeout is required.*no safe default"):

@@ -53,13 +53,23 @@ Rules the async broker follows:
 - It never publishes again on its own once frames may have left the client.
   A connection lost mid-publish is `UNKNOWN`. Failures before the frame (no
   channel) are healed by reconnecting and re-acquiring, which cannot duplicate.
-- **SyncBroker exception:** a publish that hits a dead connection from the
-  owner thread is reconnected and sent **once more** (an idle connection
-  closed by heartbeat would otherwise fail the first publish of the day). If
-  the first attempt had reached the broker, that is a duplicate. The sync
-  transport also reports connection failures as `ERROR`, not
-  `NOT_SENT` / `UNKNOWN` (except `NOT_SENT` / `not_connected` from a
-  non-owner thread).
+- `SyncBroker` follows the same contract. `NOT_SENT`: no connection and none
+  could be made, or the publishing thread may not reconnect (`not_connected`:
+  a worker thread, or a handler running inside the consume loop, whose
+  connection is down); the channel already closed before `basic_publish`
+  (`channel_unavailable`); a worker-thread publish the I/O loop did not pick
+  up within `confirm_timeout` (`admission_timeout`). `UNKNOWN`: the
+  connection (`connection_lost`) or channel (`channel_closed`) was lost after
+  `basic_publish`. `TIMEOUT` (`confirm_timeout`): no confirm in time. `ERROR`
+  with `reply_code` / `reply_text`: `exchange_not_found` (404),
+  `access_refused` (403), `precondition_failed` (406), sent once; the next
+  publish reopens the publisher channel on the same connection. A
+  publish-only `SyncBroker` whose connection the broker closed while it sat
+  idle notices that before sending (it reads the socket first) and
+  reconnects, so the first publish after a quiet period is `CONFIRMED`, not
+  `UNKNOWN`. The sync transport no longer republishes after a dead
+  connection (it used to, once, which could duplicate a message and still
+  report `CONFIRMED`).
 - Admission is bounded: a free pooled channel within
   `PoolConfig.channel_acquire_timeout`, the byte budget
   `PublisherConfig.max_in_flight_bytes` when set, and the per-call
@@ -109,11 +119,20 @@ middlewares).
 | Raises an AMQP client error or `InfrastructureError` | `INFRASTRUCTURE` | as `RETRYABLE` | as `RETRYABLE` |
 | Exceeds `ConsumerConfig.processing_timeout` (async only) | `UNKNOWN_OUTCOME` | task cancelled, then as `RETRYABLE` | as `RETRYABLE` |
 | Raises anything else (unclassified) or a permanent error | `PERMANENT` | confirmed DLQ copy with failure metadata, then ack | reject → source queue's DLX → `<queue>.dlq` |
-| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX | reject → DLX |
-| Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler | same |
+| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
+| Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler (copy with metadata first when `dead_letter_with_metadata`, e.g. under CRITICAL) | same |
 | Retries exhausted, or `max_retry_age` passed | terminal | confirmed DLQ copy with metadata, then ack | — |
 | Cancelled by `stop()` | `SHUTDOWN` | nack(requeue); `CancelledError` propagates | same |
 | Filtered out by `filter_fn` | — | nack(requeue=False) → DLX | same |
+
+"reject → DLX" rows: with `SafetyConfig.dead_letter_with_metadata=True`
+(async broker; the CRITICAL profile sets it) the delivery first gets a
+confirmed DLQ copy carrying the same failure metadata as a retry terminal
+copy and is then acked; only if that copy is not confirmed does the reject
+(checked as below) or the requeue for a missing DLQ happen. Default `False`:
+the reject, and the DLQ entry carries only `x-death`. Handler-requested
+rejects (`RejectMessage`, `msg.reject_async()`) and `filter_fn` rejects are
+never copied. `SyncBroker` always rejects.
 
 Rules:
 
@@ -145,7 +164,13 @@ Rules:
   delivery into the source's DLX when the DLQ exists (async: checked first) or
   the source is a quorum queue declared `at-least-once`; otherwise (async) it
   requeues after a 0.5–5 s backoff. A broker-dead-lettered copy carries only
-  `x-death`, not the failure metadata.
+  `x-death`, not the failure metadata. A delivery is never acked without a
+  confirmed copy; a copy that landed without its confirm can leave a
+  duplicate in the DLQ after that fallback.
+- `rabbitkit_messages_dead_lettered_total` counts completed dead-letters:
+  a confirmed DLQ copy, or the reject the pipeline actually sent. A delivery
+  requeued because its DLQ is missing is not counted. The G-17 copies of
+  failures outside `RetryMiddleware` are not counted by it.
 - Copies keep the wire body and encoding, `message_id` (a message without one
   gets a stable id on its first handoff), `correlation_id`, `type`, `app_id`,
   `user_id`, `reply_to`, `priority`, `timestamp`, `delivery_mode` and every
@@ -192,7 +217,8 @@ Signals: `broker.run()` and `start(install_signal_handlers=True)` install
 SIGINT/SIGTERM handlers and `stop()` restores the previous ones; a handler an
 application registered with `loop.add_signal_handler` is left alone. Embedding
 applications should pass `install_signal_handlers=False` (`rabbitkit_lifespan`
-does). `RabbitApp.run_async()` follows the same rules: it restores the
+does, and so does `async with AsyncBroker(config) as broker:`, which starts
+the broker on entry and stops it on exit). `RabbitApp.run_async()` follows the same rules: it restores the
 handlers it replaced and leaves an existing asyncio handler alone. Keep
 `graceful_timeout` below Kubernetes' `terminationGracePeriodSeconds`.
 
@@ -335,8 +361,34 @@ profile forbids, and when `consumer.processing_timeout` is unset.
 | Quorum source queues | — | per route (error) | — |
 | Source `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` | — | per route: warning if not declared; verified on the broker by `preflight(management_client=...)` (which then replaces the warning) | — |
 | Dead-letter path never `discard` | — | yes | `reject_without_dlx="discard"` |
+| DLQ copy with metadata for failures outside retry (`on_receive`, body cap, no-retry routes) | `safety.dead_letter_with_metadata=True` (async) | yes | — |
 | Event metadata validation | — (opt-in) | not checked | — |
-| Connection reconnect budget / backoff | **Not implemented** in the profile yet | — | — |
+| Heartbeat on (`connection.heartbeat > 0`) | — (default 30 s) | yes | `heartbeat=0` |
+| Async reconnect budget | — (unlimited by default) | warning when `reconnect_budget_seconds < reconnect_backoff_max` | — |
+| TLS | — (deployment choice) | warning when enabled with `cert_reqs="CERT_NONE"` | — |
+
+Why the connection rows look like this:
+
+- **Heartbeats are required.** Without them a peer that disappears without
+  closing TCP (a crashed or partitioned node) is never detected: publishes
+  wait on a dead socket and unacked deliveries stay assigned to a consumer
+  that cannot settle them. The default (30 s) satisfies the profile.
+- **The reconnect budget stays unlimited by default.** No guarantee depends
+  on it: a publish during an outage is reported `NOT_SENT` / `UNKNOWN`, never
+  `CONFIRMED`, and unacked deliveries are redelivered after the reconnect. An
+  unlimited budget keeps a consumer available through a long broker outage or
+  a rolling restart without a restart storm; a connection that fails for a
+  reason retrying cannot fix (refused credentials, vhost or TLS) stops at once
+  anyway, and the supervisor (Kubernetes) restarts the pod on a terminal
+  failure. Set `reconnect_budget_attempts` / `reconnect_budget_seconds` when
+  you prefer a restart after a bounded outage; the profile only checks that a
+  seconds budget is not shorter than `reconnect_backoff_max` (the backoff it
+  bounds could never reach its own cap). The budgets apply to `AsyncBroker`;
+  `SyncBroker` keeps its own bounded loop (`reconnect_max_attempts`).
+- **TLS is not required.** Whether broker traffic is encrypted by the client,
+  a service mesh or a private network is a deployment decision the library
+  cannot see. When TLS is enabled through `SSLConfig`, turning certificate
+  verification off (`cert_reqs="CERT_NONE"`) is reported.
 
 Per-route requirements cannot be applied to a config: register the
 subscribers, then call `validate_profile(config, "critical",

@@ -119,6 +119,32 @@ class TestRPCClient:
         assert exc_info.value.timeout == 0.1
         assert exc_info.value.correlation_id is not None
 
+    @pytest.mark.parametrize("status", [PublishStatus.NOT_SENT, PublishStatus.ERROR, PublishStatus.RETURNED])
+    def test_undelivered_request_fails_at_once(self, status: PublishStatus) -> None:
+        from rabbitkit.core.errors import PublishError
+
+        transport = MagicMock()
+        transport.publish = MagicMock(return_value=PublishOutcome(status=status))
+        transport.consume = MagicMock(return_value="reply-tag")
+        client = RPCClient(transport)
+
+        start = time.monotonic()
+        with pytest.raises(PublishError) as exc_info:
+            client.call("rpc.queue", b"test", timeout=5.0)
+
+        assert time.monotonic() - start < 1.0
+        assert exc_info.value.outcome.status is status
+        assert client._router.pending_count() == 0
+
+    def test_unknown_request_outcome_still_waits_for_the_reply(self) -> None:
+        transport = MagicMock()
+        transport.publish = MagicMock(return_value=PublishOutcome(status=PublishStatus.UNKNOWN))
+        transport.consume = MagicMock(return_value="reply-tag")
+        client = RPCClient(transport)
+
+        with pytest.raises(RPCTimeoutError):
+            client.call("rpc.queue", b"test", timeout=0.05)
+
     def test_call_sets_reply_to(self) -> None:
         transport = MagicMock()
         transport.publish = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
@@ -360,6 +386,20 @@ class TestAsyncRPCClient:
             await client.call("rpc.queue", b"test", timeout=0.1)
 
         assert exc_info.value.timeout == 0.1
+
+    @pytest.mark.asyncio
+    async def test_undelivered_request_fails_at_once(self) -> None:
+        from rabbitkit.core.errors import PublishError
+
+        transport = AsyncMock()
+        transport.publish = AsyncMock(return_value=PublishOutcome(status=PublishStatus.NOT_SENT))
+        transport.consume = AsyncMock(return_value="reply-tag")
+        client = AsyncRPCClient(transport)
+
+        async with asyncio.timeout(1.0):
+            with pytest.raises(PublishError):
+                await client.call("rpc.queue", b"test", timeout=5.0)
+        assert client._router.pending_count() == 0
 
     @pytest.mark.asyncio
     async def test_call_sets_reply_to(self) -> None:
@@ -968,7 +1008,9 @@ class TestRPCClientClosedGuard:
             client._ensure_consuming()
         transport.consume.assert_not_called()
 
+
 # ── R4: _ReplyRouter / sink-based routing ----------------------------------
+
 
 class TestReplyRouter:
     """R4: shared reply routing logic lives in _ReplyRouter."""
@@ -1084,6 +1126,7 @@ class TestReplyRouter:
         assert fut.cancelled() or fut.done()
         assert router.pending_count() == 0
 
+
 class TestFutureSink:
     """R4: _FutureSink wraps concurrent.futures.Future."""
 
@@ -1107,6 +1150,7 @@ class TestFutureSink:
         assert sink.cancel()
         assert fut.cancelled()
 
+
 class TestAsyncFutureSink:
     """R4: _AsyncFutureSink wraps asyncio.Future."""
 
@@ -1127,6 +1171,7 @@ class TestAsyncFutureSink:
         sink = _AsyncFutureSink(fut)
         assert sink.cancel()
         assert fut.cancelled()
+
 
 class TestRPCClientUsesConcurrentFuture:
     """R4: sync client uses concurrent.futures.Future, not _PendingCall."""

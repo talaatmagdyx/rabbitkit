@@ -42,6 +42,35 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+class _IoLoopStalledError(TimeoutError):
+    """A cross-thread callback timed out before it started: it never ran and
+    never will (the caller cancelled it atomically). For a publish this means
+    nothing was sent."""
+
+
+class _PublishNotSentError(Exception):
+    """Raised before ``basic_publish`` when the channel or connection is
+    already known to be closed: no frame of the message was written."""
+
+
+#: Broker channel-close codes that refuse a publish -> ERROR reason.
+_PUBLISH_REFUSALS: dict[int, str] = {
+    404: PublishReason.EXCHANGE_NOT_FOUND,
+    403: PublishReason.ACCESS_REFUSED,
+    406: PublishReason.PRECONDITION_FAILED,
+}
+
+
+def _returned_fields(exc: Any) -> tuple[int | None, str | None]:
+    """``(reply_code, reply_text)`` of the ``Basic.Return`` behind pika's
+    ``UnroutableError`` (``(None, None)`` if it carries none)."""
+    messages = getattr(exc, "messages", None) or []
+    if not messages:
+        return None, None
+    method = getattr(messages[0], "method", None)
+    return getattr(method, "reply_code", None), getattr(method, "reply_text", None)
+
+
 class SyncTransport:
     """Pika-based synchronous transport.
 
@@ -453,6 +482,9 @@ class SyncTransport:
                 "is handled by the broker's recovery loop on the owner thread."
             )
 
+        if self._reopen_publisher_channel():
+            return
+
         self._connected = False
         if self._ever_connected and not self._loss_reported:
             self._loss_reported = True
@@ -503,6 +535,48 @@ class SyncTransport:
                         self._reconnect_total_timeout,
                     )
                     raise
+
+    def _reopen_publisher_channel(self) -> bool:
+        """Replace a closed publisher channel on a connection that is still open.
+
+        A broker refusal of a publish (404 missing exchange, 403, 406) closes
+        only the publisher channel. Building a whole new connection for that
+        left the old one open, with every consumer channel on it, while the
+        consume loop moved on to the new one. Returns False when the
+        connection itself is gone (the caller reconnects).
+        """
+        conn = self._connection
+        if not self._connected or conn is None or not conn.is_open:
+            return False
+        if self._channel is not None and self._channel.is_open:
+            return True  # another caller reopened it first
+        try:
+            channel = conn.channel()
+            if self._confirm_delivery:
+                channel.confirm_delivery()
+        except get_connection_errors() as e:
+            logger.warning("Could not reopen the publisher channel (%s); reconnecting", type(e).__name__)
+            return False
+        self._channel = channel
+        if self._confirm_delivery:
+            self._confirmed_channel_ids.add(self._channel_key(channel))
+        self._fire_channel_opened()
+        self._fire_channel_rebuilt()
+        logger.info("Reopened the publisher channel")
+        return True
+
+    def _reopen_publisher_channel_on_io_thread(self) -> bool:
+        """:meth:`_reopen_publisher_channel` for a caller that may not touch the
+        connection itself (a worker thread, or a handler inside the consume
+        loop): marshalled onto the I/O thread, never a reconnect. False when
+        the connection is gone or the I/O loop did not run it in time."""
+        conn = self._connection
+        if not self._connected or conn is None or not conn.is_open:
+            return False
+        try:
+            return self._run_on_io_thread(self._reopen_publisher_channel, timeout=self._confirm_timeout)
+        except TimeoutError:
+            return False
 
     def reconnect(self, cause: BaseException | None = None) -> None:
         """Force a fresh connection + channel (used by consumer recovery).
@@ -572,12 +646,19 @@ class SyncTransport:
         # R-3: set when the caller gives up waiting, so a later _cb drain is a
         # no-op rather than settling an already-redelivered message.
         cancelled = threading.Event()
+        # Whether fn() began, decided atomically against the caller giving up:
+        # on expiry the caller knows for certain whether fn() never ran (and
+        # never will) or may still be running.
+        handshake = threading.Lock()
+        started: list[bool] = []
 
         def _cb() -> None:
-            if cancelled.is_set():
-                # The caller already timed out and moved on (nack+requeue).
-                # Running fn() now could double-settle, so drop the late callback.
-                return
+            with handshake:
+                if cancelled.is_set():
+                    # The caller already timed out and moved on (nack+requeue).
+                    # Running fn() now could double-settle, so drop the late callback.
+                    return
+                started.append(True)
             try:
                 result.append(fn())
             except BaseException as exc:  # re-raised on the caller thread
@@ -593,7 +674,14 @@ class SyncTransport:
         io_stall_timeout = timeout
         self._connection.add_callback_threadsafe(_cb)
         if not done.wait(timeout=io_stall_timeout):
-            cancelled.set()
+            with handshake:
+                cancelled.set()
+                never_ran = not started
+            if never_ran:
+                raise _IoLoopStalledError(
+                    f"Timed out after {io_stall_timeout}s waiting for the pika I/O "
+                    "loop to run a cross-thread callback; it never ran and never will"
+                )
             raise TimeoutError(
                 f"Timed out after {io_stall_timeout}s waiting for the pika I/O "
                 "loop to drain a cross-thread callback (connection stalled?)"
@@ -696,26 +784,34 @@ class SyncTransport:
         # unsynchronized threads driving one pika connection (frame
         # corruption, lost acks, mass redelivery). Reconnection is owned
         # exclusively by the owner thread (SyncBroker.run()'s recovery loop);
-        # here we fail fast with a clean outcome instead.
+        # here we fail fast with a clean outcome instead. The owner thread
+        # itself must not reconnect while its consume loop is running either
+        # (a handler publishing inline): the loop would go on pumping a fresh
+        # connection that carries none of its consumers.
         if (
             (self._ever_consumed or self._ever_consumed_any)
-            and threading.get_ident() != self._owner_ident
+            and (threading.get_ident() != self._owner_ident or self._consuming)
             and not self.is_connected()
+            and not self._reopen_publisher_channel_on_io_thread()
         ):
-            return PublishOutcome(
-                status=PublishStatus.NOT_SENT,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                reason=PublishReason.NOT_CONNECTED,
-                error=ConnectionError(
-                    "Connection is down and this thread does not own it — "
-                    "reconnection is handled by the broker's recovery loop on the "
-                    "owner thread. The publish was NOT sent; treat as transient "
-                    "and retry/nack."
+            return self._outcome(
+                envelope,
+                PublishStatus.NOT_SENT,
+                PublishReason.NOT_CONNECTED,
+                ConnectionError(
+                    "Connection is down and reconnection is handled by the broker's "
+                    "recovery loop on the owner thread. The publish was NOT sent; "
+                    "treat as transient and retry/nack."
                 ),
             )
 
-        self._ensure_connected()
+        try:
+            self._ensure_connected()
+            self._detect_closed_idle_connection()
+        except get_connection_errors() as e:
+            # Nothing was sent: the connection could not be (re)established.
+            logger.warning("Publish not sent: no connection (%s)", type(e).__name__)
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.NOT_CONNECTED, e)
 
         channel = self._channel
         if (
@@ -724,48 +820,65 @@ class SyncTransport:
             and self._reply_to_channel.is_open
         ):
             channel = self._reply_to_channel
-            # m1: this consumer channel is not in confirm mode by default, so
-            # without this the outcome below would claim CONFIRMED for a
-            # fire-and-forget RPC publish. Enabling confirms on it keeps the
-            # reported status truthful (confirm.select is legal on a channel
-            # with an active consumer).
-            if self._confirm_delivery:
-                self._ensure_mandatory_confirms(channel)
 
-        outcome = self._publish_on_channel(channel, envelope)
+        # Never republished here once frames may have left the client: a
+        # connection lost after basic_publish is UNKNOWN (the broker may hold
+        # the message), so republishing could deliver it twice and still
+        # report CONFIRMED. A dead idle connection is caught before sending
+        # by _detect_closed_idle_connection instead.
+        return self._publish_on_channel(channel, envelope)
 
-        # M4 (architect review): a pure-producer connection that nobody pumps
-        # gets heartbeat-closed broker-side, and pika's is_open stays True
-        # until the socket is read — so the FIRST publish after an idle gap
-        # fails with a connection error. When this thread is allowed to
-        # reconnect (owner, or nothing ever consumed), reconnect and retry
-        # exactly once: safe pre-confirm (at-least-once), and it turns the
-        # "first publish after a quiet night" page into a non-event.
+    def _outcome(
+        self,
+        envelope: MessageEnvelope,
+        status: PublishStatus,
+        reason: str | None = None,
+        error: BaseException | None = None,
+        *,
+        reply_code: int | None = None,
+        reply_text: str | None = None,
+    ) -> PublishOutcome:
+        return PublishOutcome(
+            status=status,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+            error=error,
+            reason=reason,
+            reply_code=reply_code,
+            reply_text=reply_text,
+        )
+
+    def _detect_closed_idle_connection(self) -> None:
+        """Notice, before sending, a pure-producer connection the broker closed.
+
+        Nothing pumps a publish-only connection between publishes, so one the
+        broker closed while it sat idle (missed heartbeats, an operator or a
+        restart) still reports ``is_open`` until its socket is read: the next
+        publish would write its frames into a dead socket and its outcome
+        would be UNKNOWN. A zero-time ``process_data_events`` reads what is
+        pending; if the connection turns out closed it is replaced before
+        anything is sent. Only for a pure producer: no consume loop has ever
+        run AND no consumer is registered. On a consuming connection the loop
+        reads the socket; and once ``consume()`` registered a consumer (e.g.
+        ``SyncBroker.start()`` before ``run()``), pumping would dispatch
+        deliveries here, before any consume loop exists, so worker-pool
+        handlers would settle them inline from their own threads (pika is
+        not thread-safe).
+        """
         if (
-            outcome.status is PublishStatus.ERROR
-            and outcome.error is not None
-            and isinstance(outcome.error, get_connection_errors())
+            self._ever_consumed
+            or self._ever_consumed_any
+            or self._consumer_channels
+            or self._reply_to_channel is not None
+            or self._connection is None
         ):
-            allowed_to_reconnect = (
-                not (self._ever_consumed or self._ever_consumed_any) or threading.get_ident() == self._owner_ident
-            )
-            if allowed_to_reconnect:
-                logger.warning(
-                    "Publish hit a dead connection (%s); reconnecting and retrying once",
-                    type(outcome.error).__name__,
-                )
-                self._connected = False
-                self._ensure_connected()
-                retry_channel = self._channel
-                if (
-                    envelope.reply_to == DIRECT_REPLY_TO_QUEUE
-                    and self._reply_to_channel is not None
-                    and self._reply_to_channel.is_open
-                ):
-                    retry_channel = self._reply_to_channel
-                return self._publish_on_channel(retry_channel, envelope)
-
-        return outcome
+            return
+        try:
+            self._connection.process_data_events(time_limit=0)
+        except get_connection_errors() as e:
+            logger.warning("Publisher connection was closed while idle (%s); reconnecting before publishing", e)
+            self.disconnect()
+            self._ensure_connected()
 
     @staticmethod
     def _channel_key(channel: Any) -> tuple[int, int]:
@@ -810,16 +923,32 @@ class SyncTransport:
     def _publish_on_channel_unreported(
         self, channel: Any, envelope: MessageEnvelope, timing: list[float] | None
     ) -> PublishOutcome:
-        """:meth:`_publish_on_channel` without the outcome hooks. When *timing*
-        is a list, the duration of the ``basic_publish`` call is appended."""
+        """Publish *envelope* on a specific channel and classify the result.
+
+        The same contract as the async transport (docs/reliable-messaging.md):
+
+        * NOT_SENT: nothing of the message left the client. The channel or
+          connection was already closed before ``basic_publish``
+          (``channel_unavailable`` / ``not_connected``), confirm mode could
+          not be enabled (``channel_unavailable``), or a cross-thread publish
+          was never picked up by the I/O loop in time (``admission_timeout``).
+        * UNKNOWN: the connection (``connection_lost``) or channel
+          (``channel_closed``) was lost after ``basic_publish`` wrote the
+          frames; the broker may hold the message. Never republished here.
+        * TIMEOUT (``confirm_timeout``): no confirm within ``confirm_timeout``.
+        * ERROR: the broker refused this publish (404 ``exchange_not_found``,
+          403 ``access_refused``, 406 ``precondition_failed``, with
+          ``reply_code`` / ``reply_text``; the publisher channel is used by
+          one publish at a time, so the refusal is this publish's own), the
+          envelope could not be encoded (``invalid_envelope``), or anything
+          unclassified (``publish_error``).
+        """
+        import pika
+        import pika.exceptions
+
+        # An empty message_id/content_type means "no such property"
+        # (DLQ replay of a message that had none), not an empty string.
         try:
-            import pika
-
-            if envelope.mandatory:
-                self._ensure_mandatory_confirms(channel)
-
-            # An empty message_id/content_type means "no such property"
-            # (DLQ replay of a message that had none), not an empty string.
             properties = pika.BasicProperties(
                 message_id=envelope.message_id or None,
                 correlation_id=envelope.correlation_id,
@@ -834,30 +963,52 @@ class SyncTransport:
                 user_id=envelope.user_id,
                 app_id=envelope.app_id,
             )
-
             if envelope.timestamp:
                 properties.timestamp = int(envelope.timestamp.timestamp())
+        except (ValueError, TypeError) as e:
+            logger.error("Publish failed (invalid envelope): %s", e)
+            return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, e)
 
-            # I-10: bound the publish+confirm wait by confirm_timeout so a
-            # missing confirm cannot stall the worker forever.
-            # m4: honor the configured confirm_timeout as-is — the old
-            # min(30, x) silently clamped an operator's deliberate 60 s to 30.
-            publish_timeout = self._confirm_timeout
+        # The direct reply-to channel is a consumer channel, not in confirm
+        # mode by default (m1); without confirms the outcome below would claim
+        # CONFIRMED for a fire-and-forget publish. confirm.select is legal on
+        # a channel with an active consumer. No message frame is sent here.
+        needs_confirms = envelope.mandatory or (self._confirm_delivery and channel is self._reply_to_channel)
+        if needs_confirms:
+            try:
+                self._ensure_mandatory_confirms(channel)
+            except Exception as e:  # nothing of the message has been sent
+                logger.warning("Publish not sent: could not enable confirms on the channel (%s)", e)
+                return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.CHANNEL_UNAVAILABLE, e)
 
-            def do_publish() -> None:
-                started = time.monotonic()
-                try:
-                    channel.basic_publish(
-                        exchange=envelope.exchange,
-                        routing_key=envelope.routing_key,
-                        body=envelope.body,
-                        properties=properties,
-                        mandatory=envelope.mandatory,
-                    )
-                finally:
-                    if timing is not None:
-                        timing.append(time.monotonic() - started)
+        def do_publish() -> None:
+            # Checked on the thread that publishes, right before basic_publish
+            # (pika itself raises on a closed channel/connection there, before
+            # writing a frame). Past this point the frames may have left.
+            conn = self._connection
+            if conn is None or not conn.is_open:
+                raise _PublishNotSentError(PublishReason.NOT_CONNECTED)
+            if not channel.is_open:
+                raise _PublishNotSentError(PublishReason.CHANNEL_UNAVAILABLE)
+            started = time.monotonic()
+            try:
+                channel.basic_publish(
+                    exchange=envelope.exchange,
+                    routing_key=envelope.routing_key,
+                    body=envelope.body,
+                    properties=properties,
+                    mandatory=envelope.mandatory,
+                )
+            finally:
+                if timing is not None:
+                    timing.append(time.monotonic() - started)
 
+        # I-10: bound the publish+confirm wait by confirm_timeout so a
+        # missing confirm cannot stall the worker forever.
+        # m4: honor the configured confirm_timeout as-is — the old
+        # min(30, x) silently clamped an operator's deliberate 60 s to 30.
+        publish_timeout = self._confirm_timeout
+        try:
             if threading.get_ident() == self._owner_ident and self._ever_consumed:
                 # I-11: this thread also owns dispatching further deliveries
                 # via start_consuming() -- cannot safely bound this wait on a
@@ -885,75 +1036,94 @@ class SyncTransport:
                 # Cross-thread: marshal onto the owner's I/O loop, which
                 # _run_on_io_thread already bounds by confirm_timeout.
                 self._run_on_io_thread(do_publish, timeout=publish_timeout)
-
-            # M4: only report CONFIRMED when the channel is actually in
-            # publisher-confirm mode -- confirm_delivery=False (unless this
-            # publish is `mandatory`, which always enables confirms via
-            # _ensure_mandatory_confirms above) means basic_publish() is
-            # fire-and-forget and nothing was broker-acknowledged.
-            confirmed = self._confirm_delivery or envelope.mandatory
-            return PublishOutcome(
-                status=PublishStatus.CONFIRMED if confirmed else PublishStatus.SENT,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-            )
-
-        except pika.exceptions.UnroutableError as e:
-            logger.warning(
-                "Publish returned as unroutable (mandatory=True, no matching binding): exchange=%s routing_key=%s",
-                envelope.exchange,
-                envelope.routing_key,
-            )
-            return PublishOutcome(
-                status=PublishStatus.RETURNED,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
-            )
-
-        except pika.exceptions.NackError as e:
-            logger.warning(
-                "Publish nacked by broker: exchange=%s routing_key=%s",
-                envelope.exchange,
-                envelope.routing_key,
-            )
-            return PublishOutcome(
-                status=PublishStatus.NACKED,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
-            )
-
-        except TimeoutError as e:
-            # I-10: basic_publish() blocks synchronously for the broker confirm
-            # (in confirm mode); _run_on_io_thread bounds that wait by
-            # confirm_timeout and raises TimeoutError on expiry -- exactly the
-            # "no confirm arrived in time" case docs/message-safety.md documents
-            # as PublishStatus.TIMEOUT (matching the async transport's
-            # equivalent asyncio.timeout(confirm_timeout) branch). This used to
-            # fall through to the generic ERROR branch below, so a caller
-            # correctly checking `status == PublishStatus.TIMEOUT` per the
-            # documented contract silently never saw it on the sync transport.
-            logger.warning(
-                "Publish confirm timed out: exchange=%s routing_key=%s",
-                envelope.exchange,
-                envelope.routing_key,
-            )
-            return PublishOutcome(
-                status=PublishStatus.TIMEOUT,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
-            )
-
         except Exception as e:
-            logger.error("Publish failed: %s", e)
-            return PublishOutcome(
-                status=PublishStatus.ERROR,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
+            return self._classify_publish_failure(e, envelope)
+
+        # M4: only report CONFIRMED when the channel is actually in
+        # publisher-confirm mode -- confirm_delivery=False (unless this
+        # publish is `mandatory`, which always enables confirms via
+        # _ensure_mandatory_confirms above) means basic_publish() is
+        # fire-and-forget and nothing was broker-acknowledged.
+        confirmed = self._confirm_delivery or envelope.mandatory
+        return self._outcome(envelope, PublishStatus.CONFIRMED if confirmed else PublishStatus.SENT)
+
+    def _classify_publish_failure(self, exc: Exception, envelope: MessageEnvelope) -> PublishOutcome:
+        """Map an exception from the send step of :meth:`_publish_on_channel`."""
+        import pika.exceptions
+
+        if isinstance(exc, _PublishNotSentError):
+            reason = str(exc)
+            logger.warning(
+                "Publish not sent (%s): exchange=%s routing_key=%s", reason, envelope.exchange, envelope.routing_key
             )
+            return self._outcome(envelope, PublishStatus.NOT_SENT, reason, exc)
+        if isinstance(exc, _IoLoopStalledError):
+            logger.warning("Publish not sent: the I/O loop did not pick it up in time")
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.ADMISSION_TIMEOUT, exc)
+        if isinstance(exc, pika.exceptions.UnroutableError):
+            code, text = _returned_fields(exc)
+            logger.warning(
+                "Publish returned as unroutable (mandatory=True, no matching binding): "
+                "exchange=%s routing_key=%s reply_code=%s reply_text=%s",
+                envelope.exchange,
+                envelope.routing_key,
+                code,
+                text,
+            )
+            return self._outcome(
+                envelope, PublishStatus.RETURNED, PublishReason.RETURNED, exc, reply_code=code, reply_text=text
+            )
+        if isinstance(exc, pika.exceptions.NackError):
+            logger.warning(
+                "Publish nacked by broker: exchange=%s routing_key=%s", envelope.exchange, envelope.routing_key
+            )
+            return self._outcome(envelope, PublishStatus.NACKED, PublishReason.NACKED, exc)
+        if isinstance(exc, TimeoutError):
+            # I-10: no confirm within confirm_timeout (_run_on_io_thread or
+            # _publish_confirm_wait_bounded gave up): the message may be on
+            # the broker. Same status as the async transport's confirm wait.
+            logger.warning(
+                "Publish confirm timed out: exchange=%s routing_key=%s", envelope.exchange, envelope.routing_key
+            )
+            return self._outcome(envelope, PublishStatus.TIMEOUT, PublishReason.CONFIRM_TIMEOUT, exc)
+        if isinstance(exc, pika.exceptions.ChannelClosedByBroker):
+            refusal = _PUBLISH_REFUSALS.get(exc.reply_code)
+            if refusal is not None:
+                logger.error(
+                    "Publish refused by broker (%s): exchange=%s routing_key=%s: %s",
+                    refusal,
+                    envelope.exchange,
+                    envelope.routing_key,
+                    exc.reply_text,
+                )
+                return self._outcome(
+                    envelope,
+                    PublishStatus.ERROR,
+                    refusal,
+                    exc,
+                    reply_code=exc.reply_code,
+                    reply_text=exc.reply_text,
+                )
+        invalid_input = (TypeError, pika.exceptions.UnsupportedAMQPFieldException, pika.exceptions.ShortStringTooLong)
+        if isinstance(exc, invalid_input) or (isinstance(exc, ValueError) and not self._connection_died(exc)):
+            logger.error("Publish failed (invalid envelope): %s", exc)
+            return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, exc)
+        if isinstance(exc, pika.exceptions.ChannelClosed | pika.exceptions.ChannelWrongStateError):
+            logger.warning("Publish outcome unknown: channel closed after sending (%s)", exc)
+            return self._outcome(envelope, PublishStatus.UNKNOWN, PublishReason.CHANNEL_CLOSED, exc)
+        if isinstance(exc, (*get_connection_errors(), ValueError)):
+            logger.warning("Publish outcome unknown: connection lost after sending (%s)", type(exc).__name__)
+            return self._outcome(envelope, PublishStatus.UNKNOWN, PublishReason.CONNECTION_LOST, exc)
+        logger.error("Publish failed: %s", exc)
+        return self._outcome(envelope, PublishStatus.ERROR, PublishReason.PUBLISH_ERROR, exc)
+
+    def _connection_died(self, exc: ValueError) -> bool:
+        """pika's ioloop raises a bare ``ValueError("Timeout closed before
+        call")`` when the connection died between poll ticks (see
+        :meth:`start_consuming`); any ValueError on a closed connection is
+        that, not invalid input."""
+        conn = self._connection
+        return "Timeout closed before call" in str(exc) or conn is None or bool(getattr(conn, "is_closed", False))
 
     def consume(
         self,

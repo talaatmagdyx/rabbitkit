@@ -49,10 +49,10 @@ If your use case requires that messages are processed in the exact order they we
 Example:
 
 ```python
-from rabbitkit import AsyncBroker, RabbitConfig
+from rabbitkit import AsyncBroker, ConnectionConfig, RabbitConfig
 from rabbitkit.core.config import WorkerConfig
 
-config = RabbitConfig(url="amqp://guest:guest@localhost/")
+config = RabbitConfig(connection=ConnectionConfig.from_url("amqp://guest:guest@localhost/"))
 broker = AsyncBroker(config)
 
 @broker.subscriber(
@@ -64,10 +64,8 @@ async def handle_order(order_id: str) -> None:
 
 
 async def main() -> None:
-    async with broker:
-        await broker.start(
-            worker_config=WorkerConfig(worker_count=1),
-        )
+    # Runs until SIGINT/SIGTERM, then drains and stops.
+    await broker.run(worker_config=WorkerConfig(worker_count=1))
 ```
 
 This configuration processes exactly one message at a time, in delivery order.

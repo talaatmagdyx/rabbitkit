@@ -26,10 +26,21 @@ import uuid
 from concurrent.futures import Future
 from typing import Any
 
+from rabbitkit.core.errors import PublishError
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import DIRECT_REPLY_TO_QUEUE, MessageEnvelope
+from rabbitkit.core.types import DIRECT_REPLY_TO_QUEUE, MessageEnvelope, PublishOutcome, PublishStatus
 
 logger = logging.getLogger(__name__)
+
+
+#: Request publish outcomes that prove no request reached a server, so no
+#: reply can come: the call fails at once instead of waiting for its timeout.
+#: UNKNOWN / TIMEOUT may have been delivered and still wait for the reply.
+_UNDELIVERED = frozenset({PublishStatus.NOT_SENT, PublishStatus.RETURNED, PublishStatus.NACKED, PublishStatus.ERROR})
+
+
+def _request_undelivered(outcome: object) -> bool:
+    return isinstance(outcome, PublishOutcome) and outcome.status in _UNDELIVERED
 
 
 class RPCTimeoutError(TimeoutError):
@@ -315,6 +326,8 @@ class RPCClient:
         Raises:
             RPCTimeoutError: If the response is not received within the timeout.
             RPCClientClosed: If the client was closed while waiting.
+            PublishError: If the request was definitely not delivered
+                (``NOT_SENT``, ``RETURNED``, ``NACKED`` or ``ERROR``).
             RuntimeError: If max_pending calls is exceeded.
 
         Note:
@@ -349,7 +362,11 @@ class RPCClient:
             correlation_id=correlation_id,
             headers=headers or {},
         )
-        self._transport.publish(envelope)
+        outcome = self._transport.publish(envelope)
+        if _request_undelivered(outcome):
+            with self._lock:
+                self._router.pop(correlation_id)
+            raise PublishError(outcome)
 
         # Wait for the response. If we own a dedicated reply connection, pump
         # its I/O loop ourselves; otherwise block directly on the future
@@ -530,6 +547,8 @@ class AsyncRPCClient:
         Raises:
             RPCTimeoutError: If the response is not received within the timeout.
             RPCClientClosed: If the client was closed (or is closed while waiting).
+            PublishError: If the request was definitely not delivered
+                (``NOT_SENT``, ``RETURNED``, ``NACKED`` or ``ERROR``).
             RuntimeError: If max_pending calls is exceeded.
         """
         # L6: refuse to operate after close() instead of silently
@@ -559,7 +578,11 @@ class AsyncRPCClient:
             correlation_id=correlation_id,
             headers=headers or {},
         )
-        await self._transport.publish(envelope)
+        outcome = await self._transport.publish(envelope)
+        if _request_undelivered(outcome):
+            async with self._lock:
+                self._router.pop(correlation_id)
+            raise PublishError(outcome)
 
         # Wait for response with timeout. R-timeout: asyncio.timeout (3.11+)
         # replaces asyncio.wait_for to avoid the wrapper-task overhead.

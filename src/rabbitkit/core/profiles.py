@@ -24,7 +24,14 @@ Processing deadline         explicit                  required (``consumer.proce
 ``AckPolicy.ACK_FIRST``     allowed                   rejected on every route
 Error text                  sanitized                 sanitized or omitted (never raw)
 Dead-letter path            auto-provisioned          never ``discard``
+DLQ metadata outside retry  ``x-death`` only          confirmed copy with failure metadata
+                                                      (``safety.dead_letter_with_metadata``, async)
 Event metadata validation   opt-in                    opt-in (an application contract choice)
+Heartbeat                   explicit                  required (> 0)
+Async reconnect budget      unlimited                 unlimited by default; when set, seconds
+                                                      >= ``reconnect_backoff_max`` (warning)
+TLS                         deployment choice         deployment choice; not ``CERT_NONE`` when
+                                                      enabled (warning)
 ==========================  ========================  ==============================================
 
 Profiles are opt-in. :func:`apply_profile` returns a NEW ``RabbitConfig``
@@ -271,9 +278,57 @@ def _critical_config_violations(config: RabbitConfig) -> list[ProfileViolation]:
         out.append(ProfileViolation("consumer.reject_transient_on_redelivery", "True", "False"))
     if not consumer.manual_settle_on_error:
         out.append(ProfileViolation("consumer.manual_settle_on_error", "True", "False"))
-    # TODO(connection-stream): validate the connection's reconnect budget and
-    # backoff here once ConnectionConfig gains the fail-fast settings; until
-    # then the profile does not constrain ConnectionConfig.
+    if not config.safety.dead_letter_with_metadata:
+        out.append(
+            ProfileViolation(
+                "safety.dead_letter_with_metadata",
+                "True (DLQ copy with failure metadata for failures outside RetryMiddleware)",
+                "False",
+            )
+        )
+    out.extend(_critical_connection_violations(config))
+    return out
+
+
+def _critical_connection_violations(config: RabbitConfig) -> list[ProfileViolation]:
+    """CRITICAL requirements on the connection (rationale: docs/reliable-messaging.md).
+
+    * Heartbeats on: without them a peer that vanishes without closing TCP
+      (a partitioned or crashed node) is never detected, so publishes wait on
+      a dead socket and deliveries sit unacknowledged.
+    * The async reconnect budget stays unlimited by default: correctness does
+      not depend on it (outcomes are reported honestly, unacked deliveries
+      are redelivered), and a supervisor restart handles a terminal failure.
+      When set, ``reconnect_budget_seconds`` must leave room for the backoff
+      it bounds (>= ``reconnect_backoff_max``); otherwise the configured
+      backoff ceiling is never reached (warning).
+    * TLS is a deployment choice and is not required. When it is enabled,
+      certificate verification must not be off (warning).
+    """
+    out: list[ProfileViolation] = []
+    conn = config.connection
+    if conn.heartbeat <= 0:
+        out.append(ProfileViolation("connection.heartbeat", "> 0 (dead-peer detection)", str(conn.heartbeat)))
+    budget = conn.reconnect_budget_seconds
+    if budget is not None and budget < conn.reconnect_backoff_max:
+        out.append(
+            ProfileViolation(
+                "connection.reconnect_budget_seconds",
+                f"None (unlimited) or >= reconnect_backoff_max ({conn.reconnect_backoff_max})",
+                str(budget),
+                severity="warning",
+            )
+        )
+    ssl = config.security.ssl
+    if ssl.enabled and ssl.cert_reqs == "CERT_NONE":
+        out.append(
+            ProfileViolation(
+                "security.ssl.cert_reqs",
+                "'CERT_REQUIRED' when TLS is enabled",
+                "'CERT_NONE'",
+                severity="warning",
+            )
+        )
     return out
 
 
@@ -304,6 +359,8 @@ def _critical_contradictions(config: RabbitConfig, defaults: RabbitConfig) -> li
         out.append("consumer.reject_transient_on_redelivery=False")
     if not consumer.manual_settle_on_error:
         out.append("consumer.manual_settle_on_error=False")
+    if config.connection.heartbeat == 0:
+        out.append("connection.heartbeat=0 (no dead-peer detection)")
     return out
 
 
@@ -321,7 +378,8 @@ def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> Ra
     unless set), ``strip_reserved_headers``, a ``RetryConfig`` when there is
     none (keeping your ladder when there is) with quorum delay queues
     dead-lettering at-least-once, a quorum DLQ, ``terminal_action=dead_letter``
-    and ``trust_retry_header=False``. Per-route requirements (quorum source
+    and ``trust_retry_header=False``, and ``safety.dead_letter_with_metadata``. It requires a heartbeat (``heartbeat=0``
+    raises) and leaves the reconnect budget and TLS to you. Per-route requirements (quorum source
     queues declared at-least-once, no ``ACK_FIRST``, retry not disabled) are
     the routes' to meet: check them with :func:`validate_profile` /
     :func:`preflight` after registering the subscribers. Event-metadata
@@ -380,7 +438,8 @@ def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> Ra
             terminal_action=TerminalAction.DEAD_LETTER,
             trust_retry_header=False,
         )
-        return dataclasses.replace(config, publisher=new_pub, retry=new_retry)
+        new_safety = dataclasses.replace(config.safety, dead_letter_with_metadata=True)
+        return dataclasses.replace(config, publisher=new_pub, retry=new_retry, safety=new_safety)
 
     new_pub = dataclasses.replace(pub, confirm_delivery=True, persistent=True, mandatory=True)
     return dataclasses.replace(config, publisher=new_pub)

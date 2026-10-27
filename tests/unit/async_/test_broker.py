@@ -2998,3 +2998,79 @@ class TestQueueExistsForGuard:
         broker._transport.queue_exists = AsyncMock(return_value=True)
         assert await broker._queue_exists_for_guard("orders.dlq") is True
         broker._transport.queue_exists.assert_awaited_once_with("orders.dlq")
+
+
+# ── async context manager (contract §4.3) ─────────────────────────────────
+
+
+class TestAsyncContextManager:
+    @pytest.mark.asyncio
+    async def test_enter_starts_without_signal_handlers_and_exit_stops(self) -> None:
+        broker = AsyncBroker()
+        calls: list[tuple[str, Any]] = []
+
+        async def fake_start(worker_config: Any = None, *, install_signal_handlers: bool = True) -> None:
+            calls.append(("start", install_signal_handlers))
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            calls.append(("stop", timeout))
+
+        with patch.object(broker, "start", fake_start), patch.object(broker, "stop", fake_stop):
+            async with broker as entered:
+                assert entered is broker
+                assert calls == [("start", False)]
+
+        assert calls == [("start", False), ("stop", None)]
+
+    @pytest.mark.asyncio
+    async def test_exit_stops_when_the_block_raises(self) -> None:
+        broker = AsyncBroker()
+        stopped: list[bool] = []
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            stopped.append(True)
+
+        with (
+            patch.object(broker, "start", AsyncMock()),
+            patch.object(broker, "stop", fake_stop),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            async with broker:
+                raise RuntimeError("boom")
+
+        assert stopped == [True]
+
+
+# ── G-17: DLQ copies for failures outside RetryMiddleware ─────────────────
+
+
+class TestDeadLetterCopyWiring:
+    def test_off_by_default(self) -> None:
+        broker = AsyncBroker()
+        assert broker._dead_letter_copier is None
+        assert broker._pipeline._dead_letter_copy is None
+
+    def test_on_wires_the_copier_into_the_pipeline(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(dead_letter_with_metadata=True)))
+        assert broker._dead_letter_copier is not None
+        assert broker._pipeline._dead_letter_copy == broker._dead_letter_copier.copy
+
+    def test_sanitizer_and_retry_header_follow_the_route_retry_config(self) -> None:
+        broker = AsyncBroker(RabbitConfig(retry=RetryConfig(error_detail="omit", retry_header="x-tries")))
+
+        @broker.subscriber(queue="with-retry")
+        async def a(body: bytes) -> None: ...
+
+        plain = AsyncBroker()
+
+        @plain.subscriber(queue="plain")
+        async def b(body: bytes) -> None: ...
+
+        route = broker.routes[0]
+        assert broker._dead_letter_sanitizer(route).policy == "omit"
+        assert broker._dead_letter_sanitizer(route) is broker._dead_letter_sanitizer(route)  # cached
+        assert broker._dead_letter_retry_header(route) == "x-tries"
+        assert plain._dead_letter_sanitizer(plain.routes[0]).policy == "sanitized"
+        assert plain._dead_letter_retry_header(plain.routes[0]) == "x-rabbitkit-retry-count"

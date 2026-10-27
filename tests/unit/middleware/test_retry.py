@@ -8,6 +8,7 @@ import pytest
 
 from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.pipeline import _note_dead_lettered
 from rabbitkit.core.types import (
     ErrorSeverity,
     MessageEnvelope,
@@ -317,12 +318,62 @@ class TestRetryMetrics:
         def failing_handler(m: RabbitMessage) -> None:
             raise ValueError("bad payload")
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc_info:
+            mw.consume_scope(failing_handler, msg)
+
+        # No DLQ copy (no publisher): handed back to the pipeline, counted
+        # only once the pipeline has sent the dead-lettering reject.
+        collector.inc_counter.assert_not_called()
+        _note_dead_lettered(exc_info.value)
+        _note_dead_lettered(exc_info.value)  # at most once
+        collector.inc_counter.assert_called_once_with(
+            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue", "category": "permanent"}
+        )
+
+    def test_confirmed_dlq_copy_counts_at_once(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
+        mw = RetryMiddleware(
+            config,
+            publish_fn=lambda env: PublishOutcome(status=PublishStatus.CONFIRMED),
+            metrics_collector=collector,
+            metrics_config=MetricsConfig(),
+        )
+        msg = _make_message(headers={"x-rabbitkit-original-queue": "orders-queue"})
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ValueError("bad payload")
+
+        with pytest.raises(ValueError) as exc_info:
             mw.consume_scope(failing_handler, msg)
 
         collector.inc_counter.assert_called_once_with(
             "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue", "category": "permanent"}
         )
+        assert not hasattr(exc_info.value, "_rabbitkit_on_dead_lettered")
+
+    def test_unconfirmed_dlq_copy_requeued_for_a_missing_dlq_is_not_counted(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+
+        collector = MagicMock()
+        config = RetryConfig(max_retries=3, delays=(5,), strict_delays=False)
+        mw = RetryMiddleware(
+            config,
+            publish_fn=lambda env: PublishOutcome(status=PublishStatus.RETURNED),
+            metrics_collector=collector,
+            metrics_config=MetricsConfig(),
+        )
+
+        def failing_handler(m: RabbitMessage) -> None:
+            raise ValueError("bad payload")
+
+        for _ in range(3):  # the pipeline requeues each time: the DLQ is missing
+            with pytest.raises(ValueError):
+                mw.consume_scope(failing_handler, _make_message(headers={"x-rabbitkit-original-queue": "q"}))
+
+        collector.inc_counter.assert_not_called()
 
     def test_exhausted_retries_emits_messages_dead_lettered_total(self) -> None:
         from rabbitkit.core.config import MetricsConfig
@@ -337,9 +388,10 @@ class TestRetryMetrics:
         def failing_handler(m: RabbitMessage) -> None:
             raise ConnectionResetError("still failing")
 
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError) as exc_info:
             mw.consume_scope(failing_handler, msg)
 
+        _note_dead_lettered(exc_info.value)
         collector.inc_counter.assert_called_once_with(
             "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue", "category": "retryable"}
         )

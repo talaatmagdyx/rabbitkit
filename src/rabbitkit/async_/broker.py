@@ -37,7 +37,7 @@ from rabbitkit.core.config import (
     SocketConfig,
     WorkerConfig,
 )
-from rabbitkit.core.dead_letter import DeadLetterGuard
+from rabbitkit.core.dead_letter import DeadLetterCopier, DeadLetterGuard
 from rabbitkit.core.errors import (
     BackpressureError,
     BrokerNotStartedError,
@@ -45,6 +45,7 @@ from rabbitkit.core.errors import (
     TerminalConnectionError,
     register_infrastructure_errors,
 )
+from rabbitkit.core.failure_copy import DEFAULT_RETRY_HEADER, ERROR_MESSAGE_MAX_LEN
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
@@ -54,6 +55,7 @@ from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.registry import SubscriberRegistry
 from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_async
 from rabbitkit.core.signals import is_default_signal_handler, is_loop_signal_handler, loop_signal_handler_is
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
@@ -140,6 +142,19 @@ class AsyncBroker:
         register_infrastructure_errors(*get_infrastructure_errors())
         # F17: verify a route's DLQ exists before dead-lettering into it.
         self._dead_letter_guard = DeadLetterGuard(self._queue_exists_for_guard)
+        # G-17: a confirmed, metadata-stamped DLQ copy for failures that
+        # bypass RetryMiddleware (SafetyConfig.dead_letter_with_metadata).
+        self._dead_letter_sanitizers: dict[str, ErrorSanitizer] = {}
+        self._dead_letter_copier: DeadLetterCopier | None = (
+            DeadLetterCopier(
+                self._flow_controlled_internal_publish,
+                self._dead_letter_guard.target_for,
+                sanitizer_for=self._dead_letter_sanitizer,
+                retry_header_for=self._dead_letter_retry_header,
+            )
+            if self._config.safety.dead_letter_with_metadata
+            else None
+        )
         self._pipeline = HandlerPipeline(
             serializer=serializer,
             di_resolver=di_resolver,
@@ -149,6 +164,7 @@ class AsyncBroker:
             processing_timeout=self._config.consumer.processing_timeout,
             dead_letter_check=self._dead_letter_guard.check,
             max_body_bytes=self._config.consumer.max_body_bytes,
+            dead_letter_copy=self._dead_letter_copier.copy if self._dead_letter_copier is not None else None,
         )
 
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -382,6 +398,41 @@ class AsyncBroker:
         self._registry.include_router(router, prefix=prefix)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def _dead_letter_sanitizer(self, route: RouteDefinition) -> ErrorSanitizer:
+        """The error-header sanitizer for *route*'s G-17 DLQ copies: its retry
+        config's ``error_detail`` (the same policy RetryMiddleware applies),
+        else the sanitized default."""
+        retry = route.effective_retry_config(self._config.retry)
+        policy = retry.error_detail if retry is not None else "sanitized"
+        sanitizer = self._dead_letter_sanitizers.get(policy)
+        if sanitizer is None:
+            sanitizer = self._dead_letter_sanitizers[policy] = ErrorSanitizer(
+                policy=policy, max_summary_len=ERROR_MESSAGE_MAX_LEN
+            )
+        return sanitizer
+
+    def _dead_letter_retry_header(self, route: RouteDefinition) -> str:
+        retry = route.effective_retry_config(self._config.retry)
+        return retry.retry_header if retry is not None else DEFAULT_RETRY_HEADER
+
+    async def __aenter__(self) -> AsyncBroker:
+        """``async with AsyncBroker(config) as broker:`` starts the broker and
+        stops it when the block exits (also on an exception or cancellation).
+
+        Entering calls ``start(install_signal_handlers=False)``: a ``with``
+        block is a scope owned by the surrounding code (a script, a test, an
+        application that embeds the broker), so the broker leaves SIGINT and
+        SIGTERM to that code. A standalone consumer process should use
+        ``await broker.run()`` instead, which owns the signals and drains on
+        SIGTERM. To pass a ``WorkerConfig``, call ``start()`` yourself and
+        ``stop()`` in a ``finally``; ``start()`` on a started broker is a no-op.
+        """
+        await self.start(install_signal_handlers=False)
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.stop()
 
     async def start(
         self,

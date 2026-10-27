@@ -22,7 +22,7 @@ from rabbitkit import AsyncBroker, SyncBroker, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 # Experimental features — may change between releases
-from rabbitkit.experimental import rpc, locking, dashboard
+from rabbitkit.experimental import RPCClient, DistributedLock, create_dashboard_app
 ```
 
 ## Deduplication mark policy

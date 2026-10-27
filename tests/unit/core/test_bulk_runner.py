@@ -431,3 +431,89 @@ class TestIterPublishSyncEdges:
         assert {it.message_id for it in items} == {"same"}
         assert len({it.attempt_id for it in items}) == 3
         assert [it.index for it in items] == [0, 1, 2]
+
+
+class TestIterPublishAsyncEveryIndexOnce:
+    """G-13 / INV-009: every input index yields exactly one item."""
+
+    async def test_a_leaked_cancelled_error_yields_unknown_not_a_dropped_item(self) -> None:
+        async def pub(e: MessageEnvelope) -> PublishOutcome:
+            if e.routing_key == "q1":
+                raise asyncio.CancelledError  # e.g. aio-pika closing the channel under it
+            return _ok(e)
+
+        items = await _collect(
+            iter_publish_async([_env(i) for i in range(3)], pub, options=BulkPublishOptions(), preparer=_prep())
+        )
+        assert [it.index for it in items] == [0, 1, 2]
+        assert items[1].status is BulkPublishStatus.UNKNOWN
+        assert items[1].reason == REASON_CANCELLED
+
+    async def test_a_task_that_produced_nothing_is_reported_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Invariant check: an admitted index with no outcome is synthesized."""
+        import rabbitkit.core.bulk_runner as runner
+
+        real_from_outcome = runner._from_outcome
+        calls = 0
+
+        def flaky(*args: Any, **kwargs: Any) -> BulkPublishItem:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("bookkeeping bug")  # the task dies without an item
+            return real_from_outcome(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "_from_outcome", flaky)
+        items = await _collect(iter_publish_async([_env(0)], _aok, options=BulkPublishOptions(), preparer=_prep()))
+        assert [(it.index, it.status) for it in items] == [(0, BulkPublishStatus.UNKNOWN)]
+        assert items[0].reason == "no_outcome"
+
+    async def test_hook_sees_each_index_once_when_a_finished_item_is_also_abandoned(self) -> None:
+        seen: list[int] = []
+        release = asyncio.Event()
+
+        async def pub(e: MessageEnvelope) -> PublishOutcome:
+            await release.wait()
+            return _ok(e)
+
+        async def consume() -> None:
+            async for _ in iter_publish_async(
+                [_env(i) for i in range(3)],
+                pub,
+                options=BulkPublishOptions(max_in_flight=3),
+                preparer=_prep(),
+                on_item=lambda it: seen.append(it.index),
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.01)
+        release.set()  # publishes finish in the same tick the consumer is cancelled
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sorted(seen) == [0, 1, 2]
+
+    async def test_a_real_outcome_beats_the_abandon_for_the_same_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A task that already queued its outcome but is still releasing its
+        bytes when the deadline abandons it must not yield a second item."""
+        import rabbitkit.core.bulk_runner as runner
+
+        class SlowRelease(runner.AsyncByteBudget):
+            async def release(self, n: int) -> None:
+                await asyncio.sleep(1.0)
+                await super().release(n)  # pragma: no cover — cancelled first
+
+        monkeypatch.setattr(runner, "AsyncByteBudget", SlowRelease)
+        seen: list[int] = []
+        items = await _collect(
+            iter_publish_async(
+                [_env(0)],
+                _aok,
+                options=BulkPublishOptions(overall_timeout=0.05, drain_grace=0.0),
+                preparer=_prep(),
+                on_item=lambda it: seen.append(it.index),
+            )
+        )
+        assert [(it.index, it.status) for it in items] == [(0, BulkPublishStatus.CONFIRMED)]
+        assert seen == [0]

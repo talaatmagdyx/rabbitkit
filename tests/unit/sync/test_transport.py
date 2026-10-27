@@ -2584,6 +2584,27 @@ class TestNoRepublishAfterConnectionLoss:
         assert outcome.status is PublishStatus.CONFIRMED
         conn.process_data_events.assert_not_called()
 
+    def test_idle_probe_skipped_once_a_consumer_is_registered(self) -> None:
+        """start() registers consumers before any consume loop runs: pumping
+        then would dispatch deliveries to worker threads that settle inline."""
+        transport = _make_transport()
+        conn, _channel = self._live(transport)
+        transport._consumer_channels["orders"] = MagicMock()
+
+        outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        assert outcome.status is PublishStatus.CONFIRMED
+        conn.process_data_events.assert_not_called()
+
+    def test_idle_probe_skipped_with_a_reply_consumer(self) -> None:
+        transport = _make_transport()
+        conn, _channel = self._live(transport)
+        transport._reply_to_channel = MagicMock()
+
+        transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+
+        conn.process_data_events.assert_not_called()
+
     def test_reconnect_failure_is_not_sent(self) -> None:
         import pika.exceptions
 

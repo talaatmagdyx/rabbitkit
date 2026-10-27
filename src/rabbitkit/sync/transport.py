@@ -799,11 +799,21 @@ class SyncTransport:
         publish would write its frames into a dead socket and its outcome
         would be UNKNOWN. A zero-time ``process_data_events`` reads what is
         pending; if the connection turns out closed it is replaced before
-        anything is sent. Only for a transport no consume loop has ever used:
-        on a consuming connection the loop reads the socket, and pumping it
-        from inside a handler would dispatch deliveries re-entrantly.
+        anything is sent. Only for a pure producer: no consume loop has ever
+        run AND no consumer is registered. On a consuming connection the loop
+        reads the socket; and once ``consume()`` registered a consumer (e.g.
+        ``SyncBroker.start()`` before ``run()``), pumping would dispatch
+        deliveries here, before any consume loop exists, so worker-pool
+        handlers would settle them inline from their own threads (pika is
+        not thread-safe).
         """
-        if self._ever_consumed or self._ever_consumed_any or self._connection is None:
+        if (
+            self._ever_consumed
+            or self._ever_consumed_any
+            or self._consumer_channels
+            or self._reply_to_channel is not None
+            or self._connection is None
+        ):
             return
         try:
             self._connection.process_data_events(time_limit=0)

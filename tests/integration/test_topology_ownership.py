@@ -196,7 +196,20 @@ async def test_public_declare_api_for_publish_only_service(rabbit: dict[str, Any
 @pytest.mark.asyncio
 @pytest.mark.parametrize("strategy", ["at-least-once", "at-most-once"])
 async def test_quorum_at_least_once_keeps_message_when_dlq_missing(rabbit4: dict[str, Any], strategy: str) -> None:
+    """A terminally failed message whose DLQ is missing is never lost.
+
+    RetryMiddleware's confirmed DLQ publish comes back unroutable, so it
+    hands the delivery back to the pipeline. Then:
+
+    * at-least-once (quorum): the broker keeps a dead-lettered message on
+      the source until the target exists, so the pipeline rejects at once
+      (no DLQ probe) and the handler runs exactly once (``messages_dlx=1``).
+    * at-most-once: a reject would drop it, so the pipeline requeues it with
+      a capped backoff; the handler runs again at a bounded rate, and once
+      the DLQ is back the next failure lands there WITH metadata.
+    """
     from rabbitkit import AsyncBroker, QueueType, RabbitQueue, RetryConfig
+    from tests.integration.conftest import QueueProbe
 
     q = _name("rk-alo")
     source = RabbitQueue(q, queue_type=QueueType.QUORUM, dead_letter_strategy=strategy, overflow="reject-publish")  # type: ignore[arg-type]
@@ -209,7 +222,7 @@ async def test_quorum_at_least_once_keeps_message_when_dlq_missing(rabbit4: dict
         raise ValueError("permanent")
 
     try:
-        async with asyncio.timeout(60):
+        async with asyncio.timeout(90):
             await broker.start(install_signal_handlers=False)
             await await_consumers(rabbit4["url"], q)
             _cleanup(rabbit4, [f"{q}.dlq"])  # the DLQ disappears
@@ -220,22 +233,41 @@ async def test_quorum_at_least_once_keeps_message_when_dlq_missing(rabbit4: dict
                 if calls["n"]:
                     break
                 await asyncio.sleep(0.05)
-            await asyncio.sleep(1)
-            await broker.stop()
-            # rabbitkit's DLQ publish came back unroutable → it fell back to
-            # reject → the broker's dead-letter strategy decides.
-            dlx = None
-            for _ in range(30):  # management stats refresh every ~5s
-                info = _mgmt_get(rabbit4, f"/queues/%2F/{q}")
-                dlx = info.get("messages_dlx")
-                if dlx is not None and (dlx == 1 or strategy == "at-most-once"):
-                    break
-                await asyncio.sleep(0.5)
-        assert calls["n"] == 1
-        assert info["arguments"]["x-dead-letter-strategy"] == strategy
-        if strategy == "at-least-once":
-            assert dlx == 1, info  # retained, waiting for the DLQ to come back
-        else:
-            assert not dlx  # dropped: the at-most-once data-loss case
+            await asyncio.sleep(3)
+            runs_while_missing = calls["n"]
+            assert _mgmt_get(rabbit4, f"/queues/%2F/{q}")["arguments"]["x-dead-letter-strategy"] == strategy
+
+            if strategy == "at-least-once":
+                await broker.stop()
+                dlx = None
+                for _ in range(30):  # management stats refresh every ~5s
+                    dlx = _mgmt_get(rabbit4, f"/queues/%2F/{q}").get("messages_dlx")
+                    if dlx == 1:
+                        break
+                    await asyncio.sleep(0.5)
+                assert runs_while_missing == 1  # rejected once; the broker holds it
+                assert dlx == 1  # retained on the source, waiting for the DLQ
+            else:
+                # Requeued with 0.5 s / 1 s / 2 s backoff: a few runs, not a hot loop.
+                assert 2 <= runs_while_missing <= 6, runs_while_missing
+                with _pika(rabbit4) as ch:  # restore the DLQ
+                    ch.queue_declare(f"{q}.dlq", durable=True, arguments={"x-queue-type": "quorum"})
+                with QueueProbe(rabbit4["url"]) as probe:
+                    for _ in range(200):
+                        if probe.ready(f"{q}.dlq") == 1:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert probe.ready(f"{q}.dlq") == 1
+                await broker.stop()
+                with _pika(rabbit4) as ch:
+                    _m, props, body = ch.basic_get(f"{q}.dlq", auto_ack=True)
+                    assert ch.queue_declare(q, passive=True).method.message_count == 0
+                assert body == b"{}"
+                headers = props.headers
+                assert headers["x-rabbitkit-failure-category"] == "permanent"
+                assert headers["x-rabbitkit-error-category"] == "permanent"
+                assert headers["x-rabbitkit-original-queue"] == q
     finally:
+        with contextlib.suppress(Exception):
+            await broker.stop()
         _cleanup(rabbit4, [q, f"{q}.dlq", f"{q}.retry.1"])

@@ -473,7 +473,16 @@ async def test_replay_preserves_properties(side: str, rabbit: dict[str, Any]) ->
     assert props.content_type is None  # was "application/octet-stream"
     if side == "sync":
         assert props.message_id is None  # aiormq always stamps one on async
-    assert props.headers == {"x-rabbitkit-original-queue": source}
+    # Every original header survives untouched; replay only ADDS its audit
+    # trail (count, when, who) on top.
+    headers = dict(props.headers)
+    replayed_at = headers.pop("x-rabbitkit-replayed-at")
+    replayed_by = headers.pop("x-rabbitkit-replayed-by")
+    assert headers == {"x-rabbitkit-original-queue": source, "x-rabbitkit-replay-count": 1}
+    replayed_at = replayed_at.decode() if isinstance(replayed_at, bytes) else replayed_at
+    assert datetime.fromisoformat(replayed_at).tzinfo is not None
+    replayed_by = replayed_by.decode() if isinstance(replayed_by, bytes) else replayed_by
+    assert isinstance(replayed_by, str) and replayed_by
 
 
 # ── #34 / #35: held messages and per-inspection channels ───────────────────

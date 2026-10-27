@@ -27,6 +27,11 @@ Limits, stated plainly:
   every dead-letter attempt re-probes until the DLQ is back.
 * A probe that fails (connection down) counts as "missing" (fail closed):
   requeueing is always safe, dead-lettering into the unknown is not.
+
+Exception: a quorum source declared with ``dead_letter_strategy=
+AT_LEAST_ONCE`` is not probed. The broker itself keeps a dead-lettered
+message on the source until the target confirms it, so rejecting is already
+loss-free, and requeueing would only run the handler again for nothing.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.types import DeadLetterStrategy, QueueType
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +99,7 @@ class DeadLetterGuard:
         target cannot be verified at all); False when the DLQ is missing or
         the probe failed."""
         target = self.target_for(route)
-        if target is None:
+        if target is None or _broker_retains_dead_letters(route):
             return True
         now = self._clock()
         if self._verified_until.get(target, 0.0) > now:
@@ -110,3 +116,11 @@ class DeadLetterGuard:
         self._verified_until.pop(target, None)
         self.missing += 1
         return False
+
+
+def _broker_retains_dead_letters(route: RouteDefinition) -> bool:
+    """True when the broker guarantees the dead-letter hop itself: a quorum
+    queue with ``x-dead-letter-strategy=at-least-once`` (which
+    ``RabbitQueue`` only accepts together with ``overflow=reject-publish``)."""
+    q = route.queue
+    return q.queue_type is QueueType.QUORUM and q.dead_letter_strategy is DeadLetterStrategy.AT_LEAST_ONCE

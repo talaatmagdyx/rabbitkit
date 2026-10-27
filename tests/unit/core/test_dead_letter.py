@@ -76,3 +76,32 @@ class TestCheck:
         assert await guard.check(route) is True
         guard.set_target("orders", "", "orders.dlq2")
         assert await guard.check(route) is False
+
+
+class TestBrokerRetainedDeadLetters:
+    async def test_quorum_at_least_once_source_is_not_probed(self) -> None:
+        from rabbitkit.core.types import DeadLetterStrategy, QueueType
+
+        probe = AsyncMock(return_value=False)
+        guard = DeadLetterGuard(probe)
+        guard.set_target("orders", "", "orders.dlq")
+        q = RabbitQueue(
+            name="orders",
+            queue_type=QueueType.QUORUM,
+            dead_letter_strategy=DeadLetterStrategy.AT_LEAST_ONCE,
+            overflow="reject-publish",
+        )
+        assert await guard.check(_route(q)) is True
+        probe.assert_not_awaited()
+
+    async def test_quorum_at_most_once_source_is_still_probed(self) -> None:
+        from rabbitkit.core.types import DeadLetterStrategy, QueueType
+
+        probe = AsyncMock(return_value=False)
+        guard = DeadLetterGuard(probe)
+        guard.set_target("orders", "", "orders.dlq")
+        q = RabbitQueue(
+            name="orders", queue_type=QueueType.QUORUM, dead_letter_strategy=DeadLetterStrategy.AT_MOST_ONCE
+        )
+        assert await guard.check(_route(q)) is False
+        probe.assert_awaited_once()

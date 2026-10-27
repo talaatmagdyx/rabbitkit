@@ -689,7 +689,17 @@ class AsyncConnectionPool:
         except ChannelPoolClosedError:
             # Closed under us. A concurrent rebuild replaced it: retry once on
             # the replacement. Closed for shutdown (same pool still current, or
-            # none): give up.
+            # none): give up. A rebuild closes the old pool before the new
+            # connection exists (the slot is None meanwhile), so wait for an
+            # in-progress rebuild to finish before deciding.
+            if self._lock.locked():
+                try:
+                    async with asyncio.timeout(max(deadline - loop.time(), 0.0)), self._lock:
+                        pass
+                except TimeoutError:
+                    raise ChannelPoolExhaustedError(
+                        "publish deadline expired while rebuilding the publisher connection"
+                    ) from None
             replacement = current_pool()
             if replacement is None or replacement is pool or replacement.closed:
                 raise

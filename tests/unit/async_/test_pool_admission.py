@@ -440,6 +440,47 @@ class TestRebuildIsGenerationSafe:
         assert pool._publisher_channel_pool.owns(channel)
 
     @pytest.mark.asyncio
+    async def test_a_waiter_woken_mid_rebuild_waits_for_the_replacement(self) -> None:
+        old_conn = _conn()
+        new_conn = _conn()
+        pool = _connection_pool(channel_pool_size=1, channel_acquire_timeout=5.0)
+
+        async def slow_connect(_: Any) -> Any:
+            await asyncio.sleep(0.05)
+            return new_conn
+
+        with _patch_connect(old_conn):
+            await pool.acquire_publisher_channel()
+            waiter = asyncio.create_task(pool.acquire_publisher_channel())
+            await asyncio.sleep(0)
+        with patch.object(AsyncConnectionPool, "_create_connection", new=slow_connect):
+            await pool._rebuild_publisher_connection(stale=old_conn)
+            channel = await asyncio.wait_for(waiter, timeout=1.0)
+        assert pool._publisher_channel_pool is not None
+        assert pool._publisher_channel_pool.owns(channel)
+
+    @pytest.mark.asyncio
+    async def test_a_waiter_whose_deadline_ends_mid_rebuild_is_admission_timeout(self) -> None:
+        old_conn = _conn()
+        pool = _connection_pool(channel_pool_size=1, channel_acquire_timeout=5.0)
+        release = asyncio.Event()
+
+        async def stuck_connect(_: Any) -> Any:
+            await release.wait()
+            return _conn()
+
+        with _patch_connect(old_conn):
+            await pool.acquire_publisher_channel()
+            waiter = asyncio.create_task(pool.acquire_publisher_channel(timeout=0.1))
+            await asyncio.sleep(0)
+        with patch.object(AsyncConnectionPool, "_create_connection", new=stuck_connect):
+            rebuild = asyncio.create_task(pool._rebuild_publisher_connection(stale=old_conn))
+            with pytest.raises(ChannelPoolExhaustedError):
+                await asyncio.wait_for(waiter, timeout=2.0)
+            release.set()
+            await rebuild
+
+    @pytest.mark.asyncio
     async def test_closed_for_shutdown_is_not_retried(self) -> None:
         pool = _connection_pool(channel_pool_size=1, channel_acquire_timeout=5.0)
         with _patch_connect(_conn()):

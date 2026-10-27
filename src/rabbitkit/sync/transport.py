@@ -31,6 +31,7 @@ from rabbitkit.core.types import (
     DIRECT_REPLY_TO_QUEUE,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     TopologyMode,
 )
@@ -646,9 +647,10 @@ class SyncTransport:
             and not self.is_connected()
         ):
             return PublishOutcome(
-                status=PublishStatus.ERROR,
+                status=PublishStatus.NOT_SENT,
                 exchange=envelope.exchange,
                 routing_key=envelope.routing_key,
+                reason=PublishReason.NOT_CONNECTED,
                 error=ConnectionError(
                     "Connection is down and this thread does not own it — "
                     "reconnection is handled by the broker's recovery loop on the "

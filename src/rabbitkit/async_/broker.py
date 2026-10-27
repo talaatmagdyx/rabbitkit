@@ -52,6 +52,7 @@ from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     QueueType,
     ReliabilityProfile,
@@ -72,6 +73,16 @@ logger = structlog.stdlib.get_logger(__name__)
 #: graceful deadline. A handler that swallows CancelledError is abandoned
 #: after this, so stop() stays bounded (graceful_timeout + this).
 _CANCEL_JOIN_TIMEOUT = 1.0
+
+
+def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = None) -> PublishOutcome:
+    return PublishOutcome(
+        status=PublishStatus.NOT_SENT,
+        exchange=env.exchange,
+        routing_key=env.routing_key,
+        error=error,
+        reason=reason,
+    )
 
 
 class AsyncBroker:
@@ -139,6 +150,9 @@ class AsyncBroker:
         self._transport: Any | None = None  # AsyncTransportImpl
         self._worker_pool: AsyncWorkerPool | None = None
         self._started = False
+        # G-12: set by stop() once publisher shutdown begins; publish() then
+        # raises BrokerNotStartedError instead of silently reconnecting.
+        self._publish_closed = False
         self._rpc_client: Any | None = None
 
         # L14: liveness heartbeat (see health.broker_liveness). None until
@@ -398,7 +412,9 @@ class AsyncBroker:
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,
             on_topology_conflict=self._config.safety.on_topology_conflict,
+            max_in_flight_bytes=self._config.publisher.max_in_flight_bytes,
         )
+        self._publish_closed = False
 
         await self._transport.connect()
 
@@ -454,7 +470,13 @@ class AsyncBroker:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            self._batch_publisher = AsyncBatchPublisher(self._transport, batch_cfg)
+            self._batch_publisher = AsyncBatchPublisher(
+                self._transport,
+                batch_cfg,
+                admission_timeout=self._config.pool.channel_acquire_timeout,
+                confirm_timeout=self._config.publisher.confirm_timeout,
+                byte_limiter=self._transport.byte_limiter,
+            )
             await self._batch_publisher.start()
 
         # Declare topology
@@ -698,6 +720,10 @@ class AsyncBroker:
                 except Exception:
                     logger.warning("nack on abandoned handler's message raised", exc_info=True)
 
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        return None if deadline is None else max(0.0, deadline - time.monotonic())
+
     async def stop(self, timeout: float | None = None) -> None:
         """Stop the broker - cancel consumers, drain pool, drain in-flight, disconnect.
 
@@ -750,10 +776,18 @@ class AsyncBroker:
         # Drain inline in-flight handlers (C-2).
         await self._wait_in_flight(deadline)
 
-        # Stop batch publisher (drain remaining messages before disconnecting)
+        # Publisher shutdown (G-12). After the consumer drain, so a handler
+        # finishing inside the grace period can still publish its result or
+        # retry handoff. Then, within what is left of the deadline:
+        # 1. close admission (publish() now raises BrokerNotStartedError and
+        #    never reconnects); 2. flush the batch queue and wait for
+        #    in-flight confirms; 3. resolve the rest (queued: NOT_SENT,
+        #    on the wire: UNKNOWN) and release every waiter; then disconnect.
+        self._publish_closed = True
         if self._batch_publisher is not None:
-            await self._batch_publisher.stop()
+            await self._batch_publisher.stop(timeout=self._remaining(deadline))
             self._batch_publisher = None
+        await self._transport.close_publishing(timeout=self._remaining(deadline))
 
         # Close RPC client if used
         if self._rpc_client is not None:
@@ -781,6 +815,8 @@ class AsyncBroker:
         content_type: str = "application/json",
         correlation_id: str | None = None,
         reply_to: str | None = None,
+        message_id: str | None = None,
+        timeout: float | None = None,
     ) -> PublishOutcome:
         """Publish a message.
 
@@ -810,7 +846,28 @@ class AsyncBroker:
         Middleware wraps OUTSIDE both flow control and batching, so a
         middleware-transformed envelope is what gets rate-limited/batched, and
         what actually reaches the wire.
+
+        ``message_id`` (kwargs form only) sets the AMQP message id instead of
+        a fresh uuid4, so an application can republish the SAME logical
+        message after an ``UNKNOWN`` outcome and let consumers deduplicate.
+        With an envelope, set ``MessageEnvelope.message_id`` instead.
+
+        ``timeout`` bounds this call end to end: admission (flow control,
+        byte budget, a free channel), send and confirm. On expiry the outcome
+        is ``NOT_SENT`` (``admission_timeout``) if nothing was sent, else
+        ``TIMEOUT`` (``publish_timeout``), which is an unknown outcome.
+        ``None`` keeps the configured bounds (``channel_acquire_timeout``,
+        ``confirm_timeout``).
+
+        Outcomes are returned, not raised (see :class:`PublishStatus`).
+        Raises ``BrokerNotStartedError`` before ``start()`` and once
+        ``stop()`` has begun closing the publisher — a publish never
+        reconnects a stopped broker.
         """
+        if timeout is not None and not timeout > 0:
+            raise ValueError(f"publish timeout must be > 0, got {timeout}")
+        if envelope is not None and message_id is not None:
+            raise ValueError("message_id applies to the kwargs form; set MessageEnvelope.message_id instead")
         if envelope is None:
             import json as _json
 
@@ -835,6 +892,8 @@ class AsyncBroker:
                 mandatory=self._config.publisher.mandatory,
                 delivery_mode=2 if self._config.publisher.persistent else 1,
             )
+            if message_id is not None:
+                envelope = replace(envelope, message_id=message_id)
 
         # M10: reject oversized bodies at publish time (see sync broker).
         max_bytes = self._config.publisher.max_message_bytes
@@ -848,24 +907,39 @@ class AsyncBroker:
 
         if self._transport is None:
             raise BrokerNotStartedError("Broker not started. Call start() first.")
+        if self._publish_closed:
+            raise BrokerNotStartedError("Broker is stopping or stopped; publishing is closed. Call start() first.")
 
         publish_fn = self._batch_publisher.publish if self._batch_publisher is not None else self._transport.publish
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+
+        async def send(env: MessageEnvelope) -> PublishOutcome:
+            if deadline is None:
+                return await publish_fn(env)  # type: ignore[no-any-return]
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return _not_sent(env, PublishReason.ADMISSION_TIMEOUT)
+            return await publish_fn(env, timeout=remaining)  # type: ignore[no-any-return]
 
         async def do_publish(env: MessageEnvelope) -> PublishOutcome:
             fc = self._flow_controller
             if fc is not None:
-                if not await fc.acquire_async():
-                    return PublishOutcome(
-                        status=PublishStatus.ERROR,
-                        exchange=env.exchange,
-                        routing_key=env.routing_key,
-                        error=BackpressureError("publish dropped by backpressure policy"),
+                if deadline is None:
+                    acquired = await fc.acquire_async()
+                else:
+                    acquired = await fc.acquire_async(timeout=max(0.0, deadline - loop.time()))
+                if not acquired:
+                    return _not_sent(
+                        env,
+                        PublishReason.BACKPRESSURE_DROPPED,
+                        BackpressureError("publish dropped by backpressure policy"),
                     )
                 try:
-                    return await publish_fn(env)  # type: ignore[no-any-return]
+                    return await send(env)
                 finally:
                     await fc.release_async()
-            return await publish_fn(env)  # type: ignore[no-any-return]
+            return await send(env)
 
         if self._publish_middlewares:
             chain = self._pipeline.compose_broker_publish_async(self._publish_middlewares)
@@ -967,7 +1041,7 @@ class AsyncBroker:
         the whole operation by ``overall_timeout`` (in-flight items past the
         deadline are reported ``UNKNOWN``, never dropped).
         """
-        if self._transport is None:
+        if self._transport is None or self._publish_closed:
             raise BrokerNotStartedError("Broker not started. Call start() first.")
         opts = options or BulkPublishOptions()
         # Without a batch publisher every in-flight publish holds one pooled
@@ -1086,15 +1160,10 @@ class AsyncBroker:
         try:
             acquired = await fc.acquire_async()
         except BackpressureError as exc:
-            return PublishOutcome(
-                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
-            )
+            return _not_sent(env, PublishReason.BACKPRESSURE_DROPPED, exc)
         if not acquired:
-            return PublishOutcome(
-                status=PublishStatus.ERROR,
-                exchange=env.exchange,
-                routing_key=env.routing_key,
-                error=BackpressureError("publish dropped by backpressure policy"),
+            return _not_sent(
+                env, PublishReason.BACKPRESSURE_DROPPED, BackpressureError("publish dropped by backpressure policy")
             )
         try:
             return await transport.publish(env)  # type: ignore[no-any-return]

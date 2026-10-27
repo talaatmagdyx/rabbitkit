@@ -28,9 +28,16 @@ originally published with (``x-rabbitkit-original-routing-key``, then
 (``max_replays=None`` / ``--ignore-replay-limit``): a message that keeps
 failing should be fixed, not cycled. Each replay run writes a start and a
 finish record to the ``rabbitkit.dlq.audit`` logger (actor, queue, target,
-predicate, limit, counts). Who may replay is a broker-permission question:
-run replays as a dedicated RabbitMQ user with read on the DLQ and write on
-the targets only — rabbitkit does not add an authorization layer.
+predicate, limit, counts).
+
+**Authorization.** The hard boundary is RabbitMQ's: run replays as a
+dedicated user with read on the DLQ and write on the targets only. On top of
+that, ``DLQInspector(authorizer=...)`` is asked before every replay and purge
+with a :class:`ReplayRequest` (operation, actor, whether the actor was given
+explicitly, queue, target, options). ``False`` or an exception refuses the
+operation before anything is read: :class:`~rabbitkit.core.errors.DLQOperationDeniedError`
+is raised and a ``DENIED`` record goes to the audit logger. The CLI's
+``--require-actor`` refuses a replay with no explicit ``--actor``.
 
 **Quorum queues.** AMQP 0-9-1 has no browse, so a peek is ``basic.get`` plus
 a requeue, and a quorum queue counts every requeue as a delivery. Past the
@@ -49,10 +56,11 @@ import contextlib
 import getpass
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from rabbitkit.core.errors import UnsafeToBrowseError
+from rabbitkit.core.errors import DLQOperationDeniedError, UnsafeToBrowseError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.quorum import (
     DEFAULT_MAX_QUORUM_SCAN,
@@ -243,6 +251,48 @@ def audit_replay_finish(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ReplayRequest:
+    """What a DLQ operation is about to do, for :class:`DLQInspector`'s
+    ``authorizer``.
+
+    Attributes:
+        operation: ``"replay"`` or ``"purge"``.
+        actor: Who is acting (the explicit ``actor`` or the OS user).
+        actor_explicit: True when the caller passed ``actor``; an
+            authorizer can insist on it.
+        queue: The DLQ being read or purged.
+        target: Where replayed messages go (empty for a purge).
+        reset_retry_count / max_replays / limit / predicate: the replay's
+            options (``max_replays=None`` means the loop limit was lifted).
+    """
+
+    operation: str
+    actor: str
+    actor_explicit: bool
+    queue: str
+    target: str = ""
+    reset_retry_count: bool = False
+    max_replays: int | None = None
+    limit: int | None = None
+    predicate: str = "all"
+
+
+#: ``(request) -> bool``; ``False`` (or raising) refuses the operation.
+ReplayAuthorizer = Callable[[ReplayRequest], bool]
+
+
+def audit_denied(request: ReplayRequest, reason: str) -> None:
+    audit_logger.warning(
+        "DLQ %s DENIED: actor=%s queue=%r target=%s reason=%s",
+        request.operation,
+        request.actor,
+        request.queue,
+        request.target or "-",
+        reason,
+    )
+
+
 def _release_messages(messages: list[RabbitMessage]) -> None:
     """Requeue whatever is still unsettled. Never raises: this runs in
     ``finally`` blocks, and the original error must win."""
@@ -345,6 +395,11 @@ class DLQInspector:
             Defaults to the transport's configured vhost.
         check_delivery_limit: Set False to skip both checks, e.g. for a
             quorum DLQ you know is unlimited and have no management access to.
+        authorizer: Optional ``(ReplayRequest) -> bool`` asked before every
+            replay and purge. ``False`` or an exception raises
+            :class:`~rabbitkit.core.errors.DLQOperationDeniedError` before
+            anything is read, and is audited. ``None`` allows everything
+            (RabbitMQ permissions remain the boundary).
     """
 
     def __init__(
@@ -355,8 +410,10 @@ class DLQInspector:
         vhost: str | None = None,
         check_delivery_limit: bool = True,
         max_quorum_scan: int = DEFAULT_MAX_QUORUM_SCAN,
+        authorizer: ReplayAuthorizer | None = None,
     ) -> None:
         self._transport = transport
+        self._authorizer = authorizer
         self._management = management
         self._max_quorum_scan = max_quorum_scan
         # Vetted quorum queues: read only whole (a partial read reorders them).
@@ -370,6 +427,54 @@ class DLQInspector:
         # Queues the tripwire has seen to be quorum: refuse those up front
         # instead of spending another delivery on the head message.
         self._known_quorum: set[str] = set()
+
+    # ── Authorization ────────────────────────────────────────────────────
+
+    def _authorize(self, request: ReplayRequest) -> None:
+        """Ask the ``authorizer``; refuse (audited) on ``False`` or an error."""
+        if self._authorizer is None:
+            return
+        try:
+            allowed = bool(self._authorizer(request))
+        except Exception as exc:
+            audit_denied(request, f"authorizer raised {type(exc).__name__}")
+            raise DLQOperationDeniedError(
+                f"DLQ {request.operation} of {request.queue!r} by {request.actor!r} denied: the authorizer raised"
+            ) from exc
+        if not allowed:
+            audit_denied(request, "authorizer refused")
+            raise DLQOperationDeniedError(f"DLQ {request.operation} of {request.queue!r} by {request.actor!r} denied")
+
+    def _authorize_replay(
+        self,
+        queue: str,
+        target: str,
+        actor: str | None,
+        predicate: Any,
+        limit: int | None,
+        reset_retry_count: bool,
+        max_replays: int | None,
+    ) -> str:
+        who = actor or default_actor()
+        self._authorize(
+            ReplayRequest(
+                operation="replay",
+                actor=who,
+                actor_explicit=actor is not None,
+                queue=queue,
+                target=target,
+                reset_retry_count=reset_retry_count,
+                max_replays=max_replays,
+                limit=limit,
+                predicate=_describe_predicate(predicate),
+            )
+        )
+        return who
+
+    def _authorize_purge(self, queue: str, actor: str | None) -> None:
+        who = actor or default_actor()
+        self._authorize(ReplayRequest(operation="purge", actor=who, actor_explicit=actor is not None, queue=queue))
+        audit_logger.info("DLQ purge: actor=%s queue=%r", who, queue)
 
     # ── Delivery-limit guard ─────────────────────────────────────────────
 
@@ -721,8 +826,8 @@ class DLQInspector:
                 already reached this (loop prevention; default 3). Refused
                 messages stay on the DLQ (``ReplayResult.refused``). ``None``
                 lifts the limit — an explicit, audited decision.
-            actor: Who is replaying, for the audit log and the
-                ``x-rabbitkit-replayed-by`` header (default: the OS user).
+            actor: Who is replaying, for the audit log, the authorizer and
+                the ``x-rabbitkit-replayed-by`` header (default: the OS user).
 
         Returns:
             :class:`ReplayResult` — int-compatible replayed count, with
@@ -730,6 +835,8 @@ class DLQInspector:
             ``.skipped`` (no safe destination, left on the DLQ).
 
         Raises:
+            DLQOperationDeniedError: The ``authorizer`` refused; nothing was
+                read.
             UnsafeToBrowseError: For a quorum queue with a delivery limit, or
                 one that can't be verified, since every requeue counts as a
                 delivery. With a ``predicate`` the queue is checked up front
@@ -752,6 +859,8 @@ class DLQInspector:
         the publisher fails. The requeue runs in a ``finally``, so a raising
         predicate or a failed ``basic_get`` can't strand held messages.
         """
+        target = self._target_label(target_queue, target_exchange)
+        who = self._authorize_replay(queue, target, actor, predicate, limit, reset_retry_count, max_replays)
         # A filtered replay requeues by design: vet up front. An unfiltered
         # one acks what it republishes and vets lazily, at its first requeue.
         vetted: bool | None = self._ensure_browsable(queue) if predicate is not None else None
@@ -763,8 +872,6 @@ class DLQInspector:
         skipped = 0
         refused = 0
         fetched = 0
-        who = actor or default_actor()
-        target = self._target_label(target_queue, target_exchange)
         self._audit_start(who, queue, target, predicate, limit, reset_retry_count, max_replays)
 
         with self._session() as session:
@@ -835,11 +942,15 @@ class DLQInspector:
 
         return ReplayResult(replayed, failed=failed, requeued=requeued, skipped=skipped, refused=refused)
 
-    def purge(self, queue: str) -> int:
+    def purge(self, queue: str, *, actor: str | None = None) -> int:
         """Purge all messages from the queue.
+
+        Asks the ``authorizer`` first (``operation="purge"``) and writes an
+        audit record with *actor* (default: the OS user).
 
         Returns the number of messages purged.
         """
+        self._authorize_purge(queue, actor)
         return int(self._transport.purge_queue(queue))
 
     # ── Async methods ────────────────────────────────────────────────────
@@ -880,6 +991,8 @@ class DLQInspector:
         the delivery-limit check, and why non-matching / failed messages are
         held, not nacked, until the fetch loop has fully exhausted the queue
         (termination guarantee)."""
+        target = self._target_label(target_queue, target_exchange)
+        who = self._authorize_replay(queue, target, actor, predicate, limit, reset_retry_count, max_replays)
         vetted: bool | None = await self._ensure_browsable_async(queue) if predicate is not None else None
         self._check_partial_replay(queue, predicate, limit)
         replayed = 0
@@ -889,8 +1002,6 @@ class DLQInspector:
         skipped = 0
         refused = 0
         fetched = 0
-        who = actor or default_actor()
-        target = self._target_label(target_queue, target_exchange)
         self._audit_start(who, queue, target, predicate, limit, reset_retry_count, max_replays)
 
         async with self._session_async() as session:
@@ -954,6 +1065,7 @@ class DLQInspector:
 
         return ReplayResult(replayed, failed=failed, requeued=requeued, skipped=skipped, refused=refused)
 
-    async def purge_async(self, queue: str) -> int:
+    async def purge_async(self, queue: str, *, actor: str | None = None) -> int:
         """Async variant of ``purge``."""
+        self._authorize_purge(queue, actor)
         return int(await self._transport.purge_queue(queue))

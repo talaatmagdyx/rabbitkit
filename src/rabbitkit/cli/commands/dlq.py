@@ -277,6 +277,12 @@ def dlq_replay(
     actor: str | None = typer.Option(
         None, "--actor", envvar="RABBITKIT_REPLAY_ACTOR", help="Who is replaying, for the audit log (default: OS user)."
     ),
+    require_actor: bool = typer.Option(
+        False,
+        "--require-actor",
+        envvar="RABBITKIT_REPLAY_REQUIRE_ACTOR",
+        help="Refuse (audited, exit 2) unless --actor / RABBITKIT_REPLAY_ACTOR names who is replaying.",
+    ),
 ) -> None:
     """Replay messages from a dead-letter queue to a target exchange/queue.
 
@@ -297,6 +303,8 @@ def dlq_replay(
     / ``-replayed-at`` / ``-replayed-by``; a message already replayed
     ``--max-replays`` times stays on the DLQ unless ``--ignore-replay-limit``.
     Start and finish records go to the ``rabbitkit.dlq.audit`` logger.
+    ``--require-actor`` (or ``RABBITKIT_REPLAY_REQUIRE_ACTOR=1`` in a shared
+    ops environment) refuses a replay that does not name its actor.
 
     ``--dry-run`` requeues every message it shows, so it gets the same
     quorum delivery-limit checks as ``inspect``.
@@ -326,6 +334,8 @@ def dlq_replay(
         raise typer.Exit(1) from None
     from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
     from rabbitkit.dlq import (
+        ReplayRequest,
+        audit_denied,
         audit_replay_finish,
         audit_replay_start,
         default_actor,
@@ -337,6 +347,12 @@ def dlq_replay(
     who = actor or default_actor()
     limit_label: int | str = "unlimited" if ignore_replay_limit else max_replays
     target_label = f"exchange={target!r} routing_key={routing_key!r}" if routing_key else f"exchange={target!r}"
+    if require_actor and not actor and not dry_run:
+        audit_denied(
+            ReplayRequest(operation="replay", actor=who, actor_explicit=False, queue=queue, target=target_label),
+            "no --actor given (--require-actor)",
+        )
+        raise _fail("--require-actor: name who is replaying with --actor or RABBITKIT_REPLAY_ACTOR")
 
     # --dry-run requeues everything it shows: vet up front. A real replay
     # acks what it republishes and vets at its first requeue (a failed or

@@ -42,6 +42,7 @@ from rabbitkit.core.errors import (
     BrokerNotStartedError,
     ConfigurationError,
     ConfigValidationError,
+    DLQOperationDeniedError,
     HandlerTimeoutError,
     InfrastructureError,
     InvalidMessageError,
@@ -110,7 +111,7 @@ from rabbitkit.core.types import (
 )
 from rabbitkit.di import Context, ContextRepo, Depends, DIResolver, Header, Path
 from rabbitkit.di.resolver import DependencyScope
-from rabbitkit.dlq import DLQInspector, ReplayResult
+from rabbitkit.dlq import DLQInspector, ReplayRequest, ReplayResult
 from rabbitkit.fastapi import rabbitkit_lifespan
 from rabbitkit.health import (
     AsyncHealthWatcher,
@@ -209,6 +210,7 @@ __all__ = [
     "CoordinatorError",
     "DIResolver",
     "DLQInspector",
+    "DLQOperationDeniedError",
     "DataclassDecoder",
     "DeadLetterStrategy",
     "DeduplicationConfig",
@@ -277,6 +279,7 @@ __all__ = [
     "RejectMessage",
     "RejectWithoutDLXPolicy",
     "ReliabilityProfile",
+    "ReplayRequest",
     "ReplayResult",
     "RetryConfig",
     "RetryDisabled",

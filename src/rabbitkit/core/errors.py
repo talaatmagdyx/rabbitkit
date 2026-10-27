@@ -416,6 +416,13 @@ class UnsafeToBrowseError(RuntimeError):
     """
 
 
+class DLQOperationDeniedError(PermissionError):
+    """A DLQ replay or purge was refused by the inspector's ``authorizer``
+    (or the CLI's ``--require-actor``) before anything was read or
+    published. The denial is written to the ``rabbitkit.dlq.audit`` logger.
+    """
+
+
 class BackpressureError(Exception):
     """Raised when publish-side flow control blocks a publish attempt.
 

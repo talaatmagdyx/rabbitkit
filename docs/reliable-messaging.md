@@ -125,6 +125,15 @@ middlewares).
 | Cancelled by `stop()` | `SHUTDOWN` | nack(requeue); `CancelledError` propagates | same |
 | Filtered out by `filter_fn` | — | nack(requeue=False) → DLX | same |
 
+"reject → DLX" rows: with `SafetyConfig.dead_letter_with_metadata=True`
+(async broker; the CRITICAL profile sets it) the delivery first gets a
+confirmed DLQ copy carrying the same failure metadata as a retry terminal
+copy and is then acked; only if that copy is not confirmed does the reject
+(checked as below) or the requeue for a missing DLQ happen. Default `False`:
+the reject, and the DLQ entry carries only `x-death`. Handler-requested
+rejects (`RejectMessage`, `msg.reject_async()`) and `filter_fn` rejects are
+never copied. `SyncBroker` always rejects.
+
 Rules:
 
 - Never ack before the handler succeeds, except under `AckPolicy.ACK_FIRST`
@@ -155,7 +164,13 @@ Rules:
   delivery into the source's DLX when the DLQ exists (async: checked first) or
   the source is a quorum queue declared `at-least-once`; otherwise (async) it
   requeues after a 0.5–5 s backoff. A broker-dead-lettered copy carries only
-  `x-death`, not the failure metadata.
+  `x-death`, not the failure metadata. A delivery is never acked without a
+  confirmed copy; a copy that landed without its confirm can leave a
+  duplicate in the DLQ after that fallback.
+- `rabbitkit_messages_dead_lettered_total` counts completed dead-letters:
+  a confirmed DLQ copy, or the reject the pipeline actually sent. A delivery
+  requeued because its DLQ is missing is not counted. The G-17 copies of
+  failures outside `RetryMiddleware` are not counted by it.
 - Copies keep the wire body and encoding, `message_id` (a message without one
   gets a stable id on its first handoff), `correlation_id`, `type`, `app_id`,
   `user_id`, `reply_to`, `priority`, `timestamp`, `delivery_mode` and every
@@ -346,6 +361,7 @@ profile forbids, and when `consumer.processing_timeout` is unset.
 | Quorum source queues | — | per route (error) | — |
 | Source `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` | — | per route: warning if not declared; verified on the broker by `preflight(management_client=...)` (which then replaces the warning) | — |
 | Dead-letter path never `discard` | — | yes | `reject_without_dlx="discard"` |
+| DLQ copy with metadata for failures outside retry (`on_receive`, body cap, no-retry routes) | `safety.dead_letter_with_metadata=True` (async) | yes | — |
 | Event metadata validation | — (opt-in) | not checked | — |
 | Heartbeat on (`connection.heartbeat > 0`) | — (default 30 s) | yes | `heartbeat=0` |
 | Async reconnect budget | — (unlimited by default) | warning when `reconnect_budget_seconds < reconnect_backoff_max` | — |

@@ -81,6 +81,7 @@ def _critical_ok_config() -> RabbitConfig:
         ),
         consumer=ConsumerConfig(processing_timeout=30.0),
         retry=_critical_retry(),
+        safety=SafetyConfig(dead_letter_with_metadata=True),
     )
 
 
@@ -284,7 +285,14 @@ class TestApplyProfile:
         assert cfg.retry.terminal_action is TerminalAction.DEAD_LETTER
         assert cfg.retry.trust_retry_header is False
         assert cfg.consumer.reject_transient_on_redelivery and cfg.consumer.manual_settle_on_error
+        assert cfg.safety.dead_letter_with_metadata is True
         assert validate_profile(cfg, ReliabilityProfile.CRITICAL) == []
+
+    def test_critical_requires_dead_letter_metadata_copies(self) -> None:
+        cfg = dataclasses.replace(_critical_ok_config(), safety=SafetyConfig())
+        v = validate_profile(cfg, ReliabilityProfile.CRITICAL)
+        assert [(x.setting, x.severity) for x in v] == [("safety.dead_letter_with_metadata", "error")]
+        assert validate_profile(cfg, ReliabilityProfile.STANDARD) == []
 
     def test_critical_requires_a_processing_timeout(self) -> None:
         with pytest.raises(ConfigValidationError, match=r"processing_timeout is required.*no safe default"):

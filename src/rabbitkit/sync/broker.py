@@ -136,6 +136,11 @@ class SyncBroker:
                 "thread cannot be interrupted); use TimeoutMiddleware for sync handlers.",
                 self._config.consumer.processing_timeout,
             )
+        if self._config.safety.dead_letter_with_metadata:
+            logger.warning(
+                "SafetyConfig.dead_letter_with_metadata is applied by AsyncBroker only: SyncBroker dead-letters "
+                "failures RetryMiddleware did not handle by a reject, so their DLQ entry carries only x-death."
+            )
 
         self._transport: SyncTransport | None = None
         self._worker_pool: SyncWorkerPool | None = None

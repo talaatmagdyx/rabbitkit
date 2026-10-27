@@ -344,6 +344,23 @@ once:
 | missing | quorum, `dead_letter_strategy="at-least-once"` | reject; the broker keeps it on the source until the DLQ is back; the handler is not run again |
 | missing | anything else (async broker) | requeued after a 0.5 s to 5 s backoff (see *A missing DLQ never swallows a message*); once the DLQ is back the next failure lands there with metadata |
 
+### Failures that never reach RetryMiddleware
+
+An `on_receive` failure (a body that does not decompress, a bad
+signature), a body over `ConsumerConfig.max_body_bytes`, a failure on a
+route without retry, and a transient failure on redelivery are settled by
+the pipeline, not by `RetryMiddleware`. By default they are rejected into
+the source's DLX and their DLQ entry carries only `x-death`. With
+`SafetyConfig(dead_letter_with_metadata=True)` (async broker; set by the
+CRITICAL profile) the pipeline first publishes the same metadata-stamped
+copy (`x-rabbitkit-error-category` such as `invalid_message`,
+`x-rabbitkit-original-queue`, ..., the wire body and encoding) to the
+route's DLQ, `mandatory=True` and confirmed, and acks the delivery only
+then. If the copy is not confirmed, the table above applies. Only a DLQ
+reached through the default exchange (the retry DLQ or the `auto_provision`
+safety DLQ) is addressed; a route whose dead-letter exchange has its own
+bindings keeps the reject.
+
 The exception carries `_rabbitkit_dead_letter_failed`: an outer
 `ExceptionMiddleware` re-raises it even with `swallow_permanent=True` or a
 matching fallback handler, because recovering it would ack a message that

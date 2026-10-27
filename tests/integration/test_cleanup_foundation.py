@@ -265,3 +265,189 @@ def _consumers(url: str, queue: str) -> int | None:
     with QueueProbe(url) as probe:
         return probe.consumers(queue)
 
+
+# ── G-17: DLQ copies with metadata for failures outside RetryMiddleware ────
+
+
+def _get_one(url: str, queue: str) -> tuple[Any, bytes] | None:
+    import pika
+
+    conn = pika.BlockingConnection(pika.URLParameters(url))
+    try:
+        method, props, body = conn.channel().basic_get(queue, auto_ack=True)
+        return None if method is None else (props, body)
+    finally:
+        conn.close()
+
+
+async def _await_dlq_copy(url: str, dlq: str, timeout: float = 20.0) -> tuple[Any, bytes]:
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await asyncio.to_thread(_ready, url, dlq) == 1:
+            got = await asyncio.to_thread(_get_one, url, dlq)
+            assert got is not None
+            return got
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{dlq}: no dead-lettered copy within {timeout}s (ready={_ready(url, dlq)})")
+
+
+def _publish_raw(url: str, queue: str, body: bytes, **props: Any) -> None:
+    import pika
+
+    conn = pika.BlockingConnection(pika.URLParameters(url))
+    try:
+        channel = conn.channel()
+        channel.confirm_delivery()
+        channel.basic_publish("", queue, body, pika.BasicProperties(delivery_mode=2, **props))
+    finally:
+        conn.close()
+
+
+async def test_bad_gzip_on_a_retry_route_reaches_the_dlq_with_metadata(rabbit: dict[str, Any]) -> None:
+    """A gzip body that does not decompress fails in on_receive, before
+    RetryMiddleware: it used to reach the DLQ by a broker reject with only
+    x-death. Now the DLQ copy is confirmed with the failure metadata and the
+    wire body, and the source is acked."""
+    import asyncio
+
+    from rabbitkit import AsyncBroker, RetryConfig
+    from rabbitkit.core.config import SafetyConfig
+    from rabbitkit.middleware.compression import CompressionMiddleware
+
+    queue = _name("gz")
+    calls: list[bytes] = []
+    broker = AsyncBroker(
+        _config(
+            rabbit["url"],
+            retry=RetryConfig(max_retries=2, delays=(1, 2)),
+            safety=SafetyConfig(dead_letter_with_metadata=True),
+        )
+    )
+
+    @broker.subscriber(queue, middlewares=[CompressionMiddleware()])
+    async def handle(body: bytes) -> None:
+        calls.append(body)
+
+    async with asyncio.timeout(60):
+        async with broker:
+            await asyncio.to_thread(wait_for_consumers, rabbit["url"], queue)
+            await asyncio.to_thread(
+                _publish_raw, rabbit["url"], queue, b"definitely not gzip", content_encoding="gzip", message_id="gz-1"
+            )
+            props, body = await _await_dlq_copy(rabbit["url"], f"{queue}.dlq")
+
+    headers = props.headers
+    assert body == b"definitely not gzip" and props.content_encoding == "gzip"
+    assert props.message_id == "gz-1"
+    assert headers["x-rabbitkit-error-category"] == "invalid_message"
+    assert headers["x-rabbitkit-failure-category"] == "permanent"
+    assert headers["x-rabbitkit-original-queue"] == queue
+    assert headers["x-rabbitkit-original-routing-key"] == queue
+    assert headers["x-rabbitkit-original-message-id"] == "gz-1"
+    assert headers["x-rabbitkit-retry-count"] == 0
+    assert "x-rabbitkit-dead-lettered-at" in headers
+    assert "x-death" not in headers, "the copy, not a broker dead-letter, reached the DLQ"
+    assert calls == []
+    assert _ready(rabbit["url"], queue) == 0
+
+
+async def test_permanent_failure_on_a_route_without_retry_carries_metadata(rabbit: dict[str, Any]) -> None:
+    import asyncio
+
+    from rabbitkit import AsyncBroker
+    from rabbitkit.core.config import SafetyConfig
+
+    queue = _name("noretry")
+    broker = AsyncBroker(_config(rabbit["url"], safety=SafetyConfig(dead_letter_with_metadata=True)))
+
+    @broker.subscriber(queue)
+    async def handle(body: bytes) -> None:
+        raise ValueError("order 42 is invalid; token=s3cr3t")
+
+    async with asyncio.timeout(60):
+        async with broker:
+            await asyncio.to_thread(wait_for_consumers, rabbit["url"], queue)
+            await asyncio.to_thread(_publish_raw, rabbit["url"], queue, b'{"id": 42}', message_id="p-1")
+            props, body = await _await_dlq_copy(rabbit["url"], f"{queue}.dlq")
+
+    headers = props.headers
+    assert body == b'{"id": 42}'
+    assert headers["x-rabbitkit-error-category"] == "permanent"
+    assert headers["x-rabbitkit-error-class"] == "ValueError"
+    assert "s3cr3t" not in str(headers.get("x-rabbitkit-error-message", ""))
+    assert headers["x-rabbitkit-original-queue"] == queue
+    assert headers["x-rabbitkit-attempts"] == 1
+    assert "x-death" not in headers
+    assert _ready(rabbit["url"], queue) == 0
+
+
+async def test_without_the_setting_the_dlq_entry_has_only_x_death(rabbit: dict[str, Any]) -> None:
+    """The default (old) path: a broker reject into the safety DLX."""
+    import asyncio
+
+    from rabbitkit import AsyncBroker
+
+    queue = _name("plain")
+    broker = AsyncBroker(_config(rabbit["url"]))
+
+    @broker.subscriber(queue)
+    async def handle(body: bytes) -> None:
+        raise ValueError("permanent")
+
+    async with asyncio.timeout(60):
+        async with broker:
+            await asyncio.to_thread(wait_for_consumers, rabbit["url"], queue)
+            await asyncio.to_thread(_publish_raw, rabbit["url"], queue, b"{}")
+            props, _ = await _await_dlq_copy(rabbit["url"], f"{queue}.dlq")
+
+    assert "x-death" in props.headers
+    assert "x-rabbitkit-error-category" not in props.headers
+
+
+async def test_copy_to_a_missing_dlq_is_never_acked_and_lands_once_restored(rabbit: dict[str, Any]) -> None:
+    """The DLQ is deleted under a running consumer: the copy comes back
+    RETURNED, the delivery is not acked (requeued after a backoff, since a
+    reject would drop it), and once the DLQ exists again the next attempt's
+    copy is confirmed: exactly one copy, with metadata."""
+    import asyncio
+
+    import pika
+
+    from rabbitkit import AsyncBroker
+    from rabbitkit.core.config import SafetyConfig
+
+    queue = _name("missing-dlq")
+    dlq = f"{queue}.dlq"
+    broker = AsyncBroker(_config(rabbit["url"], safety=SafetyConfig(dead_letter_with_metadata=True)))
+    attempts: list[int] = []
+
+    @broker.subscriber(queue)
+    async def handle(body: bytes) -> None:
+        attempts.append(1)
+        raise ValueError("permanent")
+
+    def _delete_dlq() -> None:
+        conn = pika.BlockingConnection(pika.URLParameters(rabbit["url"]))
+        try:
+            conn.channel().queue_delete(dlq)
+        finally:
+            conn.close()
+
+    async with asyncio.timeout(90):
+        async with broker:
+            await asyncio.to_thread(wait_for_consumers, rabbit["url"], queue)
+            await asyncio.to_thread(_delete_dlq)
+            await asyncio.to_thread(_publish_raw, rabbit["url"], queue, b"{}", message_id="keep-1")
+            while len(attempts) < 2:  # failed, copy RETURNED, requeued, failed again
+                await asyncio.sleep(0.05)
+            assert await asyncio.to_thread(_ready, rabbit["url"], dlq) is None  # still missing
+            await asyncio.to_thread(_declare, rabbit["url"], dlq)
+            props, _ = await _await_dlq_copy(rabbit["url"], dlq, timeout=30)
+
+    assert props.message_id == "keep-1"
+    assert props.headers["x-rabbitkit-error-category"] == "permanent"
+    await asyncio.sleep(0.5)
+    assert _ready(rabbit["url"], dlq) == 0  # the one copy was taken by _await_dlq_copy
+    assert _ready(rabbit["url"], queue) == 0

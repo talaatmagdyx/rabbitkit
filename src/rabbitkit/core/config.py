@@ -1266,11 +1266,26 @@ class SafetyConfig:
 
     Only applied under ``TopologyMode.AUTO_DECLARE``; per-route override via
     ``@subscriber(reject_without_dlx=...)``.
+
+    ``dead_letter_with_metadata`` (G-17, async broker; default ``False``) —
+    failures that never reach ``RetryMiddleware`` (an ``on_receive`` failure
+    such as a bad gzip body or signature, a body over
+    ``ConsumerConfig.max_body_bytes``, a failure on a route without retry, a
+    transient failure on redelivery) are dead-lettered by a broker reject,
+    so their DLQ entry carries only ``x-death``. With ``True`` the async
+    broker first publishes a confirmed copy carrying the same failure
+    metadata as ``RetryMiddleware``'s terminal copy to the route's DLQ (one
+    reached through the default exchange: the retry DLQ or the
+    ``auto_provision`` safety DLQ) and acks the delivery only once that copy
+    is confirmed; if it is not, the reject (or the requeue for a missing
+    DLQ) runs as before. Such a DLQ entry has no ``x-death``. The CRITICAL
+    profile turns it on. ``SyncBroker`` ignores it (and logs so).
     """
 
     reject_without_dlx: str = "auto_provision"
     dlq_suffix: str = ".dlq"
     warn_on_discard: bool = True
+    dead_letter_with_metadata: bool = False
     # M14: what to do when declaring a queue/exchange 406s because it already
     # exists with incompatible arguments (drift — e.g. ops created it, or a
     # prior rabbitkit version, with a different type/TTL/DLX).

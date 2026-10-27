@@ -277,5 +277,6 @@ route on that connection waits for the queue to come back.
 | Publish-only `SyncBroker` connection closed by the broker while idle | Noticed before sending; reconnected; the publish is sent once |
 | Publisher channel pool exhausted (async) | Waits `channel_acquire_timeout`, then `NOT_SENT` (`admission_timeout`); connection untouched |
 | Publish after `stop()` (async) | `BrokerNotStartedError`; nothing is sent, nothing reconnects |
-| Delivery body over `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE`: rejected into the DLX before the filter, middleware or handler run |
+| Delivery body over `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE`: rejected into the DLX before the filter, middleware or handler run (with `SafetyConfig.dead_letter_with_metadata`, async: a confirmed DLQ copy with failure metadata first, then ack) |
+| `on_receive` failure, or a failure on a route without retry, with `SafetyConfig.dead_letter_with_metadata=True` (async) | Confirmed DLQ copy with failure metadata, then ack; if the copy is not confirmed, the usual reject (or requeue for a missing DLQ) |
 | Application publish carrying `x-rabbitkit-retry-count` / `x-death` with `strip_reserved_headers=True` | Headers removed before sending; the library's own retry/DLQ/replay copies keep theirs |

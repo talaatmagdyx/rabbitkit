@@ -4,12 +4,12 @@ Before this protocol, ``plan()`` removed deliveries from the ledger at
 planning time and the executor continued after a failed frame. Those two
 choices combine into message loss:
 
-    101 SUCCESS  102 SUCCESS  103 NACK  104 SUCCESS  105 SUCCESS
-    -> ack(102, multiple=True), nack(103), ack(105, multiple=True)
+    1 SUCCESS  2 SUCCESS  3 NACK  4 SUCCESS  5 SUCCESS
+    -> ack(2, multiple=True), nack(3), ack(5, multiple=True)
 
-``basic_ack(105, multiple=True)`` acknowledges every delivery still
-unacknowledged up to tag 105. If the nack never reached the broker, that
-includes 103 -- the delivery that was supposed to be requeued. An intended
+``basic_ack(5, multiple=True)`` acknowledges every delivery still
+unacknowledged up to tag 5. If the nack never reached the broker, that
+includes 3 -- the delivery that was supposed to be requeued. An intended
 NACK silently becomes an ACK and the work is lost.
 
 The rule is therefore: a command whose safety depends on an earlier frame
@@ -64,13 +64,13 @@ class Wire:
 
 def _five_with_nack_in_the_middle() -> SettlementCoordinator:
     coord = SettlementCoordinator()
-    for tag in (101, 102, 103, 104, 105):
+    for tag in (1, 2, 3, 4, 5):
         coord.register(tag)
-    coord.mark_success(101)
-    coord.mark_success(102)
-    coord.mark_nack(103, requeue=True)
-    coord.mark_success(104)
-    coord.mark_success(105)
+    coord.mark_success(1)
+    coord.mark_success(2)
+    coord.mark_nack(3, requeue=True)
+    coord.mark_success(4)
+    coord.mark_success(5)
     return coord
 
 
@@ -97,9 +97,9 @@ class TestTheOverAckRegression:
         """The efficient shape is kept; only its execution is made safe."""
         batch = _five_with_nack_in_the_middle().prepare()
         assert [(c.kind, c.delivery_tag, c.multiple) for c in batch.commands] == [
-            (SettlementAction.ACK, 102, True),
-            (SettlementAction.NACK, 103, False),
-            (SettlementAction.ACK, 105, True),
+            (SettlementAction.ACK, 2, True),
+            (SettlementAction.NACK, 3, False),
+            (SettlementAction.ACK, 5, True),
         ]
 
     def test_a_cumulative_ack_never_follows_a_failed_nack(self) -> None:
@@ -110,11 +110,11 @@ class TestTheOverAckRegression:
 
         report = emit_batch(batch, coord, ack=wire.ack, nack=wire.nack, reject=wire.reject)
 
-        assert wire.calls == [("ack", 102, True), ("nack", 103, True)]
-        assert ("ack", 105, True) not in wire.calls, "ack(105, multiple=True) would have swallowed tag 103"
+        assert wire.calls == [("ack", 2, True), ("nack", 3, True)]
+        assert ("ack", 5, True) not in wire.calls, "ack(5, multiple=True) would have swallowed tag 3"
         assert report.failed is not None
-        assert report.failed.delivery_tag == 103
-        assert [c.delivery_tag for c in report.not_attempted] == [105]
+        assert report.failed.delivery_tag == 3
+        assert [c.delivery_tag for c in report.not_attempted] == [5]
 
     def test_when_every_frame_lands_all_three_go_out(self) -> None:
         coord = _five_with_nack_in_the_middle()
@@ -123,7 +123,7 @@ class TestTheOverAckRegression:
 
         report = emit_batch(batch, coord, ack=wire.ack, nack=wire.nack, reject=wire.reject)
 
-        assert wire.calls == [("ack", 102, True), ("nack", 103, True), ("ack", 105, True)]
+        assert wire.calls == [("ack", 2, True), ("nack", 3, True), ("ack", 5, True)]
         assert report.ok
         assert report.settled_tags == 5
         assert coord.pending == 0
@@ -237,11 +237,11 @@ class TestPrepareDoesNotSettle:
     def test_committing_one_command_settles_only_its_tags(self) -> None:
         coord = _five_with_nack_in_the_middle()
         batch = coord.prepare()
-        coord.commit_command(batch, batch.commands[0])  # ack(102, multiple=True)
+        coord.commit_command(batch, batch.commands[0])  # ack(2, multiple=True)
         assert coord.pending == 3
-        assert coord.state_of(101) is None
-        assert coord.state_of(102) is None
-        assert coord.state_of(103) is not None
+        assert coord.state_of(1) is None
+        assert coord.state_of(2) is None
+        assert coord.state_of(3) is not None
 
     def test_reserved_tags_are_not_planned_twice(self) -> None:
         coord = _five_with_nack_in_the_middle()
@@ -282,8 +282,8 @@ class TestMetricsDistinguishPlannedFromSettled:
         report = emit_batch(batch, coord, ack=wire.ack, nack=wire.nack, reject=wire.reject)
 
         assert len(batch) == 3, "three frames planned"
-        assert report.settled_tags == 2, "only ack(102, multiple=True) landed"
-        assert report.unresolved_tags == (103,)
+        assert report.settled_tags == 2, "only ack(2, multiple=True) landed"
+        assert report.unresolved_tags == (3,)
         assert len(report.not_attempted) == 1
 
     def test_stats_separate_failed_frames_from_sent_ones(self) -> None:
@@ -312,7 +312,7 @@ class TestMetricsDistinguishPlannedFromSettled:
 class TestSettlementBatch:
     def test_covered_tags_are_sorted_and_complete(self) -> None:
         batch = _five_with_nack_in_the_middle().prepare()
-        assert batch.covered_tags == (101, 102, 103, 104, 105)
+        assert batch.covered_tags == (1, 2, 3, 4, 5)
 
     def test_an_empty_ledger_yields_a_falsey_batch(self) -> None:
         batch = SettlementCoordinator().prepare()

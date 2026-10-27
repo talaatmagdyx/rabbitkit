@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A cumulative ack could acknowledge a delivery that was never processed.**
+  `SettlementCoordinator` (behind `CoalescingAcker` / `AsyncCoalescingAcker`)
+  planned `ack(N, multiple=True)` from its own ledger only. A delivery refused
+  with `LedgerFullError` (`max_pending`), or any delivery tag never registered
+  on that channel, is still unacked at the broker, and the next cumulative
+  ack above it acknowledged it. The message was lost: never processed, never
+  redelivered. Reproduced on a real broker (`max_pending=2`: the third
+  delivery was refused, then `ack(5, multiple=True)` swept it). The
+  coordinator now records the lowest unregistered tag of the channel
+  generation (`gap_floor`, also in `stats`, with `unregistered_gaps`) and
+  never coalesces at or past it; deliveries above a gap are acked
+  individually until the channel is rebuilt. Because tags start at 1 on
+  every channel, a coordinator whose first registered tag is not 1 no longer
+  coalesces at all.
+- The `AsyncCoalescingAcker` docstring example used `msg.channel` (not a
+  `RabbitMessage` attribute) with the default `AckPolicy.AUTO`, which would
+  have settled every delivery twice. It now uses `AckPolicy.MANUAL` and
+  `msg.raw_message.channel`, and does not re-raise after `acker.fail()`.
+
 ## [0.19.2] — 2026-10-02
 
 ### Fixed

@@ -406,13 +406,13 @@ class TestInvalidationIsLogged:
             reject_fn=ack_ok,
             config=BatchAckConfig(batch_size=1000, flush_interval_ms=0),
         )
-        for tag in (101, 102, 103, 104, 105):
+        for tag in (1, 2, 3, 4, 5):
             acker.register(tag)
-        acker.complete(101)
-        acker.complete(102)
-        acker.fail(103, requeue=True)
-        acker.complete(104)
-        acker.complete(105)
+        acker.complete(1)
+        acker.complete(2)
+        acker.fail(3, requeue=True)
+        acker.complete(4)
+        acker.complete(5)
         gen = acker.generation
 
         with caplog.at_level(logging.WARNING):

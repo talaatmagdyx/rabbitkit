@@ -18,6 +18,9 @@ Transport-free (hard invariant 1). Two layers:
 Safety invariants enforced here (see the plan, §3):
 
 * Never coalesce across an unfinished or retry-pending delivery (3).
+* Never coalesce across a delivery tag the coordinator does not know: a
+  refused (``LedgerFullError``) or never-registered tag is still unacked at
+  the broker, and ``ack(N, multiple=True)`` would acknowledge it unprocessed.
 * Delivery handles belong to one channel generation; ``invalidate()`` on
   reconnect drops the whole ledger — old tags are never replayed (4).
 * Consumer settlement has no broker confirmation; the report vocabulary
@@ -408,8 +411,10 @@ class LedgerFullError(CoordinatorError):
 
     Raised by :meth:`SettlementCoordinator.register`, so the caller applies
     backpressure (stop consuming / lower prefetch). The delivery stays
-    unacked and the broker redelivers it. Bounds NEVER cause an unsafe ack
-    (invariant I7).
+    unacked and the broker redelivers it when the channel closes. Bounds
+    NEVER cause an unsafe ack (invariant I7): the refused tag becomes a
+    *gap*, and no cumulative ack on this generation will ever reach past it
+    (deliveries above it are acked individually).
     """
 
 
@@ -424,7 +429,15 @@ class SettlementCoordinator:
     Decision rule for a cumulative ack: let ``P`` be the longest prefix of
     the ledger (ascending tag order) in which every entry is ``SUCCESS``.
     If ``|P| >= 2`` emit ``ack(max(P), multiple=True)``; ``|P| == 1`` is a
-    plain individual ack. Any ``SUCCESS`` entry AFTER the first non-success
+    plain individual ack. ``max(P)`` must also lie below the generation's
+    first *gap* -- the lowest delivery tag that was never registered (refused
+    by ``max_pending``, consumed by someone else on the channel, or skipped
+    by the caller). The broker settles EVERY unacked tag up to ``max(P)``, so
+    a gap below it would be acknowledged without ever being processed. Tags
+    above a gap are acked individually; :meth:`invalidate` (a new channel,
+    where tags restart at 1) clears the gap. Tags below the first registered
+    one count as a gap too: the coordinator must own the channel from
+    delivery tag 1. Any ``SUCCESS`` entry AFTER the first non-success
     entry is acked individually (never buffered past ``max_hold``). NACK /
     REJECT intents are always individual and are emitted in tag order
     interleaved with acks, so a later prefix decision can never leap over
@@ -492,6 +505,10 @@ class SettlementCoordinator:
         self._requeue: dict[int, bool] = {}
         self._registered_at: dict[int, float] = {}
         self._last_registered = 0
+        # Lowest delivery tag of this generation that was never registered
+        # (0 = none). A cumulative ack may never reach it (see class doc).
+        self._gap_floor = 0
+        self._unregistered_gaps = 0
         self._prev_high_water = 0  # highest tag of any dropped generation
         self._registered_count = 0
         self._settled_count = 0
@@ -554,6 +571,8 @@ class SettlementCoordinator:
     def _frontier_locked(self) -> int:
         frontier = 0
         for tag in sorted(self._ledger):
+            if self._gap_floor and tag > self._gap_floor:
+                break
             if self._ledger[tag].is_ack_safe:
                 frontier = tag
             else:
@@ -600,10 +619,19 @@ class SettlementCoordinator:
                 "unresolved": self._unresolved_count,
                 "frames_failed": self._frames_failed,
                 "frames_not_attempted": self._frames_not_attempted,
+                "gap_floor": self._gap_floor,
+                "unregistered_gaps": self._unregistered_gaps,
                 "oldest_pending_age": (
                     max(0.0, self._clock() - min(self._registered_at.values())) if self._registered_at else 0.0
                 ),
             }
+
+    @property
+    def gap_floor(self) -> int:
+        """Lowest delivery tag of this generation that was never registered
+        (0 = none). No cumulative ack will reach it or anything above it."""
+        with self._lock:
+            return self._gap_floor
 
     def state_of(self, delivery_tag: int) -> DeliveryState | None:
         with self._lock:
@@ -617,7 +645,13 @@ class SettlementCoordinator:
         a redelivered message — which always arrives with a NEW, higher tag —
         registers cleanly while the old tag can never be re-registered.
 
-        Raises :class:`LedgerFullError` when ``max_pending`` is reached.
+        Raises :class:`LedgerFullError` when ``max_pending`` is reached. The
+        refused tag is not recorded, so the next registration sees it as a
+        gap and cumulative acks stop short of it for this generation.
+
+        A tag that skips ahead (``delivery_tag > last + 1``) records a gap at
+        ``last + 1`` for the same reason: the skipped deliveries are unacked
+        at the broker and unknown to the ledger.
         """
         with self._lock:
             if delivery_tag <= 0:
@@ -635,6 +669,10 @@ class SettlementCoordinator:
                     "(stop consuming / lower prefetch) — the delivery stays unacked and the "
                     "broker will redeliver it."
                 )
+            if delivery_tag > self._last_registered + 1:
+                self._unregistered_gaps += 1
+                if not self._gap_floor:
+                    self._gap_floor = self._last_registered + 1
             self._ledger[delivery_tag] = DeliveryState.OUTSTANDING
             self._registered_at[delivery_tag] = self._clock()
             self._last_registered = delivery_tag
@@ -757,30 +795,41 @@ class SettlementCoordinator:
         run: list[int] = []  # current contiguous ack-safe run
         blocked = False  # a blocking delivery has been passed
 
+        gap_floor = self._gap_floor
+
         def flush_run() -> None:
             if not run:
                 return
-            if self._coalesce and not force_individual and len(run) >= 2:
+            # A cumulative ack settles EVERY unacked tag up to its own, so it
+            # may only cover tags below the first gap (a tag the ledger never
+            # saw is still unacked at the broker). The rest go individually.
+            if gap_floor:
+                safe = [t for t in run if t < gap_floor]
+                rest = run[len(safe) :]
+            else:
+                safe, rest = run, []
+            if self._coalesce and not force_individual and len(safe) >= 2:
                 commands.append(
                     SettlementCommand(
                         kind=SettlementAction.ACK,
-                        delivery_tag=run[-1],
+                        delivery_tag=safe[-1],
                         multiple=True,
-                        covers=tuple(run),
+                        covers=tuple(safe),
                         generation=self._generation,
                     )
                 )
             else:
-                commands.extend(
-                    SettlementCommand(
-                        kind=SettlementAction.ACK,
-                        delivery_tag=t,
-                        multiple=False,
-                        covers=(t,),
-                        generation=self._generation,
-                    )
-                    for t in run
+                rest = run
+            commands.extend(
+                SettlementCommand(
+                    kind=SettlementAction.ACK,
+                    delivery_tag=t,
+                    multiple=False,
+                    covers=(t,),
+                    generation=self._generation,
                 )
+                for t in rest
+            )
             covered.update(run)
             run.clear()
 
@@ -971,6 +1020,7 @@ class SettlementCoordinator:
             # so commit/fail/release for it become no-ops.
             self._reserved.clear()
             self._last_registered = 0
+            self._gap_floor = 0
             self._generation += 1
             self._invalidations += 1
             self._dropped_on_invalidate += len(dropped)

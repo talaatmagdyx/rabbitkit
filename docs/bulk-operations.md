@@ -369,7 +369,7 @@ machine in `tests/property/`, and real-broker runs in
 
 | | Invariant | Enforced by |
 |---|---|---|
-| **I1** | Never cumulative-ack across an unsafe gap | `plan()` coalesces only contiguous ack-safe runs |
+| **I1** | Never cumulative-ack across an unsafe gap | `plan()` coalesces only contiguous ack-safe runs, and never past a delivery tag that was not registered (refused or skipped) |
 | **I2** | Never settle a delivery from another channel/generation | `channel_key` binding + per-generation ledger |
 | **I3** | Never ack a delivery that did not reach ACK_READY | `SUCCESS` reachable only from `OUTSTANDING`/`RETRY_PENDING` |
 | **I4** | A contradictory settlement is never silently accepted | transition table + `ContradictorySettlementError` |
@@ -526,7 +526,19 @@ the redelivery is simply a new delivery.
 `CoalescingAcker(max_pending=N)` caps the ledger. Exceeding it raises
 `LedgerFullError` from `register()`, so you apply backpressure (stop
 consuming, lower prefetch); the delivery stays unacked and the broker
-redelivers it. A full ledger **never** relaxes the ack rules.
+redelivers it when the channel closes. A full ledger **never** relaxes the
+ack rules.
+
+A refused tag is a *gap*: the broker still holds it unacked, so a later
+`ack(N, multiple=True)` above it would acknowledge it without it ever being
+processed. The coordinator records the lowest unregistered tag of the
+channel generation (`gap_floor`) and never coalesces at or above it; tags
+above a gap are acked individually until the channel is rebuilt
+(`on_reconnect()` / `invalidate()`). The same applies to any tag the acker
+never saw: the coordinator must own the channel from delivery tag 1, so
+registering a channel's deliveries starting anywhere else disables
+coalescing for that generation. Earlier releases swept a refused delivery
+into the next cumulative ack, losing it.
 
 Watch `oldest_pending_age` and `gap_count` to see a straggler holding the
 frontier back before the ceiling is reached.
@@ -536,7 +548,8 @@ frontier back before the ceiling is reached.
 `acker.metrics` (and `group.metrics`, summed) exposes `registered`,
 `pending`, `outstanding`, `ack_ready`, `frontier`, `gap_count`,
 `oldest_pending_age`, `settled`, `coalesced`, `frames_sent`,
-`coalescing_ratio`, `invalidations` and `dropped_on_invalidate`. Pass
+`coalescing_ratio`, `invalidations`, `dropped_on_invalidate`, `gap_floor`
+and `unregistered_gaps`. Pass
 `collector=` and `metrics_config=` to have the gauges emitted on every flush
 (see [Observability](observability.md)).
 

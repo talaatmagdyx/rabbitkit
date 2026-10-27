@@ -126,15 +126,15 @@ class TestLegalTransitions:
 
 class TestI1NoCumulativeAcrossGap:
     def test_the_plans_worked_example(self) -> None:
-        """101 DONE, 102 DONE, 103 RUNNING, 104 DONE, 105 DONE
-        → the maximum safe cumulative ack is 102. Never 105."""
-        coord = _coord({101: "success", 102: "success", 103: "outstanding", 104: "success", 105: "success"})
+        """1 DONE, 2 DONE, 3 RUNNING, 4 DONE, 5 DONE
+        → the maximum safe cumulative ack is 2. Never 5."""
+        coord = _coord({1: "success", 2: "success", 3: "outstanding", 4: "success", 5: "success"})
         commands = coord.plan()
-        assert _emitted(commands) == [("ack", 102, True), ("ack", 104, False), ("ack", 105, False)]
-        assert 103 not in _covered(commands)
+        assert _emitted(commands) == [("ack", 2, True), ("ack", 4, False), ("ack", 5, False)]
+        assert 3 not in _covered(commands)
         for command in commands:
             if command.multiple:
-                assert max(command.covers) <= 102
+                assert max(command.covers) <= 2
 
     @pytest.mark.parametrize("blocker", BLOCKING)
     def test_every_blocking_state_stops_the_frontier(self, blocker: str) -> None:
@@ -282,14 +282,14 @@ class TestI4NoSilentContradiction:
 
 class TestNackAndRejectSegments:
     def test_the_plans_nack_example_forms_a_second_segment(self) -> None:
-        """101 ACK, 102 ACK, 103 NACK, 104 ACK, 105 ACK →
-        ack(102, multiple), nack(103), then 104-105 may coalesce again."""
+        """1 ACK, 2 ACK, 3 NACK, 4 ACK, 5 ACK →
+        ack(2, multiple), nack(3), then 4-5 may coalesce again."""
         coord = _coord(
-            {101: "success", 102: "success", 103: "nack", 104: "success", 105: "success"},
+            {1: "success", 2: "success", 3: "nack", 4: "success", 5: "success"},
         )
         commands = coord.plan()
-        assert _emitted(commands) == [("ack", 102, True), ("nack", 103, False), ("ack", 105, True)]
-        assert _covered(commands) == {101, 102, 103, 104, 105}
+        assert _emitted(commands) == [("ack", 2, True), ("nack", 3, False), ("ack", 5, True)]
+        assert _covered(commands) == {1, 2, 3, 4, 5}
 
     def test_commands_are_ordered_so_the_lower_frames_go_first(self) -> None:
         """A cumulative ack is only safe because everything below it was
@@ -327,20 +327,20 @@ class TestNackAndRejectSegments:
 
 class TestRequeueAndRedelivery:
     def test_a_redelivered_message_is_a_new_delivery(self) -> None:
-        """After nack(102, requeue=True) the broker redelivers with a NEW tag.
+        """After nack(2, requeue=True) the broker redelivers with a NEW tag.
         The old tag must never be reused for it."""
-        coord = _coord({101: "success", 102: "nack", 103: "success"})
+        coord = _coord({1: "success", 2: "nack", 3: "success"})
         coord.plan()
-        coord.register(104)  # the redelivery
-        coord.mark_success(104)
-        assert _emitted(coord.plan()) == [("ack", 104, False)]
+        coord.register(4)  # the redelivery
+        coord.mark_success(4)
+        assert _emitted(coord.plan()) == [("ack", 4, False)]
 
     def test_the_old_tag_can_never_be_re_registered(self) -> None:
-        coord = _coord({101: "success", 102: "nack"})
+        coord = _coord({1: "success", 2: "nack"})
         coord.plan()
-        coord.register(103)
+        coord.register(3)
         with pytest.raises(CoordinatorError, match="not greater than last registered"):
-            coord.register(102)
+            coord.register(2)
 
     def test_registration_must_be_strictly_increasing(self) -> None:
         coord = SettlementCoordinator()
@@ -355,12 +355,12 @@ class TestRequeueAndRedelivery:
 
 class TestI6Shutdown:
     def test_drain_emits_approved_work_and_leaves_the_rest_unacked(self) -> None:
-        """101 DONE, 102 DONE, 103 RUNNING, 104 DONE, 105 DONE at shutdown:
-        ack through 102 and stop — never ack 103's siblings past it."""
-        coord = _coord({101: "success", 102: "success", 103: "outstanding", 104: "success", 105: "success"})
+        """1 DONE, 2 DONE, 3 RUNNING, 4 DONE, 5 DONE at shutdown:
+        ack through 2 and stop — never ack 3's siblings past it."""
+        coord = _coord({1: "success", 2: "success", 3: "outstanding", 4: "success", 5: "success"})
         commands = coord.drain_plan()
-        assert 103 not in _covered(commands)
-        assert coord.state_of(103) is DeliveryState.OUTSTANDING
+        assert 3 not in _covered(commands)
+        assert coord.state_of(3) is DeliveryState.OUTSTANDING
         assert coord.pending == 1
 
     def test_drain_never_coalesces(self) -> None:
@@ -477,6 +477,8 @@ class TestInstrumentation:
             "unresolved",
             "frames_failed",
             "frames_not_attempted",
+            "gap_floor",
+            "unregistered_gaps",
             "oldest_pending_age",
         }
         assert stats["registered"] == 3 and stats["ack_ready"] == 2 and stats["frontier"] == 1

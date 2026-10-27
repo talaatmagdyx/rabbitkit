@@ -53,13 +53,13 @@ def _acker(wire: AsyncWire, **kw: Any) -> AsyncCoalescingAcker:
 
 
 async def _load_nack_in_the_middle(acker: AsyncCoalescingAcker) -> None:
-    for tag in (101, 102, 103, 104, 105):
+    for tag in (1, 2, 3, 4, 5):
         acker.register(tag)
-    acker.complete(101)
-    acker.complete(102)
-    acker.fail(103, requeue=True)
-    acker.complete(104)
-    acker.complete(105)
+    acker.complete(1)
+    acker.complete(2)
+    acker.fail(3, requeue=True)
+    acker.complete(4)
+    acker.complete(5)
 
 
 class TestTheOverAckRegressionOnAsync:
@@ -70,8 +70,8 @@ class TestTheOverAckRegressionOnAsync:
 
         report = await acker.flush()
 
-        assert wire.calls == [("ack", 102, True), ("nack", 103, True)]
-        assert ("ack", 105, True) not in wire.calls
+        assert wire.calls == [("ack", 2, True), ("nack", 3, True)]
+        assert ("ack", 5, True) not in wire.calls
         assert len(report.not_attempted) == 1
         assert report.settled_tags == 2
 
@@ -82,7 +82,7 @@ class TestTheOverAckRegressionOnAsync:
 
         report = await acker.flush()
 
-        assert wire.calls == [("ack", 102, True), ("nack", 103, True), ("ack", 105, True)]
+        assert wire.calls == [("ack", 2, True), ("nack", 3, True), ("ack", 5, True)]
         assert report.settled_tags == 5
         assert acker.pending == 0
 

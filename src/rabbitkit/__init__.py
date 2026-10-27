@@ -43,7 +43,9 @@ from rabbitkit.core.errors import (
     ConfigurationError,
     ConfigValidationError,
     DLQOperationDeniedError,
+    EventMetadataError,
     HandlerTimeoutError,
+    InboundMessageTooLargeError,
     InfrastructureError,
     InvalidMessageError,
     MessageTooLargeError,
@@ -53,6 +55,7 @@ from rabbitkit.core.errors import (
     UnsafeToBrowseError,
     UnsafeTopologyError,
 )
+from rabbitkit.core.event_metadata import EventMetadata
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.profiles import (
@@ -144,6 +147,7 @@ from rabbitkit.highload.batch import (
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
+from rabbitkit.middleware.event_metadata import EventMetadataMiddleware
 from rabbitkit.middleware.metrics import (
     MetricsCollector,
     MetricsMiddleware,
@@ -223,6 +227,9 @@ __all__ = [
     "ErrorCategory",
     "ErrorSanitizer",
     "ErrorSeverity",
+    "EventMetadata",
+    "EventMetadataError",
+    "EventMetadataMiddleware",
     "ExchangeType",
     "FailureCategory",
     "FlowController",
@@ -236,6 +243,7 @@ __all__ = [
     "HealthCheckConfig",
     "HealthStatus",
     "HealthWatcher",
+    "InboundMessageTooLargeError",
     "InfrastructureError",
     "InvalidMessageError",
     "JsonParser",

@@ -22,7 +22,12 @@ from typing import Any, Protocol
 
 import structlog
 
-from rabbitkit.core.errors import HandlerTimeoutError, classify_error, mark_invalid_message
+from rabbitkit.core.errors import (
+    HandlerTimeoutError,
+    InboundMessageTooLargeError,
+    classify_error,
+    mark_invalid_message,
+)
 from rabbitkit.core.message import (
     AckMessage,
     NackMessage,
@@ -508,6 +513,7 @@ class HandlerPipeline:
         manual_settle_on_error: bool = True,
         processing_timeout: float | None = None,
         dead_letter_check: Callable[[RouteDefinition], Awaitable[bool]] | None = None,
+        max_body_bytes: int | None = None,
     ) -> None:
         self._serializer = serializer
         self._di_resolver = di_resolver
@@ -520,6 +526,8 @@ class HandlerPipeline:
         self._processing_timeout = processing_timeout
         # F17: verify the dead-letter target before rejecting into it (async).
         self._dead_letter_check = dead_letter_check
+        # §15.6: raw-body cap (ConsumerConfig.max_body_bytes); None = no cap.
+        self._max_body_bytes = max_body_bytes
         self._dlq_missing_streak: dict[str, int] = {}
         self._failure_log = _WindowedLog()
         # Counters a metrics exporter can read (also emitted through a
@@ -676,6 +684,13 @@ class HandlerPipeline:
         3. Process result (serialize + publish if applicable)
         4. Settle message (ack/nack/reject per AckPolicy)
         """
+        # §15.6: an oversized delivery is dead-lettered before anything
+        # (filter, middleware, decode, handler) looks at its body.
+        oversized = self._oversized(message)
+        if oversized is not None:
+            self._dead_letter_oversized_sync(route, message, oversized)
+            return
+
         # Filter check — reject before any processing
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
@@ -757,6 +772,11 @@ class HandlerPipeline:
 
         Same stages as sync, but async.
         """
+        oversized = self._oversized(message)  # §15.6, see process_sync
+        if oversized is not None:
+            await self._dead_letter_oversized_async(route, message, oversized)
+            return
+
         # Filter check — reject before any processing
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
@@ -833,6 +853,47 @@ class HandlerPipeline:
             _emit_settlement_metric(route, message)
             if debug:
                 structlog.contextvars.clear_contextvars()
+
+    # ── Internal: raw-body cap (§15.6) ───────────────────────────────────
+
+    def _oversized(self, message: RabbitMessage) -> InboundMessageTooLargeError | None:
+        limit = self._max_body_bytes
+        if limit is None:
+            return None
+        size = len(message.wire_body)
+        return InboundMessageTooLargeError(size, limit) if size > limit else None
+
+    def _dead_letter_oversized_sync(
+        self, route: RouteDefinition, message: RabbitMessage, exc: InboundMessageTooLargeError
+    ) -> None:
+        """Reject an oversized delivery without requeue, whatever the AckPolicy:
+        the handler never ran, so a MANUAL handler cannot own it."""
+        try:
+            if not message.is_settled:
+                self._log_failure(route, message, exc, _ACTION_DEAD_LETTER, "body_too_large")
+                message.reject(requeue=False)
+        except Exception as settle_exc:
+            if not _is_channel_gone(settle_exc):
+                raise
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
+        finally:
+            _emit_settlement_metric(route, message)
+
+    async def _dead_letter_oversized_async(
+        self, route: RouteDefinition, message: RabbitMessage, exc: InboundMessageTooLargeError
+    ) -> None:
+        """Async variant of :meth:`_dead_letter_oversized_sync` (verifies the DLQ exists first, F17)."""
+        try:
+            if not message.is_settled:
+                await self._settle_failure_async(
+                    route, message, "reject", requeue=False, exc=exc, reason="body_too_large"
+                )
+        except Exception as settle_exc:
+            if not _is_channel_gone(settle_exc):
+                raise
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
+        finally:
+            _emit_settlement_metric(route, message)
 
     # ── Internal: middleware composition ─────────────────────────────────
 

@@ -51,8 +51,10 @@ from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_async
+from rabbitkit.core.signals import is_default_signal_handler, is_loop_signal_handler, loop_signal_handler_is
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
@@ -89,21 +91,9 @@ def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = N
         error=error,
         reason=reason,
     )
-def _is_loop_signal_handler(handler: Any) -> bool:
-    """True if *handler* is the placeholder an event loop installs for
-    ``loop.add_signal_handler`` (asyncio's and uvloop's ``_sighandler_noop``)."""
-    return callable(handler) and getattr(handler, "__name__", "") == "_sighandler_noop"
-
-
-def _is_default_signal_handler(sig: signal.Signals, handler: Any) -> bool:
-    """True for handlers nobody chose on purpose: ``SIG_DFL``, none set from
-    Python, SIGINT's ``default_int_handler``, and ``asyncio.run()``'s SIGINT
-    handler (a ``functools.partial`` of ``Runner._on_sigint``)."""
-    if handler is None or handler == signal.SIG_DFL:
-        return True
-    if sig == signal.SIGINT and handler is signal.default_int_handler:
-        return True
-    return getattr(getattr(handler, "func", None), "__name__", "") == "_on_sigint"
+# Shared with RabbitApp (core/signals.py); kept under the old private names.
+_is_loop_signal_handler = is_loop_signal_handler
+_is_default_signal_handler = is_default_signal_handler
 
 
 class AsyncBroker:
@@ -156,6 +146,7 @@ class AsyncBroker:
             manual_settle_on_error=self._config.consumer.manual_settle_on_error,
             processing_timeout=self._config.consumer.processing_timeout,
             dead_letter_check=self._dead_letter_guard.check,
+            max_body_bytes=self._config.consumer.max_body_bytes,
         )
 
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -168,6 +159,12 @@ class AsyncBroker:
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
         self._publish_middlewares: list[BaseMiddleware] = middlewares or []
+        # G-19: PublisherConfig.strip_reserved_headers (None = off).
+        self._reserved_header_stripper: ReservedHeaderStripper | None = (
+            ReservedHeaderStripper(extra=(self._config.retry.retry_header,) if self._config.retry is not None else ())
+            if self._config.publisher.strip_reserved_headers
+            else None
+        )
 
         self._batch_config = batch_config
         self._batch_publisher: Any | None = None  # BatchPublisher, started lazily in start()
@@ -667,11 +664,7 @@ class AsyncBroker:
         not removed by ``stop()``. Without it (e.g. uvloop) the broker
         assumes the handler is still its own, as before.
         """
-        handlers = getattr(loop, "_signal_handlers", None)
-        if not isinstance(handlers, dict):
-            return True
-        handle = handlers.get(sig)
-        return handle is not None and getattr(handle, "_callback", None) == self._on_signal
+        return loop_signal_handler_is(loop, sig, self._on_signal)
 
     def _trigger_shutdown(self) -> None:
         """Set the shutdown event so an in-progress ``run()`` joins the drain
@@ -983,6 +976,11 @@ class AsyncBroker:
             )
             if message_id is not None:
                 envelope = replace(envelope, message_id=message_id)
+
+        # G-19: an application publish cannot carry rabbitkit's retry/DLQ
+        # bookkeeping headers (opt-in; the library's own republishes bypass this).
+        if self._reserved_header_stripper is not None:
+            envelope = self._reserved_header_stripper(envelope)
 
         # M10: reject oversized bodies at publish time (see sync broker).
         max_bytes = self._config.publisher.max_message_bytes

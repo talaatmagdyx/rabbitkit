@@ -358,6 +358,17 @@ class PublisherConfig:
     # when ``max_message_bytes`` is set, >= ``max_message_bytes`` so every
     # admissible message fits.
     max_in_flight_bytes: int | None = None
+    # G-19: remove rabbitkit's retry/DLQ/replay bookkeeping headers
+    # (``x-rabbitkit-retry-count``, ``x-rabbitkit-first-failed-at``,
+    # ``x-rabbitkit-original-queue`` ...) and the broker's ``x-death`` from
+    # APPLICATION publishes (``broker.publish()`` and the bulk APIs built on
+    # it), so a forged or copied header cannot make a new message skip its
+    # retries. Also strips a custom ``RetryConfig.retry_header``. rabbitkit's
+    # own retry / DLQ / replay republishes do not go through
+    # ``broker.publish()`` and keep them. Default False (headers pass
+    # through unchanged, the previous behaviour); the CRITICAL reliability
+    # profile turns it on. See ``rabbitkit.core.reserved_headers``.
+    strip_reserved_headers: bool = False
 
     def __post_init__(self) -> None:
         if self.max_in_flight_bytes is None:
@@ -417,6 +428,14 @@ class ConsumerConfig:
             failure settlement. The sync broker ignores it (Python cannot
             interrupt a thread) and logs a warning; use
             ``TimeoutMiddleware`` there.
+        max_body_bytes: raw-body cap for deliveries, in bytes (``None`` =
+            no cap, the default). A delivery whose body as received (before
+            decompression or any ``on_receive`` hook) is larger is
+            ``INVALID_MESSAGE``: rejected without requeue, so the source
+            queue's dead-letter exchange moves it to the DLQ, without running
+            any middleware or the handler. The broker dead-letters it, so the
+            DLQ copy carries ``x-death`` but not rabbitkit's failure headers.
+            ``CompressionMiddleware`` caps the decompressed size separately.
     """
 
     prefetch_count: int = 10
@@ -424,6 +443,7 @@ class ConsumerConfig:
     reject_transient_on_redelivery: bool = True
     manual_settle_on_error: bool = True
     processing_timeout: float | None = None
+    max_body_bytes: int | None = None
 
     def __post_init__(self) -> None:
         # Architect review M1: prefetch_count=0 means AMQP "unlimited" — a
@@ -443,6 +463,10 @@ class ConsumerConfig:
         if self.processing_timeout is not None and self.processing_timeout <= 0:
             raise ConfigValidationError(
                 f"ConsumerConfig.processing_timeout must be > 0 or None, got {self.processing_timeout}"
+            )
+        if self.max_body_bytes is not None and self.max_body_bytes < 1:
+            raise ConfigValidationError(
+                f"ConsumerConfig.max_body_bytes must be >= 1 or None, got {self.max_body_bytes}"
             )
 
 

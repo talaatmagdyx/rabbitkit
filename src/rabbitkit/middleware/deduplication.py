@@ -9,7 +9,11 @@ If Redis is unavailable, behaviour depends on ``fallback_on_redis_error``:
 
 Mark policy (``DeduplicationConfig.mark_policy``):
   - ``"on_success"`` (default): check for the key before the handler (no
-    write), mark it only after the handler returns successfully. Crash-safe:
+    write), mark it only once the WHOLE processing succeeded — when the
+    pipeline acks the delivery, i.e. after the handler returned AND its
+    result was published (``@publisher`` / RPC reply). A failed result
+    publish nack-requeues and leaves no mark, so the redelivery is processed
+    instead of being acked as a duplicate (which lost the result). Crash-safe:
     a consumer killed mid-handler (OOM/SIGKILL) leaves no mark, so the
     broker's redelivery is processed rather than dropped as a duplicate.
     Risk: concurrent deliveries of the same message may both pass the dedup
@@ -23,8 +27,9 @@ Mark policy (``DeduplicationConfig.mark_policy``):
     permanent), the retry may be skipped — see the H8 note below for the one
     case this middleware CAN detect and correct for.
   - ``"claim"``: two-state. Before the handler, atomically claim the key as
-    ``in-flight`` with ``processing_timeout`` as its TTL; on success flip it
-    to ``completed`` with the full ``ttl``. A concurrent duplicate that sees
+    ``in-flight`` with ``processing_timeout`` as its TTL; when the pipeline
+    acks (handler and result publish both succeeded) flip it to
+    ``completed`` with the full ``ttl``; a nack/reject releases the claim. A concurrent duplicate that sees
     a live in-flight claim is handled per ``on_in_flight``:
     ``"nack_requeue"`` (default — the copy comes back and retries, so it is
     NOT lost if the claiming consumer dies) or ``"ack_skip"``. A crash
@@ -238,6 +243,111 @@ class DeduplicationMiddleware(BaseMiddleware):
             logger.warning("Redis error during dedup key cleanup after non-success", exc_info=True)
         self._local_remove(key)
 
+    # ── Deferred mark (R-D7) ──────────────────────────────────────────────
+    #
+    # A handler returning is not the end of processing: the pipeline still
+    # publishes its result (``@publisher`` / RPC reply) and only then acks.
+    # If that publish fails the pipeline nack-requeues for redelivery — and a
+    # key marked when the handler returned made the redelivery look like a
+    # duplicate, so it was acked and the result was lost for good. The mark
+    # is therefore written when the pipeline ACKS the delivery (mark, then
+    # ack): only a fully successful processing marks the key. A nack/reject
+    # writes nothing (and releases a claim). If the message was already
+    # settled inside the handler chain (MANUAL settlement), or the transport
+    # exposes no ack hook, the mark is written immediately as before.
+
+    def _write_mark_sync(self, key: str, value: str, message: RabbitMessage, *, nx: bool) -> None:
+        """Never raises: it runs inside the ack, and the handler's side
+        effects are committed — failing the ack would force a duplicate."""
+        try:
+            if nx:
+                self._redis.set(key, value, nx=True, ex=self._config.ttl)
+            else:
+                self._redis.set(key, value, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return
+        self._local_mark(key)
+
+    async def _write_mark_async(self, key: str, value: str, message: RabbitMessage, *, nx: bool) -> None:
+        try:
+            if nx:
+                await self._redis.set(key, value, nx=True, ex=self._config.ttl)
+            else:
+                await self._redis.set(key, value, ex=self._config.ttl)
+        except Exception:
+            self._record_fallback(message)
+            return
+        self._local_mark(key)
+
+    def _mark_on_ack_sync(self, message: RabbitMessage, key: str, value: str, *, nx: bool, claim: bool) -> None:
+        ack = message._ack_fn
+        if message.is_settled or ack is None:
+            self._write_mark_sync(key, value, message, nx=nx)
+            return
+
+        def ack_after_mark() -> None:
+            self._write_mark_sync(key, value, message, nx=nx)
+            ack()
+
+        message._ack_fn = ack_after_mark
+        if claim:
+            self._release_claim_on_failure_sync(message, key)
+
+    async def _mark_on_ack_async(
+        self, message: RabbitMessage, key: str, value: str, *, nx: bool, claim: bool
+    ) -> None:
+        ack = message._ack_async_fn
+        if message.is_settled or ack is None:
+            await self._write_mark_async(key, value, message, nx=nx)
+            return
+
+        async def ack_after_mark() -> None:
+            await self._write_mark_async(key, value, message, nx=nx)
+            await ack()
+
+        message._ack_async_fn = ack_after_mark
+        if claim:
+            self._release_claim_on_failure_async(message, key)
+
+    def _release_claim_on_failure_sync(self, message: RabbitMessage, key: str) -> None:
+        """A nack/reject after the handler returned (e.g. the result publish
+        failed) releases the in-flight claim, so the redelivery is processed
+        at once instead of waiting out ``processing_timeout``."""
+        for attr in ("_nack_fn", "_reject_fn"):
+            settle = getattr(message, attr)
+            if settle is None:
+                continue
+
+            def release(requeue: bool, _settle: Callable[[bool], None] = settle) -> None:
+                try:
+                    _settle(requeue)
+                finally:
+                    self._cleanup_key_after_non_success(key)
+
+            setattr(message, attr, release)
+
+    def _release_claim_on_failure_async(self, message: RabbitMessage, key: str) -> None:
+        for attr in ("_nack_async_fn", "_reject_async_fn"):
+            settle = getattr(message, attr)
+            if settle is None:
+                continue
+
+            async def release(requeue: bool, _settle: Callable[[bool], Awaitable[None]] = settle) -> None:
+                try:
+                    await _settle(requeue)
+                finally:
+                    await self._cleanup_key_after_non_success_async(key)
+
+            setattr(message, attr, release)
+
+    def _completed_value(self, result: Any) -> str:
+        if self._config.store_results and result is not None:
+            encoded = _encode_completed_with_result(result, self._config.max_result_bytes)
+            if encoded is not None:
+                return encoded
+        return _COMPLETED
+
     # ── Key extraction ────────────────────────────────────────────────────
 
     def _extract_key(self, message: RabbitMessage) -> str:
@@ -391,16 +501,12 @@ class DeduplicationMiddleware(BaseMiddleware):
             # redelivery (same dedup key) passes the dedup check — just skip
             # the mark.
             return result
-        # Handler succeeded — mark now. Never raise past this point, even with
+        # Handler returned — mark when the pipeline acks (after the result
+        # publish succeeded; R-D7). Never raises, even with
         # fallback_on_redis_error=False: the handler's side effects are done,
         # and raising would nack → redeliver → a GUARANTEED duplicate
         # execution, worse than the unmarked-key window it would signal.
-        try:
-            self._redis.set(key, "1", nx=True, ex=self._config.ttl)
-        except Exception:
-            self._record_fallback(message)
-            return result
-        self._local_mark(key)
+        self._mark_on_ack_sync(message, key, "1", nx=True, claim=False)
         return result
 
     async def consume_scope_async(
@@ -459,15 +565,9 @@ class DeduplicationMiddleware(BaseMiddleware):
             # redelivery (same dedup key) passes the dedup check — just skip
             # the mark.
             return result
-        # Handler succeeded — mark now. Never raise past this point, even with
-        # fallback_on_redis_error=False: raising would nack → redeliver → a
-        # GUARANTEED duplicate execution.
-        try:
-            await self._redis.set(key, "1", nx=True, ex=self._config.ttl)
-        except Exception:
-            self._record_fallback(message)
-            return result
-        self._local_mark(key)
+        # Handler returned — mark when the pipeline acks (R-D7). Never
+        # raises (see the sync variant).
+        await self._mark_on_ack_async(message, key, "1", nx=True, claim=False)
         return result
 
     # ── mark_policy == "claim" ────────────────────────────────────────────
@@ -554,9 +654,10 @@ class DeduplicationMiddleware(BaseMiddleware):
                     # reply_to, so a duplicate (e.g. redelivered RPC request)
                     # gets a byte-identical answer without re-running the
                     # handler's side effects.
+                    # Not acked here: the pipeline acks only after the
+                    # replayed result is published, and nack-requeues if
+                    # that publish fails (acking first lost it — R-D7).
                     logger.debug("Duplicate (key=%s); replaying stored result", key)
-                    if not message.is_settled:
-                        message.ack()
                     return stored
             logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
             if not message.is_settled:
@@ -574,20 +675,17 @@ class DeduplicationMiddleware(BaseMiddleware):
             # H8: release the claim for the delayed retry redelivery.
             self._cleanup_key_after_non_success(key)
             return result
-        # Handler succeeded — flip the claim to completed with the full TTL.
-        # Never raise past this point (side effects are committed; raising
-        # would nack → redeliver → a guaranteed duplicate execution).
-        value = _COMPLETED
-        if self._config.store_results and result is not None:
-            encoded = _encode_completed_with_result(result, self._config.max_result_bytes)
-            if encoded is not None:
-                value = encoded
-        try:
-            self._redis.set(key, value, ex=self._config.ttl)
-        except Exception:
-            self._record_fallback(message)
-            return result
-        self._local_mark(key)
+        # Handler returned — flip the claim to completed (full TTL) when the
+        # pipeline acks, i.e. after the result publish succeeded (R-D7); a
+        # nack/reject releases the claim instead. A STORED result is written
+        # at once: a redelivery then replays it (and the pipeline re-publishes
+        # it before acking), so nothing is lost and the handler's side effects
+        # don't run twice. Never raises (raising would force a duplicate).
+        value = self._completed_value(result)
+        if value != _COMPLETED:
+            self._write_mark_sync(key, value, message, nx=False)
+        else:
+            self._mark_on_ack_sync(message, key, value, nx=False, claim=True)
         return result
 
     async def _handle_in_flight_duplicate_async(self, message: RabbitMessage, key: str) -> None:
@@ -646,8 +744,6 @@ class DeduplicationMiddleware(BaseMiddleware):
                 if has_result:
                     # F5: replay the stored result -- see the sync counterpart.
                     logger.debug("Duplicate (key=%s); replaying stored result", key)
-                    if not message.is_settled:
-                        await message.ack_async()
                     return stored
             logger.debug("Duplicate message detected (key=%s); acking and skipping", key)
             if not message.is_settled:
@@ -662,15 +758,9 @@ class DeduplicationMiddleware(BaseMiddleware):
         if result is REQUEUED_FOR_RETRY:
             await self._cleanup_key_after_non_success_async(key)
             return result
-        value = _COMPLETED
-        if self._config.store_results and result is not None:
-            encoded = _encode_completed_with_result(result, self._config.max_result_bytes)
-            if encoded is not None:
-                value = encoded
-        try:
-            await self._redis.set(key, value, ex=self._config.ttl)
-        except Exception:
-            self._record_fallback(message)
-            return result
-        self._local_mark(key)
+        value = self._completed_value(result)
+        if value != _COMPLETED:  # stored result: replayable (see the sync variant)
+            await self._write_mark_async(key, value, message, nx=False)
+        else:
+            await self._mark_on_ack_async(message, key, value, nx=False, claim=True)
         return result

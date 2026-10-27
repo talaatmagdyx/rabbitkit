@@ -84,6 +84,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held for the full `backoff_max` (consumption of the queue is effectively
   paused at `prefetch` messages per `backoff_max`) with one CRITICAL log per
   outage. The sync path still never sleeps on the I/O thread.
+- **`DeduplicationMiddleware` could lose a handler's result.** The key was
+  marked as soon as the handler returned; the pipeline then published the
+  result (`@publisher` / RPC reply) and, if that publish failed,
+  nack-requeued — and the redelivery was acked as a duplicate, so the result
+  was never published. The mark is now written when the pipeline ACKS the
+  delivery (after the result publish succeeded; mark, then ack); a
+  nack/reject writes nothing and releases a `claim`. With `mark_policy="claim",
+  store_results=True` a storable result is still written at once, and the
+  duplicate's stored-result replay is no longer acked before the pipeline
+  re-publishes it. If the handler chain settles the message itself, or the
+  transport exposes no ack hook, the mark is written immediately as before.
 - **The "Terminal failure" log printed raw exception text** (e.g.
   `password=hunter2`) while the headers were sanitized. It now uses the same
   `ErrorSanitizer`.

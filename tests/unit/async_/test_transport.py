@@ -586,11 +586,11 @@ class TestWaitForRecovery:
             assert await transport._wait_for_recovery(timeout=2.0) is True
 
 
-class TestPublishConfirmedRetryOnce:
-    """Item 6: the confirmed (pooled-channel) publish path retries exactly
-    once on a connection-class error, after a bounded wait for aio-pika's
-    own recovery -- and the pool-release cleanup can never overwrite an
-    already-computed outcome (the precondition fix this builds on)."""
+class TestPublishConfirmedNoHiddenRetry:
+    """G-03: once basic.publish may have left the client, a connection-class
+    failure is reported UNKNOWN and never republished (the old retry-once
+    could deliver a duplicate reported as CONFIRMED) -- and the pool-release
+    cleanup can never overwrite an already-computed outcome."""
 
     async def _connect_transport(self, transport: AsyncTransportImpl) -> AsyncMock:
         mock_connection = _make_mock_connection()
@@ -602,9 +602,9 @@ class TestPublishConfirmedRetryOnce:
         return mock_connection
 
     @pytest.mark.asyncio
-    async def test_connection_error_retries_once_and_succeeds(self) -> None:
+    async def test_connection_error_mid_publish_is_unknown_and_not_retried(self) -> None:
         transport = _make_transport()
-        mock_connection = await self._connect_transport(transport)
+        await self._connect_transport(transport)
         conn = transport._conn_pool._publisher_connection
 
         bad_channel = AsyncMock()
@@ -621,39 +621,16 @@ class TestPublishConfirmedRetryOnce:
         conn.channel = AsyncMock(side_effect=[bad_channel, good_channel])
 
         envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
+        outcome = await transport.publish(envelope)
 
-        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
-            outcome = await transport.publish(envelope)
-
-        assert outcome.status == PublishStatus.CONFIRMED
+        assert outcome.status == PublishStatus.UNKNOWN
+        assert outcome.reason == "connection_lost"
+        assert outcome.is_unknown
         bad_channel.default_exchange.publish.assert_awaited_once()
-        good_channel.default_exchange.publish.assert_awaited_once()  # exactly one retry, no double-publish
-        mock_wait.assert_awaited_once()
-        del mock_connection  # unused beyond connect()
+        good_channel.default_exchange.publish.assert_not_awaited()  # no republish
 
     @pytest.mark.asyncio
-    async def test_no_recovery_within_timeout_returns_error_without_retry(self) -> None:
-        transport = _make_transport()
-        await self._connect_transport(transport)
-        conn = transport._conn_pool._publisher_connection
-
-        bad_channel = AsyncMock()
-        bad_channel.is_closed = False
-        bad_channel.default_exchange.publish = AsyncMock(side_effect=ConnectionResetError("gone"))
-        conn.channel = AsyncMock(return_value=bad_channel)
-
-        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
-
-        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=False)):
-            outcome = await transport.publish(envelope)
-
-        assert outcome.status == PublishStatus.ERROR
-        bad_channel.default_exchange.publish.assert_awaited_once()  # no retry attempted
-
-    @pytest.mark.asyncio
-    async def test_non_connection_error_does_not_retry(self) -> None:
-        """A broker-decision-level failure (not a dead connection) must not
-        trigger the wait-for-recovery/retry machinery at all."""
+    async def test_non_connection_error_is_error(self) -> None:
         transport = _make_transport()
         await self._connect_transport(transport)
         conn = transport._conn_pool._publisher_connection
@@ -663,46 +640,32 @@ class TestPublishConfirmedRetryOnce:
         channel.default_exchange.publish = AsyncMock(side_effect=ValueError("bad body"))
         conn.channel = AsyncMock(return_value=channel)
 
-        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
-
-        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
-            outcome = await transport.publish(envelope)
+        outcome = await transport.publish(MessageEnvelope(routing_key="rk", body=b"hello", exchange=""))
 
         assert outcome.status == PublishStatus.ERROR
-        mock_wait.assert_not_awaited()
+        assert outcome.reason == "invalid_envelope"
         channel.default_exchange.publish.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_second_connection_error_after_retry_still_returns_error(self) -> None:
-        """Retry is exactly ONE attempt -- a persistent connection error
-        across both attempts must not loop, just return ERROR."""
+    async def test_reconnecting_publisher_waits_before_sending(self) -> None:
+        """A publish that finds the publisher connection mid-reconnect waits
+        (bounded) for recovery BEFORE sending, and is NOT_SENT if it never
+        comes back."""
         transport = _make_transport()
         await self._connect_transport(transport)
         conn = transport._conn_pool._publisher_connection
+        conn.connected.is_set = MagicMock(return_value=False)
+        channel = AsyncMock()
+        channel.is_closed = False
+        conn.channel = AsyncMock(return_value=channel)
 
-        def _make_bad_channel() -> AsyncMock:
-            ch = AsyncMock()
-            ch.is_closed = False
+        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=False)) as mock_wait:
+            outcome = await transport.publish(MessageEnvelope(routing_key="rk", body=b"x"))
 
-            async def _fail(*args: object, **kwargs: object) -> None:
-                ch.is_closed = True
-                raise ConnectionResetError("still down")
-
-            ch.default_exchange.publish = AsyncMock(side_effect=_fail)
-            return ch
-
-        first, second = _make_bad_channel(), _make_bad_channel()
-        conn.channel = AsyncMock(side_effect=[first, second])
-
-        envelope = MessageEnvelope(routing_key="rk", body=b"hello", exchange="")
-
-        with patch.object(transport, "_wait_for_recovery", new=AsyncMock(return_value=True)) as mock_wait:
-            outcome = await transport.publish(envelope)
-
-        assert outcome.status == PublishStatus.ERROR
-        first.default_exchange.publish.assert_awaited_once()
-        second.default_exchange.publish.assert_awaited_once()
-        mock_wait.assert_awaited_once()  # only tried recovery once, not per-attempt-forever
+        assert outcome.status == PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
+        mock_wait.assert_awaited_once()
+        channel.default_exchange.publish.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_failure_does_not_override_a_successful_outcome(self) -> None:
@@ -2007,7 +1970,7 @@ class TestMandatoryChannelClosedOnTimeout:
 
         used: list[Any] = []
 
-        async def fake_publish(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+        async def fake_publish(channel: Any, envelope: MessageEnvelope, **_: Any) -> PublishOutcome:
             used.append(channel)
             status = PublishStatus.TIMEOUT if len(used) == 1 else PublishStatus.CONFIRMED
             return PublishOutcome(status=status, exchange="", routing_key="q")
@@ -2016,6 +1979,7 @@ class TestMandatoryChannelClosedOnTimeout:
             envelope = MessageEnvelope(routing_key="q", body=b"x", mandatory=True)
             outcome = await transport.publish(envelope)
             assert outcome.status == PublishStatus.TIMEOUT
+            await asyncio.sleep(0)  # the discarded channel is closed in the background
             timed_out_channel.close.assert_called_once()
             assert (await transport.publish(envelope)).status == PublishStatus.CONFIRMED
         assert used == [timed_out_channel, fresh_channel]
@@ -2045,7 +2009,7 @@ class TestPooledChannelClosedOnTimeout:
     channel on the next acquire."""
 
     @pytest.mark.asyncio
-    async def test_timeout_closes_channel_before_release(self) -> None:
+    async def test_timeout_discards_the_channel_instead_of_releasing_it(self) -> None:
         transport = _make_transport(confirm_delivery=True, confirm_timeout=0.01)
         channel = AsyncMock()
         channel.is_closed = False
@@ -2066,11 +2030,11 @@ class TestPooledChannelClosedOnTimeout:
         with patch.object(transport, "_publish_on_channel", new_callable=AsyncMock) as mock_pub:
             mock_pub.return_value = PublishOutcome(status=PublishStatus.TIMEOUT, exchange="", routing_key="q")
             outcome = await transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
+        await asyncio.sleep(0)  # the discarded channel is closed in the background
 
         assert outcome.status == PublishStatus.TIMEOUT
         channel.close.assert_called_once()
-        # Released AFTER being closed, so the pool sees is_closed=True.
-        assert release_calls == [True]
+        assert release_calls == []  # never handed back to the pool
 
     @pytest.mark.asyncio
     async def test_confirmed_publish_does_not_close_pooled_channel(self) -> None:
@@ -2247,7 +2211,7 @@ class TestReplyToChannelAffinity:
 
         captured: list[Any] = []
 
-        async def fake_publish_on_channel(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+        async def fake_publish_on_channel(channel: Any, envelope: MessageEnvelope, **_: Any) -> PublishOutcome:
             captured.append(channel)
             return PublishOutcome(
                 status=PublishStatus.CONFIRMED, exchange=envelope.exchange, routing_key=envelope.routing_key
@@ -2448,7 +2412,7 @@ class TestRefusedMandatoryPublishIsIsolated:
         gate = _asyncio.Event()
         refusal = "PRECONDITION_FAILED - user_id property set to 'intruder' but authenticated user was 'app'"
 
-        async def broker(channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+        async def broker(channel: Any, envelope: MessageEnvelope, **_: Any) -> PublishOutcome:
             if envelope.user_id == "intruder":
                 channel.is_closed = True  # the broker closes the channel
                 raise ChannelPreconditionFailed(refusal)
@@ -2472,6 +2436,8 @@ class TestRefusedMandatoryPublishIsIsolated:
             ok = await innocent
 
         assert refused.status == PublishStatus.ERROR
+        assert refused.reason == "precondition_failed"
+        assert refused.reply_code == 406
         assert isinstance(refused.error, ChannelPreconditionFailed)
         assert ok.status == PublishStatus.CONFIRMED
         assert all(kwargs == {"publisher_confirms": True, "on_return_raises": True} for _, kwargs in opened)
@@ -2676,8 +2642,9 @@ class TestSameMessageIdPublishSerialization:
         e = MessageEnvelope(routing_key="q", body=b"x", message_id="same")
         with patch("aio_pika.Message", side_effect=lambda **kw: MagicMock(message_id=kw["message_id"])):
             with patch("aio_pika.DeliveryMode", return_value=2):
-                with pytest.raises(RuntimeError):
-                    await transport._publish_on_channel(ch, e)
+                failed = await transport._publish_on_channel(ch, e)
+                assert failed.status is PublishStatus.ERROR
+                assert failed.reason == "publish_error"
                 assert transport._inflight_message_ids == {}
                 o = await transport._publish_on_channel(ch, e)
         assert o.status is PublishStatus.CONFIRMED

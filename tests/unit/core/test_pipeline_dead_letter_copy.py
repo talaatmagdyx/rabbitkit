@@ -3,10 +3,8 @@ and the completed-dead-letter hook RetryMiddleware attaches."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
-
-import pytest
 
 from rabbitkit.core.message import RabbitMessage, RejectMessage
 from rabbitkit.core.pipeline import HandlerPipeline, _note_dead_lettered
@@ -14,6 +12,9 @@ from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import AckPolicy
 from rabbitkit.middleware.base import BaseMiddleware
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _route(handler: Any, **kw: Any) -> RouteDefinition:

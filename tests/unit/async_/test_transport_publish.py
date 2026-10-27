@@ -523,3 +523,35 @@ class TestAdmissionEdges:
         assert not transport._publishes_idle.is_set()
         transport._publish_exited()
         assert transport._publishes_idle.is_set()
+
+
+class TestPreSendFailures:
+    @pytest.mark.asyncio
+    async def test_invalid_envelope_is_an_error_not_a_raise(self) -> None:
+        transport = _transport()
+        channel = _channel()
+        outcome = await transport._publish_on_channel(channel, _env(delivery_mode=7))
+        assert (outcome.status, outcome.reason) == (PublishStatus.ERROR, "invalid_envelope")
+        channel.default_exchange.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exchange_lookup_failure_is_not_sent(self) -> None:
+        transport = _transport()
+        channel = _channel()
+        channel.get_exchange = AsyncMock(side_effect=RuntimeError("channel gone"))
+        outcome = await transport._publish_on_channel(channel, _env(exchange="ex"))
+        assert (outcome.status, outcome.reason) == (PublishStatus.NOT_SENT, "channel_unavailable")
+
+    @pytest.mark.asyncio
+    async def test_cancelled_exchange_lookup_propagates(self) -> None:
+        transport = _transport()
+        channel = _channel()
+        channel.get_exchange = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await transport._publish_on_channel(channel, _env(exchange="ex"))
+
+    @pytest.mark.asyncio
+    async def test_invalid_envelope_on_the_fast_path_is_an_error(self) -> None:
+        transport = _transport(confirm_delivery=False)
+        outcome = await transport.publish(_env(delivery_mode=7))
+        assert (outcome.status, outcome.reason) == (PublishStatus.ERROR, "invalid_envelope")

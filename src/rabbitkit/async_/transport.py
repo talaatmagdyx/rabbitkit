@@ -745,12 +745,19 @@ class AsyncTransportImpl:
         this publish's own. See :meth:`_classify_publish_failure`.
         """
 
-        message = self._build_aio_message(envelope)
-        exchange = (
-            await channel.get_exchange(envelope.exchange, ensure=False)
-            if envelope.exchange
-            else channel.default_exchange
-        )
+        try:
+            message = self._build_aio_message(envelope)
+            exchange = (
+                await channel.get_exchange(envelope.exchange, ensure=False)
+                if envelope.exchange
+                else channel.default_exchange
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # nothing has been sent yet
+            if isinstance(e, (ValueError, TypeError)):
+                return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, e)
+            return self._not_sent(envelope, PublishReason.CHANNEL_UNAVAILABLE, e)
         # Serialize publishes of the SAME message_id on the SAME channel.
         # aiormq keys its Basic.Return correlation by message_id
         # (``message_id_delivery_tag``) and pops that key when a publish of
@@ -1092,7 +1099,9 @@ class AsyncTransportImpl:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as e:  # nothing has been sent yet
+            if isinstance(e, (ValueError, TypeError)):
+                return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, e)
             logger.error("Async publish failed: no publish channel: %s", e)
             return self._not_sent(envelope, PublishReason.CHANNEL_UNAVAILABLE, e)
         try:

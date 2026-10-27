@@ -2772,3 +2772,37 @@ class TestEmbeddingAppSignalHandlers:
 
         broker = AsyncBroker()
         assert broker._owns_loop_signal(MagicMock(spec=[]), signal.SIGTERM) is True
+
+
+class TestDeadLetterGuardProbe:
+    """F17: the broker's queue-existence probe used by the dead-letter guard."""
+
+    async def test_without_a_transport_the_queue_is_reported_missing(self) -> None:
+        assert await AsyncBroker()._queue_exists_for_guard("orders.dlq") is False
+
+    async def test_delegates_to_the_transport(self) -> None:
+        broker = AsyncBroker()
+        transport = AsyncMock()
+        transport.queue_exists = AsyncMock(return_value=1)
+        broker._transport = transport
+        assert await broker._queue_exists_for_guard("orders.dlq") is True
+        transport.queue_exists.assert_awaited_once_with("orders.dlq")
+
+
+class TestBulkSettlementMetricsHook:
+    def test_hook_counts_settlement_items_through_the_metrics_collector(self) -> None:
+        from types import SimpleNamespace
+
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock(spec=["inc_counter"])
+        mw = MetricsMiddleware(collector=collector)
+        broker = AsyncBroker(middlewares=[mw])
+        action = SimpleNamespace(value="ack")
+        hook = broker._settlement_item_hook(action)  # type: ignore[arg-type]
+        assert hook is not None
+        hook(SimpleNamespace(status=SimpleNamespace(value="settled")))  # type: ignore[arg-type]
+        collector.inc_counter.assert_called_once_with(
+            mw.config.settlement_items_total, {"action": "ack", "status": "settled"}
+        )
+        broker._set_lifecycle_gauges(connected=True)  # collector without set_gauge: no-op

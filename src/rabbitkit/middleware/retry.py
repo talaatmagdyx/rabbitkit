@@ -608,8 +608,7 @@ class RetryMiddleware(BaseMiddleware):
         ``content_encoding="gzip"``). Republishing that decoded body under
         the original encoding made every retried compressed message
         undecodable on its next delivery, so it was dead-lettered instead of
-        retried. The wire bytes are also what a signature covers and what
-        the size limits were checked against.
+        retried. The wire bytes are also what a signature covers.
         """
         return MessageEnvelope(
             routing_key=routing_key,

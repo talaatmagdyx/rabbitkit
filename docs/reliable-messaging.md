@@ -346,7 +346,32 @@ profile forbids, and when `consumer.processing_timeout` is unset.
 | Source `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` | — | per route: warning if not declared; verified on the broker by `preflight(management_client=...)` (which then replaces the warning) | — |
 | Dead-letter path never `discard` | — | yes | `reject_without_dlx="discard"` |
 | Event metadata validation | — (opt-in) | not checked | — |
-| Connection reconnect budget / backoff | **Not implemented** in the profile yet | — | — |
+| Heartbeat on (`connection.heartbeat > 0`) | — (default 30 s) | yes | `heartbeat=0` |
+| Async reconnect budget | — (unlimited by default) | warning when `reconnect_budget_seconds < reconnect_backoff_max` | — |
+| TLS | — (deployment choice) | warning when enabled with `cert_reqs="CERT_NONE"` | — |
+
+Why the connection rows look like this:
+
+- **Heartbeats are required.** Without them a peer that disappears without
+  closing TCP (a crashed or partitioned node) is never detected: publishes
+  wait on a dead socket and unacked deliveries stay assigned to a consumer
+  that cannot settle them. The default (30 s) satisfies the profile.
+- **The reconnect budget stays unlimited by default.** No guarantee depends
+  on it: a publish during an outage is reported `NOT_SENT` / `UNKNOWN`, never
+  `CONFIRMED`, and unacked deliveries are redelivered after the reconnect. An
+  unlimited budget keeps a consumer available through a long broker outage or
+  a rolling restart without a restart storm; a connection that fails for a
+  reason retrying cannot fix (refused credentials, vhost or TLS) stops at once
+  anyway, and the supervisor (Kubernetes) restarts the pod on a terminal
+  failure. Set `reconnect_budget_attempts` / `reconnect_budget_seconds` when
+  you prefer a restart after a bounded outage; the profile only checks that a
+  seconds budget is not shorter than `reconnect_backoff_max` (the backoff it
+  bounds could never reach its own cap). The budgets apply to `AsyncBroker`;
+  `SyncBroker` keeps its own bounded loop (`reconnect_max_attempts`).
+- **TLS is not required.** Whether broker traffic is encrypted by the client,
+  a service mesh or a private network is a deployment decision the library
+  cannot see. When TLS is enabled through `SSLConfig`, turning certificate
+  verification off (`cert_reqs="CERT_NONE"`) is reported.
 
 Per-route requirements cannot be applied to a config: register the
 subscribers, then call `validate_profile(config, "critical",

@@ -36,6 +36,7 @@ from rabbitkit.core.config import (
     SocketConfig,
     WorkerConfig,
 )
+from rabbitkit.core.dead_letter import DeadLetterGuard
 from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
@@ -104,11 +105,16 @@ class AsyncBroker:
         self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
+        # F17: verify a route's DLQ exists before dead-lettering into it.
+        self._dead_letter_guard = DeadLetterGuard(self._queue_exists_for_guard)
         self._pipeline = HandlerPipeline(
             serializer=serializer,
             di_resolver=di_resolver,
             context_repo=context_repo,
             reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
+            manual_settle_on_error=self._config.consumer.manual_settle_on_error,
+            processing_timeout=self._config.consumer.processing_timeout,
+            dead_letter_check=self._dead_letter_guard.check,
         )
 
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -611,6 +617,12 @@ class AsyncBroker:
             except (ValueError, OSError):  # pragma: no cover
                 pass  # pragma: no cover
         self._original_handlers.clear()
+
+    async def _queue_exists_for_guard(self, queue: str) -> bool:
+        transport = self._transport
+        if transport is None:
+            return False
+        return bool(await transport.queue_exists(queue))
 
     async def _wait_in_flight(self, deadline: float | None) -> None:
         cond = self._ensure_inflight_cond()
@@ -1311,6 +1323,10 @@ class AsyncBroker:
                 )
             else:
                 source_queue = route.queue
+
+            self._dead_letter_guard.set_target(
+                route.queue.name, source_queue.dead_letter_exchange, source_queue.dead_letter_routing_key
+            )
 
             # Declare queue (with DLQ routing arguments if retry/safety DLX applies)
             if source_queue is route.queue and is_anothers_dlq and route.queue.queue_type == QueueType.QUORUM:

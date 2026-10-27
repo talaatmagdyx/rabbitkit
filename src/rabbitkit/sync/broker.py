@@ -111,7 +111,14 @@ class SyncBroker:
             di_resolver=di_resolver,
             context_repo=context_repo,
             reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
+            manual_settle_on_error=self._config.consumer.manual_settle_on_error,
         )
+        if self._config.consumer.processing_timeout is not None:
+            logger.warning(
+                "ConsumerConfig.processing_timeout=%s is not enforced by SyncBroker (a running "
+                "thread cannot be interrupted); use TimeoutMiddleware for sync handlers.",
+                self._config.consumer.processing_timeout,
+            )
 
         self._transport: SyncTransport | None = None
         self._worker_pool: SyncWorkerPool | None = None

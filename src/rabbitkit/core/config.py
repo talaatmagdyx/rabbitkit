@@ -355,22 +355,51 @@ class PublisherConfig:
 
 @dataclass(frozen=True, slots=True)
 class ConsumerConfig:
-    """Consumer behavior tuning."""
+    """Consumer behavior tuning.
+
+    Attributes:
+        prefetch_count: AMQP QoS per consumer channel. On the async broker
+            this is also the handler concurrency per queue unless a
+            ``WorkerConfig(worker_count >= 2)`` pool is used.
+        graceful_timeout: shutdown drain budget in seconds (``stop()``).
+        reject_transient_on_redelivery: bound the transient-failure loop on
+            routes without retry (default True). A transient error
+            (``TimeoutError``, ``OSError``, ``HandlerTimeoutError``, ...) on
+            a first delivery is nack-requeued once; the same error on a
+            message the broker has already redelivered
+            (``redelivered=True``) is dead-lettered instead of requeued
+            again. This is a 2-strike cap on the broker's ``redelivered``
+            flag, the only per-message redelivery signal classic queues
+            carry. It also counts a redelivery caused by a crash or a lost
+            connection, so one transient failure after a reconnect goes to
+            the DLQ. For more attempts or delays use ``RetryConfig`` (delay
+            queues). ``False`` restores the previous behaviour: transient
+            errors requeue immediately with no cap, which hot-loops a
+            poison message (thousands of handler runs per second).
+        manual_settle_on_error: under ``AckPolicy.MANUAL``, a handler that
+            raises WITHOUT settling its message gets the same failure
+            settlement as ``AUTO`` (transient: requeue, bounded as above;
+            permanent: dead-letter), logged with the action taken (default
+            True). Without it the delivery stayed unacked until the channel
+            closed, holding a prefetch slot; ``prefetch`` such failures
+            stalled the consumer. Set False only if the handler settles
+            through something other than ``RabbitMessage`` (a raw channel or
+            a coalescing acker) and then re-raises: the pipeline cannot see
+            that settlement and would settle the delivery a second time.
+        processing_timeout: per-delivery handler deadline in seconds,
+            async broker only (``None`` = off, the default). On expiry the
+            handler task is cancelled and ``HandlerTimeoutError``
+            (``outcome_unknown=True``, transient) goes through the normal
+            failure settlement. The sync broker ignores it (Python cannot
+            interrupt a thread) and logs a warning; use
+            ``TimeoutMiddleware`` there.
+    """
 
     prefetch_count: int = 10
     graceful_timeout: float = 30.0
-    # M6: bound the transient hot-loop on retry-less AUTO routes. By default
-    # (False), a transient error nack-requeues with no cap — legitimate
-    # "wait for the downstream to recover" behavior, but a footgun when the
-    # failure is really permanent. When True, a transient error on a message
-    # the broker has ALREADY redelivered (redelivered=True) is rejected to the
-    # DLQ instead of requeued again — a 2-strike cap using the broker's
-    # redelivered flag (the only per-message redelivery signal available
-    # without republishing; classic-queue requeues can't carry a count). For
-    # a higher cap or delays, use retry (delay ladder) or a quorum source
-    # queue with x-delivery-limit. Requires a dead-letter path — the default
-    # reject_without_dlx="auto_provision" (C3) gives AUTO routes one.
-    reject_transient_on_redelivery: bool = False
+    reject_transient_on_redelivery: bool = True
+    manual_settle_on_error: bool = True
+    processing_timeout: float | None = None
 
     def __post_init__(self) -> None:
         # Architect review M1: prefetch_count=0 means AMQP "unlimited" — a
@@ -386,6 +415,10 @@ class ConsumerConfig:
         if self.graceful_timeout <= 0:
             raise ConfigValidationError(
                 f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}"
+            )
+        if self.processing_timeout is not None and self.processing_timeout <= 0:
+            raise ConfigValidationError(
+                f"ConsumerConfig.processing_timeout must be > 0 or None, got {self.processing_timeout}"
             )
 
 
@@ -644,6 +677,13 @@ class MetricsConfig:
     @property
     def messages_dead_lettered_total(self) -> str:
         return f"{self.namespace}_messages_dead_lettered_total"
+
+    @property
+    def settlement_outcome_unknown_total(self) -> str:
+        """Incremented (labeled by ``queue``) when a handler succeeded but its
+        ack raised: the ack may or may not have reached the broker, so the
+        message may be redelivered and processed again."""
+        return f"{self.namespace}_settlement_outcome_unknown_total"
 
     @property
     def dedup_fallback_total(self) -> str:
@@ -1118,6 +1158,19 @@ class WorkerConfig:
     """Consumer concurrency configuration.
 
     Accepted by broker.start(), NOT part of RabbitConfig. Added in 0.2.0.
+
+    Concurrency semantics, per queue:
+
+    * ``worker_count >= 2``: a worker pool of that size runs the handlers;
+      prefetch is ``worker_count * prefetch_per_worker`` when
+      ``prefetch_per_worker`` is set.
+    * ``worker_count == 1`` (the default) creates NO pool, and
+      ``prefetch_per_worker`` is ignored. On the **async** broker every
+      delivery then runs as its own task, so up to ``prefetch_count``
+      handlers of one queue run concurrently -- ``worker_count=1`` does
+      **not** serialize async handlers. Use ``prefetch_count=1`` (or a
+      lock in the handler) for one-at-a-time processing. On the **sync**
+      broker handlers run inline on the I/O thread, one at a time.
 
     ``stop_timeout`` (H12): a FALLBACK drain deadline for the worker pool's
     ``stop()`` — consulted only when no explicit timeout is passed. On the

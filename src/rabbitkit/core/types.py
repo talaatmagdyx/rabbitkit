@@ -474,11 +474,20 @@ class MessageEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class ClassifiedError:
-    """Result of error classification."""
+    """Result of error classification.
+
+    ``outcome_unknown`` is True when the failure does not say whether the
+    handler's side effects happened -- a processing deadline expired
+    (:class:`~rabbitkit.core.errors.HandlerTimeoutError`) while the work may
+    have been half done or fully done. Such a failure is still ``TRANSIENT``
+    (it is worth retrying), but a redelivery runs the handler again on top of
+    whatever the first attempt did, so the handler must be idempotent.
+    """
 
     severity: ErrorSeverity
     original: BaseException
     reason: str
+    outcome_unknown: bool = False
 
 
 @runtime_checkable

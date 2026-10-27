@@ -408,8 +408,8 @@ Settlement is a decision, not a side effect hidden in a callback.
 
 | Policy | Behavior | Use case |
 |---|---|---|
-| `AUTO` | Ack on success, retry/reject on failure | Most consumers |
-| `MANUAL` | Handler owns ack/nack/reject | Custom settlement flows |
+| `AUTO` | Ack on success, retry/reject on failure (without retry: a transient failure is requeued once, then dead-lettered) | Most consumers |
+| `MANUAL` | Handler owns ack/nack/reject; if it raises without settling, the `AUTO` failure settlement applies | Custom settlement flows |
 | `NACK_ON_ERROR` | Ack on success, nack on failure | Never silently accept failed work |
 | `ACK_FIRST` | Ack before the handler runs | At-most-once workloads |
 

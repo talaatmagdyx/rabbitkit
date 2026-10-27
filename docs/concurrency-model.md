@@ -23,7 +23,7 @@ them from.
 | `SyncBatchPublisher.publish()` | dedicated `SelectConnection` I/O thread inside | **any thread** (this is its purpose) |
 | Startup/shutdown hooks (sync, with timeout) | a fresh single-worker executor thread per hook | n/a |
 | `AsyncBroker` — everything | one asyncio event loop | that loop only |
-| Async handlers | tasks on the broker's loop | n/a |
+| Async handlers | tasks on the broker's loop — up to `prefetch_count` per queue run concurrently unless `worker_count >= 2` (then the pool size bounds them); `worker_count=1` does **not** serialize them | n/a |
 | Large-body decode (≥ 256 KiB, async) | `asyncio.to_thread` worker | internal |
 | `HealthWatcher` | its own daemon poller thread | constructed anywhere; `stop()` from anywhere |
 | `AsyncHealthWatcher` | an asyncio task on the broker's loop | that loop |

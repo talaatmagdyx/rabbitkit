@@ -48,10 +48,10 @@ Read these first. They are the non-obvious facts that determine whether your ret
    so the pipeline rejects them with `requeue=False` → the source queue's
    DLX → the DLQ — under `AUTO` as well as `NACK_ON_ERROR`. The historical
    claim that AUTO hot-loops exhausted-transient failures is stale; the
-   terminal marker closed it. What remains true: on **retry-less** routes,
-   AUTO nack-requeues transient failures indefinitely by design (opt into
-   `ConsumerConfig(reject_transient_on_redelivery=True)` for a 2-strike
-   cap). Classification is TYPE-based (§7): custom transient errors must
+   terminal marker closed it. On **retry-less** routes a transient
+   failure is requeued once and dead-lettered if the redelivery fails too
+   (`ConsumerConfig(reject_transient_on_redelivery=True)` is the default;
+   set it False for the old unbounded requeue). Classification is TYPE-based (§7): custom transient errors must
    subclass `OSError`/`TimeoutError`, or register a predicate — unknown
    errors default to PERMANENT and skip retries.
 

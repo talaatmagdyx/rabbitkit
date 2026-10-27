@@ -129,7 +129,7 @@ async def handle_order(msg: RabbitMessage) -> None:
         await msg.reject(requeue=False)
 ```
 
-With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your handler returns. Settlement is entirely your responsibility.
+With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your handler *returns*. If the handler *raises* without having settled the message, RabbitKit applies the `AUTO` failure settlement (transient: requeue once, then DLQ; permanent: DLQ) and logs it, so a failing handler cannot pin prefetch slots and stall the consumer. Opt out with `ConsumerConfig(manual_settle_on_error=False)` if you settle outside `RabbitMessage` and re-raise (see [Acknowledgement Policies](ack-policy.md#manual)).
 
 ---
 
@@ -140,9 +140,14 @@ With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your h
 | Handler succeeds | Message acked after handler returns |
 | Handler raises, retry published, broker confirms | Original acked; retry message in broker |
 | Handler raises, retry publish fails | Original not acked; requeued or redelivered |
-| Handler raises, max retries exceeded | Message published to DLQ, original acked only after DLQ confirm |
+| Handler raises, max retries exceeded | Original rejected into the source queue's dead-letter path (the DLQ) — only after the DLQ was verified to exist (async broker) |
+| Dead-letter target missing (async broker) | Not rejected: requeued after a backoff, ERROR logged; never dropped |
+| Transient failure, no retry | Requeued once; dead-lettered if the redelivery fails too (default) |
+| Handler succeeds but the ack write fails | Outcome unknown: logged and counted, nothing else sent; redelivered if the broker never got the ack |
 | Manual ack: handler calls `msg.ack()` | Message acked at that point, no earlier |
 | Manual ack: handler returns without acking | Message remains unacked; redelivered when channel closes |
+| Manual ack: handler raises without settling | `AUTO` failure settlement (requeue once / DLQ), logged |
+| `stop()` with a handler past `graceful_timeout` | Handler cancelled; nacked for redelivery; abandoned after 1 s more if it ignores cancellation, so `stop()` stays bounded |
 | Connection drops mid-processing | Broker redelivers; duplicate delivery is possible and expected |
 | Publisher confirms disabled (unsupported path) | Not supported for retry/DLQ paths; confirms are always required |
 | `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED`; `.ok` is `False` — never reported as `CONFIRMED` |

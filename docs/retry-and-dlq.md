@@ -50,6 +50,32 @@ Retry-enabled routes and queues with a manually configured `dead_letter_exchange
 
 **Upgrading an existing deployment:** auto-provisioning adds `x-dead-letter-exchange`/`x-dead-letter-routing-key` to the source queue's declare arguments. RabbitMQ rejects re-declaring an existing queue with different arguments (406 `PRECONDITION_FAILED` → a clear `ConfigurationError` at startup). Either delete/re-create the queue, apply the matching arguments via a policy on the broker, switch that route to `reject_without_dlx="discard"`/`"error"`, run with `TopologyMode.PASSIVE_ONLY`, or set `SafetyConfig(on_topology_conflict="warn_continue")` — which warns and continues using the *existing* queue definition for just the conflicting queues while still declaring the rest (unlike `PASSIVE_ONLY`, which skips declaration entirely).
 
+### A missing DLQ never swallows a message
+
+The dead-letter path only protects a message if the DLQ exists when the
+message is rejected. A classic queue (and a quorum queue without
+`dead-letter-strategy: at-least-once`) dead-letters at most once: if the
+target queue is gone, RabbitMQ drops the message and nobody is told.
+Measured on 3.13 and 4.1: a permanent failure after the auto-provisioned
+`{queue}.dlq` was deleted lost the message on both queue types.
+
+The async broker therefore checks that the DLQ exists before it
+dead-letters anything (handler failures, retry-exhausted messages,
+`RejectMessage(requeue=False)`, `NackMessage(requeue=False)`,
+`NACK_ON_ERROR`). If it is missing, the message is requeued instead, after
+a backoff that starts at 0.5 s and doubles to 5 s while the DLQ stays
+missing, and an ERROR is logged once per 10 s window
+(`HandlerPipeline.dead_letter_blocked_total` counts them). The message
+survives until an operator restores the DLQ; restarting the service with
+`TopologyMode.AUTO_DECLARE` recreates it.
+
+Limits: the check covers dead-letter targets reached through the default
+exchange (`x-dead-letter-exchange: ""` with the DLQ name as the routing
+key), which is what the retry and `auto_provision` paths declare. A
+dead-letter *exchange* with its own bindings is not verified. A positive
+check is cached for 5 s, so a DLQ deleted inside that window can still drop
+a message. The sync broker does not run the check yet.
+
 ---
 
 ## Full Topology Example

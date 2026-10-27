@@ -244,8 +244,20 @@ class TestClientProperties:
 
 
 class TestConsumerConfigM6:
-    def test_reject_transient_on_redelivery_default_off(self) -> None:
-        assert ConsumerConfig().reject_transient_on_redelivery is False
+    def test_reject_transient_on_redelivery_default_on(self) -> None:
+        """F15: the transient-failure loop is bounded by default."""
+        assert ConsumerConfig().reject_transient_on_redelivery is True
+
+    def test_manual_settle_on_error_default_on(self) -> None:
+        assert ConsumerConfig().manual_settle_on_error is True
+
+    def test_processing_timeout_default_off(self) -> None:
+        assert ConsumerConfig().processing_timeout is None
+
+    @pytest.mark.parametrize("value", [0, -1.0])
+    def test_processing_timeout_must_be_positive(self, value: float) -> None:
+        with pytest.raises(ValueError, match="processing_timeout"):
+            ConsumerConfig(processing_timeout=value)
 
 
 class TestCredentialsProvider:

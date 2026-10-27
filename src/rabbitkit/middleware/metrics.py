@@ -287,6 +287,13 @@ class MetricsMiddleware(BaseMiddleware):
             return  # pragma: no cover - defensive, disposition is always one of the three
         self._collector.inc_counter(name, {"queue": _queue_label(message)})
 
+    def record_settlement_outcome_unknown(self, message: RabbitMessage) -> None:
+        """Count an ack that raised after the handler succeeded: the broker
+        may or may not have received it (labelled by ``queue``)."""
+        if self._collector is None:
+            return
+        self._collector.inc_counter(self._cfg.settlement_outcome_unknown_total, {"queue": _queue_label(message)})
+
     # ── Consume-side ──────────────────────────────────────────────────
 
     def consume_scope(

@@ -2135,8 +2135,14 @@ class TestRejectTransientOnRedeliveryWiring:
         broker = SyncBroker(RabbitConfig(consumer=ConsumerConfig(reject_transient_on_redelivery=True)))
         assert broker._pipeline._reject_transient_on_redelivery is True
 
-    def test_default_off(self) -> None:
-        assert SyncBroker()._pipeline._reject_transient_on_redelivery is False
+    def test_default_on(self) -> None:
+        assert SyncBroker()._pipeline._reject_transient_on_redelivery is True
+
+    def test_manual_settle_on_error_threaded_to_pipeline(self) -> None:
+        from rabbitkit.core.config import ConsumerConfig
+
+        broker = SyncBroker(RabbitConfig(consumer=ConsumerConfig(manual_settle_on_error=False)))
+        assert broker._pipeline._manual_settle_on_error is False
 
 
 class TestPublishSizeGuard:

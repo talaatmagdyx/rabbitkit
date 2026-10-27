@@ -133,6 +133,36 @@ class TestTimeoutMiddlewareAsync:
         with pytest.raises(HandlerTimeoutError) as exc_info:
             await mw.consume_scope_async(slow, msg)
         assert exc_info.value.timeout_seconds == 0.1
+        assert exc_info.value.outcome_unknown is True
+
+    @pytest.mark.asyncio
+    async def test_handlers_own_timeout_error_is_not_relabelled(self) -> None:
+        """F14: only the middleware's deadline is a HandlerTimeoutError."""
+        mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=5.0))
+        msg = _make_message()
+
+        async def client_timeout(m: RabbitMessage) -> None:
+            raise TimeoutError("upstream HTTP timeout")
+
+        with pytest.raises(TimeoutError, match="upstream HTTP timeout") as exc_info:
+            await mw.consume_scope_async(client_timeout, msg)
+        assert not isinstance(exc_info.value, HandlerTimeoutError)
+
+    def test_sync_handlers_own_timeout_error_is_not_relabelled(self) -> None:
+        mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=5.0))
+        msg = _make_message()
+
+        def client_timeout(m: RabbitMessage) -> None:
+            raise TimeoutError("upstream")
+
+        with pytest.raises(TimeoutError) as exc_info:
+            mw.consume_scope(client_timeout, msg)
+        assert not isinstance(exc_info.value, HandlerTimeoutError)
+
+    def test_handler_timeout_error_is_the_core_class(self) -> None:
+        from rabbitkit.core.errors import HandlerTimeoutError as CoreHandlerTimeoutError
+
+        assert HandlerTimeoutError is CoreHandlerTimeoutError
 
 
 # ── sync abandon observability + on_timeout (M-S4) ──────────────────────

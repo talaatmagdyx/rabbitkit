@@ -51,6 +51,36 @@ class MissingDependencyError(Exception):
         self.param_name = param_name
 
 
+# ── Handler deadline (CONSUMER-006) ─────────────────────────────────────
+
+
+class HandlerTimeoutError(TimeoutError):
+    """A handler exceeded its processing deadline and was abandoned.
+
+    Raised ONLY by a deadline rabbitkit enforces itself
+    (``ConsumerConfig.processing_timeout`` or
+    :class:`~rabbitkit.middleware.timeout.TimeoutMiddleware`). A
+    ``TimeoutError`` raised by the handler's own code (an HTTP client
+    timeout, say) is NOT relabelled as this: it stays an ordinary transient
+    error.
+
+    The outcome is unknown: the handler was cancelled (async) or abandoned
+    (sync) part-way, so some, all, or none of its side effects may have
+    happened. ``outcome_unknown`` is True on every instance and
+    :func:`classify_error` copies it to :attr:`ClassifiedError.outcome_unknown`
+    and the reason string. It is classified ``TRANSIENT`` (retrying is
+    reasonable) -- which is only safe for idempotent handlers.
+    """
+
+    outcome_unknown: bool = True
+
+    def __init__(self, timeout_seconds: float) -> None:
+        super().__init__(
+            f"Handler exceeded timeout of {timeout_seconds}s; outcome unknown (side effects may have happened)"
+        )
+        self.timeout_seconds = timeout_seconds
+
+
 # Generic (stdlib) error categories — transport layers extend these
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     TimeoutError,
@@ -107,7 +137,30 @@ def classify_error(
 
     Returns:
         ClassifiedError with severity, original exception, and reason.
+        ``outcome_unknown`` is set when *exc* carries a truthy
+        ``outcome_unknown`` attribute (:class:`HandlerTimeoutError` does).
     """
+    classified = _classify(
+        exc, predicates=predicates, transient=transient, permanent=permanent, unknown_policy=unknown_policy
+    )
+    if getattr(exc, "outcome_unknown", False) is True:
+        return ClassifiedError(
+            severity=classified.severity,
+            original=exc,
+            reason=f"{classified.reason}; outcome unknown (side effects may have happened)",
+            outcome_unknown=True,
+        )
+    return classified
+
+
+def _classify(
+    exc: BaseException,
+    *,
+    predicates: Sequence[ErrorPredicate],
+    transient: tuple[type[BaseException], ...],
+    permanent: tuple[type[BaseException], ...],
+    unknown_policy: ErrorSeverity,
+) -> ClassifiedError:
     # 1. User predicates (first non-None wins)
     for predicate in predicates:
         result = predicate(exc)

@@ -7,7 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (behaviour)
+
+- **Transient failures on routes without retry are bounded by default.**
+  `ConsumerConfig.reject_transient_on_redelivery` now defaults to `True`: a
+  transient error (`TimeoutError`, `OSError`, `EOFError`,
+  `HandlerTimeoutError`) on a first delivery is nack-requeued once, and the
+  same failure on a message the broker has already redelivered is
+  dead-lettered. Previously transient errors were requeued immediately and
+  forever. Measured against a local broker with a handler that always
+  raises `TimeoutError`: 4,111 to 6,049 handler runs in 3 s on classic
+  queues (3.13 and 4.1), 1,936 on a 3.13 quorum queue, and the message never
+  reached the DLQ. Now: 2 runs, message in the DLQ. Rationale: an infinite
+  immediate requeue loop burns CPU, floods logs and starves other messages
+  (INV-007); the DLQ keeps the message for inspection and replay. The
+  `redelivered` flag is the only per-message signal a classic queue
+  carries, so the cap is two attempts, and a redelivery caused by a crash
+  or reconnect counts as the first. Use `RetryConfig` for more attempts
+  with delays. Opt out with `ConsumerConfig(reject_transient_on_redelivery=False)`.
+- **`AckPolicy.MANUAL`: a handler that raises without settling is now
+  settled** with the `AUTO` failure policy (transient: requeue once, then
+  DLQ; permanent: DLQ) and logged. Previously the delivery stayed unacked
+  until the channel closed and held a prefetch slot: with `prefetch=2`, two
+  failures stalled the consumer for good (reproduced on a real broker). A
+  handler that settled before raising is not settled again. New
+  `ConsumerConfig.manual_settle_on_error` (default `True`); set it `False`
+  if the handler settles outside `RabbitMessage` (raw channel, coalescing
+  acker) and then re-raises, which would otherwise double-settle.
+- **A failing ack after a successful handler is reported as "outcome
+  unknown", not as a handler failure.** It used to go down the
+  handler-failure path, which then tried to reject a message that had been
+  processed. Now it is logged ("Ack outcome unknown ... the handler must be
+  idempotent"), counted in `HandlerPipeline.ack_outcome_unknown_total` and,
+  with a `MetricsMiddleware` on the route, in
+  `<namespace>_settlement_outcome_unknown_total`
+  (`MetricsConfig.settlement_outcome_unknown_total`), and nothing else is
+  sent for that delivery (§11.3).
+
+### Added
+
+- **`ConsumerConfig.processing_timeout`** (default `None`, off): a
+  per-delivery handler deadline on the async broker. On expiry the handler
+  task is cancelled and `HandlerTimeoutError` goes through the normal failure
+  settlement. The sync broker ignores it and logs a warning (use
+  `TimeoutMiddleware`).
+- **`HandlerTimeoutError` marks an unknown outcome.** It moved to
+  `rabbitkit.core.errors` (re-exported from `rabbitkit.middleware.timeout`
+  and now from the package root), carries `outcome_unknown = True`, and
+  `classify_error` copies that to the new `ClassifiedError.outcome_unknown`
+  field and the reason string, so logs and classifiers can tell "timed out,
+  side effects unknown" apart from an ordinary transient failure. It is
+  still `TRANSIENT`.
+- Every handler failure now logs one structured line (queue, message id,
+  correlation id, delivery tag, `redelivered`, exception class, reason,
+  `outcome_unknown`, action taken). No body, headers or exception text; the
+  traceback is at DEBUG. Repeats are collapsed to one line per queue, error
+  class and action per 10 s window, with a count. Previously a failure that
+  was dead-lettered under `AUTO` produced no log line at all.
+
 ### Fixed
+
+- **A rejected message was silently lost when the DLQ was missing.** Classic
+  queues, and quorum queues without the at-least-once dead-letter strategy,
+  dead-letter at most once: rejecting into a missing DLQ drops the message.
+  Reproduced on 3.13 and 4.1 with the default topology after deleting the
+  auto-provisioned `{queue}.dlq` (classic and quorum), and with retry after
+  exhaustion. The async broker now verifies that the DLQ exists (passive
+  declare on a throwaway channel, positive answers cached 5 s) before any
+  dead-lettering settlement: handler failures, retry-terminal failures,
+  `NACK_ON_ERROR`, `RejectMessage(requeue=False)` and
+  `NackMessage(requeue=False)`. If it is missing, the message is requeued
+  after a backoff (0.5 s doubling to 5 s) and an ERROR is logged; it
+  survives until the DLQ is restored. Covers dead-letter targets reached
+  through the default exchange (what rabbitkit declares); a custom
+  dead-letter exchange is not verified. Not yet on the sync broker.
+- **`TimeoutMiddleware` relabelled the handler's own `TimeoutError` as a
+  handler timeout** (`asyncio.wait_for` cannot tell them apart). Only the
+  middleware's deadline raises `HandlerTimeoutError` now.
+- **`AsyncBroker.stop()` was not bounded** when a handler swallowed
+  `CancelledError`: with `graceful_timeout=1.0` it took 6.01 s, and the
+  message was then acked by the late-finishing handler. The inline drain
+  and `AsyncWorkerPool.stop()` now wait at most 1 s for cancelled handlers
+  to unwind, log the ones that ignored cancellation, and nack their
+  deliveries for redelivery (measured: 2.01 s, message back on the queue).
+
+### Documentation
+
+- `WorkerConfig` documents what `worker_count=1` actually does: no worker
+  pool is created and `prefetch_per_worker` is ignored, so on the async
+  broker up to `prefetch_count` handlers of one queue run concurrently. It
+  does not serialize async handlers. (Sync handlers run inline, one at a
+  time.)
 
 - **A cumulative ack could acknowledge a delivery that was never processed.**
   `SettlementCoordinator` (behind `CoalescingAcker` / `AsyncCoalescingAcker`)

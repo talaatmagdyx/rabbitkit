@@ -5,7 +5,7 @@ than ``TimeoutConfig.timeout_seconds``, a ``HandlerTimeoutError`` is raised.
 
 Implementation strategy
 -----------------------
-* **Async** — ``asyncio.wait_for()`` cancels the coroutine cleanly.
+* **Async** — ``asyncio.timeout()`` cancels the coroutine cleanly.
 * **Sync**  — handler is run in a ``daemon=True`` ``threading.Thread``; the
   calling thread waits ``timeout_seconds`` and raises if the thread is still
   alive.  The background thread continues to its natural end but its result is
@@ -16,6 +16,17 @@ Implementation strategy
 classifier treats it as **TRANSIENT**, so retry middleware (if configured) will
 re-queue the message.  Override the classifier if you want timeouts to go
 straight to the DLQ.
+
+Only the middleware's own deadline raises ``HandlerTimeoutError``. A
+``TimeoutError`` the handler raises itself (a client timeout inside the
+handler) propagates unchanged, as an ordinary transient error. A
+``HandlerTimeoutError`` means *outcome unknown*: the handler was cut off
+part-way, so its side effects may or may not have happened
+(``exc.outcome_unknown`` is True, and ``classify_error`` reports
+``outcome_unknown=True``). Retrying it is only safe for idempotent handlers.
+
+For async brokers, ``ConsumerConfig(processing_timeout=...)`` applies the
+same deadline to every route without this middleware.
 
 Quick start
 -----------
@@ -49,8 +60,9 @@ Combining with retry::
 
 Exception hierarchy
 -------------------
-``HandlerTimeoutError(TimeoutError)``  — carries ``.timeout_seconds`` attribute
-for logging / classification.
+``HandlerTimeoutError(TimeoutError)``  — carries ``.timeout_seconds`` and
+``.outcome_unknown = True`` for logging / classification. Defined in
+``rabbitkit.core.errors`` and re-exported here.
 """
 
 from __future__ import annotations
@@ -62,8 +74,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from rabbitkit.core.errors import HandlerTimeoutError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.middleware.base import BaseMiddleware
+
+__all__ = ["HandlerTimeoutError", "TimeoutConfig", "TimeoutMiddleware"]
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +96,6 @@ class _DiscardedSettlement(BaseException):
     was already settled. Landing back in ``_run()``'s ``except
     BaseException`` — harmless, since the background thread's outcome is
     already discarded by that point (see ``TimeoutMiddleware.consume_scope``)."""
-
-
-class HandlerTimeoutError(TimeoutError):
-    """Raised when a handler exceeds the configured timeout."""
-
-    def __init__(self, timeout_seconds: float) -> None:
-        super().__init__(f"Handler exceeded timeout of {timeout_seconds}s")
-        self.timeout_seconds = timeout_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +116,7 @@ class TimeoutConfig:
 class TimeoutMiddleware(BaseMiddleware):
     """Enforces a maximum processing time per message.
 
-    Async: uses ``asyncio.wait_for()`` — clean cancellation.
+    Async: uses ``asyncio.timeout()`` — clean cancellation.
     Sync: runs ``call_next`` in a daemon ``threading.Thread`` and raises
     ``HandlerTimeoutError`` if the thread is still alive at the deadline.
 
@@ -281,11 +288,18 @@ class TimeoutMiddleware(BaseMiddleware):
         call_next: Any,
         message: RabbitMessage,
     ) -> Any:
-        """Async timeout — uses asyncio.wait_for()."""
+        """Async timeout — uses ``asyncio.timeout()``.
+
+        Only this middleware's deadline becomes ``HandlerTimeoutError``. A
+        ``TimeoutError`` raised by the handler itself before the deadline is
+        re-raised unchanged (``asyncio.wait_for`` could not tell the two
+        apart, so every handler timeout used to be reported as a deadline).
+        """
+        deadline = asyncio.timeout(self._config.timeout_seconds)
         try:
-            return await asyncio.wait_for(
-                call_next(message),
-                timeout=self._config.timeout_seconds,
-            )
+            async with deadline:
+                return await call_next(message)
         except TimeoutError:
-            raise HandlerTimeoutError(self._config.timeout_seconds) from None
+            if deadline.expired():
+                raise HandlerTimeoutError(self._config.timeout_seconds) from None
+            raise

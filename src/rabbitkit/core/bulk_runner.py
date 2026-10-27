@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from typing import Any
@@ -42,6 +43,8 @@ from rabbitkit.core.bulk import (
     new_attempt_id,
 )
 from rabbitkit.core.types import BulkPublishStatus, MessageEnvelope, PublishOutcome
+
+logger = logging.getLogger(__name__)
 
 SyncPublishFn = Callable[[MessageEnvelope], PublishOutcome]
 AsyncPublishFn = Callable[[MessageEnvelope], Awaitable[PublishOutcome]]
@@ -213,6 +216,11 @@ async def iter_publish_async(
     done_q: asyncio.Queue[BulkPublishItem] = asyncio.Queue()
     tasks: set[asyncio.Task[None]] = set()
     inflight: dict[asyncio.Task[None], tuple[int, MessageEnvelope, str, float]] = {}
+    # INV-009 bookkeeping: every submitted index, and every index already
+    # reported. Each input yields exactly one item (duplicates are dropped,
+    # a missing one is synthesized UNKNOWN — see _missing_items).
+    admitted: dict[int, tuple[MessageEnvelope, str, float]] = {}
+    reported: set[int] = set()
 
     def _remaining_to_deadline() -> float | None:
         if deadline is None:
@@ -221,15 +229,23 @@ async def iter_publish_async(
 
     async def _one(index: int, env: MessageEnvelope, attempt_id: str) -> None:
         submitted_at = time.monotonic()
-        inflight[asyncio.current_task()] = (index, env, attempt_id, submitted_at)  # type: ignore[index]
+        task = asyncio.current_task()
+        assert task is not None
+        inflight[task] = (index, env, attempt_id, submitted_at)
+        admitted[index] = (env, attempt_id, submitted_at)
         try:
             try:
                 if options.confirm_timeout is not None:
                     outcome = await asyncio.wait_for(publish_fn(env), timeout=options.confirm_timeout)
                 else:
                     outcome = await publish_fn(env)
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as exc:
+                if task.cancelling():
+                    raise  # really cancelled (deadline / consumer): _abandon_inflight reports it
+                # G-13: the publish raised CancelledError without this task
+                # being cancelled (aio-pika closing a channel under it). It
+                # may have reached the broker: UNKNOWN, never dropped.
+                item = _from_exception(index, env, attempt_id, exc, submitted_at)
             except TimeoutError as exc:
                 item = _from_exception(
                     index, env, attempt_id, exc, submitted_at, reason_override=REASON_CONFIRM_TIMEOUT
@@ -242,8 +258,8 @@ async def iter_publish_async(
                 )
             done_q.put_nowait(item)
         finally:
-            await budget.release(len(env.body))
             sem.release()
+            await budget.release(len(env.body))
 
     def _drain_done() -> list[BulkPublishItem]:
         out: list[BulkPublishItem] = []
@@ -272,10 +288,29 @@ async def iter_publish_async(
                 )
         return items
 
-    def _emit(item: BulkPublishItem) -> BulkPublishItem:
-        if on_item is not None:
-            on_item(item)
-        return item
+    def _fresh(items: Iterable[BulkPublishItem]) -> list[BulkPublishItem]:
+        """Drop items for indexes already reported (a task can finish its
+        publish just as it is abandoned), and run ``on_item`` once each."""
+        out: list[BulkPublishItem] = []
+        for item in items:
+            if item.index in reported:
+                continue
+            reported.add(item.index)
+            if on_item is not None:
+                on_item(item)
+            out.append(item)
+        return out
+
+    def _missing_items() -> list[BulkPublishItem]:
+        """Invariant check: an admitted index nobody reported gets UNKNOWN."""
+        items: list[BulkPublishItem] = []
+        for index, (env, attempt_id, submitted_at) in sorted(admitted.items()):
+            if index in reported:
+                continue
+            logger.error("Bulk publish invariant violated: item %d produced no outcome; reporting UNKNOWN", index)
+            item = _from_outcome(index, env, attempt_id, None, submitted_at)
+            items.append(item)
+        return items
 
     # Normalise sync/async input into one async iterator.
     async def _aiter() -> AsyncGenerator[Any, None]:
@@ -304,16 +339,16 @@ async def iter_publish_async(
 
             env, invalid = preparer.prepare(index, raw)
             if invalid is not None:
-                yield _emit(invalid)
+                for it in _fresh([invalid, *_drain_done()]):
+                    yield it
                 index += 1
-                for it in _drain_done():
-                    yield _emit(it)
                 continue
             assert env is not None
 
             if deadline_hit or (deadline is not None and loop.time() >= deadline):
                 deadline_hit = True
-                yield _emit(_not_sent(index, env, REASON_OVERALL_TIMEOUT))
+                for it in _fresh([_not_sent(index, env, REASON_OVERALL_TIMEOUT)]):
+                    yield it
                 index += 1
                 continue
 
@@ -326,10 +361,9 @@ async def iter_publish_async(
                 await asyncio.wait_for(sem.acquire(), timeout=wait)
             except TimeoutError:
                 reason = REASON_OVERALL_TIMEOUT if (rem is not None and wait == rem) else REASON_ADMISSION_TIMEOUT
-                yield _emit(_not_sent(index, env, reason))
+                for it in _fresh([_not_sent(index, env, reason), *_drain_done()]):
+                    yield it
                 index += 1
-                for it in _drain_done():
-                    yield _emit(it)
                 continue
             # ── admission: byte budget ──
             wait = options.admission_timeout
@@ -339,10 +373,9 @@ async def iter_publish_async(
             if not await budget.acquire(len(env.body), timeout=wait):
                 sem.release()
                 reason = REASON_OVERALL_TIMEOUT if (rem is not None and wait == rem) else REASON_ADMISSION_TIMEOUT
-                yield _emit(_not_sent(index, env, reason))
+                for it in _fresh([_not_sent(index, env, reason), *_drain_done()]):
+                    yield it
                 index += 1
-                for it in _drain_done():
-                    yield _emit(it)
                 continue
 
             attempt_id = new_attempt_id()
@@ -350,8 +383,8 @@ async def iter_publish_async(
             tasks.add(task)
             task.add_done_callback(tasks.discard)
             index += 1
-            for it in _drain_done():
-                yield _emit(it)
+            for it in _fresh(_drain_done()):
+                yield it
 
         # ── drain phase ──
         if tasks:
@@ -360,13 +393,14 @@ async def iter_publish_async(
             pending = [t for t in tasks if not t.done()]
             if pending:
                 await asyncio.wait(pending, timeout=timeout)
-        for it in _drain_done():
-            yield _emit(it)
+        for it in _fresh(_drain_done()):
+            yield it
         if any(not t.done() for t in tasks):
-            for it in await _abandon_inflight(REASON_OVERALL_TIMEOUT):
-                yield _emit(it)
-            for it in _drain_done():
-                yield _emit(it)
+            abandoned = await _abandon_inflight(REASON_OVERALL_TIMEOUT)
+            for it in _fresh([*_drain_done(), *abandoned]):  # a real outcome beats the abandon
+                yield it
+        for it in _fresh([*_drain_done(), *_missing_items()]):
+            yield it
         if input_error is not None:
             # Accounting is complete for everything admitted; now surface
             # the caller's own iterator failure.
@@ -374,12 +408,9 @@ async def iter_publish_async(
     except asyncio.CancelledError:
         # Consumer cancelled us: stop admitting, classify in-flight UNKNOWN
         # via on_item (we cannot yield from a cancelled generator).
-        for it in await _abandon_inflight(REASON_CANCELLED):
-            if on_item is not None:
-                on_item(it)
-        for it in _drain_done():
-            if on_item is not None:
-                on_item(it)
+        abandoned = await _abandon_inflight(REASON_CANCELLED)
+        _fresh([*_drain_done(), *abandoned])
+        _fresh([*_drain_done(), *_missing_items()])
         raise
     finally:
         with contextlib.suppress(BaseException):

@@ -52,6 +52,7 @@ from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     QueueType,
     ReliabilityProfile,
@@ -597,6 +598,7 @@ class SyncBroker:
         content_type: str = "application/json",
         correlation_id: str | None = None,
         reply_to: str | None = None,
+        message_id: str | None = None,
     ) -> PublishOutcome:
         """Publish a message.
 
@@ -632,7 +634,13 @@ class SyncBroker:
         BlockingConnection serializes confirms, it cannot pipeline them. To
         drain a large backlog fast, use AsyncBroker + AsyncBatchPublisher
         (pipelined confirms, ~6.1k msg/s) or more processes.
+
+        ``message_id`` (kwargs form only) sets the AMQP message id instead of
+        a fresh uuid4, so the same logical message can be republished after
+        an unknown outcome and deduplicated downstream.
         """
+        if envelope is not None and message_id is not None:
+            raise ValueError("message_id applies to the kwargs form; set MessageEnvelope.message_id instead")
         if envelope is None:
             import json as _json
 
@@ -657,6 +665,8 @@ class SyncBroker:
                 mandatory=self._config.publisher.mandatory,
                 delivery_mode=2 if self._config.publisher.persistent else 1,
             )
+            if message_id is not None:
+                envelope = replace(envelope, message_id=message_id)
 
         # M10: reject oversized bodies at publish time (input validation at
         # the trust boundary — a too-large message is a programming/policy
@@ -680,10 +690,11 @@ class SyncBroker:
                 if not fc.acquire():
                     # Dropped by backpressure policy (drop/timeout). Do not publish.
                     return PublishOutcome(
-                        status=PublishStatus.ERROR,
+                        status=PublishStatus.NOT_SENT,
                         exchange=env.exchange,
                         routing_key=env.routing_key,
                         error=BackpressureError("publish dropped by backpressure policy"),
+                        reason=PublishReason.BACKPRESSURE_DROPPED,
                     )
                 try:
                     return transport.publish(env)
@@ -896,8 +907,9 @@ class SyncBroker:
         the existing safe nack+requeue-on-publish-failure behavior both paths
         already implement. So regardless of the configured policy, a
         blocked/dropped slot here always resolves as a failed
-        ``PublishOutcome`` (status=ERROR), never an exception — the same
-        outcome shape a real transport failure already produces.
+        ``PublishOutcome`` (status=NOT_SENT, reason ``backpressure_dropped``),
+        never an exception — the same outcome shape a real transport failure
+        already produces.
         """
         if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
             raise BrokerNotStartedError("Broker not started. Call start() first.")
@@ -909,14 +921,19 @@ class SyncBroker:
             acquired = fc.acquire()
         except BackpressureError as exc:
             return PublishOutcome(
-                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
+                status=PublishStatus.NOT_SENT,
+                exchange=env.exchange,
+                routing_key=env.routing_key,
+                error=exc,
+                reason=PublishReason.BACKPRESSURE_DROPPED,
             )
         if not acquired:
             return PublishOutcome(
-                status=PublishStatus.ERROR,
+                status=PublishStatus.NOT_SENT,
                 exchange=env.exchange,
                 routing_key=env.routing_key,
                 error=BackpressureError("publish dropped by backpressure policy"),
+                reason=PublishReason.BACKPRESSURE_DROPPED,
             )
         try:
             return transport.publish(env)

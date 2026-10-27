@@ -1626,13 +1626,13 @@ class TestBatchPublisherAutoCap:
         captured: list[Any] = []
 
         class CapturingPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 captured.append(cfg)
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -1660,13 +1660,13 @@ class TestBatchPublisherAutoCap:
         )
 
         class NoOpPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 pass
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -1700,13 +1700,13 @@ class TestBatchPublisherAutoCap:
         )
 
         class NoOpPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 pass
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -2117,7 +2117,7 @@ class TestAsyncPublishWithFlowController:
 
     @pytest.mark.asyncio
     async def test_publish_dropped_by_backpressure(self) -> None:
-        """fc.acquire_async() returns False → publish returns ERROR outcome."""
+        """fc.acquire_async() returns False → NOT_SENT (backpressure_dropped): it never left the client."""
         from rabbitkit.core.config import BackpressureConfig
         from rabbitkit.highload.backpressure import FlowController
 
@@ -2128,7 +2128,8 @@ class TestAsyncPublishWithFlowController:
 
         envelope = MessageEnvelope(routing_key="rk", body=b"test")
         outcome = await broker.publish(envelope)
-        assert outcome.status == PublishStatus.ERROR
+        assert outcome.status == PublishStatus.NOT_SENT
+        assert outcome.reason == "backpressure_dropped"
 
     @pytest.mark.asyncio
     async def test_publish_succeeds_with_flow_controller(self) -> None:

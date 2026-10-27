@@ -688,51 +688,39 @@ class TestAsyncChannelPoolExhausted:
         assert pool.size <= 1
 
     @pytest.mark.asyncio
-    async def test_release_discards_when_channel_closed_and_close_raises(self) -> None:
-        """release() handles exception when closing a discarded closed channel."""
+    async def test_release_of_a_foreign_closed_channel_changes_nothing(self) -> None:
+        """G-05: a channel this pool does not own (stale, from a replaced
+        pool) must never decrement this pool's counter."""
         mock_conn = AsyncMock()
         mock_channel = AsyncMock()
-        mock_channel.is_closed = True  # channel is already closed
+        mock_channel.is_closed = True
         mock_channel.close = AsyncMock(side_effect=RuntimeError("already closed"))
-        mock_conn.channel = AsyncMock(return_value=mock_channel)
-
         pool = AsyncChannelPool(mock_conn, pool_size=5)
-
-        # Manually set _created so decrement makes sense
         pool._created = 1
 
-        # Should not raise even when channel.close() raises
         await pool.release(mock_channel)
-        assert pool.created_count == 0  # decremented
+
+        assert pool.created_count == 1
+        mock_channel.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_release_discards_open_channel_when_close_raises(self) -> None:
-        """release() swallows exception when channel is open but close() raises (lines 93-94)."""
+    async def test_release_of_a_foreign_open_channel_closes_it_without_counting(self) -> None:
         mock_conn = AsyncMock()
-        mock_channel = AsyncMock()
-        # Channel appears open (not closed), but close() raises
-        mock_channel.is_closed = False
-        mock_channel.close = AsyncMock(side_effect=RuntimeError("close failed"))
-        mock_conn.channel = AsyncMock(return_value=mock_channel)
-
+        owned = AsyncMock()
+        owned.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=owned)
         pool = AsyncChannelPool(mock_conn, pool_size=1)
+        await pool.acquire()
 
-        # Acquire the only channel to set _created = 1
-        ch = await pool.acquire()
-        # Fill the pool queue to capacity so put_nowait raises QueueFull
-        pool._pool.put_nowait(ch)
-        # Reset pool._created so the decrement makes sense
-        pool._created = 2
+        foreign = AsyncMock()
+        foreign.is_closed = False
+        foreign.close = AsyncMock(side_effect=RuntimeError("close error"))
+        await pool.release(foreign)
+        await asyncio.sleep(0)  # let the background close run
 
-        # Now release another open channel — queue is full, so it tries to close it,
-        # but close() raises. Should be silently swallowed.
-        another_open_channel = AsyncMock()
-        another_open_channel.is_closed = False
-        another_open_channel.close = AsyncMock(side_effect=RuntimeError("close error"))
-
-        # Should not raise
-        await pool.release(another_open_channel)
-        assert pool.created_count == 1  # decremented from 2
+        assert pool.created_count == 1
+        assert pool.in_use_count == 1
+        foreign.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_close_all_handles_exception_in_channel_close(self) -> None:

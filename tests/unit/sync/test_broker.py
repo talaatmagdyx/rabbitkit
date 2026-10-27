@@ -1774,7 +1774,7 @@ class TestPublishWithFlowController:
         return broker
 
     def test_publish_dropped_by_backpressure(self) -> None:
-        """fc.acquire() returns False → publish returns ERROR outcome."""
+        """fc.acquire() returns False → NOT_SENT (backpressure_dropped)."""
         from rabbitkit.core.config import BackpressureConfig
         from rabbitkit.core.types import PublishStatus
         from rabbitkit.highload.backpressure import FlowController
@@ -1786,7 +1786,8 @@ class TestPublishWithFlowController:
 
         envelope = MessageEnvelope(routing_key="rk", body=b"test")
         outcome = broker.publish(envelope)
-        assert outcome.status == PublishStatus.ERROR
+        assert outcome.status == PublishStatus.NOT_SENT
+        assert outcome.reason == "backpressure_dropped"
 
     def test_publish_succeeds_with_flow_controller(self) -> None:
         """fc.acquire() returns True → publishes and releases the slot."""
@@ -2613,3 +2614,25 @@ class TestUserSuppliedRetryMiddlewareWiring:
                 broker.start()
 
         assert user_mw._publish_fn is not None
+
+
+class TestPublishMessageIdKwarg:
+    """Parity with AsyncBroker.publish: the kwargs form can carry a stable
+    message_id so a republish after an unknown outcome can be deduplicated."""
+
+    def _broker(self) -> tuple[SyncBroker, MagicMock]:
+        broker = SyncBroker()
+        transport = MagicMock()
+        transport.publish = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        broker._transport = transport
+        return broker, transport
+
+    def test_kwargs_form_uses_the_given_message_id(self) -> None:
+        broker, transport = self._broker()
+        broker.publish(routing_key="q", body=b"x", message_id="order-42")
+        assert transport.publish.call_args.args[0].message_id == "order-42"
+
+    def test_message_id_with_an_envelope_is_rejected(self) -> None:
+        broker, _ = self._broker()
+        with pytest.raises(ValueError, match="message_id"):
+            broker.publish(MessageEnvelope(routing_key="q", body=b"x"), message_id="m")

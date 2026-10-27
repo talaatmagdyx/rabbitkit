@@ -9,7 +9,8 @@ Metric names:
 - rabbitkit_message_processing_seconds Histogram(queue)
 - rabbitkit_messages_published_total  Counter(exchange, status)
                                       status: confirmed | sent | nacked |
-                                      timeout | returned | error (the real
+                                      timeout | returned | error |
+                                      not_sent | unknown (the real
                                       PublishOutcome.status value -- a
                                       raised exception escaping the publish
                                       call itself is also labeled "error")

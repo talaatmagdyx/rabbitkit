@@ -2342,7 +2342,8 @@ class TestNonOwnerReconnectGuard:
 
         outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
 
-        assert outcome.status is PublishStatus.ERROR
+        assert outcome.status is PublishStatus.NOT_SENT
+        assert outcome.reason == "not_connected"
         assert isinstance(outcome.error, ConnectionError)
         assert connect_calls == [], "non-owner thread must never reconnect"
 
@@ -2362,7 +2363,7 @@ class TestNonOwnerReconnectGuard:
         transport.connect = lambda: connect_calls.append(True)  # type: ignore[method-assign]
 
         outcome = transport.publish(MessageEnvelope(routing_key="q", body=b"x"))
-        assert outcome.status is PublishStatus.ERROR
+        assert outcome.status is PublishStatus.NOT_SENT
         assert connect_calls == []
 
 

@@ -251,9 +251,84 @@ class PublishStatus(str, Enum):
     #: when nothing was actually confirmed.
     SENT = "sent"
     NACKED = "nacked"
+    #: No publisher confirm arrived within the confirm timeout (or the
+    #: per-call ``timeout``). The frames left the client, so the broker may
+    #: or may not have the message: a flavour of :attr:`UNKNOWN`
+    #: (``PublishOutcome.is_unknown`` is True for both).
     TIMEOUT = "timeout"
     RETURNED = "returned"
+    #: An unexpected, unclassified failure. Every failure the transport can
+    #: classify is reported as NOT_SENT, UNKNOWN, TIMEOUT, NACKED or RETURNED
+    #: instead; ``PublishOutcome.reason`` says which ERROR it was when known
+    #: (e.g. ``exchange_not_found``).
     ERROR = "error"
+    #: The message definitely never left the client: admission timed out,
+    #: the publisher is closed, no connection or channel was available, or a
+    #: flow-control policy dropped it. Safe to publish again.
+    NOT_SENT = "not_sent"
+    #: The frames may have left the client but no confirm, return or nack
+    #: was observed (connection or channel lost mid-publish, shutdown).
+    #: Republish only with the SAME ``message_id`` so consumers can
+    #: deduplicate; the library never republishes on its own.
+    UNKNOWN = "unknown"
+
+
+class PublishReason:
+    """Bounded ``PublishOutcome.reason`` codes (snake_case, safe as a metric label).
+
+    Plain string constants rather than an Enum so ``outcome.reason`` is an
+    ordinary ``str`` (``"admission_timeout"``), whatever produced it.
+    """
+
+    # NOT_SENT
+    ADMISSION_TIMEOUT = "admission_timeout"
+    PUBLISHER_CLOSED = "publisher_closed"
+    NOT_CONNECTED = "not_connected"
+    CHANNEL_UNAVAILABLE = "channel_unavailable"
+    EXCEEDS_BYTE_BUDGET = "exceeds_max_in_flight_bytes"
+    BACKPRESSURE_DROPPED = "backpressure_dropped"
+    #: The caller was cancelled before its message left the client.
+    CANCELLED = "cancelled"
+    # UNKNOWN
+    CONNECTION_LOST = "connection_lost"
+    CHANNEL_CLOSED = "channel_closed"
+    SHUTDOWN = "shutdown"
+    # TIMEOUT
+    CONFIRM_TIMEOUT = "confirm_timeout"
+    PUBLISH_TIMEOUT = "publish_timeout"
+    # RETURNED / NACKED
+    RETURNED = "returned"
+    NACKED = "nacked"
+    # ERROR
+    EXCHANGE_NOT_FOUND = "exchange_not_found"
+    ACCESS_REFUSED = "access_refused"
+    PRECONDITION_FAILED = "precondition_failed"
+    INVALID_ENVELOPE = "invalid_envelope"
+    PUBLISH_ERROR = "publish_error"
+
+    ALL: frozenset[str] = frozenset(
+        {
+            ADMISSION_TIMEOUT,
+            PUBLISHER_CLOSED,
+            NOT_CONNECTED,
+            CHANNEL_UNAVAILABLE,
+            EXCEEDS_BYTE_BUDGET,
+            BACKPRESSURE_DROPPED,
+            CONNECTION_LOST,
+            CHANNEL_CLOSED,
+            SHUTDOWN,
+            CANCELLED,
+            CONFIRM_TIMEOUT,
+            PUBLISH_TIMEOUT,
+            RETURNED,
+            NACKED,
+            EXCHANGE_NOT_FOUND,
+            ACCESS_REFUSED,
+            PRECONDITION_FAILED,
+            INVALID_ENVELOPE,
+            PUBLISH_ERROR,
+        }
+    )
 
 
 class BulkPublishStatus(str, Enum):
@@ -448,7 +523,14 @@ def safe_exception_repr(exc: BaseException) -> str:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class PublishOutcome:
-    """Result of a publish operation."""
+    """Result of a publish operation.
+
+    ``reason`` is a bounded code from :class:`PublishReason` saying why a
+    non-success status happened (``None`` when the transport did not
+    classify it). ``reply_code`` / ``reply_text`` carry the broker's
+    ``basic.return`` fields for a RETURNED publish (e.g. ``312`` /
+    ``"NO_ROUTE"``) and the channel-close fields for a refused one.
+    """
 
     status: PublishStatus
     delivery_tag: int | None = None
@@ -456,17 +538,35 @@ class PublishOutcome:
     routing_key: str = ""
     error: BaseException | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+    reason: str | None = None
+    reply_code: int | None = None
+    reply_text: str | None = None
 
     def __repr__(self) -> str:
         # Hand-written so a broken error repr (see safe_exception_repr) can't
         # make the outcome itself unprintable: raise_for_status() builds its
         # message from this, and used to raise AttributeError on aiormq 7.
         error = None if self.error is None else safe_exception_repr(self.error)
+        extra = ""
+        if self.reason is not None:
+            extra += f", reason={self.reason!r}"
+        if self.reply_code is not None:
+            extra += f", reply_code={self.reply_code!r}, reply_text={self.reply_text!r}"
         return (
             f"PublishOutcome(status={self.status!r}, delivery_tag={self.delivery_tag!r}, "
             f"exchange={self.exchange!r}, routing_key={self.routing_key!r}, error={error}, "
-            f"timestamp={self.timestamp!r})"
+            f"timestamp={self.timestamp!r}{extra})"
         )
+
+    @property
+    def is_unknown(self) -> bool:
+        """True when the broker may or may not have the message: ``UNKNOWN``
+        or ``TIMEOUT`` (a confirm timeout is one kind of unknown outcome).
+
+        Republish only with the same ``message_id`` so consumers can
+        deduplicate.
+        """
+        return self.status in (PublishStatus.UNKNOWN, PublishStatus.TIMEOUT)
 
     @property
     def ok(self) -> bool:
@@ -486,7 +586,8 @@ class PublishOutcome:
         """Raise ``PublishError`` if the publish failed; else return self (M1).
 
         ``broker.publish()`` never raises — it returns this outcome so a
-        failed publish (NACKED / TIMEOUT / RETURNED / ERROR) can't be lost by
+        failed publish (NACKED / TIMEOUT / RETURNED / ERROR / NOT_SENT /
+        UNKNOWN) can't be lost by
         code that simply ignores the return value. Callers who prefer
         exceptions opt in::
 

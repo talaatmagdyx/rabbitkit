@@ -349,6 +349,29 @@ class PublisherConfig:
     # head-of-line blocking, slow recovery) — consider a tighter cap
     # (e.g. 1_048_576 for 1 MiB) and storing payloads externally.
     max_message_bytes: int = 16_777_216
+    # Async broker only: cap on the sum of body bytes of publishes between
+    # admission and their terminal outcome (single ``publish()`` and the
+    # batch publisher share it). A publish waits (bounded by
+    # PoolConfig.channel_acquire_timeout or its per-call ``timeout``) for
+    # room and then returns NOT_SENT(reason="admission_timeout"). None (the
+    # default) = no byte bound, the previous behaviour. Must be >= 1 and,
+    # when ``max_message_bytes`` is set, >= ``max_message_bytes`` so every
+    # admissible message fits.
+    max_in_flight_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_in_flight_bytes is None:
+            return
+        if self.max_in_flight_bytes < 1:
+            raise ConfigValidationError(
+                f"PublisherConfig.max_in_flight_bytes must be >= 1 or None, got {self.max_in_flight_bytes}"
+            )
+        if self.max_message_bytes and self.max_in_flight_bytes < self.max_message_bytes:
+            raise ConfigValidationError(
+                f"PublisherConfig.max_in_flight_bytes ({self.max_in_flight_bytes}) must be >= "
+                f"max_message_bytes ({self.max_message_bytes}), otherwise a message within the "
+                "size limit could never be admitted. Lower max_message_bytes or raise the budget."
+            )
 
 
 # ── Consumer ───────────────────────────────────────────────────────────────
@@ -432,10 +455,22 @@ class PoolConfig:
 
     ``channel_pool_size`` (publisher channel pool) and ``channel_acquire_timeout``
     are active. ``publisher_connections`` / ``consumer_connections`` are
-    **reserved**: the transport currently uses one connection per role, because
-    multiple connections sharing a single event loop showed no throughput benefit
-    in benchmarks (the loop is the bound). Scale throughput by running more
-    processes/pods, not more connections per process.
+    **reserved and ignored** (setting them changes nothing): the transport
+    currently uses one connection per role, because multiple connections
+    sharing a single event loop showed no throughput benefit in benchmarks
+    (the loop is the bound). Scale throughput by running more processes/pods,
+    not more connections per process.
+
+    Attributes:
+        channel_pool_size: Maximum publisher channels per pool (>= 1). On the
+            async broker every confirmed publish holds one channel until its
+            confirm arrives, so this is also the in-flight confirmed-publish
+            cap.
+        channel_acquire_timeout: Admission bound in seconds (> 0). A publish
+            that cannot get a channel (pool exhausted) within it returns
+            ``NOT_SENT`` with reason ``admission_timeout``; exhaustion never
+            rebuilds the connection. Also bounds opening one channel.
+        prewarm_channels: Pre-create all pool channels on ``connect()``.
     """
 
     channel_pool_size: int = 10
@@ -443,6 +478,14 @@ class PoolConfig:
     consumer_connections: int = 1  # reserved — see class docstring
     channel_acquire_timeout: float = 10.0  # seconds to wait for a pooled channel
     prewarm_channels: bool = False  # pre-create all pool channels on connect() to eliminate warmup jitter
+
+    def __post_init__(self) -> None:
+        if self.channel_pool_size < 1:
+            raise ConfigValidationError(f"PoolConfig.channel_pool_size must be >= 1, got {self.channel_pool_size}")
+        if not self.channel_acquire_timeout > 0:
+            raise ConfigValidationError(
+                f"PoolConfig.channel_acquire_timeout must be > 0, got {self.channel_acquire_timeout}"
+            )
 
 
 # ── Retry ──────────────────────────────────────────────────────────────────

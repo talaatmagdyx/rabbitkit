@@ -105,4 +105,5 @@
   does not emit reconnects_total"; reconnect hooks),
   `docs/kubernetes.md` (async failover on reconnect, liveness after a
   terminal failure), `docs/concurrency-model.md`,
-  `docs/production/scale.md`, `docs/production/checklist.md`.
+  `docs/production/scale.md`, `docs/production/checklist.md`,
+  `docs/guide/full-guide.md` (ConnectionConfig table).

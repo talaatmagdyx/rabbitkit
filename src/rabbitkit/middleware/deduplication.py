@@ -90,6 +90,11 @@ _COMPLETED = "completed"
 # result written by an incompatible version).
 _RESULT_SCHEMA_VERSION = 1
 
+#: Upper bound on the claim release after a cancelled handler. Shutdown
+#: waits about a second for cancelled handlers, so the release must not
+#: outlive it; if Redis is slower the claim expires after processing_timeout.
+_CANCEL_RELEASE_TIMEOUT = 1.0
+
 
 def _encode_completed_with_result(result: object, max_bytes: int) -> str | None:
     """JSON envelope for a completed key carrying the handler result, or
@@ -688,6 +693,17 @@ class DeduplicationMiddleware(BaseMiddleware):
             self._mark_on_ack_sync(message, key, value, nx=False, claim=True)
         return result
 
+    async def _release_claim_after_cancel(self, key: str) -> None:
+        try:
+            async with asyncio.timeout(_CANCEL_RELEASE_TIMEOUT):
+                await self._cleanup_key_after_non_success_async(key)
+        except TimeoutError:
+            logger.warning(
+                "Dedup claim release timed out after a cancelled handler (key=%s); the claim "
+                "expires after processing_timeout",
+                key,
+            )
+
     async def _handle_in_flight_duplicate_async(self, message: RabbitMessage, key: str) -> None:
         """A concurrent copy hit another consumer's live claim (async)."""
         if self._config.on_in_flight == "ack_skip":
@@ -752,6 +768,13 @@ class DeduplicationMiddleware(BaseMiddleware):
 
         try:
             result = await call_next(message)
+        except asyncio.CancelledError:
+            # Cancelled mid-handler (shutdown, processing_timeout): the
+            # delivery is requeued, so release the claim now or its
+            # redelivery waits out processing_timeout as an "in-flight
+            # duplicate". Bounded; the cancellation always propagates.
+            await self._release_claim_after_cancel(key)
+            raise
         except Exception:
             await self._cleanup_key_after_non_success_async(key)
             raise

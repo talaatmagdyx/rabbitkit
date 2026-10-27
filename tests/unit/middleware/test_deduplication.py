@@ -2192,3 +2192,108 @@ class TestMarkOnlyAfterFullSuccess:
         assert handled == [1, 1]
         assert [e.routing_key for e in broker.published_messages].count("p9.results") == 1
         broker.assert_acked(broker.consumed_messages[1])
+
+
+# ── claim: async release paths (cancellation, failed settlement) ─────────
+
+
+def _async_wired(message_id: str) -> RabbitMessage:
+    from unittest.mock import AsyncMock
+
+    msg = _make_message(message_id=message_id)
+    msg._ack_async_fn, msg._nack_async_fn, msg._reject_async_fn = AsyncMock(), AsyncMock(), AsyncMock()
+    return msg
+
+
+class TestAsyncClaimRelease:
+    async def test_cancelled_handler_releases_the_claim(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+        msg = _async_wired("claim-cancel")
+        key = mw._extract_key(msg)
+
+        async def handler(m: RabbitMessage) -> None:
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await mw.consume_scope_async(handler, msg)
+        assert redis.delete_calls == [key]
+        assert key not in redis._store  # the redelivery claims it at once
+
+    async def test_cancelled_task_releases_and_still_propagates(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+        msg = _async_wired("claim-cancel-task")
+        started = asyncio.Event()
+
+        async def handler(m: RabbitMessage) -> None:
+            started.set()
+            await asyncio.sleep(30)
+
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(mw.consume_scope_async(handler, msg))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert redis.delete_calls == [mw._extract_key(msg)]
+
+    async def test_slow_release_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from rabbitkit.middleware import deduplication
+
+        class _HangingDelete(_FakeAsyncRedis):
+            async def delete(self, key: str) -> None:
+                await asyncio.sleep(30)
+
+        monkeypatch.setattr(deduplication, "_CANCEL_RELEASE_TIMEOUT", 0.01)
+        mw = DeduplicationMiddleware(redis_client=_HangingDelete(), config=_claim_config())
+
+        async def handler(m: RabbitMessage) -> None:
+            raise asyncio.CancelledError
+
+        async with asyncio.timeout(5):
+            with pytest.raises(asyncio.CancelledError):
+                await mw.consume_scope_async(handler, _async_wired("claim-hang"))
+
+    @pytest.mark.parametrize("settle", ["nack_async", "reject_async"])
+    async def test_failed_settlement_after_success_releases_the_claim(self, settle: str) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+        msg = _async_wired(f"claim-{settle}")
+        key = mw._extract_key(msg)
+
+        async def handler(m: RabbitMessage) -> str:
+            return "done"
+
+        assert await mw.consume_scope_async(handler, msg) == "done"
+        assert redis._store[key] == "in-flight"  # completed only on ack
+        await getattr(msg, settle)(requeue=False)
+        assert redis.delete_calls == [key]
+
+    async def test_ack_after_success_completes_the_claim(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+        msg = _async_wired("claim-ack")
+        key = mw._extract_key(msg)
+
+        async def handler(m: RabbitMessage) -> str:
+            return "done"
+
+        await mw.consume_scope_async(handler, msg)
+        await msg.ack_async()
+        assert redis._store[key] == "completed"
+        assert redis.delete_calls == []
+
+    async def test_missing_reject_fn_is_left_unwrapped(self) -> None:
+        redis = _AsyncDeleteTrackingRedis()
+        mw = DeduplicationMiddleware(redis_client=redis, config=_claim_config())
+        msg = _async_wired("claim-no-reject")
+        msg._reject_async_fn = None
+
+        async def handler(m: RabbitMessage) -> str:
+            return "done"
+
+        await mw.consume_scope_async(handler, msg)
+        assert msg._reject_async_fn is None
+        await msg.nack_async(requeue=True)
+        assert redis.delete_calls == [mw._extract_key(msg)]

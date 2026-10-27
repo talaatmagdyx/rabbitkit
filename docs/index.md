@@ -22,7 +22,7 @@ broker = AsyncBroker(RabbitConfig())
 
 @broker.subscriber(
     queue="orders",
-    retry_config=RetryConfig(max_retries=3, delays=(5, 30, 120)),
+    retry=RetryConfig(max_retries=3, delays=(5, 30, 120)),
 )
 async def handle(body: dict) -> None:
     print(f"Order: {body}")
@@ -65,5 +65,5 @@ from rabbitkit import AsyncBroker, SyncBroker, RabbitConfig
 from rabbitkit.async_ import AsyncBroker
 
 # Experimental features (may change between releases)
-from rabbitkit.experimental import rpc, locking, dashboard
+from rabbitkit.experimental import RPCClient, DistributedLock, create_dashboard_app
 ```

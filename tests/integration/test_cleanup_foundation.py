@@ -232,3 +232,36 @@ def test_sync_idle_publisher_connection_closed_by_broker_is_replaced_before_send
     finally:
         with contextlib.suppress(Exception):
             broker.stop()
+
+
+# ── async with AsyncBroker (contract §4.3) ─────────────────────────────────
+
+
+async def test_async_with_starts_consumes_and_stops(rabbit: dict[str, Any]) -> None:
+    import asyncio
+
+    from rabbitkit import AsyncBroker
+
+    queue = _name("ctx")
+    received: list[bytes] = []
+    broker = AsyncBroker(_config(rabbit["url"]))
+
+    @broker.subscriber(queue, reject_without_dlx="discard")
+    async def handle(body: bytes) -> None:
+        received.append(body)
+
+    async with asyncio.timeout(30):
+        async with broker as entered:
+            assert entered is broker and broker.started
+            assert (await broker.publish(routing_key=queue, body=b"hello")).ok
+            while not received:
+                await asyncio.sleep(0.05)
+        assert not broker.started
+    assert received == [b"hello"]
+    assert await asyncio.to_thread(_consumers, rabbit["url"], queue) == 0
+
+
+def _consumers(url: str, queue: str) -> int | None:
+    with QueueProbe(url) as probe:
+        return probe.consumers(queue)
+

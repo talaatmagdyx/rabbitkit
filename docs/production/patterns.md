@@ -197,7 +197,8 @@ Why each number:
 ## 2. The reference publisher
 
 ```python
-from rabbitkit import MessageEnvelope, MessageTooLargeError, PublishError
+from rabbitkit import MessageEnvelope, MessageTooLargeError
+from rabbitkit.core.errors import PublishError
 from rabbitkit.core.types import PublishStatus
 
 

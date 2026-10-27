@@ -34,7 +34,7 @@ When using `CompressionMiddleware`, configure a maximum decompressed size to pre
 from rabbitkit import CompressionConfig
 from rabbitkit.middleware.compression import CompressionMiddleware
 
-mw = CompressionMiddleware(config=CompressionConfig(max_decompressed_size=10 * 1024 * 1024))  # 10 MB
+mw = CompressionMiddleware(config=CompressionConfig(), max_decompressed_size=10 * 1024 * 1024)  # 10 MB
 ```
 
 ## TLS for Broker Connections
@@ -42,14 +42,17 @@ mw = CompressionMiddleware(config=CompressionConfig(max_decompressed_size=10 * 1
 Always use TLS in production. Use `SSLConfig` to configure mutual TLS:
 
 ```python
-from rabbitkit import RabbitConfig, ConnectionConfig, SSLConfig
+from rabbitkit import RabbitConfig, ConnectionConfig, SecurityConfig, SSLConfig
 
 config = RabbitConfig(
     connection=ConnectionConfig(host="rabbitmq.internal", port=5671),
-    ssl=SSLConfig(
-        ca_certs="/etc/ssl/certs/ca.crt",
-        certfile="/etc/ssl/certs/service.crt",
-        keyfile="/etc/ssl/private/service.key",
+    security=SecurityConfig(
+        ssl=SSLConfig(
+            enabled=True,
+            ca_certs="/etc/ssl/certs/ca.crt",
+            certfile="/etc/ssl/certs/service.crt",
+            keyfile="/etc/ssl/private/service.key",
+        ),
     ),
 )
 ```

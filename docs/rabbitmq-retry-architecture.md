@@ -817,7 +817,7 @@ await broker.start(worker_config=WorkerConfig(worker_count=8, prefetch_per_worke
 
 **Critical interaction:** `channel_pool_size` must be `>= worker_count`. Handlers that publish (retry, outbox, results) acquire a channel; if the pool is smaller than the worker count, concurrent publishers block on `channel_acquire_timeout` and you get latency cliffs or deadlock-like stalls. The broker warns about this at start — heed it.
 
-**`connection.blocked`:** when the broker raises a memory/disk alarm, it stops accepting publishes. `FlowController(on_blocked="wait")` parks publishers (up to `blocked_timeout`) instead of erroring. Alert on blocked duration (§22) — it means the broker is in trouble.
+**`connection.blocked`:** when the broker raises a memory/disk alarm, it stops accepting publishes. `FlowController(BackpressureConfig(on_blocked="wait"))` parks publishers (up to `blocked_timeout`) instead of erroring. Alert on blocked duration (§22) — it means the broker is in trouble.
 
 ---
 
@@ -1411,6 +1411,7 @@ assert mgmt.health_check()      # broker reachable + healthy
 
 ```python
 # fastapi_app.py — mount dashboard + lifespan-managed broker
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.routing import Mount
@@ -1424,7 +1425,7 @@ async def lifespan(app: FastAPI):
         yield
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/_rabbit", create_dashboard_app(broker, management_client=mgmt))  # behind OIDC + netpol
+app.mount("/_rabbit", create_dashboard_app(broker, auth_token=os.environ["DASHBOARD_TOKEN"]))  # behind OIDC + netpol
 
 @app.get("/health/ready")
 async def ready():

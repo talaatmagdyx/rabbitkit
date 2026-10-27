@@ -2998,3 +2998,45 @@ class TestQueueExistsForGuard:
         broker._transport.queue_exists = AsyncMock(return_value=True)
         assert await broker._queue_exists_for_guard("orders.dlq") is True
         broker._transport.queue_exists.assert_awaited_once_with("orders.dlq")
+
+
+# ── async context manager (contract §4.3) ─────────────────────────────────
+
+
+class TestAsyncContextManager:
+    @pytest.mark.asyncio
+    async def test_enter_starts_without_signal_handlers_and_exit_stops(self) -> None:
+        broker = AsyncBroker()
+        calls: list[tuple[str, Any]] = []
+
+        async def fake_start(worker_config: Any = None, *, install_signal_handlers: bool = True) -> None:
+            calls.append(("start", install_signal_handlers))
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            calls.append(("stop", timeout))
+
+        with patch.object(broker, "start", fake_start), patch.object(broker, "stop", fake_stop):
+            async with broker as entered:
+                assert entered is broker
+                assert calls == [("start", False)]
+
+        assert calls == [("start", False), ("stop", None)]
+
+    @pytest.mark.asyncio
+    async def test_exit_stops_when_the_block_raises(self) -> None:
+        broker = AsyncBroker()
+        stopped: list[bool] = []
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            stopped.append(True)
+
+        with (
+            patch.object(broker, "start", AsyncMock()),
+            patch.object(broker, "stop", fake_stop),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            async with broker:
+                raise RuntimeError("boom")
+
+        assert stopped == [True]
+

@@ -525,10 +525,11 @@ async def handle(msg: RabbitMessage) -> None:
     print(msg.redelivered)   # bool
     print(msg.delivery_tag)  # int | None
 
-    # Manual settlement
-    msg.ack()                 # async: await msg.ack_async()
-    msg.nack(requeue=True)    # async: await msg.nack_async(requeue=True)
-    msg.reject(requeue=False) # async: await msg.reject_async(requeue=False)
+    # Manual settlement (an async handler awaits the *_async methods;
+    # a SyncBroker handler calls msg.ack() / msg.nack() / msg.reject())
+    await msg.ack_async()
+    await msg.nack_async(requeue=True)
+    await msg.reject_async(requeue=False)
 ```
 
 ### Exception-based settlement
@@ -672,8 +673,9 @@ and channel-churn counters, retry/DLQ/dedup/rate-limit counters, and the
 ### Using middleware
 
 ```python
-from rabbitkit import RetryConfig
-from rabbitkit.middleware import RetryMiddleware, CompressionMiddleware
+from rabbitkit import CompressionConfig, RetryConfig
+from rabbitkit.middleware.compression import CompressionMiddleware
+from rabbitkit.middleware.retry import RetryMiddleware
 
 # Global (applied to all routes via broker config)
 config = RabbitConfig(retry=RetryConfig(max_retries=3, delays=(5, 30)))
@@ -693,7 +695,7 @@ async def handle(body: bytes) -> None:
 ### Custom middleware
 
 ```python
-from rabbitkit.middleware import BaseMiddleware
+from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit import RabbitMessage, MessageEnvelope
 
 class LoggingMiddleware(BaseMiddleware):
@@ -885,7 +887,8 @@ with their feature: `RPCTimeoutError`, `ReplyTooLargeError`,
 ### Built-in serializers
 
 ```python
-from rabbitkit import JSONSerializer, SerializationPipeline, JsonParser, PydanticDecoder
+from rabbitkit import SerializationPipeline, JsonParser, PydanticDecoder
+from rabbitkit.serialization import JSONSerializer
 
 # Default JSON (built-in, no extras)
 serializer = JSONSerializer()  # strict: raises on non-serializable objects
@@ -1336,7 +1339,7 @@ sentinel.
 
 ```python
 from rabbitkit import CircuitBreakerMiddleware
-from rabbitkit.middleware.circuit_breaker import CircuitBreakerProtocol
+from rabbitkit.core.protocols import CircuitBreakerProtocol
 
 # Using any CircuitBreakerProtocol-compatible implementation (e.g. pybreaker)
 breaker = MyCircuitBreaker(failure_threshold=5, recovery_timeout=30)
@@ -1399,7 +1402,9 @@ not covered — don't use freeform headers for security-critical routing.
 ## 18. Compression
 
 ```python
-from rabbitkit import CompressionMiddleware, CompressionConfig
+from rabbitkit import CompressionConfig
+from rabbitkit.middleware.compression import CompressionMiddleware
+from rabbitkit.serialization import JSONSerializer
 
 @broker.subscriber(
     queue="large-payloads",
@@ -1427,7 +1432,7 @@ OOM attacks.
 from rabbitkit.experimental import ResultMiddleware
 from rabbitkit.results import RedisResultBackend
 
-backend = RedisResultBackend(redis_client, ttl=3600)
+backend = RedisResultBackend(redis_client)  # the TTL is ResultMiddleware's
 
 @broker.subscriber(
     queue="compute-jobs",
@@ -1634,9 +1639,11 @@ broker.publish_outcome = PublishOutcome(status=PublishStatus.NACKED)
 ### TestApp
 
 ```python
-from rabbitkit.testing import TestApp
+from rabbitkit import RabbitApp
+from rabbitkit.testing import TestApp, TestBroker
 
-app = TestApp()
+broker = TestBroker()
+app = RabbitApp(title="orders")
 
 @app.on_startup
 def init():
@@ -1646,10 +1653,10 @@ def init():
 def cleanup():
     print("Stopping")
 
-with app.test_with_lifecycle():
-    # Startup hooks have run; app.state == AppState.RUNNING
-    ...
-# Shutdown hooks have run; app.state == AppState.STOPPED
+with TestApp(app, broker) as test_app:
+    # Startup hooks have run and the broker is started; test_app.state == AppState.RUNNING
+    broker.publish("orders", b'{"id": 1}')
+# Shutdown hooks have run; test_app.state == AppState.STOPPED
 ```
 
 ---
@@ -1880,8 +1887,11 @@ IDLE → STARTING → RUNNING → STOPPING → STOPPED
   DLX cycles, retry+ack conflicts, duplicate queues, invalid handler signatures).
 - **Middleware chain is cached per route** — composed once, reused per message (no per-message
   closure allocation).
-- **Settlement happens AFTER the transport call** — `RabbitMessage.ack()` sets `_disposition`
-  only after `_ack_fn()` returns successfully (a failed ack propagates, not silently swallowed).
+- **Settlement order differs by transport** — the sync `RabbitMessage.ack()` sets the
+  disposition only after `_ack_fn()` returns (a failed ack propagates and the message stays
+  pending); the async `ack_async()` / `nack_async()` / `reject_async()` claim the disposition
+  before awaiting the transport, so one delivery never gets two frames (G-15); a failed write
+  propagates and sets `settlement_outcome_unknown`.
 
 ### Sync vs. async: two different connection models
 

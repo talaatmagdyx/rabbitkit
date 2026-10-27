@@ -378,6 +378,24 @@ class AsyncBroker:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
+    async def __aenter__(self) -> AsyncBroker:
+        """``async with AsyncBroker(config) as broker:`` starts the broker and
+        stops it when the block exits (also on an exception or cancellation).
+
+        Entering calls ``start(install_signal_handlers=False)``: a ``with``
+        block is a scope owned by the surrounding code (a script, a test, an
+        application that embeds the broker), so the broker leaves SIGINT and
+        SIGTERM to that code. A standalone consumer process should use
+        ``await broker.run()`` instead, which owns the signals and drains on
+        SIGTERM. To pass a ``WorkerConfig``, call ``start()`` yourself and
+        ``stop()`` in a ``finally``; ``start()`` on a started broker is a no-op.
+        """
+        await self.start(install_signal_handlers=False)
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.stop()
+
     async def start(
         self,
         worker_config: WorkerConfig | None = None,

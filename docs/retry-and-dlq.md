@@ -378,10 +378,10 @@ section for how to run it locally.
 ## Code Example
 
 ```python
-from rabbitkit import AsyncBroker, RabbitConfig
+from rabbitkit import AsyncBroker, ConnectionConfig, RabbitConfig
 from rabbitkit.core.config import RetryConfig
 
-config = RabbitConfig(url="amqp://guest:guest@localhost/")
+config = RabbitConfig(connection=ConnectionConfig.from_url("amqp://guest:guest@localhost/"))
 broker = AsyncBroker(config)
 
 retry = RetryConfig(
@@ -391,16 +391,14 @@ retry = RetryConfig(
 
 @broker.subscriber(
     queue="orders.created",
-    retry_config=retry,
+    retry=retry,
 )
 async def handle_order(order_id: str) -> None:
     await process_order(order_id)
 
 
 async def main() -> None:
-    async with broker:
-        await broker.start()
-        # broker runs until shutdown signal
+    await broker.run()  # runs until SIGINT/SIGTERM, then drains and stops
 ```
 
 With this configuration:

@@ -133,10 +133,10 @@ if not outcome.ok:
 When you need precise control over when acknowledgement happens — for example, after writing to a database — use `AckPolicy.MANUAL`. You receive the `RabbitMessage` directly and settle it yourself: `await msg.ack_async()` / `nack_async()` / `reject_async()` on `AsyncBroker`, `msg.ack()` / `nack()` / `reject()` on `SyncBroker`.
 
 ```python
-from rabbitkit import AsyncBroker, RabbitConfig, RabbitMessage
+from rabbitkit import AsyncBroker, ConnectionConfig, RabbitConfig, RabbitMessage
 from rabbitkit.core.types import AckPolicy
 
-config = RabbitConfig(url="amqp://guest:guest@localhost/")
+config = RabbitConfig(connection=ConnectionConfig.from_url("amqp://guest:guest@localhost/"))
 broker = AsyncBroker(config)
 
 @broker.subscriber(

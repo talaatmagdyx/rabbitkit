@@ -202,7 +202,8 @@ Signals: `broker.run()` and `start(install_signal_handlers=True)` install
 SIGINT/SIGTERM handlers and `stop()` restores the previous ones; a handler an
 application registered with `loop.add_signal_handler` is left alone. Embedding
 applications should pass `install_signal_handlers=False` (`rabbitkit_lifespan`
-does). `RabbitApp.run_async()` follows the same rules: it restores the
+does, and so does `async with AsyncBroker(config) as broker:`, which starts
+the broker on entry and stops it on exit). `RabbitApp.run_async()` follows the same rules: it restores the
 handlers it replaced and leaves an existing asyncio handler alone. Keep
 `graceful_timeout` below Kubernetes' `terminationGracePeriodSeconds`.
 

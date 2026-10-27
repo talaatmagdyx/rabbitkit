@@ -186,3 +186,44 @@ def test_passive_only_notice(caplog: pytest.LogCaptureFixture) -> None:
         assert caplog.records == []
         log_passive_only_limits(TopologyMode.PASSIVE_ONLY, routes)
     assert "verify_topology" in caplog.text and "no topology writes" in caplog.text
+
+
+def test_report_as_dict_is_json_ready() -> None:
+    mgmt = _Mgmt({"q": {"type": "classic", "durable": True, "arguments": {}}})
+    data = verify_topology([_route(RabbitQueue("q"))], management_client=mgmt).as_dict()
+    assert data["ok"] is True and data["fully_verified"] is True
+    assert {"entity": "queue", "name": "q", "check": "type", "status": "verified"}.items() <= data["findings"][
+        0
+    ].items()
+
+
+def test_unexpected_payload_is_unverified() -> None:
+    class _Odd(_Mgmt):
+        def get_queue(self, name: str, vhost: str = "/") -> Any:
+            return ["not", "a", "dict"]
+
+    report = verify_topology([_route(RabbitQueue("q"))], management_client=_Odd({}))
+    assert report.ok and not report.fully_verified
+    assert report.unverified[0].detail == "unexpected management payload"
+
+
+def test_missing_retry_source_skips_its_dead_letter_check() -> None:
+    retry = RetryConfig(max_retries=1, delays=(1,))
+    s = _statuses(verify_topology([_route(RabbitQueue("q"), retry=retry)], management_client=_Mgmt({})))
+    assert s[("queue", "q", "exists")] is PreflightStatus.FAILED
+    assert ("queue", "q", "dead-letter-path") not in s
+
+
+@pytest.mark.parametrize("failure", ["raises", "not-a-list"])
+def test_binding_lookup_failure_is_unverified(failure: str) -> None:
+    class _NoBindings(_Mgmt):
+        def get_queue_bindings(self, queue: str, vhost: str = "/") -> Any:
+            if failure == "raises":
+                raise TimeoutError("mgmt down")
+            return {"unexpected": True}
+
+    ex = RabbitExchange("ex", type=ExchangeType.TOPIC)
+    mgmt = _NoBindings({"q": {"type": "classic", "durable": True, "arguments": {}}}, {"ex": {"type": "topic"}})
+    report = verify_topology([_route(RabbitQueue("q", routing_key="a.#"), ex)], management_client=mgmt)
+    assert _statuses(report)[("binding", "ex->q", "routing_key=a.#")] is PreflightStatus.UNVERIFIED
+    assert report.ok and not report.fully_verified

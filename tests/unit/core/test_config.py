@@ -422,6 +422,14 @@ class TestPoolConfig:
 
 
 class TestRetryConfig:
+    def test_negative_delay_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="delays must be >= 0"):
+            RetryConfig(max_retries=1, delays=(-1,))
+
+    def test_retry_header_is_trusted_by_default(self) -> None:
+        assert RetryConfig().trust_retry_header is True
+        assert RetryConfig(trust_retry_header=False).trust_retry_header is False
+
     def test_delays_shorter_than_max_retries_warns(self) -> None:
         """Mismatched delays/max_retries emits the reuse-last-delay warning."""
         import warnings

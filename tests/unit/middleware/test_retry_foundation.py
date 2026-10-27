@@ -253,3 +253,76 @@ class TestTerminalHandoffComposition:
             retry_reject.consume_scope(_raise(ValueError("bad")), _message())
         assert info.value._rabbitkit_dead_letter_failed is False  # type: ignore[attr-defined]
         assert rec.envelopes == []
+
+
+# ── metadata parsing and handoff hooks (edge cases) ───────────────────────
+
+
+class TestMetadataEdgeCases:
+    def test_datetime_first_failed_at_drives_retry_age(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        rec = _Recorder()
+        naive_old = (datetime.now(UTC) - timedelta(hours=2)).replace(tzinfo=None)
+        msg = _message(headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-first-failed-at": naive_old})
+        with pytest.raises(OSError):
+            _mw(rec, max_retry_age=60).consume_scope(_raise(OSError("x")), msg)
+        assert rec.envelopes[0].headers["x-rabbitkit-failure-category"] == "retry-age-exceeded"
+
+    def test_malformed_x_death_entries_are_ignored(self) -> None:
+        rec = _Recorder()
+        deaths = ["garbage", {"queue": "orders.retry.x"}, {"queue": "other.retry.2"}, {"queue": "orders.retry.1"}]
+        msg = _message(headers={"x-rabbitkit-original-queue": "orders", "x-death": deaths})
+        _mw(rec, trust_retry_header=False).consume_scope(_raise(OSError("x")), msg)
+        assert rec.envelopes[0].routing_key == "orders.retry.2"
+
+    def test_sync_dlq_handoff_failure_hands_back_to_the_pipeline(self, caplog: pytest.LogCaptureFixture) -> None:
+        msg = _message()
+        with pytest.raises(ValueError) as info:
+            _mw(_Recorder(PublishStatus.RETURNED)).consume_scope(_raise(ValueError("bad")), msg)
+        assert info.value._rabbitkit_dead_letter_failed is True  # type: ignore[attr-defined]
+        assert msg.raw_message == []
+        assert "handing the delivery back to the pipeline" in caplog.text
+
+
+async def test_async_dlq_handoff_failure_hands_back_to_the_pipeline() -> None:
+    msg = _message()
+    with pytest.raises(ValueError) as info:
+        await _mw(_Recorder(PublishStatus.TIMEOUT)).consume_scope_async(_raise(ValueError("bad")), msg)
+    assert info.value._rabbitkit_dead_letter_failed is True  # type: ignore[attr-defined]
+    assert msg.raw_message == []
+
+
+class TestHandoffHooks:
+    def _failing(self, **kw: Any) -> RetryMiddleware:
+        from rabbitkit.core.config import RetryHandoffConfig
+
+        return RetryMiddleware(
+            RetryConfig(max_retries=1, delays=(1,), handoff=RetryHandoffConfig(max_consecutive_failures=1)),
+            publish_fn=_Recorder(PublishStatus.NACKED),
+            **kw,
+        )
+
+    def test_a_raising_exhausted_hook_is_logged_not_propagated(self, caplog: pytest.LogCaptureFixture) -> None:
+        def boom(_tracker: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        msg = _message()
+        self._failing(on_handoff_exhausted=boom).consume_scope(_raise(OSError("x")), msg)
+        assert msg.raw_message == [("nack", True)]
+        assert "on_handoff_exhausted hook raised" in caplog.text
+
+    def test_paused_gauge_needs_a_collector_with_set_gauge(self) -> None:
+        class _CounterOnly:
+            def __init__(self) -> None:
+                self.counters: list[str] = []
+
+            def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None:
+                self.counters.append(name)
+
+        collector = _CounterOnly()
+        mw = self._failing(metrics_collector=collector, metrics_config=MetricsConfig())
+        mw.consume_scope(_raise(OSError("x")), _message())  # no set_gauge: skipped quietly
+        assert collector.counters == ["rabbitkit_retry_handoff_failures_total"]
+        mw._metrics_collector = None
+        mw._set_paused_gauge(_message(), 1.0)  # no collector at all: no-op

@@ -919,7 +919,7 @@ class RetryMiddleware(BaseMiddleware):
         classified: ClassifiedError,
         retry_count: int,
         message: RabbitMessage,
-        category: FailureCategory | None = None,
+        category: FailureCategory,
         *,
         dead_lettered: bool = False,
         handoff_failed: bool = False,
@@ -947,12 +947,6 @@ class RetryMiddleware(BaseMiddleware):
         The log line uses the same sanitizer as the headers (F30): raw
         exception text routinely embeds credentials.
         """
-        if category is None:
-            category = (
-                FailureCategory.PERMANENT
-                if classified.severity is not ErrorSeverity.TRANSIENT
-                else FailureCategory.EXHAUSTED
-            )
         exc._rabbitkit_terminal = True  # type: ignore[attr-defined]
         exc._rabbitkit_dead_lettered = dead_lettered  # type: ignore[attr-defined]
         exc._rabbitkit_dead_letter_failed = handoff_failed  # type: ignore[attr-defined]

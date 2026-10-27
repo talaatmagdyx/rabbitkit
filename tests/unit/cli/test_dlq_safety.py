@@ -392,3 +392,13 @@ class TestReplayLoopPreventionCli:
         stamped = channel.basic_publish.call_args.kwargs["properties"].headers
         assert "x-rabbitkit-retry-count" not in stamped and "x-death" not in stamped
         assert channel.basic_publish.call_args.kwargs["routing_key"] == "orders"
+
+    def test_refused_message_on_a_counted_queue_stops_the_replay(self) -> None:
+        """A message over --max-replays is requeued, so it trips the quorum
+        tripwire like any other requeue: stop before spending more deliveries."""
+        headers = {"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 3, "x-delivery-count": 1}
+        queue = _Queue([b"a", b"b"], headers=headers)
+        result, channel = _run(queue, ["replay", "orders.dlq", ""])
+        assert result.exit_code == 2 and "REFUSED" in result.output
+        channel.basic_publish.assert_not_called()
+        assert queue.events.count("get") == 1 and queue.unacked == {}

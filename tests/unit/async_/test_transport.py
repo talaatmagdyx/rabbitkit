@@ -2552,6 +2552,25 @@ class TestBindingRestoreAfterReconnect:
         assert ("queue", "orders", "events", "orders.*", None) in transport._recorded_bindings
 
     @pytest.mark.asyncio
+    async def test_repeated_binds_are_recorded_once(self) -> None:
+        transport = _make_transport()
+        transport._connected = True
+        topo = AsyncMock()
+        topo.is_closed = False
+        transport._topology_channel = topo
+
+        for _ in range(3):
+            await transport.bind_queue(queue="orders", exchange="events", routing_key="orders.*")
+            await transport.bind_queue(queue="orders", exchange="events", routing_key="h", arguments={"x-match": "all"})
+            await transport.bind_exchange(destination="d", source="s", routing_key="k")
+
+        assert transport._recorded_bindings == [
+            ("queue", "orders", "events", "orders.*", None),
+            ("queue", "orders", "events", "h", {"x-match": "all"}),
+            ("exchange", "d", "s", "k", None),
+        ]
+
+    @pytest.mark.asyncio
     async def test_reapply_bindings_rebinds_and_stops_when_done(self) -> None:
         import asyncio as _asyncio
         from unittest.mock import patch as _patch

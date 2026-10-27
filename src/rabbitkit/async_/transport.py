@@ -394,6 +394,14 @@ class AsyncTransportImpl:
                 self._binding_restore_tasks.add(task)
                 task.add_done_callback(self._binding_restore_tasks.discard)
 
+    def _record_binding(self, binding: tuple[str, str, str, str, dict[str, Any] | None]) -> None:
+        """Remember *binding* for re-apply after a reconnect, once: repeating
+        the same bind (every reconnect, every restart of a route) used to
+        append it again, so the list and each re-apply pass grew without
+        bound. Bindings are few and recorded off the hot path."""
+        if binding not in self._recorded_bindings:
+            self._recorded_bindings.append(binding)
+
     async def _reapply_bindings(self) -> None:
         """Re-apply all recorded bindings after a robust reconnect (m3).
 
@@ -1482,7 +1490,7 @@ class AsyncTransportImpl:
         # queue recreated after a broker restart would come back UNBOUND
         # (consumer silently receives nothing). Record it; the reconnect
         # callback re-applies all recorded bindings (bind is idempotent).
-        self._recorded_bindings.append(("queue", queue, exchange, routing_key, arguments))
+        self._record_binding(("queue", queue, exchange, routing_key, arguments))
 
     async def bind_exchange(
         self,
@@ -1502,7 +1510,7 @@ class AsyncTransportImpl:
         src_ex = await self._topology_channel.get_exchange(source, ensure=False)
         await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
         # m3: recorded for post-reconnect re-apply — see bind_queue.
-        self._recorded_bindings.append(("exchange", destination, source, routing_key, arguments))
+        self._record_binding(("exchange", destination, source, routing_key, arguments))
 
     async def cancel_consumer(self, consumer_tag: str) -> None:
         """Cancel a consumer by tag.

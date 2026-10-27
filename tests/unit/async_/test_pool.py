@@ -1099,3 +1099,156 @@ class TestExhaustedWarningIsRateLimited:
 
         levels = [r.levelno for r in caplog.records if "pool exhausted" in r.getMessage()]
         assert levels == [logging.WARNING, logging.DEBUG]
+
+
+# ── G-08 / G-10: fail fast, terminal failures, no leaks ─────────────────
+
+
+class TestPoolConnectionFoundation:
+    @staticmethod
+    def _pool(**kw: Any) -> AsyncConnectionPool:
+        config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.002)
+        return AsyncConnectionPool(connection_config=config, security_config=SecurityConfig(), **kw)
+
+    @staticmethod
+    def _auth_error() -> BaseException:
+        from aiormq.exceptions import ProbableAuthenticationError
+
+        return ProbableAuthenticationError("ACCESS_REFUSED - Login was refused")
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_raises_at_once(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        pool = self._pool()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=self._auth_error()) as connect:
+            with pytest.raises(AuthenticationFailedError) as caught:
+                await pool._create_connection()
+        connect.assert_awaited_once()  # no 30-attempt retry loop
+        assert caught.value.endpoint == "localhost:5672"
+        assert pool.terminal_error is None  # startup failure: start() raises, nothing to report
+
+    @pytest.mark.asyncio
+    async def test_unclassified_non_connection_error_raises_at_once(self) -> None:
+        pool = self._pool()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=ValueError("bad")) as connect:
+            with pytest.raises(ValueError, match="bad"):
+                await pool._create_connection()
+        connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_builds_rabbitkit_robust_connections(self) -> None:
+        from rabbitkit.async_.reconnect import RabbitkitRobustConnection
+
+        pool = self._pool()
+        conn = AsyncMock()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn) as connect:
+            assert await pool._create_connection(role="consumer") is conn
+        factory = connect.call_args.kwargs["connection_class"]
+        assert factory.func is RabbitkitRobustConnection
+        policy = factory.keywords["rk_policy"]
+        assert policy.role == "consumer"
+        assert policy.on_terminal == pool._record_terminal
+
+    @pytest.mark.asyncio
+    async def test_abandoned_connection_objects_are_closed(self) -> None:
+        """A failed or cancelled initial connect must not leave aio-pika's
+        reconnect task running in the background."""
+        pool = self._pool()
+        built: list[Any] = []
+
+        async def fake_connect_robust(**kwargs: Any) -> Any:
+            built.append(kwargs["connection_class"]("amqp://u:p@h:5672/"))
+            raise ConnectionRefusedError(61, "refused")
+
+        with patch("aio_pika.connect_robust", side_effect=fake_connect_robust):
+            pool._connection_config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.001)
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ConnectionRefusedError):
+                    await pool._create_connection()
+        assert len(built) == 30
+        assert all(conn._close_called for conn in built)  # is_closed stays False on aio-pika 9 without a transport
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_closes_the_abandoned_connection(self) -> None:
+        pool = self._pool()
+        built: list[Any] = []
+
+        async def hangs(**kwargs: Any) -> Any:
+            built.append(kwargs["connection_class"]("amqp://u:p@h:5672/"))
+            await asyncio.sleep(60)
+
+        with patch("aio_pika.connect_robust", side_effect=hangs):
+            task = asyncio.ensure_future(pool._create_connection())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert built and built[0]._close_called
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_after_startup_is_terminal_and_sticky(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        failures: list[Any] = []
+        pool = self._pool(on_connection_failed=failures.append)
+        pool._connected_once = True
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=self._auth_error()):
+            with pytest.raises(AuthenticationFailedError):
+                await pool._create_connection()
+        assert failures == [pool.terminal_error]
+
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock) as connect:
+            with pytest.raises(AuthenticationFailedError) as again:
+                await pool._create_connection()
+        connect.assert_not_awaited()
+        assert again.value is not pool.terminal_error
+        assert again.value.__cause__ is pool.terminal_error
+        assert again.value.reason == "authentication_failed"
+        assert failures == [pool.terminal_error]  # reported once
+
+    def test_record_terminal_reports_only_the_first_and_survives_a_raising_hook(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        def boom(_error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        pool = self._pool(on_connection_failed=boom)
+        first = ReconnectBudgetExhaustedError("one", reason="reconnect_budget_exhausted")
+        pool._record_terminal(first)
+        pool._record_terminal(ReconnectBudgetExhaustedError("two", reason="reconnect_budget_exhausted"))
+        assert pool.terminal_error is first
+        assert "on_connection_failed callback raised" in caplog.text
+
+    def test_record_terminal_without_a_hook(self) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        pool = self._pool()
+        error = ReconnectBudgetExhaustedError("one", reason="reconnect_budget_exhausted")
+        pool._record_terminal(error)
+        assert pool.terminal_error is error
+
+    @pytest.mark.asyncio
+    async def test_connect_closes_the_first_connection_when_the_second_fails(self) -> None:
+        pool = self._pool()
+        publisher = AsyncMock()
+        publisher.is_closed = False
+        with patch(
+            "aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[publisher, ValueError("consumer failed")]
+        ):
+            with pytest.raises(ValueError, match="consumer failed"):
+                await pool.connect()
+        publisher.close.assert_awaited_once()
+        assert pool._publisher_connection is None and pool._consumer_connection is None
+        assert not pool._connected_once
+
+    @pytest.mark.asyncio
+    async def test_successful_connect_marks_the_pool_connected_once(self) -> None:
+        pool = self._pool()
+        conn = AsyncMock()
+        conn.is_closed = False
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
+            await pool.connect()
+        assert pool._connected_once

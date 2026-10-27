@@ -36,7 +36,11 @@ app.router.add_get("/readyz", readiness)
 
 Liveness should NOT fail on a temporary RabbitMQ disconnect. A broker that
 is reconnecting is still alive; restarting the pod would only make things
-worse. `broker_liveness()` is built exactly this way: it checks the process
+worse. The exception is a connection that gave up for good (a refused login
+or vhost, a TLS verification failure, or a spent
+`ConnectionConfig.reconnect_budget_attempts` / `reconnect_budget_seconds`
+on async): only a restart can fix that, so `broker_liveness()` returns
+False. `broker_liveness()` is built exactly this way: it checks the process
 is making forward progress (the heartbeat ticks during message handling,
 idle I/O loops, *and* each reconnect-backoff iteration), and deliberately
 ignores broker connectivity and `connection.blocked` alarms.
@@ -311,10 +315,11 @@ config = RabbitConfig(
 
 - **Sync (pika):** all nodes are tried natively via a `ConnectionParameters`
   list — full failover, including on reconnect.
-- **Async (aio-pika):** endpoints are cycled on the *initial* connect; once
-  `connect_robust` succeeds it pins to that node for reconnects (aio-pika has
-  no multi-host reconnect). For per-reconnect failover on async, front the
-  cluster with a load balancer or DNS round-robin and point `host` at the VIP.
+- **Async (aio-pika):** endpoints are cycled on the initial connect and on
+  every reconnect attempt: after a drop the connection first retries the
+  node it was on, then moves to the next endpoint after each failed attempt,
+  while aio-pika restores channels, QoS, topology and consumers on whichever
+  node answers. Credentials are re-resolved on every attempt too.
 
 For a queue-level HA guarantee independent of connection failover, use
 **quorum queues** (`RabbitQueue(queue_type=QueueType.QUORUM)`) so messages are

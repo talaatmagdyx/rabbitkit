@@ -62,7 +62,11 @@ Use separate RabbitMQ credentials per service. Do not share a single admin accou
 
 For short-lived / rotated secrets (Vault, IAM), pass a `credentials_provider`
 instead of static `username`/`password`. It is called at every (re)connect,
-so a rotated secret is picked up on the next reconnect with no redeploy:
+so a rotated secret is picked up on the next reconnect with no redeploy. On
+the async broker that includes every attempt of aio-pika's in-place
+reconnect after a dropped connection (before the connection-foundation fix,
+only connections rabbitkit built itself called it, so an in-place reconnect
+retried the old password forever):
 
 ```python
 from rabbitkit import RabbitConfig, ConnectionConfig
@@ -77,7 +81,32 @@ config = RabbitConfig(
 
 The provider must be quick and non-blocking (it runs on the connect path).
 Cache the secret and refresh it out-of-band; the reconnect just reads the
-current value.
+current value. If it raises, the attempt reuses the previous credentials
+and a warning names only the exception type.
+
+Rotate in this order: make the new secret available to the provider, then
+revoke the old one on the broker. A refused login is a permanent failure
+(see below), so a reconnect that still presents a revoked password stops
+the connection for good instead of retrying.
+
+### Permanent connection failures fail fast
+
+A refused login (`ACCESS_REFUSED`), a refused vhost (`NOT_ALLOWED`: missing
+vhost or no permissions on it) and a TLS failure that retrying cannot fix
+(certificate verification, hostname mismatch, a rejected client
+certificate, a non-TLS port) are not retried. On `AsyncBroker`:
+
+- at `start()` they raise `AuthenticationFailedError`,
+  `VhostAccessRefusedError` or `TLSVerificationError` (all
+  `PermanentConnectionError`, a `ConnectionError`) at once, instead of after
+  30 attempts (6 to 12 minutes);
+- after startup, when a reconnect attempt hits one, the connection stops
+  reconnecting for good: `on_connection_failed` hooks fire, readiness and
+  liveness turn false, publishes fail without sending, and `run()` stops the
+  broker and raises the error so the process exits and is restarted.
+
+Error messages name the endpoint and vhost, never the username or password.
+A `NOT_ALLOWED` that says the vhost "is down" stays retryable.
 
 ### Least-privilege consumers with `TopologyMode.PASSIVE_ONLY`
 

@@ -330,12 +330,17 @@ config = RabbitConfig(
 | `username` | str | `"guest"` | SASL username |
 | `password` | str | `"guest"` | SASL password |
 | `vhost` | str | `"/"` | Virtual host |
-| `heartbeat` | int | `30` | Heartbeat interval (seconds) |
-| `socket_timeout` | float | `10.0` | TCP socket timeout |
+| `heartbeat` | int | `30` | Heartbeat interval (seconds); `0` disables it (warns), negative is rejected |
+| `socket_timeout` | float | `10.0` | TCP socket / connect timeout; must be > 0 |
 | `blocked_connection_timeout` | float | `60.0` | Fail-fast on broker alarm (k8s-friendly) |
 | `connection_name` | str \| None | `None` | Shows in RabbitMQ management UI |
-| `reconnect_backoff_base` | float | `1.0` | Initial reconnect backoff |
-| `reconnect_backoff_max` | float | `30.0` | Max reconnect backoff |
+| `reconnect_backoff_base` | float | `1.0` | Initial reconnect backoff; must be > 0 |
+| `reconnect_backoff_max` | float | `30.0` | Max reconnect backoff; must be >= base |
+| `reconnect_max_attempts` | int | `30` | Sync only: bound on the sync reconnect loop |
+| `reconnect_budget_attempts` | int \| None | `None` | Async only: consecutive failed reconnects in one outage before giving up for good (`None` = unlimited) |
+| `reconnect_budget_seconds` | float \| None | `None` | Async only: seconds since the connection was lost before giving up for good (`None` = unlimited) |
+| `credentials_provider` | callable \| None | `None` | `() -> (user, password)`, called before every connect and reconnect attempt |
+| `nodes` | tuple[str, ...] | `()` | Extra cluster endpoints (`"host"` / `"host:port"`), tried in order on connect and reconnect |
 
 ### ConsumerConfig
 

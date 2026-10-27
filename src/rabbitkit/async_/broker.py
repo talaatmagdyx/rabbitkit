@@ -42,6 +42,7 @@ from rabbitkit.core.errors import (
     BackpressureError,
     BrokerNotStartedError,
     MessageTooLargeError,
+    TerminalConnectionError,
     register_infrastructure_errors,
 )
 from rabbitkit.core.message import RabbitMessage
@@ -406,10 +407,66 @@ class AsyncBroker:
         staleness check, instead of bypassing it entirely (a ``None``
         heartbeat is treated as "no signal available" there, which
         previously meant "always alive").
+
+        G-10: all or nothing. If any step raises (or the call is cancelled),
+        everything this call created is undone before the error propagates:
+        consumers already started are cancelled, the worker pool, batch
+        publisher and heartbeat are stopped, and both connections are closed.
+        ``start()`` can then simply be called again.
+
+        G-08: a refused login or vhost, or a TLS verification failure, raises a
+        :class:`~rabbitkit.core.errors.PermanentConnectionError` at once
+        instead of retrying.
         """
         if self._started:
             return
+        try:
+            await self._start_unguarded(worker_config, install_signal_handlers=install_signal_handlers)
+        except BaseException:
+            await self._abort_failed_start()
+            raise
 
+    async def _abort_failed_start(self) -> None:
+        """Undo a ``start()`` that raised part-way (G-10). Best effort and bounded."""
+        self._restore_signal_handlers()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        transport, self._transport = self._transport, None
+        bound = self._config.connection.socket_timeout
+        if transport is not None:
+            for route in self._registry.routes:
+                tag = route.consumer_tag
+                if tag:
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(bound):
+                            await transport.cancel_consumer(tag)
+                    route.runtime_state.consumer_tag = None
+        if self._worker_pool is not None:
+            pool, self._worker_pool = self._worker_pool, None
+            with contextlib.suppress(Exception):
+                await pool.stop(timeout=0)
+        # Handlers of consumers that started before the failure: cancel and
+        # nack them now (an immediate drain deadline).
+        with contextlib.suppress(Exception):
+            await self._wait_in_flight(time.monotonic())
+        if self._batch_publisher is not None:
+            batch, self._batch_publisher = self._batch_publisher, None
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(bound):
+                    await batch.stop()
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(bound):
+                    await transport.disconnect()
+            # disconnect() is a no-op unless connect() finished; connect()
+            # cleans up after itself, this covers a connect() that succeeded.
+        self._started = False
+        self._set_lifecycle_gauges(connected=False)
+
+    async def _start_unguarded(self, worker_config: WorkerConfig | None, *, install_signal_handlers: bool) -> None:
         self.last_heartbeat = time.monotonic()
 
         # Configure structured logging if enabled
@@ -449,6 +506,7 @@ class AsyncBroker:
             max_in_flight_bytes=self._config.publisher.max_in_flight_bytes,
         )
         self._publish_closed = False
+        self._transport.on_connection_failed(self._on_connection_failed)
 
         await self._transport.connect()
 
@@ -602,6 +660,31 @@ class AsyncBroker:
         finally:
             self._run_waiting = False
             await self.stop()
+        failure = self._connection_failure()
+        if failure is not None:
+            raise failure
+
+    def _connection_failure(self) -> TerminalConnectionError | None:
+        transport = self._transport
+        failure = getattr(transport, "connection_failure", None) if transport is not None else None
+        return failure if isinstance(failure, TerminalConnectionError) else None
+
+    def _on_connection_failed(self, error: TerminalConnectionError) -> None:
+        """A connection stopped reconnecting for good after startup (G-08).
+
+        The broker stays started (``stop()`` still drains and closes), but
+        readiness and liveness go false. Under :meth:`run` this also ends the
+        run: it stops the broker and raises *error*, so the process exits and
+        its supervisor restarts it.
+        """
+        logger.critical(
+            "RabbitMQ connection failed for good (%s); readiness and liveness are now false: %s",
+            error.reason,
+            error,
+        )
+        self._set_lifecycle_gauges(connected=False)
+        if self._run_waiting:
+            self._shutdown_event.set()
 
     def _install_signal_handlers(self) -> None:
         """Install SIGINT/SIGTERM handlers that drain via stop() (H-SRE5, G-24).
@@ -1384,13 +1467,11 @@ class AsyncBroker:
         """Wire the channel-churn counters via the first route
         ``MetricsMiddleware``'s collector, if any. No-op without metrics.
 
-        Does NOT wire ``reconnects_total``, unlike the sync broker. 0.14
-        removed it on a measurement that said aio-pika never fires
+        Wires ``reconnects_total`` like the sync broker (G-08). 0.14 removed
+        it on a measurement that said aio-pika never fires
         ``reconnect_callbacks`` for a broker-closed connection; re-measured in
         0.19.2 (aio-pika 9.6.2 and 10.1.0), it does, once per connection and
-        after the consumers are restored. Re-adding the counter is a separate
-        change; ``channel_rebuilds_total`` remains the async churn signal —
-        see ``docs/observability.md``.
+        after the consumers are restored, and a real-broker test now covers it.
 
         ``on_reconnect`` fires for a broker-closed connection and whenever
         rabbitkit REPLACES a connection (a rebuilt publisher connection, a
@@ -1412,13 +1493,8 @@ class AsyncBroker:
         if metrics_mw is None or metrics_mw.collector is None:
             return
         collector = metrics_mw.collector
-        logger.info(
-            "Async broker: not emitting %s — aio-pika does not report a broker-initiated "
-            "reconnect, so the series would be permanently 0 while connections flap. "
-            "Alert on %s instead (see docs/observability.md).",
-            metrics_mw.config.reconnects_total,
-            metrics_mw.config.channel_rebuilds_total,
-        )
+        reconnects_name = metrics_mw.config.reconnects_total
+        self._transport.on_reconnect(lambda: collector.inc_counter(reconnects_name, {}))
 
         # Item 3: channel open/rebuild counters — same collector, same
         # no-route-metrics no-op behavior.

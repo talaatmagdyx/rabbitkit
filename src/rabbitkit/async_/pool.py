@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import functools
 import logging
 import random
 import time
@@ -19,8 +20,13 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from rabbitkit.async_.connection import get_connection_errors, make_aio_pika_connect_kwargs
+from rabbitkit.async_.connection import (
+    get_connection_errors,
+    make_aio_pika_connect_kwargs,
+    permanent_connection_error,
+)
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
+from rabbitkit.core.errors import TerminalConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -468,6 +474,8 @@ class AsyncConnectionPool:
         on_channel_opened: Callable[[], None] | None = None,
         on_channel_rebuilt: Callable[[], None] | None = None,
         on_connection_created: Callable[[Any], None] | None = None,
+        on_reconnect_attempt: Callable[[Any], None] | None = None,
+        on_connection_failed: Callable[[TerminalConnectionError], None] | None = None,
     ) -> None:
         self._connection_config = connection_config
         self._security_config = security_config
@@ -482,6 +490,15 @@ class AsyncConnectionPool:
         # previously were registered once in connect() and so were silently
         # lost the moment a connection object was replaced.
         self._on_connection_created = on_connection_created
+        # G-08: a failed reconnect attempt (a ReconnectAttempt) and the one
+        # terminal failure (TerminalConnectionError) of any connection.
+        self._on_reconnect_attempt = on_reconnect_attempt
+        self._on_connection_failed = on_connection_failed
+        # Set once a connection gives up for good (permanent failure or spent
+        # reconnect budget) after startup. Sticky: every later connect raises
+        # it instead of retrying, so the transport stays "not connected".
+        self._terminal_error: TerminalConnectionError | None = None
+        self._connected_once = False
 
         self._publisher_connection: Any | None = None
         self._consumer_connection: Any | None = None
@@ -492,8 +509,39 @@ class AsyncConnectionPool:
         self._lock = asyncio.Lock()
         self._prewarmed = False
 
+    @property
+    def terminal_error(self) -> TerminalConnectionError | None:
+        """Why this pool's connections stopped reconnecting for good, else ``None``."""
+        return self._terminal_error
+
+    def _record_terminal(self, error: TerminalConnectionError) -> None:
+        """A connection gave up for good after startup (G-08): remember it and
+        tell the transport. Only the first failure is reported."""
+        if self._terminal_error is not None:
+            return
+        self._terminal_error = error
+        if self._on_connection_failed is not None:
+            try:
+                self._on_connection_failed(error)
+            except Exception:  # never let a hook break the reconnect path
+                logger.exception("on_connection_failed callback raised")
+
     async def connect(self) -> None:
-        """Establish publisher and consumer connections eagerly."""
+        """Establish publisher and consumer connections eagerly.
+
+        All or nothing (G-10): if the second connection fails, the first is
+        closed before the error propagates.
+        """
+        try:
+            await self._connect_unguarded()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(self._connection_config.socket_timeout):
+                    await self.close_all()
+            raise
+        self._connected_once = True
+
+    async def _connect_unguarded(self) -> None:
         do_prewarm = False
         async with self._lock:
             if self._publisher_connection is None:
@@ -507,7 +555,7 @@ class AsyncConnectionPool:
                     on_channel_rebuilt=self._on_channel_rebuilt,
                 )
             if self._consumer_connection is None:
-                self._consumer_connection = await self._create_connection()
+                self._consumer_connection = await self._create_connection(role="consumer")
             if self._pool_config.prewarm_channels and not self._prewarmed:
                 self._prewarmed = True
                 do_prewarm = True
@@ -557,7 +605,7 @@ class AsyncConnectionPool:
         """
         async with self._lock:
             if self._consumer_connection is None:
-                self._consumer_connection = await self._create_connection()
+                self._consumer_connection = await self._create_connection(role="consumer")
             return self._consumer_connection
 
     async def acquire_publisher_channel(self, *, timeout: float | None = None) -> Any:
@@ -762,42 +810,81 @@ class AsyncConnectionPool:
             self._publisher_connection = None
             self._consumer_connection = None
 
-    async def _create_connection(self) -> Any:
-        """Create a new aio-pika connection."""
+    async def _create_connection(self, *, role: str = "publisher") -> Any:
+        """Create a new aio-pika connection.
+
+        G-08: a permanent failure (refused login or vhost, TLS verification)
+        raises a :class:`~rabbitkit.core.errors.PermanentConnectionError` at
+        once instead of being retried, and the connection object is a
+        :class:`~rabbitkit.async_.reconnect.RabbitkitRobustConnection`, so its
+        reconnects after a later drop back off exponentially, re-resolve
+        credentials and nodes on every attempt, and stop for good on a
+        permanent failure or a spent reconnect budget. *role* names the
+        connection in hooks and logs (only the consumer connection passes it).
+        """
         try:
             import aio_pika
         except ImportError:
             raise ImportError(
                 "aio-pika is required for async transport. Install it with: pip install rabbitkit[async]"
             ) from None
+        from rabbitkit.async_.reconnect import RabbitkitRobustConnection, ReconnectPolicy
+
+        if self._terminal_error is not None:
+            failed = self._terminal_error
+            raise type(failed)(str(failed), reason=failed.reason, endpoint=failed.endpoint) from failed
 
         # M9: cycle through cluster endpoints on the initial connect so a dead
-        # configured primary doesn't take the client down at startup. Once
-        # connect_robust succeeds it pins to that node for reconnects (aio-pika
-        # has no multi-host reconnect) — put a load balancer / DNS in front for
-        # per-reconnect failover across nodes.
+        # configured primary doesn't take the client down at startup. After a
+        # later drop the connection itself moves through the endpoints
+        # (RabbitkitRobustConnection), starting from the one that worked.
         endpoints = self._connection_config.cluster_endpoints()
 
-        # H-SRE3: connect_robust handles reconnects AFTER the first connection
-        # with a FIXED interval, so a fleet of clients starting at once thunder
-        # the broker. Apply an outer retry with full jitter for the INITIAL
-        # connect only; bounded so we never spin forever.
+        # H-SRE3: an outer retry with full jitter for the INITIAL connect,
+        # bounded so we never spin forever. Reconnects after it are driven by
+        # the connection's ReconnectPolicy.
         backoff = self._connection_config.reconnect_backoff_base
         max_backoff = self._connection_config.reconnect_backoff_max
         connection_errors = get_connection_errors()
+        vhost = self._connection_config.vhost
         max_attempts = 30
         for attempt in range(1, max_attempts + 1):
-            host, port = endpoints[(attempt - 1) % len(endpoints)]
+            index = (attempt - 1) % len(endpoints)
+            host, port = endpoints[index]
             kwargs = make_aio_pika_connect_kwargs(
                 self._connection_config,
                 self._security_config,
                 host_override=host,
                 port_override=port,
             )
+            built: list[Any] = []
+            policy = ReconnectPolicy(
+                self._connection_config,
+                role=role,
+                endpoint_index=index,
+                on_attempt=self._on_reconnect_attempt,
+                on_terminal=self._record_terminal,
+                on_instance=built.append,
+            )
+            kwargs["connection_class"] = functools.partial(RabbitkitRobustConnection, rk_policy=policy)
             try:
                 connection = await aio_pika.connect_robust(**kwargs)
-            except connection_errors as e:
-                if attempt == max_attempts:
+            except BaseException as e:
+                # aio-pika leaves an abandoned connection's reconnect task
+                # running (after a cancelled connect it retries forever in the
+                # background): close whatever was built.
+                for orphan in built:
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(self._connection_config.socket_timeout):
+                            await orphan.close()
+                if not isinstance(e, Exception):
+                    raise
+                permanent = permanent_connection_error(e, endpoint=f"{host}:{port}", vhost=vhost)
+                if permanent is not None:
+                    if self._connected_once:
+                        self._record_terminal(permanent)
+                    raise permanent from e
+                if not isinstance(e, connection_errors) or attempt == max_attempts:
                     raise
                 sleep_for = random.uniform(0.0, backoff)  # noqa: S311
                 logger.warning(

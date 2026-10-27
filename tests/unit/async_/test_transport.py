@@ -2870,3 +2870,157 @@ class TestReviewFindingsAsyncTransport:
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()
         fix.assert_called_once()
+
+
+# ── G-08 / G-10: connection hooks, terminal failure, atomic connect ─────
+
+
+class TestConnectionFoundation:
+    async def _connected(self) -> tuple[AsyncTransportImpl, AsyncMock]:
+        transport = _make_transport()
+        connection = _make_mock_connection()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=connection):
+            await transport.connect()
+        return transport, connection
+
+    def test_reconnect_attempt_hooks_fire_in_order_and_survive_errors(self, caplog: pytest.LogCaptureFixture) -> None:
+        from rabbitkit.async_.reconnect import ReconnectAttempt
+
+        transport = _make_transport()
+        seen: list[Any] = []
+
+        def boom(_attempt: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        transport.on_reconnect_attempt(boom)
+        transport.on_reconnect_attempt(seen.append)
+        attempt = ReconnectAttempt(role="publisher", attempt=1, delay=0.5, elapsed=0.1, endpoint="h:1", error=None)
+        transport._conn_pool._on_reconnect_attempt(attempt)  # the pool forwards the connection's hook here
+        assert seen == [attempt]
+        assert "reconnect_attempt callback raised" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_terminal_failure_reaches_hooks_and_disconnects(self, caplog: pytest.LogCaptureFixture) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        transport, _connection = await self._connected()
+        assert transport.is_connected()
+        assert transport.connection_failure is None
+        failures: list[Any] = []
+
+        def boom(_error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        transport.on_connection_failed(boom)
+        transport.on_connection_failed(failures.append)
+        error = ReconnectBudgetExhaustedError("gave up", reason="reconnect_budget_exhausted")
+        transport._conn_pool._record_terminal(error)
+
+        assert failures == [error]
+        assert transport.connection_failure is error
+        assert not transport.is_connected()
+        assert "connection_failed callback raised" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cancel_consumer_skips_the_broker_when_closed_for_good(self) -> None:
+        transport, connection = await self._connected()
+        channel = connection.channel.return_value
+        queue = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=queue)
+        tag = await transport.consume("amq.rabbitmq.reply-to", AsyncMock(), declare=False)
+        assert transport._reply_to_channel is channel
+
+        connection.is_closed = True
+        await transport.cancel_consumer(tag)
+
+        queue.cancel.assert_not_awaited()  # would wait forever for a reconnect
+        assert transport._consumer_tags == {}
+        assert transport._consumer_channels == {}
+        assert transport._reply_to_channel is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_consumer_closed_for_good_keeps_an_unrelated_reply_channel(self) -> None:
+        transport, connection = await self._connected()
+        tag = await transport.consume("orders", AsyncMock())
+        reply_channel = object()
+        transport._reply_to_channel = reply_channel
+        connection.is_closed = True
+        await transport.cancel_consumer(tag)
+        assert transport._reply_to_channel is reply_channel
+
+    @pytest.mark.asyncio
+    async def test_cancel_consumer_skips_the_broker_after_a_terminal_failure(self) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        transport, connection = await self._connected()
+        queue = AsyncMock()
+        connection.channel.return_value.get_queue = AsyncMock(return_value=queue)
+        tag = await transport.consume("orders", AsyncMock())
+        connection.terminal_error = ReconnectBudgetExhaustedError("x", reason="reconnect_budget_exhausted")
+        await transport.cancel_consumer(tag)
+        queue.cancel.assert_not_awaited()
+        assert transport._consumer_tags == {}
+
+    @pytest.mark.asyncio
+    async def test_failed_connect_closes_everything_it_opened(self) -> None:
+        transport = _make_transport()
+        connection = _make_mock_connection()
+        connection.channel = AsyncMock(side_effect=RuntimeError("topology channel refused"))
+        monitor = AsyncMock()
+        transport._blocked_monitors.append(monitor)
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=connection):
+            with pytest.raises(RuntimeError, match="topology channel refused"):
+                await transport.connect()
+        monitor.stop.assert_awaited_once()
+        assert connection.close.await_count >= 1
+        assert transport._conn_pool._publisher_connection is None
+        assert transport._conn_pool._consumer_connection is None
+        assert not transport._connected
+        assert transport._blocked_monitors == []
+
+    @pytest.mark.asyncio
+    async def test_failed_connect_closes_an_opened_topology_channel(self) -> None:
+        transport = _make_transport()
+        connection = _make_mock_connection()
+        channel = connection.channel.return_value
+        with (
+            patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=connection),
+            patch.object(transport, "_fire_channel_opened", side_effect=RuntimeError("hook")),
+        ):
+            with pytest.raises(RuntimeError, match="hook"):
+                await transport.connect()
+        channel.close.assert_awaited()
+        assert transport._topology_channel is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_cleans_up_too(self) -> None:
+        transport = _make_transport()
+        connection = _make_mock_connection()
+        started = asyncio.Event()
+
+        async def slow_channel(**_kw: Any) -> Any:
+            started.set()
+            await asyncio.sleep(60)
+
+        connection.channel = AsyncMock(side_effect=slow_channel)
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=connection):
+            task = asyncio.ensure_future(transport.connect())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        connection.close.assert_awaited()
+        assert transport._conn_pool._publisher_connection is None
+
+
+class TestRecoveryWaitAfterTerminalFailure:
+    @pytest.mark.asyncio
+    async def test_does_not_wait_for_a_connection_closed_for_good(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        transport = _make_transport()
+        transport._conn_pool._record_terminal(AuthenticationFailedError("refused", reason="authentication_failed"))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        assert await transport._wait_for_recovery(timeout=5.0) is False
+        assert loop.time() - started < 1.0

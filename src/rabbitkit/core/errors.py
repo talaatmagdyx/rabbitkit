@@ -383,6 +383,78 @@ class BrokerNotStartedError(RuntimeError):
     """
 
 
+# ── Terminal connection failures (G-08) ──────────────────────────────────
+# All subclass the builtin ConnectionError (an OSError): the client-library
+# errors these replace (aiormq's ProbableAuthenticationError, ssl's
+# SSLCertVerificationError) were OSErrors too, so ``except ConnectionError`` /
+# ``except OSError`` around ``start()`` keeps working.
+
+
+class TerminalConnectionError(ConnectionError):
+    """rabbitkit stopped trying to (re)connect to RabbitMQ.
+
+    Base class for the two reasons it gives up: a failure that retrying
+    cannot fix (:class:`PermanentConnectionError`) and a spent reconnect
+    budget (:class:`ReconnectBudgetExhaustedError`). Raised by
+    ``AsyncBroker.start()``, reported to ``on_connection_failed`` hooks and
+    re-raised by ``AsyncBroker.run()`` when it happens after startup.
+
+    ``reason`` is a short, bounded snake_case code (safe as a metric label).
+    ``endpoint`` is ``host:port`` of the node that failed. Neither the
+    message nor any attribute ever carries credentials.
+    """
+
+    def __init__(self, message: str, *, reason: str, endpoint: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.endpoint = endpoint
+
+
+class PermanentConnectionError(TerminalConnectionError):
+    """A connect attempt failed in a way that retrying will not fix.
+
+    RabbitMQ refused the login, the vhost or the user's access to it, or TLS
+    certificate verification failed. Retrying with the same settings only
+    burns time (it used to retry for 6 to 12 minutes at startup and forever
+    after a later drop), so rabbitkit fails fast instead. Fix the
+    configuration, the credentials or the broker's permissions.
+    """
+
+
+class AuthenticationFailedError(PermanentConnectionError):
+    """RabbitMQ refused the credentials (``ACCESS_REFUSED``, 403) or offered no
+    SASL mechanism the client supports.
+
+    ``reason`` is ``"authentication_failed"``.
+    """
+
+
+class VhostAccessRefusedError(PermanentConnectionError):
+    """RabbitMQ refused ``connection.open``: the vhost does not exist or the
+    user has no permissions on it (``NOT_ALLOWED``, 530).
+
+    ``reason`` is ``"vhost_access_refused"``.
+    """
+
+
+class TLSVerificationError(PermanentConnectionError):
+    """The TLS handshake failed for a reason retrying cannot fix: the broker's
+    certificate did not verify (unknown CA, expired, hostname mismatch), the
+    broker rejected the client certificate, or the port does not speak TLS.
+
+    ``reason`` is ``"tls_verification_failed"`` or ``"tls_handshake_rejected"``.
+    """
+
+
+class ReconnectBudgetExhaustedError(TerminalConnectionError):
+    """A connection was lost and every reconnect attempt failed until
+    ``ConnectionConfig.reconnect_budget_attempts`` or
+    ``reconnect_budget_seconds`` ran out.
+
+    ``reason`` is ``"reconnect_budget_exhausted"``. The last attempt's error
+    is the ``__cause__``.
+    """
+
 
 # ── Publish error (opt-in) ───────────────────────────────────────────────
 

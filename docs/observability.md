@@ -69,7 +69,7 @@ these are a no-op if no route has one. No labels on any of these three.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `rabbitkit_reconnects_total` | Counter | **Sync broker only since 0.14.** Every re-connection *after* the first successful connect. The async broker deliberately does not emit it — see [below](#async-does-not-emit-reconnects_total). |
+| `rabbitkit_reconnects_total` | Counter | Every re-connection *after* the first successful connect. Async counts connections, so one outage counts two (publisher and consumer); see [below](#async-reconnects). |
 | `rabbitkit_channels_opened_total` | Counter | Every new low-level channel either transport creates — the publisher/topology channel, a per-queue consumer channel, an async channel-pool slot, or a dedicated fast/mandatory/reply-to channel. A steady climb with no matching traffic growth signals a channel leak. |
 | `rabbitkit_channel_rebuilds_total` | Counter | The subset of `channels_opened_total` that **replaces** a channel lost to a reconnect, a 406 topology-drift close, or a mandatory/fast-channel recycle — as opposed to an ordinary first-ever open or async channel-pool growth. Isolates "something upstream actually failed" from routine churn. |
 
@@ -179,50 +179,44 @@ Alerting guidance:
   cumulative-ack prefix. Safe (nothing is acked early), but unacked messages
   accumulate; alert before `max_pending` is reached.
 
-## Async does not emit `reconnects_total`
+## Async reconnects
 
-**Since 0.14 `AsyncBroker` does not wire `rabbitkit_reconnects_total` at
-all.** This is a deliberate removal, not an oversight. Use
-`rabbitkit_channel_rebuilds_total` as the async reconnect signal; the broker
-logs a line saying so at startup.
+`AsyncBroker` emits `rabbitkit_reconnects_total` again (it was removed in
+0.14 on a measurement that said aio-pika never reports a broker-closed
+connection; that measurement was wrong). The counter is driven by
+`transport.on_reconnect`, which fires:
 
-The counter is driven by `transport.on_reconnect`. The 0.14 removal rested
-on a measurement that said aio-pika 9.6 never fires `reconnect_callbacks` when
-the **broker** closes the connection. **That measurement was wrong.**
-Re-measured in 0.19.2 against RabbitMQ 3.13 with `rabbitmqctl
-close_all_connections`, on aio-pika 9.6.2 and 10.1.0 alike:
+- once per AMQP connection that reconnects in place (publisher and consumer:
+  two per outage), *after* aio-pika has restored the consumers, so a restored
+  channel can already be delivering when it runs (which is why
+  `CoalescingAckerGroup.reset()` keeps live channels' ledgers; see
+  [bulk operations](bulk-operations.md));
+- when rabbitkit replaces a connection object (a rebuilt publisher
+  connection, a lazy re-create).
 
-- the callbacks fire, once per AMQP connection (publisher and consumer: two
-  per outage);
-- they fire *after* aio-pika has restored the consumers, so a restored
-  channel can already be delivering when they run (on 10.1 the first
-  restored delivery landed before the second callback).
+The transport also exposes the rest of the reconnect lifecycle as hooks, for
+your own metrics and logs:
 
-The second point is why `CoalescingAckerGroup.reset()` now keeps live
-channels' ledgers (see [bulk operations](bulk-operations.md)). The counter
-itself is still not wired on async; re-adding it (it would count
-connections, two per outage) is a separate change.
+| Hook | Fires | Argument |
+|---|---|---|
+| `transport.on_reconnect_attempt(cb)` | after every failed reconnect attempt of a connection that had been up | `ReconnectAttempt(role, attempt, delay, elapsed, endpoint, error)`: `role` is `"publisher"`/`"consumer"`, `delay` the backoff before the next attempt |
+| `transport.on_reconnect(cb)` | a reconnect succeeded | none |
+| `transport.on_connection_failed(cb)` | once, when a connection stops reconnecting for good (permanent failure or spent budget) | the `TerminalConnectionError`; also kept in `transport.connection_failure` |
 
-What is unaffected:
+Reconnect attempts back off exponentially with full jitter
+(`reconnect_backoff_base` doubling to `reconnect_backoff_max`), unlimited by
+default; `ConnectionConfig.reconnect_budget_attempts` /
+`reconnect_budget_seconds` bound an outage. A terminal failure turns
+`broker_health_check`, `broker_readiness` and `broker_liveness` false and is
+logged at CRITICAL.
 
-- The **sync** transport fires its own reconnect hook and still emits the
-  counter.
-- The async pool still attaches `reconnect_callbacks` and a
-  blocked-connection monitor to *every* connection it creates, and a
-  connection created after `connect()` finished still counts as a reconnect
-  for any hook you register yourself via `transport.on_reconnect`. A
-  broker-closed connection fires it too, once per connection, after the
-  consumers are restored. Only the built-in metric wiring is gone.
 - `transport.is_connected()` follows aio-pika's `connected` event, so it is
   False while a `RobustConnection` reconnects (before 0.19 it read
   `is_closed`, which stays False during a reconnect, and a readiness probe
   kept a disconnected pod in rotation).
-
-For async connection-churn alerting use `rabbitkit_channel_rebuilds_total`,
-`rabbitkit_settlement_items_total{status="stale"}` and the broker's own
-`connection_closed` metrics. Do not hang correctness-critical wiring off
-`on_reconnect` on async: `CoalescingAcker` does not need it, because a
-rebuilt channel is a new object and therefore gets a fresh ledger.
+- Do not hang correctness-critical wiring off `on_reconnect` on async:
+  `CoalescingAcker` does not need it, because a rebuilt channel is a new
+  object and therefore gets a fresh ledger.
 
 ## High-cardinality routing keys / queue names
 

@@ -42,6 +42,10 @@
 - **The CRITICAL profile turns on `SafetyConfig.dead_letter_with_metadata`**
   (see Added) and `validate_profile` reports it as an error when off: a
   hand-built CRITICAL config that was compliant reports one more violation.
+  Under CRITICAL a delivery over `max_body_bytes` therefore reaches the DLQ
+  as a metadata-stamped copy (`x-rabbitkit-error-category: invalid_message`,
+  no `x-death`), superseding changelog.d/profile.md's "The DLQ copy carries
+  `x-death` only" for that profile.
 - `rabbitkit_messages_dead_lettered_total` counts completed dead-letters
   only: a confirmed DLQ copy, or the dead-lettering reject the pipeline
   actually sent. It used to be recorded when `RetryMiddleware` handed a

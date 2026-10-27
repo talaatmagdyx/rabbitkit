@@ -493,8 +493,11 @@ class ConsumerConfig:
             decompression or any ``on_receive`` hook) is larger is
             ``INVALID_MESSAGE``: rejected without requeue, so the source
             queue's dead-letter exchange moves it to the DLQ, without running
-            any middleware or the handler. The broker dead-letters it, so the
-            DLQ copy carries ``x-death`` but not rabbitkit's failure headers.
+            any middleware or the handler. By default the broker dead-letters
+            it, so the DLQ entry carries ``x-death`` but not rabbitkit's
+            failure headers; with ``SafetyConfig.dead_letter_with_metadata``
+            (async broker; set by the CRITICAL profile) it is a confirmed copy
+            with them (``x-rabbitkit-error-category: invalid_message``).
             ``CompressionMiddleware`` caps the decompressed size separately.
     """
 

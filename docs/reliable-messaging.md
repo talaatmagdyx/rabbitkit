@@ -119,8 +119,8 @@ middlewares).
 | Raises an AMQP client error or `InfrastructureError` | `INFRASTRUCTURE` | as `RETRYABLE` | as `RETRYABLE` |
 | Exceeds `ConsumerConfig.processing_timeout` (async only) | `UNKNOWN_OUTCOME` | task cancelled, then as `RETRYABLE` | as `RETRYABLE` |
 | Raises anything else (unclassified) or a permanent error | `PERMANENT` | confirmed DLQ copy with failure metadata, then ack | reject → source queue's DLX → `<queue>.dlq` |
-| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX | reject → DLX |
-| Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler | same |
+| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
+| Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler (copy with metadata first when `dead_letter_with_metadata`, e.g. under CRITICAL) | same |
 | Retries exhausted, or `max_retry_age` passed | terminal | confirmed DLQ copy with metadata, then ack | — |
 | Cancelled by `stop()` | `SHUTDOWN` | nack(requeue); `CancelledError` propagates | same |
 | Filtered out by `filter_fn` | — | nack(requeue=False) → DLX | same |

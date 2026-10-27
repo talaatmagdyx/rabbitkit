@@ -2385,7 +2385,10 @@ class TestChannelGoneSettlement:
 
         route = _make_route(handler=handler)
         await HandlerPipeline().process_async(route, msg)
-        assert msg._disposition == "pending"
+        # G-15: the reject was claimed before the send; the send failed, so
+        # its outcome is unknown and nothing else is sent for this delivery.
+        assert msg._disposition == "rejected"
+        assert msg.settlement_outcome_unknown is True
 
     @pytest.mark.asyncio
     async def test_async_non_channel_settle_failure_still_raises(self) -> None:

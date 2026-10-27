@@ -233,9 +233,11 @@ def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> N
 
     A "pending" disposition (e.g. a MANUAL-policy handler that hasn't
     settled its message yet by the time this runs) emits nothing — there is
-    nothing final to report yet.
+    nothing final to report yet. Neither does a claimed settlement whose send
+    failed (``settlement_outcome_unknown``, G-15): the frame may not have
+    reached the broker, and an ack's unknown outcome is counted separately.
     """
-    if message.disposition == "pending":
+    if message.disposition == "pending" or message.settlement_outcome_unknown:
         return
     from rabbitkit.middleware.metrics import MetricsMiddleware
 

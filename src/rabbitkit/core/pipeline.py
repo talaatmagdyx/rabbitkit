@@ -94,6 +94,7 @@ def _is_channel_gone(exc: BaseException) -> bool:
         current = current.__cause__ or current.__context__
     return False
 
+
 class _SettlementLossWarner:
     """Aggregate "channel closed before settlement" warnings.
 
@@ -1018,6 +1019,7 @@ class HandlerPipeline:
             is_async = self._is_async_handler_cache.get(route.handler)
             if is_async is None:
                 import inspect as _inspect
+
                 is_async = _inspect.iscoroutinefunction(route.handler)
                 self._is_async_handler_cache[route.handler] = is_async
             if is_async:
@@ -1143,6 +1145,7 @@ class HandlerPipeline:
         plan = self._binding_plan_cache.get(route.handler)
         if plan is None:
             import inspect
+
             sig = self._sig_cache.get(route.handler)
             if sig is None:
                 sig = inspect.signature(route.handler)
@@ -1416,8 +1419,7 @@ class HandlerPipeline:
             # to it unchecked is a one-hop write into any queue in the vhost.
             if not _reply_to_permitted(message.reply_to, route.reply_to_allow):
                 logger.warning(
-                    "Route %r refused to publish its result to reply_to=%r: not in reply_to_allow. "
-                    "Result dropped.",
+                    "Route %r refused to publish its result to reply_to=%r: not in reply_to_allow. Result dropped.",
                     route.name,
                     message.reply_to,
                 )

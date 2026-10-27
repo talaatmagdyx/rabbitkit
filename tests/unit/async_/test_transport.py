@@ -1941,9 +1941,7 @@ class TestMandatoryChannelPool:
         from rabbitkit.async_.pool import AsyncConnectionPool
 
         opened: list[int] = []
-        pool = AsyncConnectionPool(
-            ConnectionConfig(), SecurityConfig(), on_channel_opened=lambda: opened.append(1)
-        )
+        pool = AsyncConnectionPool(ConnectionConfig(), SecurityConfig(), on_channel_opened=lambda: opened.append(1))
         pool._publisher_connection = connection
         return pool, opened
 
@@ -2899,7 +2897,8 @@ class TestReviewFindingsAsyncTransport:
         transport = _make_transport()
         with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
             with patch(
-                "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+                "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
+                return_value={"url": "amqp://guest:guest@localhost/"},
             ):
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()

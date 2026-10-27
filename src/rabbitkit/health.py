@@ -577,9 +577,7 @@ class HealthWatcher:
 
     def _tick(self) -> None:
         """One poll: read health, then run the shared debounced state machine."""
-        result = broker_health_check(
-            self._broker, config=self._config, management_client=self._management_client
-        )
+        result = broker_health_check(self._broker, config=self._config, management_client=self._management_client)
         self._apply(result)
 
     def _apply(self, result: BrokerHealthResult) -> None:

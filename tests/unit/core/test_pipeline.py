@@ -504,9 +504,7 @@ class TestResultPublishing:
         async def handler(body: bytes) -> None:
             raise ConnectionError("transient")
 
-        await HandlerPipeline(reject_transient_on_redelivery=True).process_async(
-            _make_route(handler=handler), msg
-        )
+        await HandlerPipeline(reject_transient_on_redelivery=True).process_async(_make_route(handler=handler), msg)
         msg._reject_async_fn.assert_awaited_once_with(False)
         msg._nack_async_fn.assert_not_awaited()
 

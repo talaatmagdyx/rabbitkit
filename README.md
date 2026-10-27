@@ -177,9 +177,12 @@ async def publish_order() -> None:
     outcome.raise_for_status()
 ```
 
-A publish can be `CONFIRMED`, `SENT`, `RETURNED`, `NACKED`, `TIMEOUT`, or
-`ERROR`. Application code can treat those as different states instead of
-assuming "publish called" means "message safe".
+A publish can be `CONFIRMED`, `SENT`, `RETURNED`, `NACKED`, `NOT_SENT`
+(definitely never left the client: safe to publish again), `UNKNOWN` or
+`TIMEOUT` (may have reached the broker: publish again only with the same
+`message_id`), or `ERROR`. `outcome.reason` says why. Application code can
+treat those as different states instead of assuming "publish called" means
+"message safe".
 
 ### 3. Add retry and DLQ handling
 

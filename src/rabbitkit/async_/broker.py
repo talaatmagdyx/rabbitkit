@@ -89,6 +89,21 @@ def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = N
         error=error,
         reason=reason,
     )
+def _is_loop_signal_handler(handler: Any) -> bool:
+    """True if *handler* is the placeholder an event loop installs for
+    ``loop.add_signal_handler`` (asyncio's and uvloop's ``_sighandler_noop``)."""
+    return callable(handler) and getattr(handler, "__name__", "") == "_sighandler_noop"
+
+
+def _is_default_signal_handler(sig: signal.Signals, handler: Any) -> bool:
+    """True for handlers nobody chose on purpose: ``SIG_DFL``, none set from
+    Python, SIGINT's ``default_int_handler``, and ``asyncio.run()``'s SIGINT
+    handler (a ``functools.partial`` of ``Runner._on_sigint``)."""
+    if handler is None or handler == signal.SIG_DFL:
+        return True
+    if sig == signal.SIGINT and handler is signal.default_int_handler:
+        return True
+    return getattr(getattr(handler, "func", None), "__name__", "") == "_on_sigint"
 
 
 class AsyncBroker:
@@ -174,6 +189,13 @@ class AsyncBroker:
         # where the broker's handler overwrites the app's). Wire
         # ``broker.on_app_shutdown = app.request_shutdown`` before ``app.run_async()``.
         self.on_app_shutdown: Callable[[], None] | None = None
+        # G-26: optional hooks called with the queue name when the BROKER
+        # cancels a route's consumer (queue deleted, quorum leader change, ...)
+        # and when it is consuming again. The transport re-subscribes on its
+        # own; the route reports as not consuming in health checks meanwhile.
+        self.on_consumer_cancelled: Callable[[str], None] | None = None
+        self.on_consumer_resumed: Callable[[str], None] | None = None
+        self._consumer_state_wired: Any = None  # the transport the state callbacks are on
 
         # Bounded graceful drain (C-2): inline in-flight counter guarded by an
         # asyncio.Condition (R-Condition). ``_in_flight`` stays a plain int so
@@ -190,7 +212,10 @@ class AsyncBroker:
         # Optional publish-side flow control (C-6).
         self._flow_controller: Any | None = None
 
-        # Signal-handler bookkeeping (H-SRE5).
+        # Signal-handler bookkeeping (H-SRE5, G-24). _signal_prev: the
+        # Python-level handler each loop-installed signal replaced, restored
+        # by stop(); _original_handlers: the signal.signal() fallback's.
+        self._signal_prev: dict[signal.Signals, Any] = {}
         self._original_handlers: dict[signal.Signals, Any] = {}
         self._installed_loop_handlers = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -579,30 +604,74 @@ class AsyncBroker:
             await self.stop()
 
     def _install_signal_handlers(self) -> None:
-        """Install portable SIGINT/SIGTERM handlers that drain via stop() (H-SRE5).
+        """Install SIGINT/SIGTERM handlers that drain via stop() (H-SRE5, G-24).
 
         Prefers ``loop.add_signal_handler``; falls back to ``signal.signal`` on
         platforms/threads where the loop API is unavailable. Idempotent.
+
+        G-24: an embedding application's handlers are not clobbered.
+
+        * The Python-level handler in place (``signal.getsignal``) is captured
+          and put back by ``stop()``. A custom one (anything but the default,
+          ``SIG_DFL`` or ``asyncio.run()``'s own SIGINT handler) is replaced
+          for the broker's lifetime, with a WARNING.
+        * A handler registered with ``loop.add_signal_handler`` cannot be read
+          back through asyncio's public API, so it could not be restored.
+          The broker leaves such a signal alone (WARNING): the application's
+          handler stays in charge and should call ``broker.request_shutdown()``
+          or ``await broker.stop()``.
+
+        Embedding applications should pass ``install_signal_handlers=False``.
         """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover
             return  # no running loop - nothing to install
         self._loop = loop
-        installed = False
-        try:
-            for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            if sig in self._signal_prev or sig in self._original_handlers:
+                continue  # already ours
+            prev = signal.getsignal(sig)
+            if _is_loop_signal_handler(prev):
+                logger.warning(
+                    "AsyncBroker: an asyncio handler for %s is already installed (e.g. by the "
+                    "application or RabbitApp); not replacing it, because asyncio cannot hand it back "
+                    "after stop(). That handler should call broker.request_shutdown() or await "
+                    "broker.stop(). Pass start(install_signal_handlers=False) to silence this.",
+                    sig.name,
+                )
+                continue
+            if not _is_default_signal_handler(sig, prev):
+                logger.warning(
+                    "AsyncBroker: replacing the existing %s handler %r until stop(), which restores it. "
+                    "Pass start(install_signal_handlers=False) if the application owns signal handling.",
+                    sig.name,
+                    prev,
+                )
+            try:
                 loop.add_signal_handler(sig, self._on_signal)
-            installed = True
-        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-            pass  # pragma: no cover
-        self._installed_loop_handlers = installed
-        if not installed:  # pragma: no cover
-            for sig in (signal.SIGINT, signal.SIGTERM):  # pragma: no cover
+            except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - Windows / non-main thread
                 try:  # pragma: no cover
                     self._original_handlers[sig] = signal.signal(sig, self._on_signal_sync)  # pragma: no cover
                 except (ValueError, OSError):  # pragma: no cover - not main thread
                     pass
+                continue  # pragma: no cover
+            self._signal_prev[sig] = prev
+            self._installed_loop_handlers = True
+
+    def _owns_loop_signal(self, loop: asyncio.AbstractEventLoop, sig: signal.Signals) -> bool:
+        """Whether *loop*'s handler for *sig* is still this broker's.
+
+        Reads asyncio's private handler table when it exists (the standard
+        Unix loop), so an application handler installed after ``start()`` is
+        not removed by ``stop()``. Without it (e.g. uvloop) the broker
+        assumes the handler is still its own, as before.
+        """
+        handlers = getattr(loop, "_signal_handlers", None)
+        if not isinstance(handlers, dict):
+            return True
+        handle = handlers.get(sig)
+        return handle is not None and getattr(handle, "_callback", None) == self._on_signal
 
     def _trigger_shutdown(self) -> None:
         """Set the shutdown event so an in-progress ``run()`` joins the drain
@@ -642,13 +711,24 @@ class AsyncBroker:
         self._trigger_shutdown()
 
     def _restore_signal_handlers(self) -> None:
-        if self._loop is not None and self._installed_loop_handlers:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    self._loop.remove_signal_handler(sig)
-                except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-                    pass
-            self._installed_loop_handlers = False
+        """Remove this broker's handlers and put back what was there before (G-24)."""
+        loop = self._loop
+        for sig, prev in self._signal_prev.items():
+            if loop is None or not self._owns_loop_signal(loop, sig):
+                logger.info("AsyncBroker: %s handler was replaced after start(); leaving it in place", sig.name)
+                continue
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
+                continue
+            if prev is None:
+                continue  # installed outside Python: nothing we can put back
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError, TypeError):
+                logger.warning("AsyncBroker: could not restore the previous %s handler", sig.name, exc_info=True)
+        self._signal_prev.clear()
+        self._installed_loop_handlers = False
         for sig, prev in self._original_handlers.items():  # pragma: no cover
             try:  # pragma: no cover
                 signal.signal(sig, prev)  # pragma: no cover
@@ -1562,12 +1642,36 @@ class AsyncBroker:
             callback = on_message
 
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
+        self._wire_consumer_state()
+        route.runtime_state.consumer_cancelled = False
         consumer_tag = await self._transport.consume(
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+    def _wire_consumer_state(self) -> None:
+        """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
+        transport: Any = self._transport  # set: _start_consumer returns early without one
+        if self._consumer_state_wired is transport:
+            return
+        self._consumer_state_wired = transport
+        transport.on_consumer_cancelled(lambda queue: self._consumer_state_changed(queue, cancelled=True))
+        transport.on_consumer_resumed(lambda queue: self._consumer_state_changed(queue, cancelled=False))
+
+    def _consumer_state_changed(self, queue: str, *, cancelled: bool) -> None:
+        for route in self._registry.routes:
+            if route.queue.name == queue:
+                route.runtime_state.consumer_cancelled = cancelled
+        hook = self.on_consumer_cancelled if cancelled else self.on_consumer_resumed
+        if hook is None:
+            return
+        try:
+            hook(queue)
+        except Exception:
+            event = "cancelled" if cancelled else "resumed"
+            logger.warning("on_consumer_%s hook raised (queue=%s)", event, queue, exc_info=True)
 
     # ── Public topology API (16.6) — additive, retry/topology owner ─────
 

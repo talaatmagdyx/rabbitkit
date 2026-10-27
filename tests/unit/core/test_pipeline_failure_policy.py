@@ -273,6 +273,8 @@ class TestAckOutcomeUnknown:
         await pipeline.process_async(_route(handler, route_middlewares=[mw]), msg)
         names = [c.args[0] for c in collector.inc_counter.call_args_list]
         assert "rabbitkit_settlement_outcome_unknown_total" in names
+        # G-15: the claimed-but-unsent ack is not also counted as acked.
+        assert "rabbitkit_messages_acked_total" not in names
 
 
 # ── CONSUMER-006: processing deadline ─────────────────────────────────────

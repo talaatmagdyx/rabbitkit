@@ -341,6 +341,10 @@ class AsyncWorkerPool:
         # stop_timeout deadline can be nacked (redelivery) and logged by
         # delivery tag/message id instead of just cancelled and forgotten.
         self._task_messages: dict[asyncio.Task[None], RabbitMessage] = {}
+        # Tasks that hold a worker slot (their handler has started). The rest
+        # of ``_tasks`` are prefetched deliveries still waiting for a slot;
+        # stop() releases those at once instead of running them (§3.2).
+        self._started: set[asyncio.Task[None]] = set()
         self._running = False
 
     @property
@@ -359,7 +363,13 @@ class AsyncWorkerPool:
     async def stop(self, timeout: float | None = None) -> None:
         """Stop the worker pool, waiting for in-flight tasks.
 
-        Waits up to *timeout* for in-flight tasks, then cancels the rest and
+        Deliveries that were prefetched into the pool but are still waiting
+        for a worker slot are released first: their tasks are cancelled
+        before the handler starts and each message is nacked with
+        ``requeue=True``, so the broker can hand it to another consumer at
+        once instead of this process running it during the grace period.
+
+        Then waits up to *timeout* for in-flight tasks, then cancels the rest and
         waits at most ``_CANCEL_JOIN_TIMEOUT`` more for them to unwind. A
         handler that swallows ``CancelledError`` is abandoned (logged) rather
         than allowed to hold ``stop()`` open past its deadline.
@@ -378,9 +388,12 @@ class AsyncWorkerPool:
         if not self._tasks:
             return
         effective = timeout if timeout is not None else self._config.stop_timeout
-        tasks = list(self._tasks)
         task_messages = dict(self._task_messages)
         try:
+            await self._release_queued(task_messages)
+            tasks = [task for task in self._tasks if task in self._started]
+            if not tasks:
+                return
             # asyncio.wait, not gather: a cancelled gather only completes once
             # every child has finished, so one handler that swallows
             # CancelledError made stop() unbounded (INV-008).
@@ -417,7 +430,38 @@ class AsyncWorkerPool:
         finally:
             self._tasks.clear()
             self._task_messages.clear()
+            self._started.clear()
             logger.info("AsyncWorkerPool stopped")
+
+    async def _release_queued(self, task_messages: dict[asyncio.Task[None], RabbitMessage]) -> None:
+        """Cancel tasks still waiting for a slot and nack their messages (requeue)."""
+        queued = [task for task in self._tasks if task not in self._started]
+        if not queued:
+            return
+        for task in queued:
+            task.cancel()
+        # A task waiting on the semaphore unwinds at its next step; the bound
+        # only guards against a callback that is not ours.
+        await asyncio.wait(queued, timeout=_CANCEL_JOIN_TIMEOUT)
+        released = 0
+        for task in queued:
+            message = task_messages.get(task)
+            if message is None or message.is_settled:
+                continue
+            try:
+                await message.nack_async(requeue=True)
+                released += 1
+            except Exception:
+                logger.warning(
+                    "AsyncWorkerPool: nack of not-started delivery_tag=%s raised; the broker "
+                    "redelivers it when the channel closes",
+                    message.delivery_tag,
+                    exc_info=True,
+                )
+        logger.info(
+            "AsyncWorkerPool: released %d prefetched message(s) that had not started (nack requeue=True)",
+            released,
+        )
 
     async def submit(
         self,
@@ -453,8 +497,13 @@ class AsyncWorkerPool:
 
         semaphore = self._semaphore
 
+        started = self._started
+
         async def _run() -> None:
             async with semaphore:
+                task = asyncio.current_task()
+                if task is not None:
+                    started.add(task)
                 await callback(message)
 
         task = asyncio.create_task(_run())
@@ -465,6 +514,7 @@ class AsyncWorkerPool:
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
         self._task_messages.pop(task, None)
+        self._started.discard(task)
 
     @property
     def pending_count(self) -> int:

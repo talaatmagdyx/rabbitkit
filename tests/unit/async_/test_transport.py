@@ -767,17 +767,110 @@ class TestConsume:
 
     @pytest.mark.asyncio
     async def test_cancel_consumer(self) -> None:
+        """CONSUMER-007: cancel through the queue object the consumer was
+        started on, so aio-pika's robust restore forgets it; a fresh
+        get_queue() wrapper left the restore record in place."""
         transport = _make_transport()
         channel = await self._connect_transport(transport)
 
-        mock_queue = AsyncMock()
-        channel.get_queue = AsyncMock(return_value=mock_queue)
+        registered = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=registered)
+        channel.get_queue = AsyncMock(return_value=AsyncMock())
 
         tag = await transport.consume("orders", AsyncMock())
         await transport.cancel_consumer(tag)
 
-        # Should have called cancel on the queue
-        assert mock_queue.cancel.called
+        registered.cancel.assert_awaited_once_with(tag)
+        channel.get_queue.assert_not_called()
+        await transport.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_failed_cancel_drops_the_robust_restore_record(self) -> None:
+        """aio-pika 9.x forgets a consumer only after Basic.CancelOk. A cancel
+        lost to a dropped connection must not be restored by the reconnect."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        registered = AsyncMock()
+        registered.cancel = AsyncMock(side_effect=ConnectionResetError("dropped"))
+        channel.declare_queue = AsyncMock(return_value=registered)
+
+        tag = await transport.consume("orders", AsyncMock())
+        registered._consumers = {tag: {"no_ack": False}, "other": {}}
+        await transport.cancel_consumer(tag)
+
+        assert registered._consumers == {"other": {}}
+        assert "orders" not in transport._consumer_tags
+        await transport.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_a_record_falls_back_to_get_queue(self) -> None:
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        fresh = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=fresh)
+        transport._consumer_channels["legacy"] = channel
+        transport._consumer_tags["legacy"] = "legacy-tag"
+
+        await transport.cancel_consumer("legacy-tag")
+
+        channel.get_queue.assert_awaited_once_with("legacy", ensure=False)
+        fresh.cancel.assert_awaited_once_with("legacy-tag")
+
+    @pytest.mark.asyncio
+    async def test_delivery_after_cancel_is_requeued_and_consumer_cancelled_again(self) -> None:
+        """CONSUMER-007: a consumer resurrected by a reconnect after rabbitkit
+        cancelled it must not run the handler: the delivery is requeued and the
+        stray consumer cancelled."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        registered = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=registered)
+        handler = AsyncMock()
+
+        tag = await transport.consume("orders", handler)
+        on_message = registered.consume.call_args.args[0]
+        await transport.cancel_consumer(tag)
+
+        stray = MagicMock()
+        stray.nack = AsyncMock()
+        stray.channel.basic_cancel = AsyncMock()
+        await on_message(stray)
+
+        handler.assert_not_called()
+        stray.nack.assert_awaited_once_with(requeue=True)
+        stray.channel.basic_cancel.assert_awaited_once_with(tag)
+        await transport.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_stray_delivery_on_no_ack_consumer_is_not_nacked(self) -> None:
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        registered = AsyncMock()
+        channel.get_queue = AsyncMock(return_value=registered)
+
+        tag = await transport.consume("amq.rabbitmq.reply-to", AsyncMock(), no_ack=True, declare=False)
+        on_message = registered.consume.call_args.args[0]
+        await transport.cancel_consumer(tag)
+
+        stray = MagicMock()
+        stray.nack = AsyncMock()
+        stray.channel.basic_cancel = AsyncMock()
+        await on_message(stray)
+
+        stray.nack.assert_not_called()
+        stray.channel.basic_cancel.assert_awaited_once_with(tag)
+
+    @pytest.mark.asyncio
+    async def test_consumer_state_hooks_and_cancelled_consumers(self) -> None:
+        transport = _make_transport()
+        cancelled: list[str] = []
+        resumed: list[str] = []
+        transport.on_consumer_cancelled(cancelled.append)
+        transport.on_consumer_resumed(resumed.append)
+        assert transport.cancelled_consumers == frozenset()
+        assert transport._consumer_supervisor._cancelled_callbacks == [cancelled.append]
+        assert transport._consumer_supervisor._resumed_callbacks == [resumed.append]
 
     @pytest.mark.asyncio
     async def test_consume_declare_false_uses_get_queue_not_declare(self) -> None:
@@ -1811,9 +1904,7 @@ class TestMandatoryChannelPool:
         from rabbitkit.async_.pool import AsyncConnectionPool
 
         opened: list[int] = []
-        pool = AsyncConnectionPool(
-            ConnectionConfig(), SecurityConfig(), on_channel_opened=lambda: opened.append(1)
-        )
+        pool = AsyncConnectionPool(ConnectionConfig(), SecurityConfig(), on_channel_opened=lambda: opened.append(1))
         pool._publisher_connection = connection
         return pool, opened
 
@@ -2773,7 +2864,8 @@ class TestReviewFindingsAsyncTransport:
         transport = _make_transport()
         with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
             with patch(
-                "rabbitkit.async_.pool.make_aio_pika_connect_kwargs", return_value={"url": "amqp://guest:guest@localhost/"}
+                "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
+                return_value={"url": "amqp://guest:guest@localhost/"},
             ):
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()

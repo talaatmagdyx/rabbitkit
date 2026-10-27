@@ -62,10 +62,17 @@ async def rabbitkit_lifespan(
                 if asyncio.iscoroutine(result):
                     await result
 
-        # Start broker
+        # Start broker. The ASGI server owns SIGINT/SIGTERM (it runs this
+        # lifespan's teardown on them), so an AsyncBroker must not install its
+        # own handlers: under uvicorn they replaced the server's, and SIGTERM
+        # then stopped only the broker while the server kept running (G-24).
         if broker is not None:
-            if inspect.iscoroutinefunction(getattr(broker, "start", None)):
-                await broker.start()
+            start = getattr(broker, "start", None)
+            if inspect.iscoroutinefunction(start):
+                if "install_signal_handlers" in inspect.signature(start).parameters:
+                    await start(install_signal_handlers=False)
+                else:
+                    await start()
             elif hasattr(broker, "start"):
                 broker.start()
 

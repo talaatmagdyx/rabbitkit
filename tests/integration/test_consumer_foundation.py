@@ -368,16 +368,22 @@ async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(
 async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> None:
     """Per-route prefetch=2 and a handler that blocks: the broker holds 2
     unacked. After every connection is killed and restored, still 2, not the
-    whole backlog."""
+    whole backlog. Also documents that aiormq cancels inline handlers when
+    their channel closes (docs/message-safety.md)."""
     from rabbitkit import AsyncBroker
 
     queue = _name("qos")
     broker = AsyncBroker(_config(rabbit["url"]))
     release = asyncio.Event()
+    cancelled: list[str] = []
 
     @broker.subscriber(queue, prefetch_count=2, reject_without_dlx="discard")
     async def handler(body: bytes) -> None:
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append("x")
+            raise
 
     await broker.start(install_signal_handlers=False)
     try:
@@ -391,6 +397,7 @@ async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> 
         await await_counts(rabbit, queue, (6, 2), timeout=20)
         await asyncio.sleep(1.0)
         assert await asyncio.to_thread(live_counts, rabbit, queue) == (6, 2)
+        assert cancelled == ["x", "x"]  # the two in-flight inline handlers, cut off by the channel loss
     finally:
         release.set()
         await broker.stop(timeout=5)

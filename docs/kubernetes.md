@@ -69,19 +69,89 @@ readinessProbe:
 
 ## Graceful Shutdown
 
-### terminationGracePeriodSeconds
+### Who handles SIGTERM
 
-Set `terminationGracePeriodSeconds` to be greater than
-`ConsumerConfig.graceful_timeout` **plus** your `preStop` sleep. The drain
-budget on `broker.stop()` is `graceful_timeout` — that is the knob to size
-to your slowest handler (`WorkerConfig.stop_timeout` is only a fallback for
-directly-driven worker pools and has no effect on the standard shutdown
-path).
+Exactly one component of the process should own SIGINT/SIGTERM and call
+`await broker.stop()` (or `broker.request_shutdown()`) from it.
+
+**Standalone worker** — the broker owns the signals:
+
+```python
+async def main() -> None:
+    broker = AsyncBroker(config)
+    ...  # @broker.subscriber(...) routes
+    await broker.run()  # start, wait for SIGTERM/SIGINT, drain, stop
+
+
+asyncio.run(main())
+```
+
+**Embedded** (FastAPI/uvicorn, aiohttp, your own supervisor, `RabbitApp`) —
+the application owns the signals. Start the broker with
+`install_signal_handlers=False` and stop it from the application's shutdown
+path:
+
+```python
+async def serve() -> None:
+    broker = AsyncBroker(config)
+    await broker.start(install_signal_handlers=False)
+    try:
+        await application_main()  # returns when the app's own SIGTERM handler fires
+    finally:
+        await broker.stop()  # drains in-flight messages, then disconnects
+```
+
+`rabbitkit_lifespan` does this for you (the ASGI server runs the lifespan
+teardown on SIGTERM).
+
+If an embedded broker is started with the default
+`install_signal_handlers=True` anyway:
+
+- A handler the application registered with `loop.add_signal_handler` is
+  left in place (asyncio cannot hand it back after `stop()`, so the broker
+  does not replace it). A WARNING says so; that handler must stop the broker.
+- A handler installed with `signal.signal` is replaced for the broker's
+  lifetime (WARNING) and restored by `stop()`. Until then, SIGTERM goes to
+  the broker only.
+
+In rabbitkit 0.19.x and earlier, `start()` replaced the application's
+handlers and `stop()` reset them to the default, so the application lost
+them.
+
+### terminationGracePeriodSeconds vs `graceful_timeout`
+
+Kubernetes sends SIGTERM, waits `terminationGracePeriodSeconds` (default
+**30 s**), then sends SIGKILL. `preStop` runs first and counts against the
+same budget. Everything `broker.stop()` does must finish before SIGKILL:
+
+| Phase of `stop()` | Bound |
+|---|---|
+| Cancel consumers; hand not-started worker-pool deliveries back (`nack`, requeue) | a few round trips |
+| Wait for in-flight handlers | `ConsumerConfig.graceful_timeout` (default **30 s**) |
+| Cancel handlers still running, wait for them to unwind | ≤ 1 s, then they are abandoned and nacked |
+| Stop the batch publisher, close the RPC client, disconnect | a few round trips |
+
+So set (the 5 s margin is a rule of thumb, not a measurement):
+
+```
+terminationGracePeriodSeconds > preStop sleep + graceful_timeout + 5 s
+```
+
+The defaults leave **no margin**: a 30 s `graceful_timeout` with Kubernetes'
+30 s default grace period means a slow handler is SIGKILLed during the drain
+(its message is redelivered, but the drain's nacks and logs are lost).
+Either lower `graceful_timeout` (for example to 20 s with a 5 s `preStop`)
+or raise the grace period:
 
 ```yaml
 spec:
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 60   # preStop 10 s + graceful_timeout 30 s + margin
 ```
+
+Size `graceful_timeout` to your slowest handler. `WorkerConfig.stop_timeout`
+is only a fallback for directly-driven worker pools and has no effect on the
+standard shutdown path. A message still in flight when SIGKILL arrives is
+not lost: the broker redelivers it, so handlers must be idempotent.
 
 ### preStop Hook
 
@@ -165,7 +235,7 @@ broker = AsyncBroker(config)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with rabbitkit_lifespan(broker):
+    async with rabbitkit_lifespan(broker=broker):
         yield
 
 app = FastAPI(lifespan=lifespan)

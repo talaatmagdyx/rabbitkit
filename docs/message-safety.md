@@ -103,7 +103,7 @@ if not outcome.ok:
 
 ## Manual Ack Policy for Full Settlement Control
 
-When you need precise control over when acknowledgement happens — for example, after writing to a database — use `AckPolicy.MANUAL`. You receive the `RabbitMessage` directly and call `.ack()`, `.nack()`, or `.reject()` yourself.
+When you need precise control over when acknowledgement happens — for example, after writing to a database — use `AckPolicy.MANUAL`. You receive the `RabbitMessage` directly and settle it yourself: `await msg.ack_async()` / `nack_async()` / `reject_async()` on `AsyncBroker`, `msg.ack()` / `nack()` / `reject()` on `SyncBroker`.
 
 ```python
 from rabbitkit import AsyncBroker, RabbitConfig, RabbitMessage
@@ -120,16 +120,106 @@ async def handle_order(msg: RabbitMessage) -> None:
     try:
         await write_to_database(msg.body)
         # Only ack after the side-effect is confirmed durable.
-        await msg.ack()
+        await msg.ack_async()
     except DatabaseUnavailableError:
         # Requeue so the message is retried after reconnect.
-        await msg.nack(requeue=True)
+        await msg.nack_async(requeue=True)
     except ValidationError:
         # Reject permanently; route to DLQ via broker dead-letter config.
-        await msg.reject(requeue=False)
+        await msg.reject_async(requeue=False)
 ```
 
 With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your handler *returns*. If the handler *raises* without having settled the message, RabbitKit applies the `AUTO` failure settlement (transient: requeue once, then DLQ; permanent: DLQ) and logs it, so a failing handler cannot pin prefetch slots and stall the consumer. Opt out with `ConsumerConfig(manual_settle_on_error=False)` if you settle outside `RabbitMessage` and re-raise (see [Acknowledgement Policies](ack-policy.md#manual)).
+
+---
+
+## Consumer Settlement, Cancellation and Shutdown (async broker)
+
+### One settlement frame per delivery
+
+`ack_async()`, `nack_async()` and `reject_async()` claim the delivery's
+settlement **before** they await the network write. A second call — a
+concurrent `ack`/`nack` from the handler, or `stop()` nacking a handler that
+was cancelled while its ack was being written — is a no-op. Sending two frames
+for one delivery tag makes RabbitMQ close the channel with
+`PRECONDITION_FAILED - unknown delivery tag`, which redelivers every unacked
+message on that channel.
+
+If the write itself raises or is cancelled, the frame may or may not have
+reached the broker. The claim is kept (`msg.disposition` stays at the claimed
+value), `msg.settlement_outcome_unknown` becomes `True`, and nothing else is
+sent for that delivery. If the frame was lost, the broker redelivers the
+message when the channel closes (at-least-once). The sync broker's methods are
+unchanged: a failed `ack()` leaves the message unsettled.
+
+### Failure settlement (verified on a real broker)
+
+- `AUTO`, no retry configured, transient error (`OSError`, `TimeoutError`,
+  ...): requeued once; the redelivery is dead-lettered if it fails too. The
+  audit's hot loop (thousands of runs per second) does not happen.
+- `MANUAL`, handler raises without settling: settled with the `AUTO` failure
+  policy and logged, so it cannot hold a prefetch slot. With `prefetch_count=1`
+  the next message is delivered.
+- `ConsumerConfig.processing_timeout`: the handler task is cancelled and the
+  failure is a `HandlerTimeoutError` with `outcome_unknown=True` (its side
+  effects may or may not have happened), settled as a transient failure.
+
+### Connection or channel loss while a handler runs
+
+- **Inline handlers** (no worker pool, the default): each delivery runs in a
+  task owned by aiormq's channel. When the channel or connection closes,
+  aiormq **cancels those tasks**, so the handler receives `CancelledError`
+  wherever it is awaiting. Its side effects may be partial, and the broker
+  redelivers the message. Handlers must be idempotent and must not swallow
+  `CancelledError`.
+- **Worker-pool handlers** (`WorkerConfig(worker_count > 1)`) are not
+  cancelled by a channel loss: they run to completion, their ack fails
+  ("Ack outcome unknown") and the broker redelivers the message, so it is
+  processed twice.
+
+### The worker pool is shared by all routes
+
+One `AsyncWorkerPool` (one semaphore of `worker_count` slots) serves every
+route of the broker. A slow queue can occupy every slot and starve the other
+routes. Per-route `prefetch_count` bounds how many deliveries each route
+holds, but not how many slots it uses. Run queues with very different
+latency in separate brokers (or processes) if that matters.
+
+### `stop()` sequence
+
+1. Consumers are cancelled through the queue object they were started on, so
+   aio-pika's reconnect logic forgets them: a connection drop during the
+   drain cannot re-subscribe them. A delivery that still reaches a cancelled
+   consumer is requeued and that consumer is cancelled again.
+2. Worker-pool deliveries that were prefetched but had not started are handed
+   back at once (`nack`, `requeue=True`), so another consumer can take them.
+3. In-flight handlers get `graceful_timeout`; then they are cancelled, given
+   at most 1 s to unwind, and their deliveries are nacked for redelivery.
+
+### Consumers cancelled by the broker
+
+RabbitMQ cancels a consumer itself (`basic.cancel`) when its queue is deleted,
+a quorum queue's leader moves, or an operator closes it. The async broker:
+
+- detects it (aiormq's consumer-cancel callback on aiormq 7, otherwise by
+  checking the channel's consumer table every second);
+- logs a WARNING, sets the route's `runtime_state.consumer_cancelled`, so
+  `broker_health_check()` reports it as not consuming (DEGRADED) and
+  `broker_readiness()` fails, and calls `broker.on_consumer_cancelled(queue)`
+  if set;
+- re-subscribes with the same consumer tag once a passive declare finds the
+  queue again, waiting 1 s, then doubling up to 30 s between probes; then
+  calls `broker.on_consumer_resumed(queue)`.
+
+It never re-creates the queue. aio-pika 10 also re-subscribes such consumers
+on its own; whichever gets there first wins, without a duplicate consumer.
+
+Limitation (from reading aio-pika, not reproduced): if the connection drops
+while the queue is still missing, aio-pika's reconnect re-declares the
+consumer's queue passively and fails, and it retries the whole connection
+until the queue exists again. With `TopologyMode.AUTO_DECLARE` the broker's
+own topology restore re-creates the queue first; with `PASSIVE_ONLY` every
+route on that connection waits for the queue to come back.
 
 ---
 
@@ -148,6 +238,11 @@ With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your h
 | Manual ack: handler returns without acking | Message remains unacked; redelivered when channel closes |
 | Manual ack: handler raises without settling | `AUTO` failure settlement (requeue once / DLQ), logged |
 | `stop()` with a handler past `graceful_timeout` | Handler cancelled; nacked for redelivery; abandoned after 1 s more if it ignores cancellation, so `stop()` stays bounded |
+| `stop()` with worker-pool deliveries not started yet | Nacked with requeue at once; never run during the grace period |
+| Reconnect during `stop()`'s drain | Cancelled consumers stay cancelled; stray deliveries are requeued |
+| Two settlements of one delivery at once (async) | One frame is sent; the channel stays open |
+| Settlement write fails or is cancelled (async) | `settlement_outcome_unknown=True`; no second frame; redelivered if the frame was lost |
+| Broker cancels the consumer (queue deleted, ...) | Health reports the route as not consuming; re-subscribed when the queue exists again |
 | Connection drops mid-processing | Broker redelivers; duplicate delivery is possible and expected |
 | Publisher confirms disabled (unsupported path) | Not supported for retry/DLQ paths; confirms are always required |
 | `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED`; `.ok` is `False` — never reported as `CONFIRMED` |

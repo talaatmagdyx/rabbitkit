@@ -276,3 +276,5 @@ route on that connection waits for the queue to come back.
 | Connection lost after the publish frame left (async) | `UNKNOWN`; never republished by the library |
 | Publisher channel pool exhausted (async) | Waits `channel_acquire_timeout`, then `NOT_SENT` (`admission_timeout`); connection untouched |
 | Publish after `stop()` (async) | `BrokerNotStartedError`; nothing is sent, nothing reconnects |
+| Delivery body over `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE`: rejected into the DLX before the filter, middleware or handler run |
+| Application publish carrying `x-rabbitkit-retry-count` / `x-death` with `strip_reserved_headers=True` | Headers removed before sending; the library's own retry/DLQ/replay copies keep theirs |

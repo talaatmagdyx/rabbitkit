@@ -306,6 +306,20 @@ class TestConsumerConfigM6:
         with pytest.raises(ValueError, match="processing_timeout"):
             ConsumerConfig(processing_timeout=value)
 
+    def test_max_body_bytes_default_off(self) -> None:
+        assert ConsumerConfig().max_body_bytes is None
+        assert ConsumerConfig(max_body_bytes=1).max_body_bytes == 1
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_max_body_bytes_must_be_positive(self, value: int) -> None:
+        with pytest.raises(ValueError, match="max_body_bytes"):
+            ConsumerConfig(max_body_bytes=value)
+
+    def test_strip_reserved_headers_default_off(self) -> None:
+        from rabbitkit.core.config import PublisherConfig
+
+        assert PublisherConfig().strip_reserved_headers is False
+
 
 class TestCredentialsProvider:
     """M13: credentials_provider enables secret rotation without a redeploy."""

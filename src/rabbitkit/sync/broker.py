@@ -45,6 +45,7 @@ from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.quorum import dlq_delivery_limit
 from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
@@ -106,6 +107,12 @@ class SyncBroker:
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
         self._publish_middlewares: list[BaseMiddleware] = middlewares or []
+        # G-19: PublisherConfig.strip_reserved_headers (None = off).
+        self._reserved_header_stripper: ReservedHeaderStripper | None = (
+            ReservedHeaderStripper(extra=(self._config.retry.retry_header,) if self._config.retry is not None else ())
+            if self._config.publisher.strip_reserved_headers
+            else None
+        )
         # Private mutable view of consumer config — brokers may apply a
         # prefetch override derived from WorkerConfig.prefetch_per_worker.
         # Stored separately so the caller's frozen RabbitConfig is never mutated.
@@ -121,6 +128,7 @@ class SyncBroker:
             context_repo=context_repo,
             reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
             manual_settle_on_error=self._config.consumer.manual_settle_on_error,
+            max_body_bytes=self._config.consumer.max_body_bytes,
         )
         if self._config.consumer.processing_timeout is not None:
             logger.warning(
@@ -667,6 +675,11 @@ class SyncBroker:
             )
             if message_id is not None:
                 envelope = replace(envelope, message_id=message_id)
+
+        # G-19: an application publish cannot carry rabbitkit's retry/DLQ
+        # bookkeeping headers (opt-in; the library's own republishes bypass this).
+        if self._reserved_header_stripper is not None:
+            envelope = self._reserved_header_stripper(envelope)
 
         # M10: reject oversized bodies at publish time (input validation at
         # the trust boundary — a too-large message is a programming/policy

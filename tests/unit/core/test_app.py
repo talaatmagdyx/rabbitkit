@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -607,3 +608,108 @@ class TestRunHooksAsyncFutureResult:
 
         with pytest.raises(TimeoutError, match="exceeded timeout"):
             await app._run_hooks_async([hook_returning_pending_future], timeout=0.05)
+
+
+# ── G-24: run_async keeps the application's signal handlers ─────────────────
+
+
+class TestRunAsyncSignalOwnership:
+    @pytest.fixture(autouse=True)
+    async def _restore_process_handlers(self) -> Any:
+        import contextlib
+        import signal
+
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        yield
+        loop = asyncio.get_running_loop()
+        for sig, handler in saved.items():
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)
+
+    @staticmethod
+    async def _run_until(app: RabbitApp, during: Any = None) -> None:
+        async def trigger() -> None:
+            await asyncio.sleep(0.01)
+            if during is not None:
+                during()
+            app.request_shutdown()
+
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(trigger())
+            await app.run_async()
+            await task
+
+    async def test_python_handlers_are_put_back(self) -> None:
+        """remove_signal_handler() alone reset SIGTERM to SIG_DFL, dropping
+        the application's handler (the bug the broker fixed in G-24)."""
+        import signal
+
+        def app_handler(signum: int, frame: Any) -> None:
+            pass
+
+        signal.signal(signal.SIGTERM, app_handler)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        app = RabbitApp()
+        seen: list[Any] = []
+        await self._run_until(app, during=lambda: seen.append(signal.getsignal(signal.SIGTERM)))
+        assert getattr(seen[0], "__name__", "") == "_sighandler_noop"  # ours while running
+        assert signal.getsignal(signal.SIGTERM) is app_handler
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+    async def test_signal_triggers_shutdown(self) -> None:
+        import os
+        import signal
+
+        app = RabbitApp()
+
+        async def send() -> None:
+            await asyncio.sleep(0.01)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(send())
+            await app.run_async()
+            await task
+        assert app.state == AppState.STOPPED
+
+    async def test_existing_asyncio_handler_is_left_alone(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import os
+        import signal
+
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        loop.add_signal_handler(signal.SIGTERM, fired.set)
+        app = RabbitApp()
+        with caplog.at_level("WARNING"):
+            await self._run_until(app)
+        assert "asyncio handler for SIGTERM is already installed" in caplog.text + capsys.readouterr().out
+
+        os.kill(os.getpid(), signal.SIGTERM)  # still the application's handler
+        async with asyncio.timeout(5):
+            await fired.wait()
+
+    async def test_handler_replaced_while_running_is_not_removed(self) -> None:
+        import os
+        import signal
+
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        app = RabbitApp()
+        await self._run_until(app, during=lambda: loop.add_signal_handler(signal.SIGTERM, fired.set))
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        async with asyncio.timeout(5):
+            await fired.wait()
+
+    async def test_unrestorable_previous_handler_is_skipped(self) -> None:
+        import signal
+
+        loop = asyncio.get_running_loop()
+        app = RabbitApp()
+        loop.add_signal_handler(signal.SIGTERM, app._signal_handler)
+        loop.add_signal_handler(signal.SIGINT, app._signal_handler)
+        app._restore_signal_handlers(loop, {signal.SIGTERM: None, signal.SIGINT: "not-a-handler"})  # logs, no raise
+        assert getattr(signal.getsignal(signal.SIGTERM), "__name__", "") != "_sighandler_noop"

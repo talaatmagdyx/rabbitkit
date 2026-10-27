@@ -247,9 +247,11 @@ The legacy `BatchAcker` now defaults to `mode="individual"`. The old
 ## Reliability profiles
 
 ```python
-from rabbitkit import RabbitConfig, ReliabilityProfile, SyncBroker, apply_profile, critical_config
+from rabbitkit import ConsumerConfig, RabbitConfig, ReliabilityProfile, SyncBroker, apply_profile, critical_config
 
-config = critical_config(RabbitConfig(connection=...))   # or apply_profile(cfg, "standard")
+config = critical_config(
+    RabbitConfig(connection=..., consumer=ConsumerConfig(processing_timeout=30.0))  # critical needs a deadline
+)                                                         # or apply_profile(cfg, "standard")
 broker = SyncBroker(config)
 
 report = broker.preflight(ReliabilityProfile.CRITICAL, management_client=mgmt)
@@ -263,10 +265,18 @@ for check in report.unverified:                           # never hidden
 |---|---|---|
 | Confirms / mandatory / persistence | on | required |
 | Body limit | bounded | ≤ 256 KiB |
+| In-flight publish bytes | explicit | bounded (64 MiB unless set) |
+| Reserved retry headers on application publishes | pass through | stripped |
 | Queue type | explicit | quorum for every durable route queue |
-| Retry topology | explicit | quorum delay chain + quorum DLQ |
+| Source dead-lettering | broker default | at-least-once + `reject-publish` (declared or by policy) |
+| Retry topology | explicit | required on every route: quorum delay chain (at-least-once) + quorum DLQ, DLQ copy with metadata, retry count from `x-death` only |
+| Processing deadline | explicit | `consumer.processing_timeout` required |
+| `AckPolicy.ACK_FIRST` | allowed | rejected |
 | Error text on DLQ headers | sanitized | sanitized or omitted |
 | Dead-letter path | auto-provisioned | never `discard` |
+
+The full list, and what each setting guarantees, is in
+[Reliable Messaging](reliable-messaging.md#enabling-the-critical-profile).
 
 `apply_profile` fills in requirements and **raises** on a contradiction (a
 value you pinned explicitly to something the profile forbids). It never

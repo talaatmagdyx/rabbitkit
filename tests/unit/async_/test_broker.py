@@ -1224,6 +1224,10 @@ class TestWorkerPoolWarning:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     async def test_warning_when_worker_count_exceeds_channel_pool_size(self) -> None:
@@ -1290,6 +1294,10 @@ class TestRPCClient:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     async def test_request_requires_started_broker(self) -> None:
@@ -1459,6 +1467,10 @@ class TestOnMessageCallback:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     async def test_on_message_sets_original_queue_header(self) -> None:
@@ -1611,6 +1623,10 @@ class TestBatchPublisherAutoCap:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     @pytest.mark.asyncio
@@ -2548,3 +2564,76 @@ class TestAsyncWaitInFlightIsBounded:
         assert any("ignored cancellation" in str(c.args[0]) for c in mock_logger.error.call_args_list)
         release.set()
         await task
+
+
+# ── G-26: broker-initiated consumer cancel → route state + hooks ─────────
+
+
+class TestConsumerCancelledByBroker:
+    @staticmethod
+    def _transport() -> AsyncMock:
+        transport = AsyncMock()
+        transport.consume = AsyncMock(return_value="tag-1")
+        transport.on_consumer_cancelled = MagicMock()
+        transport.on_consumer_resumed = MagicMock()
+        transport.on_channel_opened = MagicMock()
+        transport.on_channel_rebuilt = MagicMock()
+        return transport
+
+    async def _started(self) -> tuple[AsyncBroker, AsyncMock]:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def orders(body: bytes) -> None:
+            pass
+
+        @broker.subscriber(queue="audit")
+        async def audit(body: bytes) -> None:
+            pass
+
+        transport = self._transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            await broker.start(install_signal_handlers=False)
+        return broker, transport
+
+    async def test_cancel_and_resume_update_the_route_and_call_the_hooks(self) -> None:
+        from rabbitkit.health import broker_health_check
+
+        broker, transport = await self._started()
+        cancelled: list[str] = []
+        resumed: list[str] = []
+        broker.on_consumer_cancelled = cancelled.append
+        broker.on_consumer_resumed = resumed.append
+        # Wired once per transport, not once per route.
+        transport.on_consumer_cancelled.assert_called_once()
+        on_cancel = transport.on_consumer_cancelled.call_args.args[0]
+        on_resume = transport.on_consumer_resumed.call_args.args[0]
+
+        on_cancel("orders")
+        by_queue = {r.queue.name: r for r in broker.routes}
+        assert by_queue["orders"].runtime_state.consumer_cancelled is True
+        assert by_queue["audit"].runtime_state.consumer_cancelled is False
+        assert cancelled == ["orders"]
+        assert broker_health_check(broker).consumer_count == 1
+
+        on_resume("orders")
+        assert by_queue["orders"].runtime_state.consumer_cancelled is False
+        assert resumed == ["orders"]
+        assert broker_health_check(broker).consumer_count == 2
+        await broker.stop()
+
+    async def test_hooks_are_optional_and_a_raising_hook_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        broker, transport = await self._started()
+        on_cancel = transport.on_consumer_cancelled.call_args.args[0]
+        on_cancel("orders")  # no hook set
+
+        def boom(queue: str) -> None:
+            raise RuntimeError("hook bug")
+
+        broker.on_consumer_resumed = boom
+        on_resume = transport.on_consumer_resumed.call_args.args[0]
+        with caplog.at_level("WARNING", logger="rabbitkit.async_.broker"):
+            on_resume("orders")
+        assert "on_consumer_resumed hook raised" in caplog.text
+        assert all(not r.runtime_state.consumer_cancelled for r in broker.routes)
+        await broker.stop()

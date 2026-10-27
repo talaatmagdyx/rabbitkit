@@ -151,6 +151,13 @@ class AsyncBroker:
         # where the broker's handler overwrites the app's). Wire
         # ``broker.on_app_shutdown = app.request_shutdown`` before ``app.run_async()``.
         self.on_app_shutdown: Callable[[], None] | None = None
+        # G-26: optional hooks called with the queue name when the BROKER
+        # cancels a route's consumer (queue deleted, quorum leader change, ...)
+        # and when it is consuming again. The transport re-subscribes on its
+        # own; the route reports as not consuming in health checks meanwhile.
+        self.on_consumer_cancelled: Callable[[str], None] | None = None
+        self.on_consumer_resumed: Callable[[str], None] | None = None
+        self._consumer_state_wired: Any = None  # the transport the state callbacks are on
 
         # Bounded graceful drain (C-2): inline in-flight counter guarded by an
         # asyncio.Condition (R-Condition). ``_in_flight`` stays a plain int so
@@ -1484,12 +1491,36 @@ class AsyncBroker:
             callback = on_message
 
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
+        self._wire_consumer_state()
+        route.runtime_state.consumer_cancelled = False
         consumer_tag = await self._transport.consume(
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+    def _wire_consumer_state(self) -> None:
+        """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
+        transport = self._transport  # set: _start_consumer returns early without one
+        if self._consumer_state_wired is transport:
+            return
+        self._consumer_state_wired = transport
+        transport.on_consumer_cancelled(lambda queue: self._consumer_state_changed(queue, cancelled=True))
+        transport.on_consumer_resumed(lambda queue: self._consumer_state_changed(queue, cancelled=False))
+
+    def _consumer_state_changed(self, queue: str, *, cancelled: bool) -> None:
+        for route in self._registry.routes:
+            if route.queue.name == queue:
+                route.runtime_state.consumer_cancelled = cancelled
+        hook = self.on_consumer_cancelled if cancelled else self.on_consumer_resumed
+        if hook is None:
+            return
+        try:
+            hook(queue)
+        except Exception:
+            event = "cancelled" if cancelled else "resumed"
+            logger.warning("on_consumer_%s hook raised (queue=%s)", event, queue, exc_info=True)
 
     # ── Public topology API (16.6) — additive, retry/topology owner ─────
 

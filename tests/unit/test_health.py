@@ -1097,3 +1097,27 @@ class TestBrokerReadinessConnectedFalse:
             result = await broker_readiness_async(broker)
 
         assert result is False
+
+
+# ── G-26: a broker-cancelled consumer is not counted as consuming ─────────
+
+
+class TestBrokerCancelledConsumer:
+    def test_cancelled_route_degrades_health_and_readiness(self) -> None:
+        from rabbitkit.core.route import RouteRuntimeState
+
+        cancelled = SimpleNamespace(
+            consumer_tag="ctag-2", runtime_state=RouteRuntimeState(consumer_tag="ctag-2", consumer_cancelled=True)
+        )
+        routes = [_make_route(consumer_tag="ctag-1"), cancelled]
+        broker = _make_broker(started=True, connected=True, routes=routes)
+
+        result = broker_health_check(broker)
+
+        assert result.status == HealthStatus.DEGRADED
+        assert result.consumer_count == 1
+        assert "1/2" in result.details["reason"]
+        assert broker_readiness(broker) is False
+
+        cancelled.runtime_state.consumer_cancelled = False
+        assert broker_health_check(broker).status == HealthStatus.HEALTHY

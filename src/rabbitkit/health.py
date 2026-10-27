@@ -124,7 +124,7 @@ def _get_consumer_count(broker: Any, transport: Any) -> int:
         return int(consumer_count)
     # Fallback: compute from routes list.
     routes = getattr(broker, "routes", [])
-    computed: int = sum(1 for r in routes if getattr(r, "consumer_tag", None))
+    computed: int = sum(1 for r in routes if _route_consuming(r))
     # M-SRE3: cross-check consumer registration against live transport
     # connectivity. consumer_tag is set at registration time and may remain
     # set even after the channel dies, so a registered-but-disconnected
@@ -132,6 +132,15 @@ def _get_consumer_count(broker: Any, transport: Any) -> int:
     if transport is not None and not _transport_consumers_alive(transport):
         computed = 0
     return computed
+
+
+def _route_consuming(route: Any) -> bool:
+    """A route consumes when it has a consumer tag and the broker has not
+    cancelled that consumer (G-26: ``runtime_state.consumer_cancelled``)."""
+    if not getattr(route, "consumer_tag", None):
+        return False
+    state = getattr(route, "runtime_state", None)
+    return not bool(getattr(state, "consumer_cancelled", False))
 
 
 def _get_route_count(broker: Any) -> int:

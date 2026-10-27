@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from rabbitkit.async_.connection import get_connection_errors
+from rabbitkit.async_.consumers import ConsumerRecord, ConsumerSupervisor
 from rabbitkit.async_.pool import AsyncConnectionPool
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 from rabbitkit.core.errors import ConfigurationError
@@ -156,6 +157,10 @@ class AsyncTransportImpl:
         # unhandled and the publish resolve as CONFIRMED (a false success).
         self._inflight_message_ids: dict[tuple[int, str], asyncio.Future[None]] = {}
         self._consumer_tags: dict[str, str] = {}  # queue_name -> consumer_tag
+        # G-26 / CONSUMER-007: the queue object each consumer was started on
+        # (cancel goes through it so robust restore forgets the consumer) and
+        # detection + re-subscription of consumers the SERVER cancelled.
+        self._consumer_supervisor = ConsumerSupervisor(self.queue_exists)
 
         # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
         # consume(declare=False), cleared on cancel/disconnect). RabbitMQ's
@@ -471,6 +476,7 @@ class AsyncTransportImpl:
             return
 
         try:
+            await self._consumer_supervisor.stop()
             for monitor in self._blocked_monitors:
                 await monitor.stop()
             self._blocked_monitors.clear()
@@ -959,11 +965,26 @@ class AsyncTransportImpl:
         consumer_tag = f"rabbitkit.{uuid.uuid4()}"
 
         async def on_message(message: Any) -> None:
+            if record.stopped:
+                # CONSUMER-007: rabbitkit cancelled this consumer, yet a
+                # delivery arrived (a reconnect restored it). Hand it back.
+                await self._refuse_stray_delivery(record, message)
+                return
             rabbit_msg = self._build_message(message, no_ack=no_ack)
             await callback(rabbit_msg)
 
+        record = ConsumerRecord(
+            queue=queue,
+            tag=consumer_tag,
+            channel=channel,
+            queue_obj=q,
+            callback=on_message,
+            no_ack=no_ack,
+            supervised=declare,
+        )
         await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
         self._consumer_tags[queue] = consumer_tag
+        self._consumer_supervisor.register(record)
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)
         return consumer_tag
 
@@ -1109,25 +1130,75 @@ class AsyncTransportImpl:
         self._recorded_bindings.append(("exchange", destination, source, routing_key, arguments))
 
     async def cancel_consumer(self, consumer_tag: str) -> None:
-        """Cancel a consumer by tag."""
+        """Cancel a consumer by tag.
+
+        CONSUMER-007: the cancel goes through the queue object the consumer
+        was started on. aio-pika's robust restore re-subscribes every
+        consumer recorded on that object after a reconnect; cancelling via a
+        fresh ``get_queue()`` wrapper left the record in place, so a
+        reconnect during ``stop()``'s drain could bring the consumer back.
+        """
         if not self._connected:
             return
 
         for queue_name, tag in list(self._consumer_tags.items()):
             if tag == consumer_tag:
                 channel = self._consumer_channels.get(queue_name)
+                record = self._consumer_supervisor.unregister(queue_name)
                 if channel is not None:
+                    q: Any = None
                     try:
-                        q = await channel.get_queue(queue_name, ensure=False)
+                        if record is not None:
+                            q = record.queue_obj
+                        else:
+                            q = await channel.get_queue(queue_name, ensure=False)
                         await q.cancel(consumer_tag)
                     except Exception as e:
                         logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
+                        # aio-pika 9.x drops its restore record only after
+                        # Basic.CancelOk; a cancel lost to a dropped connection
+                        # must not be restored by the reconnect either.
+                        restore_records = getattr(q, "_consumers", None)
+                        if isinstance(restore_records, dict):
+                            restore_records.pop(consumer_tag, None)
                     finally:
                         del self._consumer_tags[queue_name]
                         del self._consumer_channels[queue_name]
                         if channel is self._reply_to_channel:
                             self._reply_to_channel = None
                 break
+
+    async def _refuse_stray_delivery(self, record: ConsumerRecord, message: Any) -> None:
+        """Requeue a delivery for a consumer rabbitkit already cancelled, and cancel it again."""
+        logger.warning(
+            "Delivery for cancelled consumer queue=%s tag=%s (restored by a reconnect); "
+            "requeueing it and cancelling the consumer",
+            record.queue,
+            record.tag,
+        )
+        if not record.no_ack:
+            with contextlib.suppress(Exception):
+                await message.nack(requeue=True)
+        with contextlib.suppress(Exception):
+            await message.channel.basic_cancel(record.tag)
+
+    def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
+
+        Fires when RabbitMQ sends ``basic.cancel`` (queue deleted, quorum
+        leader change, ...). The transport re-subscribes when the queue exists
+        again and then fires :meth:`on_consumer_resumed`.
+        """
+        self._consumer_supervisor.on_cancelled(callback)
+
+    def on_consumer_resumed(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a broker-cancelled consumer that is consuming again."""
+        self._consumer_supervisor.on_resumed(callback)
+
+    @property
+    def cancelled_consumers(self) -> frozenset[str]:
+        """Queues whose consumer the broker cancelled and that are not consuming again yet."""
+        return self._consumer_supervisor.cancelled_queues
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 

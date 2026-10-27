@@ -67,6 +67,11 @@ class RouteRuntimeState:
     """
 
     consumer_tag: str | None = None
+    #: G-26: the BROKER cancelled this route's consumer (queue deleted, quorum
+    #: leader change, ...) and it is not consuming again yet. ``consumer_tag``
+    #: is kept (the same tag is reused when the consumer is re-subscribed);
+    #: health checks count the route as not consuming while this is True.
+    consumer_cancelled: bool = False
     #: One-shot latch for the unbounded-reply_to warning (see
     #: RouteDefinition.reply_to_allow). Per route, so a busy queue does not
     #: flood the log.

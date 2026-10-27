@@ -71,6 +71,9 @@ class ConsumerRecord:
     broker_cancelled: bool = False
     #: The aiormq channel the cancel callback is attached to (None: poll mode).
     watched_underlay: Any = None
+    #: The tag was seen on ``watched_underlay`` after the callback was attached,
+    #: so a later server cancel is guaranteed to reach the callback.
+    watch_confirmed: bool = False
     missed_polls: int = 0
     retry_delay: float = RESUBSCRIBE_BACKOFF_INITIAL
     next_attempt: float = 0.0
@@ -97,10 +100,21 @@ class ConsumerSupervisor:
         """Call ``callback(queue)`` when a server-cancelled consumer is consuming again."""
         self._resumed_callbacks.append(callback)
 
-    def register(self, record: ConsumerRecord) -> None:
+    async def register(self, record: ConsumerRecord) -> None:
+        """Supervise *record*; call right after its ``basic.consume`` succeeded.
+
+        The cancel callback is attached at once, so a server cancel that
+        arrives before the first supervision pass is not missed.
+        """
         self._records[record.queue] = record
-        if record.supervised:
-            self._ensure_running()
+        if not record.supervised:
+            return
+        underlay = await self._underlay(record.channel)
+        if underlay is not None:
+            self._watch(record, underlay)
+            if record.tag in underlay.consumers:
+                record.watch_confirmed = record.watched_underlay is underlay
+        self._ensure_running()
 
     def unregister(self, queue: str) -> ConsumerRecord | None:
         """Forget *queue*'s consumer; it is marked stopped so nothing restarts it."""
@@ -174,6 +188,7 @@ class ConsumerSupervisor:
             return  # aiormq < 7: poll mode
         callbacks.add(self._on_cancel_frame)
         record.watched_underlay = underlay
+        record.watch_confirmed = False
 
     async def _underlay(self, channel: Any) -> Any | None:
         try:
@@ -193,10 +208,13 @@ class ConsumerSupervisor:
             return
         self._watch(record, underlay)
         present = record.tag in underlay.consumers
+        if present and record.watched_underlay is underlay:
+            record.watch_confirmed = True
         if not record.broker_cancelled:
-            if present or record.watched_underlay is underlay:
-                # Consuming, or callback mode: the callback is authoritative,
-                # and a restore in progress must not look like a cancel.
+            if present or record.watch_confirmed:
+                # Consuming, or callback mode with the consumer seen on this
+                # channel since the callback was attached: the callback is
+                # authoritative, and a restore in progress is not a cancel.
                 record.missed_polls = 0
                 return
             record.missed_polls += 1

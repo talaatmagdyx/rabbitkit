@@ -104,7 +104,7 @@ class _Harness:
 @pytest.fixture
 async def harness() -> Any:
     h = _Harness()
-    h.supervisor.register(h.record)
+    await h.supervisor.register(h.record)
     yield h
     await h.supervisor.stop()
 
@@ -114,8 +114,9 @@ async def harness() -> Any:
 
 class TestCallbackDetection:
     async def test_broker_cancel_marks_the_queue_and_fires_the_hook(self, harness: _Harness) -> None:
-        await harness.supervisor.check_once()  # attaches the callback
+        # register() attached the callback: a cancel before the first pass is seen.
         assert harness.record.watched_underlay is harness.underlay
+        assert harness.record.watch_confirmed is True
 
         harness.underlay.broker_cancel("t1")
 
@@ -141,6 +142,29 @@ class TestCallbackDetection:
             await harness.supervisor.check_once()
         assert harness.cancelled == []
 
+    async def test_callback_attached_while_the_tag_is_missing_falls_back_to_polling(self, harness: _Harness) -> None:
+        """A new underlay whose consumer table lacks the tag (cancelled before
+        the callback could be attached) is detected by the poll path."""
+        fresh = _Underlay()
+        harness.channel.underlay = fresh
+        await harness.supervisor.check_once()
+        assert harness.record.watched_underlay is fresh and harness.record.watch_confirmed is False
+        assert harness.cancelled == []
+        await harness.supervisor.check_once()
+        assert harness.cancelled == ["orders"]
+
+    async def test_register_with_an_unavailable_channel_attaches_later(self) -> None:
+        h = _Harness()
+        h.channel.fail = True
+        await h.supervisor.register(h.record)
+        try:
+            assert h.record.watched_underlay is None
+            h.channel.fail = False
+            await h.supervisor.check_once()
+            assert h.record.watched_underlay is h.underlay and h.record.watch_confirmed is True
+        finally:
+            await h.supervisor.stop()
+
     async def test_watch_follows_a_new_underlay_after_reconnect(self, harness: _Harness) -> None:
         await harness.supervisor.check_once()
         fresh = _Underlay()
@@ -155,7 +179,7 @@ class TestCallbackDetection:
 class TestPollDetection:
     async def test_two_consecutive_misses_mark_cancelled(self) -> None:
         h = _Harness(callbacks=False)
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         try:
             h.underlay.consumers.clear()
             await h.supervisor.check_once()
@@ -168,7 +192,7 @@ class TestPollDetection:
 
     async def test_a_present_tag_resets_the_miss_count(self) -> None:
         h = _Harness(callbacks=False)
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         try:
             h.underlay.consumers.clear()
             await h.supervisor.check_once()
@@ -185,24 +209,28 @@ class TestNothingToCheck:
     async def test_closed_channel_is_left_to_the_reconnect(self, harness: _Harness) -> None:
         harness.record.missed_polls = 1
         harness.channel.is_closed = True
+        harness.channel.underlay = _Underlay()
         await harness.supervisor.check_once()
         assert harness.record.missed_polls == 0
-        assert harness.record.watched_underlay is None
+        assert harness.record.watched_underlay is harness.underlay  # not the new one
 
     async def test_unavailable_underlay_is_skipped(self, harness: _Harness) -> None:
+        harness.channel.underlay = _Underlay()
         harness.channel.fail = True
         await harness.supervisor.check_once()
-        assert harness.record.watched_underlay is None
+        assert harness.record.watched_underlay is harness.underlay
 
     async def test_closed_underlay_is_skipped(self, harness: _Harness) -> None:
-        harness.underlay.is_closed = True
+        closed = _Underlay()
+        closed.is_closed = True
+        harness.channel.underlay = closed
         await harness.supervisor.check_once()
-        assert harness.record.watched_underlay is None
+        assert harness.record.watched_underlay is harness.underlay
 
     async def test_stopped_and_unsupervised_records_are_skipped(self) -> None:
         h = _Harness(callbacks=False)
         h.record.supervised = False
-        h.supervisor.register(h.record)  # unsupervised: no task started
+        await h.supervisor.register(h.record)  # unsupervised: no task started
         assert h.supervisor._task is None
         h.underlay.consumers.clear()
         await h.supervisor.check_once()
@@ -321,7 +349,7 @@ class TestHooksAndLifecycle:
             raise RuntimeError("hook bug")
 
         h.supervisor.on_cancelled(boom)
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         try:
             await h.supervisor.check_once()
             with caplog.at_level(logging.WARNING, logger="rabbitkit.async_.consumers"):
@@ -335,7 +363,7 @@ class TestHooksAndLifecycle:
         monkeypatch.setattr(consumers_mod, "RESUBSCRIBE_BACKOFF_INITIAL", 0.0)
         monkeypatch.setattr(consumers_mod, "WATCH_INTERVAL", 0.01)
         h = _Harness()
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         try:
             async with asyncio.timeout(5):
                 while h.record.watched_underlay is None:  # first pass
@@ -351,13 +379,13 @@ class TestHooksAndLifecycle:
 
     async def test_register_restarts_a_finished_task(self) -> None:
         h = _Harness()
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         first = h.supervisor._task
         assert first is not None
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         assert h.supervisor._task is first  # still running: reused
         await h.supervisor.stop()
-        h.supervisor.register(h.record)
+        await h.supervisor.register(h.record)
         assert h.supervisor._task is not None and h.supervisor._task is not first
         await h.supervisor.stop()
 

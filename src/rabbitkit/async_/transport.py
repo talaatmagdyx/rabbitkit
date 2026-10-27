@@ -984,7 +984,7 @@ class AsyncTransportImpl:
         )
         await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
         self._consumer_tags[queue] = consumer_tag
-        self._consumer_supervisor.register(record)
+        await self._consumer_supervisor.register(record)
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)
         return consumer_tag
 

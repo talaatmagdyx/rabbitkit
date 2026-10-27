@@ -184,8 +184,9 @@ class TestMakeAioPikaConnectKwargs:
         assert "backup:5673" in kwargs["url"]
         assert "primary" not in kwargs["url"]
 
-    def test_reconnect_jitter_survives_misconfigured_max_below_base(self) -> None:
-        """A misconfigured backoff_max <= base must not crash or drop below base."""
+    def test_reconnect_jitter_pinned_at_base_when_max_equals_base(self) -> None:
+        """backoff_max == base leaves no jitter span: the interval is base.
+        (backoff_max < base is rejected by ConnectionConfig itself.)"""
         try:
             import aio_pika  # noqa: F401
         except ImportError:
@@ -193,7 +194,7 @@ class TestMakeAioPikaConnectKwargs:
 
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
-        conn = ConnectionConfig(host="h", reconnect_backoff_base=5.0, reconnect_backoff_max=1.0)
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=5.0, reconnect_backoff_max=5.0)
         interval = make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"]
         assert interval == 5.0  # zero jitter span, pinned at base
 

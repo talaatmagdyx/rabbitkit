@@ -282,3 +282,48 @@ class TestCustomErrorTaxonomy:
             RabbitQueue(name="q", consumer_timeout=-5)
         with pytest.raises(RuntimeError):
             RabbitMessage(body=b"x", routing_key="rk").ack()
+
+
+class TestTerminalConnectionErrors:
+    """G-08: the typed connection failures keep ConnectionError as their base,
+    so ``except ConnectionError`` / ``except OSError`` around start() still
+    catches what used to be aiormq's / ssl's OSError subclasses."""
+
+    def test_hierarchy(self) -> None:
+        from rabbitkit.core.errors import (
+            AuthenticationFailedError,
+            PermanentConnectionError,
+            ReconnectBudgetExhaustedError,
+            TerminalConnectionError,
+            TLSVerificationError,
+            VhostAccessRefusedError,
+        )
+
+        assert issubclass(TerminalConnectionError, ConnectionError)
+        for cls in (AuthenticationFailedError, VhostAccessRefusedError, TLSVerificationError):
+            assert issubclass(cls, PermanentConnectionError)
+        assert issubclass(PermanentConnectionError, TerminalConnectionError)
+        assert issubclass(ReconnectBudgetExhaustedError, TerminalConnectionError)
+        assert not issubclass(ReconnectBudgetExhaustedError, PermanentConnectionError)
+
+    def test_carries_reason_and_endpoint(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError, ReconnectBudgetExhaustedError
+
+        error = AuthenticationFailedError("refused", reason="authentication_failed", endpoint="rabbit:5672")
+        assert str(error) == "refused"
+        assert (error.reason, error.endpoint) == ("authentication_failed", "rabbit:5672")
+        assert ReconnectBudgetExhaustedError("x", reason="reconnect_budget_exhausted").endpoint == ""
+
+    def test_all_exported_at_top_level(self) -> None:
+        import rabbitkit
+
+        for name in (
+            "TerminalConnectionError",
+            "PermanentConnectionError",
+            "AuthenticationFailedError",
+            "VhostAccessRefusedError",
+            "TLSVerificationError",
+            "ReconnectBudgetExhaustedError",
+        ):
+            assert name in rabbitkit.__all__, name
+            assert getattr(rabbitkit, name).__module__ == "rabbitkit.core.errors"

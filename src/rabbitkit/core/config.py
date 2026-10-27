@@ -67,25 +67,28 @@ class ConnectionConfig:
     # forever). Previously hardcoded (30 attempts) and unreachable from
     # config -- the transport constructor accepted no override and
     # RabbitConfig had no path to it at all. Async's *ongoing* reconnect
-    # (after the first successful connect) is deliberately NOT bounded here:
-    # it is owned entirely by aio-pika's connect_robust, which retries
-    # indefinitely with a jittered interval -- the correct pattern for a
-    # long-running consumer (let Kubernetes/the supervisor decide whether to
-    # kill a wedged pod via liveness, rather than have the client give up on
-    # its own). See docs/concurrency-model.md for the full reasoning.
+    # (after the first successful connect) is NOT bounded by this field: it
+    # retries with exponential backoff and full jitter (reconnect_backoff_base
+    # doubling up to reconnect_backoff_max), unlimited by default, and is
+    # bounded only by reconnect_budget_attempts / reconnect_budget_seconds
+    # below. Unlimited is the right default for a long-running consumer (let
+    # Kubernetes/the supervisor decide whether to kill a wedged pod). See
+    # docs/concurrency-model.md for the full reasoning.
     reconnect_max_attempts: int = 30
     # M13: credential rotation. When set, called at each (re)connect to fetch
     # fresh (username, password) — e.g. from Vault/short-lived secrets — so a
     # rotated credential is picked up on the next reconnect WITHOUT a redeploy
     # (the frozen username/password fields are the static fallback). Excluded
-    # from the AMQP URL/repr paths; only the connection builders call it.
+    # from the AMQP URL/repr paths; only the connection builders call it. On
+    # async this includes every in-place reconnect attempt of a live
+    # connection (G-08), not only rabbitkit-built connections.
     credentials_provider: Callable[[], tuple[str, str]] | None = None
     # M9: additional cluster nodes for failover, each "host" or "host:port".
     # The primary (host/port above) is tried first, then each node in order.
     # All share the same credentials/vhost/TLS/heartbeat. Sync (pika) tries
     # them natively via a ConnectionParameters list; async cycles endpoints on
-    # initial connect (connect_robust then pins to the chosen node — put a
-    # load balancer / DNS round-robin in front for per-reconnect failover).
+    # the initial connect AND on every reconnect attempt after a drop (G-08),
+    # moving to the next node after each failure.
     nodes: tuple[str, ...] = ()
     # Item 8: escape-hatch for extra AMQP client_properties, shown in the
     # management UI's Connections tab alongside connection_name -- e.g.
@@ -100,6 +103,18 @@ class ConnectionConfig:
     # PII here; service_name/environment/pod_name/region are fine, customer
     # IDs or API keys are not.
     client_properties: dict[str, str] = field(default_factory=dict)
+    # G-08: bounds on the ASYNC transport's reconnects after the first
+    # successful connect (an outage). Both default to None = unlimited, the
+    # availability-first behaviour rabbitkit always had. When either runs
+    # out, the connection gives up for good: ReconnectBudgetExhaustedError
+    # reaches on_connection_failed hooks, readiness and liveness go false and
+    # AsyncBroker.run() raises it. Attempts count consecutive failed
+    # reconnects within one outage; seconds count from the moment the
+    # connection was lost. The counters reset when a reconnect succeeds.
+    # The SYNC transport ignores both; its loop stays bounded by
+    # reconnect_max_attempts above (unchanged).
+    reconnect_budget_attempts: int | None = None
+    reconnect_budget_seconds: float | None = None
 
     def resolve_credentials(self) -> tuple[str, str]:
         """Return ``(username, password)`` — from ``credentials_provider`` if
@@ -177,6 +192,7 @@ class ConnectionConfig:
                 f"{self.reconnect_max_attempts} (this bounds the sync transport's "
                 "reconnect loop only -- see the field docstring)."
             )
+        self._validate_timing()
         # Item 8: basic validation for the client_properties escape hatch --
         # strings only (AMQP field-table values could otherwise smuggle
         # arbitrary types through to the broker), length-capped so a runaway
@@ -199,6 +215,50 @@ class ConnectionConfig:
                     f"{len(cp_value)} chars, exceeding the "
                     f"{_CLIENT_PROPERTY_VALUE_MAX_LEN}-char limit."
                 )
+
+    def _validate_timing(self) -> None:
+        """G-08: reject timing values that silently break reconnects.
+
+        ``reconnect_backoff_base=0`` made every retry immediate (a hot
+        reconnect loop) and ``reconnect_backoff_max < base`` capped the
+        backoff below its own starting point. ``socket_timeout <= 0`` is not
+        a usable connect timeout. ``heartbeat=0`` is legal (it disables
+        heartbeats) but means a silently dead TCP peer is never detected, so
+        it warns.
+        """
+        if not self.reconnect_backoff_base > 0:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_backoff_base must be > 0, got {self.reconnect_backoff_base}."
+            )
+        if not self.reconnect_backoff_max >= self.reconnect_backoff_base:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_backoff_max ({self.reconnect_backoff_max}) must be >= "
+                f"reconnect_backoff_base ({self.reconnect_backoff_base})."
+            )
+        if not self.socket_timeout > 0:
+            raise ConfigValidationError(f"ConnectionConfig.socket_timeout must be > 0, got {self.socket_timeout}.")
+        if self.heartbeat < 0:
+            raise ConfigValidationError(
+                f"ConnectionConfig.heartbeat must be >= 0 (0 disables heartbeats), got {self.heartbeat}."
+            )
+        if self.heartbeat == 0:
+            warnings.warn(
+                "ConnectionConfig(heartbeat=0) disables AMQP heartbeats: a broker or network "
+                "that dies without closing the TCP connection is not detected, and the client "
+                "waits on a dead socket. Keep a heartbeat (the default is 30 s) in production.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if self.reconnect_budget_attempts is not None and self.reconnect_budget_attempts < 1:
+            raise ConfigValidationError(
+                "ConnectionConfig.reconnect_budget_attempts must be >= 1 or None (unlimited), "
+                f"got {self.reconnect_budget_attempts}."
+            )
+        if self.reconnect_budget_seconds is not None and not self.reconnect_budget_seconds > 0:
+            raise ConfigValidationError(
+                "ConnectionConfig.reconnect_budget_seconds must be > 0 or None (unlimited), "
+                f"got {self.reconnect_budget_seconds}."
+            )
 
     @classmethod
     def from_url(cls, url: str) -> ConnectionConfig:

@@ -201,6 +201,53 @@ class TestReconnectMaxAttempts:
             ConnectionConfig(reconnect_max_attempts=-1)
 
 
+class TestConnectionTimingValidation:
+    """G-08: timing values that silently broke reconnects are rejected."""
+
+    def test_defaults_are_valid(self) -> None:
+        config = ConnectionConfig()
+        assert config.reconnect_budget_attempts is None
+        assert config.reconnect_budget_seconds is None
+
+    @pytest.mark.parametrize("base", [0, 0.0, -1.0])
+    def test_backoff_base_must_be_positive(self, base: float) -> None:
+        with pytest.raises(ValueError, match="reconnect_backoff_base must be > 0"):
+            ConnectionConfig(reconnect_backoff_base=base)
+
+    def test_backoff_max_below_base_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_backoff_max"):
+            ConnectionConfig(reconnect_backoff_base=5.0, reconnect_backoff_max=1.0)
+
+    def test_backoff_max_equal_to_base_accepted(self) -> None:
+        assert ConnectionConfig(reconnect_backoff_base=2.0, reconnect_backoff_max=2.0).reconnect_backoff_max == 2.0
+
+    @pytest.mark.parametrize("timeout", [0, -1.0])
+    def test_socket_timeout_must_be_positive(self, timeout: float) -> None:
+        with pytest.raises(ValueError, match="socket_timeout must be > 0"):
+            ConnectionConfig(socket_timeout=timeout)
+
+    def test_negative_heartbeat_rejected(self) -> None:
+        with pytest.raises(ValueError, match="heartbeat must be >= 0"):
+            ConnectionConfig(heartbeat=-1)
+
+    def test_zero_heartbeat_warns(self) -> None:
+        with pytest.warns(UserWarning, match="heartbeat=0"):
+            ConnectionConfig(heartbeat=0)
+
+    def test_budgets_accepted(self) -> None:
+        config = ConnectionConfig(reconnect_budget_attempts=5, reconnect_budget_seconds=120.0)
+        assert (config.reconnect_budget_attempts, config.reconnect_budget_seconds) == (5, 120.0)
+
+    def test_attempt_budget_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_budget_attempts must be >= 1"):
+            ConnectionConfig(reconnect_budget_attempts=0)
+
+    @pytest.mark.parametrize("seconds", [0, -5.0])
+    def test_seconds_budget_must_be_positive(self, seconds: float) -> None:
+        with pytest.raises(ValueError, match="reconnect_budget_seconds must be > 0"):
+            ConnectionConfig(reconnect_budget_seconds=seconds)
+
+
 class TestClientProperties:
     """Production-hardening checklist item 8: an escape hatch for extra AMQP
     client_properties (service_name/environment/pod_name etc.), validated

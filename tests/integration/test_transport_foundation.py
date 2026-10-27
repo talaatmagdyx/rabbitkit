@@ -238,11 +238,14 @@ async def test_connection_lost_after_send_is_unknown_and_never_republished(rabbi
     # ~5 s), so the confirm wait must outlast it or the outcome races to TIMEOUT.
     publisher = PublisherConfig(confirm_timeout=60.0)
     async with _broker(_config(rabbit["url"], connection_name=connection_name, publisher=publisher)) as broker:
+        # Confirms stay dropped until the outcome is in: a persistent message
+        # can be visible on the queue before the broker sends its confirm, and
+        # a confirm let through after that point would honestly be CONFIRMED.
         with _dropping_confirms():
             task = asyncio.create_task(broker.publish(MessageEnvelope(routing_key=queue, body=b"x")))
             assert await _await_ready(rabbit["url"], queue, 1) == 1  # the frames reached the broker
-        assert await asyncio.to_thread(_kill_connections_named, rabbit, connection_name) >= 1
-        outcome = await asyncio.wait_for(task, timeout=10)
+            assert await asyncio.to_thread(_kill_connections_named, rabbit, connection_name) >= 1
+            outcome = await asyncio.wait_for(task, timeout=10)
 
         assert outcome.status is PublishStatus.UNKNOWN
         assert outcome.reason == "connection_lost"

@@ -10,6 +10,7 @@ connections for publisher vs consumer separation.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import random
@@ -26,6 +27,115 @@ logger = logging.getLogger(__name__)
 #: Seconds between "Channel pool exhausted" warnings from one pool.
 _EXHAUSTED_WARNING_INTERVAL = 60.0
 
+#: Bound on closing a discarded channel in the background.
+_DISCARD_CLOSE_TIMEOUT = 5.0
+
+
+#: Strong references to fire-and-forget channel closes (see AsyncConnectionPool._discard).
+_DETACHED_CLOSES: set[asyncio.Task[None]] = set()
+
+
+async def _close_quietly(channel: Any) -> None:
+    with contextlib.suppress(Exception):
+        async with asyncio.timeout(_DISCARD_CLOSE_TIMEOUT):
+            await channel.close()
+
+
+class ChannelPoolExhaustedError(TimeoutError):
+    """No pooled channel became free within the admission timeout.
+
+    Capacity, not connection health: the caller reports ``NOT_SENT``
+    (``admission_timeout``) and the connection is never rebuilt for it.
+    Subclasses ``TimeoutError`` so code that caught the old bare timeout
+    keeps working.
+    """
+
+
+class ChannelPoolClosedError(RuntimeError):
+    """The pool was closed (shutdown or a connection rebuild) while waiting."""
+
+
+class InFlightByteLimiter:
+    """Async FIFO budget on the sum of in-flight message bytes.
+
+    ``acquire`` waits (cancellable, no polling) until ``n`` bytes fit or the
+    timeout expires; ``release`` is synchronous so it can run on every
+    terminal path, including a cancelled one. A request larger than the
+    whole limit is refused immediately.
+    """
+
+    def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        self._limit = limit
+        self._used = 0
+        self._closed = False
+        self._waiters: collections.deque[tuple[int, asyncio.Future[None]]] = collections.deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    def close(self) -> None:
+        """Fail every waiter and later acquire with :class:`ChannelPoolClosedError`."""
+        self._closed = True
+        while self._waiters:
+            _n, fut = self._waiters.popleft()
+            if not fut.done():
+                fut.set_exception(ChannelPoolClosedError("publisher is closed"))
+
+    async def acquire(self, n: int, timeout: float | None) -> bool:
+        """Reserve ``n`` bytes. False when ``n`` exceeds the limit or the wait expires.
+
+        Raises:
+            ChannelPoolClosedError: the limiter was closed (publisher shutdown).
+        """
+        if self._closed:
+            raise ChannelPoolClosedError("publisher is closed")
+        if n > self._limit:
+            return False
+        if not self._waiters and self._used + n <= self._limit:
+            self._used += n
+            return True
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        entry = (n, fut)
+        self._waiters.append(entry)
+        try:
+            async with asyncio.timeout(timeout):
+                await fut
+        except BaseException as exc:
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                self.release(n)  # granted just as we gave up: hand it back
+            else:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(entry)
+                self._grant()  # we may have been blocking the head
+            if isinstance(exc, TimeoutError):
+                return False
+            raise
+        return True
+
+    def release(self, n: int) -> None:
+        """Return ``n`` bytes and wake waiters that now fit (FIFO)."""
+        self._used = max(0, self._used - n)
+        self._grant()
+
+    def _grant(self) -> None:
+        while self._waiters:
+            n, fut = self._waiters[0]
+            if fut.done():
+                self._waiters.popleft()
+                continue
+            if self._used + n > self._limit:
+                return
+            self._waiters.popleft()
+            self._used += n
+            fut.set_result(None)
+
 
 class AsyncChannelPool:
     """Async channel pool.
@@ -34,8 +144,16 @@ class AsyncChannelPool:
     Channels are acquired and released by callers.
 
     ``acquire_timeout`` controls how long to wait when all channels are
-    checked out.  Raises ``asyncio.TimeoutError`` on exhaustion rather than
-    blocking forever (which would deadlock if a handler tries to publish).
+    checked out. Exhaustion raises :class:`ChannelPoolExhaustedError` (a
+    ``TimeoutError``) rather than blocking forever, which would deadlock if
+    a handler tries to publish.
+
+    Accounting invariants: ``_created`` counts channels this pool owns
+    (idle, checked out, or being opened), never more than ``pool_size``.
+    Bookkeeping never awaits, so a cancelled caller cannot leave it
+    half-updated. ``release`` only touches channels this pool handed out
+    and still owns: a stale release (a channel from before ``close_all`` or
+    from a replaced pool) closes the channel and changes nothing else.
     """
 
     def __init__(
@@ -54,90 +172,160 @@ class AsyncChannelPool:
         self._publisher_confirms = publisher_confirms
         self._on_return_raises = on_return_raises
         self._exhausted_warned_at = -_EXHAUSTED_WARNING_INTERVAL
+        # Idle channels. Only get_nowait/put_nowait are used; waiting is done
+        # on ``_waiters`` so a slot freed by a DISCARDED channel wakes a waiter
+        # too (it can open a new channel), not only a returned one.
         self._pool: asyncio.Queue[Any] = asyncio.Queue(maxsize=pool_size)
+        # Kept for callers that serialise against the pool; bookkeeping
+        # itself is synchronous and needs no lock.
         self._lock = asyncio.Lock()
         self._created = 0
         # Channels currently checked out by callers; closed in close_all() so they
         # are not orphaned if a caller forgets to release (leak detection).
         self._in_use: set[Any] = set()
+        self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
+        self._closed = False
+        self._background: set[asyncio.Task[None]] = set()
         # Item 3: channel-lifecycle metric hooks (optional, no-op if None).
         self._on_channel_opened = on_channel_opened
         self._on_channel_rebuilt = on_channel_rebuilt
 
-    async def acquire(self, *, _found_closed: bool = False) -> Any:
+    @property
+    def closed(self) -> bool:
+        """True once :meth:`close_all` ran; every later acquire raises."""
+        return self._closed
+
+    @property
+    def in_use_count(self) -> int:
+        """Channels currently checked out."""
+        return len(self._in_use)
+
+    def owns(self, channel: Any) -> bool:
+        """True if *channel* is checked out from this pool right now."""
+        return channel in self._in_use
+
+    def _wake_one(self) -> None:
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                fut.set_result(None)
+                return
+
+    def _wake_all(self) -> None:
+        while self._waiters:
+            fut = self._waiters.popleft()
+            if not fut.done():
+                fut.set_result(None)
+
+    def _take_idle(self) -> tuple[Any, bool]:
+        """Pop a live idle channel. Returns ``(channel | None, found_closed)``."""
+        found_closed = False
+        while True:
+            try:
+                channel = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                return None, found_closed
+            if not channel.is_closed:
+                return channel, found_closed
+            # I-6: a pooled channel was found closed — it still counted
+            # against _created, so free its slot before discarding it.
+            self._created = max(0, self._created - 1)
+            found_closed = True
+
+    async def acquire(self, *, timeout: float | None = None, _found_closed: bool = False) -> Any:
         """Acquire a channel from the pool.
 
-        Creates a new channel if the pool is empty and under the size limit.
-        Waits up to ``acquire_timeout`` seconds when all channels are in use;
-        raises ``asyncio.TimeoutError`` if the wait expires, preventing
-        deadlocks when handlers publish while processing messages.
+        Reuses an idle channel, else opens one while under ``pool_size``,
+        else waits (FIFO-ish, cancellable) for a release. ``timeout``
+        (default ``acquire_timeout``) bounds the whole call.
 
-        ``_found_closed`` is internal: set by a recursive call after this
-        method already discovered and discarded a dead pooled channel, so the
-        channel this call goes on to create is a rebuild, not a fresh-growth
-        open (item 3's channel_rebuilds_total).
+        Raises:
+            ChannelPoolExhaustedError: no channel became free in time.
+            ChannelPoolClosedError: the pool is (or got) closed.
+            Exception: opening a new channel failed or timed out (the
+                connection is likely dead); the reserved slot is returned.
+
+        ``_found_closed`` is internal: the channel this call opens replaces a
+        dead pooled one, so it counts as a rebuild (channel_rebuilds_total).
         """
-        try:
-            channel = self._pool.get_nowait()
-            if not channel.is_closed:
-                async with self._lock:
-                    self._in_use.add(channel)
-                return channel
-            # I-6: a pooled channel was found closed — it still counted
-            # against _created when it was released, so decrement before
-            # discarding it (otherwise acquire() leaks a slot each time a
-            # closed-idle channel is pulled from the pool).
-            async with self._lock:
-                self._created = max(0, self._created - 1)
-            _found_closed = True
-        except asyncio.QueueEmpty:
-            pass
-
-        # perf-M-2: create the channel OUTSIDE the lock (network round-trip) so
-        # concurrent acquire() calls don't serialize on channel creation during
-        # warmup/refill. The slot is reserved atomically under the lock (so we
-        # never over-create); the channel-open I/O happens outside the lock, and
-        # we re-acquire only to publish _in_use. If creation fails, the reserved
-        # slot is returned. The I-6 closed-idle decrement above stays under the
-        # lock.
-        async with self._lock:
-            if self._created < self._pool_size:
-                need_create = True
-                self._created += 1
-            else:
-                need_create = False
-
-        if need_create:
-            try:
-                # Bound channel creation: aio-pika ``RobustConnection.channel()``
-                # BLOCKS (does not raise) while the connection is down — no
-                # heartbeat has detected the drop yet — waiting for a
-                # ``channel.open-ok`` that never arrives. Without this bound a
-                # BatchPublisher flush worker replacing a channel closed by an
-                # outage hangs, and every publish behind it stalls. The timeout
-                # turns the hang into a raise so ``acquire_publisher_channel``
-                # can rebuild the connection.
-                async with asyncio.timeout(self._acquire_timeout):
-                    channel = await self._connection.channel(**self._channel_kwargs())
-            except BaseException:
-                # creation failed (or timed out) — give the reserved slot back.
-                async with self._lock:
-                    self._created = max(0, self._created - 1)
-                raise
-            if self._on_channel_opened is not None:
-                self._on_channel_opened()
-            if _found_closed and self._on_channel_rebuilt is not None:
-                self._on_channel_rebuilt()
-            async with self._lock:
+        budget = self._acquire_timeout if timeout is None else min(timeout, self._acquire_timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+        while True:
+            if self._closed:
+                raise ChannelPoolClosedError("channel pool is closed")
+            channel, found_closed = self._take_idle()
+            _found_closed = _found_closed or found_closed
+            if channel is not None:
                 self._in_use.add(channel)
                 return channel
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise ChannelPoolExhaustedError(
+                    f"Timed out after {budget}s waiting for a channel from the pool (pool_size={self._pool_size})."
+                )
+            if self._created < self._pool_size:
+                caller_bound = timeout is not None and timeout < self._acquire_timeout
+                return await self._open_channel(remaining, rebuilt=_found_closed, caller_bound=caller_bound)
+            self._log_exhausted()
+            fut: asyncio.Future[None] = loop.create_future()
+            self._waiters.append(fut)
+            try:
+                async with asyncio.timeout(remaining):
+                    await fut
+            except BaseException as exc:
+                # Woken, but cancelled or timed out before resuming: pass the
+                # wake-up on so the capacity it signalled is not lost.
+                if fut.done() and not fut.cancelled():
+                    self._wake_one()
+                else:
+                    with contextlib.suppress(ValueError):
+                        self._waiters.remove(fut)  # no dead entries pile up
+                if isinstance(exc, TimeoutError):
+                    raise ChannelPoolExhaustedError(
+                        f"Timed out after {budget}s waiting for a channel from the pool (pool_size={self._pool_size})."
+                    ) from None
+                raise
 
-        # Pool exhausted — wait with timeout to avoid deadlocks. R-timeout:
-        # ``asyncio.timeout`` (3.11+) replaces ``asyncio.wait_for`` to avoid
-        # the wrapper-task overhead.
+    async def _open_channel(self, remaining: float, *, rebuilt: bool, caller_bound: bool) -> Any:
+        # perf-M-2: reserve the slot synchronously, open the channel (network
+        # round-trip) without holding anything, and give the slot back if the
+        # open fails or is cancelled. ``caller_bound``: the caller's own
+        # deadline, not the pool's open bound, limits this attempt.
+        self._created += 1
+        try:
+            # Bound channel creation: aio-pika ``RobustConnection.channel()``
+            # BLOCKS (does not raise) while the connection is down — no
+            # heartbeat has detected the drop yet — waiting for a
+            # ``channel.open-ok`` that never arrives. The timeout turns the hang
+            # into a raise so ``acquire_publisher_channel`` can rebuild the
+            # connection.
+            async with asyncio.timeout(min(self._acquire_timeout, remaining)):
+                channel = await self._connection.channel(**self._channel_kwargs())
+        except BaseException as exc:
+            self._created = max(0, self._created - 1)
+            self._wake_one()
+            if caller_bound and isinstance(exc, TimeoutError):
+                # The CALLER's deadline ran out, not the connection: admission
+                # timeout, which must not trigger a connection rebuild.
+                raise ChannelPoolExhaustedError("publish deadline expired while opening a channel") from exc
+            raise
+        if self._closed:
+            # close_all() ran while we were opening: do not hand it out.
+            self._created = max(0, self._created - 1)
+            self._close_in_background(channel)
+            raise ChannelPoolClosedError("channel pool is closed")
+        self._in_use.add(channel)
+        if self._on_channel_opened is not None:
+            self._on_channel_opened()
+        if rebuilt and self._on_channel_rebuilt is not None:
+            self._on_channel_rebuilt()
+        return channel
+
+    def _log_exhausted(self) -> None:
         # Once a minute at WARNING, then DEBUG: under a burst every waiting
         # publish lands here (2000 concurrent mandatory publishes logged 11874
-        # warnings), and a wait that runs out still raises TimeoutError below.
+        # warnings), and a wait that runs out still raises below.
         now = time.monotonic()
         log = logger.debug
         if now - self._exhausted_warned_at >= _EXHAUSTED_WARNING_INTERVAL:
@@ -151,21 +339,6 @@ class AsyncChannelPool:
             self._created,
             self._acquire_timeout,
         )
-        try:
-            async with asyncio.timeout(self._acquire_timeout):
-                channel = await self._pool.get()
-        except TimeoutError:
-            raise TimeoutError(
-                f"Timed out after {self._acquire_timeout}s waiting for a channel "
-                f"from the pool (pool_size={self._pool_size})."
-            ) from None
-        if channel.is_closed:
-            async with self._lock:
-                self._created = max(0, self._created - 1)
-            return await self.acquire(_found_closed=True)
-        async with self._lock:
-            self._in_use.add(channel)
-        return channel
 
     def _channel_kwargs(self) -> dict[str, bool]:
         kwargs = {"publisher_confirms": self._publisher_confirms}
@@ -173,24 +346,49 @@ class AsyncChannelPool:
             kwargs["on_return_raises"] = True
         return kwargs
 
-    async def release(self, channel: Any) -> None:
-        """Release a channel back to the pool."""
-        async with self._lock:
+    def _close_in_background(self, channel: Any) -> None:
+        """Close *channel* without making the caller wait (or be cancellable mid-close)."""
+        if getattr(channel, "is_closed", True) is True:
+            return
+        task = asyncio.get_running_loop().create_task(_close_quietly(channel))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def discard(self, channel: Any) -> None:
+        """Drop a checked-out channel whose state is unknown (cancelled or
+        failed mid-publish): it is never reused, its slot is freed at once,
+        and it is closed in the background. Synchronous, so it is safe in a
+        cancellation path. A channel this pool does not own is only closed."""
+        if channel in self._in_use:
             self._in_use.discard(channel)
-        if not channel.is_closed:
+            self._created = max(0, self._created - 1)
+            self._wake_one()
+        self._close_in_background(channel)
+
+    async def release(self, channel: Any) -> None:
+        """Release a channel back to the pool.
+
+        Generation-safe: a channel the pool does not currently own (released
+        twice, or checked out before :meth:`close_all` / a connection
+        rebuild) is closed and otherwise ignored, so it can never decrement
+        a newer generation's counter. A closed channel frees its slot.
+        """
+        if channel not in self._in_use:
+            self._close_in_background(channel)
+            return
+        self._in_use.discard(channel)
+        if not channel.is_closed and not self._closed:
             try:
                 self._pool.put_nowait(channel)
-                return
-            except asyncio.QueueFull:
+            except asyncio.QueueFull:  # pragma: no cover — guarded by _created <= pool_size
                 pass
-        # Channel is closed or pool is full — discard
-        try:
-            if not channel.is_closed:
-                await channel.close()
-        except Exception:
-            pass
-        async with self._lock:
-            self._created = max(0, self._created - 1)
+            else:
+                self._wake_one()
+                return
+        # Channel is closed (or the pool is) — discard and free the slot.
+        self._created = max(0, self._created - 1)
+        self._wake_one()
+        self._close_in_background(channel)
 
     @asynccontextmanager
     async def acquire_ctx(self) -> Any:
@@ -208,27 +406,29 @@ class AsyncChannelPool:
             await self.release(channel)
 
     async def close_all(self) -> None:
-        """Close all channels in the pool, including checked-out ones."""
-        async with self._lock:
-            in_use = list(self._in_use)
-            self._in_use.clear()
-        for channel in in_use:
+        """Close all channels in the pool, including checked-out ones.
+
+        Marks the pool closed first: waiting acquirers are woken and raise
+        :class:`ChannelPoolClosedError`, later acquires raise it at once, and
+        later releases of channels handed out before the close are ignored.
+        """
+        self._closed = True
+        self._wake_all()
+        in_use = list(self._in_use)
+        self._in_use.clear()
+        idle: list[Any] = []
+        while True:
+            try:
+                idle.append(self._pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        self._created = 0
+        for channel in in_use + idle:
             try:
                 if not channel.is_closed:
                     await channel.close()
-            except Exception:  # pragma: no cover — best effort
+            except Exception:  # best effort — the connection may already be gone
                 pass
-            async with self._lock:
-                self._created = max(0, self._created - 1)
-        while not self._pool.empty():
-            try:
-                channel = self._pool.get_nowait()
-                if not channel.is_closed:
-                    await channel.close()
-            except (asyncio.QueueEmpty, Exception):
-                pass
-        async with self._lock:
-            self._created = 0
 
     @property
     def size(self) -> int:
@@ -360,31 +560,72 @@ class AsyncConnectionPool:
                 self._consumer_connection = await self._create_connection()
             return self._consumer_connection
 
-    async def acquire_publisher_channel(self) -> Any:
+    async def acquire_publisher_channel(self, *, timeout: float | None = None) -> Any:
         """Acquire a channel from the publisher channel pool.
 
-        Self-heals a wedged connection. After a broker outage aio-pika's
+        ``timeout`` (default ``PoolConfig.channel_acquire_timeout``) bounds the
+        wait for a free channel. Pool exhaustion raises
+        :class:`ChannelPoolExhaustedError` and does NOT touch the connection:
+        a busy pool is not a broken connection, and rebuilding it closed every
+        in-flight publish's channel (G-05).
+
+        Self-heals a wedged connection: after a broker outage aio-pika's
         RobustConnection can be left in a state where ``channel()`` hangs (no
         heartbeat has yet detected the drop) or keeps failing even once the
-        broker is back. When channel acquisition fails, we rebuild the
-        publisher connection + channel pool from scratch and retry once, so the
-        caller gets a channel on a fresh connection rather than looping on a
-        dead one. ``AsyncChannelPool.acquire`` bounds channel creation with a
-        timeout so this failure surfaces promptly instead of hanging.
+        broker is back. When OPENING a channel fails, the publisher connection
+        and its channel pools are rebuilt from scratch and the acquire is
+        retried once, so the caller gets a channel on a fresh connection
+        rather than looping on a dead one. Nothing has been sent at this
+        point, so the retry cannot duplicate a message.
         """
         if self._publisher_channel_pool is None:
             await self.get_publisher_connection()
-        pool = self._publisher_channel_pool
-        assert pool is not None
+        return await self._acquire_healing(self._current_publisher_pool, timeout, "Publisher")
+
+    def _current_publisher_pool(self) -> AsyncChannelPool | None:
+        return self._publisher_channel_pool
+
+    def _current_mandatory_pool(self) -> AsyncChannelPool | None:
+        if self._publisher_connection is None:
+            return None
+        return self._mandatory_pool()
+
+    async def _acquire_healing(
+        self,
+        current_pool: Callable[[], AsyncChannelPool | None],
+        timeout: float | None,
+        label: str,
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+        budget = self._pool_config.channel_acquire_timeout if timeout is None else timeout
+        deadline = loop.time() + budget
+        conn = self._publisher_connection
+        pool = current_pool()
+        if pool is None:
+            raise ChannelPoolClosedError(f"{label} channel pool is not available")
         try:
-            return await pool.acquire()
-        except asyncio.CancelledError:
+            return await pool.acquire(timeout=budget)
+        except ChannelPoolExhaustedError:
             raise
+        except ChannelPoolClosedError:
+            # Closed under us. A concurrent rebuild replaced it: retry once on
+            # the replacement. Closed for shutdown (same pool still current, or
+            # none): give up.
+            replacement = current_pool()
+            if replacement is None or replacement is pool or replacement.closed:
+                raise
         except Exception as exc:
-            logger.warning("Publisher channel acquire failed (%s); rebuilding connection", exc)
-            await self._rebuild_publisher_connection(stale=self._publisher_connection)
-            assert self._publisher_channel_pool is not None
-            return await self._publisher_channel_pool.acquire()
+            logger.warning("%s channel acquire failed (%s); rebuilding connection", label, exc)
+            await self._rebuild_publisher_connection(stale=conn)
+        if self._publisher_connection is None:
+            await self.get_publisher_connection()
+        retry_pool = current_pool()
+        if retry_pool is None:  # pragma: no cover — defensive; a failed rebuild raises above
+            raise ChannelPoolClosedError(f"{label} channel pool is not available")
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise ChannelPoolExhaustedError("publish deadline expired while rebuilding the publisher connection")
+        return await retry_pool.acquire(timeout=remaining)
 
     async def _rebuild_publisher_connection(self, stale: Any) -> None:
         """Replace the (likely dead) publisher connection + channel pool.
@@ -396,6 +637,11 @@ class AsyncConnectionPool:
         a rebuild attempted while the broker is still down fails fast (the
         caller retries with backoff) instead of hanging on a dead-connection
         close or on ``connect_robust``.
+
+        The replacement pool keeps the channel-lifecycle metric hooks (they
+        used to be dropped, so ``channels_opened_total`` stopped counting after
+        the first rebuild). Channels still checked out from the old pools are
+        closed with it; their later release is ignored by the new pool.
         """
         timeout = self._pool_config.channel_acquire_timeout
         async with self._lock:
@@ -417,12 +663,36 @@ class AsyncConnectionPool:
                 pool_size=self._pool_config.channel_pool_size,
                 acquire_timeout=timeout,
                 publisher_confirms=self._publisher_confirms,
+                on_channel_opened=self._on_channel_opened,
+                on_channel_rebuilt=self._on_channel_rebuilt,
             )
 
     async def release_publisher_channel(self, channel: Any) -> None:
-        """Return a publisher channel to the pool."""
+        """Return a publisher channel to the pool it came from.
+
+        Generation-safe: a channel from a pool that a rebuild has since
+        replaced is not counted against the new pool (it is just closed).
+        """
         if self._publisher_channel_pool is not None:
             await self._publisher_channel_pool.release(channel)
+
+    def discard_publisher_channel(self, channel: Any) -> None:
+        """Drop a publisher channel whose confirm state is unknown (never reused)."""
+        self._discard(channel, self._publisher_channel_pool)
+
+    def discard_mandatory_channel(self, channel: Any) -> None:
+        """Drop a mandatory-publish channel whose confirm state is unknown."""
+        self._discard(channel, self._mandatory_channel_pool)
+
+    @staticmethod
+    def _discard(channel: Any, pool: AsyncChannelPool | None) -> None:
+        if pool is not None:
+            pool.discard(channel)
+            return
+        if getattr(channel, "is_closed", True) is not True:
+            task = asyncio.get_running_loop().create_task(_close_quietly(channel))
+            _DETACHED_CLOSES.add(task)
+            task.add_done_callback(_DETACHED_CLOSES.discard)
 
     def _mandatory_pool(self) -> AsyncChannelPool:
         if self._mandatory_channel_pool is None:
@@ -438,7 +708,7 @@ class AsyncConnectionPool:
             )
         return self._mandatory_channel_pool
 
-    async def acquire_mandatory_channel(self) -> Any:
+    async def acquire_mandatory_channel(self, *, timeout: float | None = None) -> Any:
         """A channel for one ``mandatory=True`` publish: confirms on, and
         ``on_return_raises=True`` so an unroutable return raises.
 
@@ -447,24 +717,29 @@ class AsyncConnectionPool:
         ``user_id``) closes its channel, and every operation still in flight
         on that channel fails with it. One shared mandatory channel therefore
         let one refused publish fail every concurrent innocent one. Closed
-        channels are discarded on release. Self-heals a wedged connection the
-        same way :meth:`acquire_publisher_channel` does.
+        channels are discarded on release. Exhaustion and self-healing behave
+        exactly as in :meth:`acquire_publisher_channel`.
         """
         if self._publisher_connection is None:
             await self.get_publisher_connection()
-        try:
-            return await self._mandatory_pool().acquire()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Mandatory channel acquire failed (%s); rebuilding connection", exc)
-            await self._rebuild_publisher_connection(stale=self._publisher_connection)
-            return await self._mandatory_pool().acquire()
+        return await self._acquire_healing(self._current_mandatory_pool, timeout, "Mandatory")
 
     async def release_mandatory_channel(self, channel: Any) -> None:
         """Return a mandatory-publish channel to its pool (a closed one is discarded)."""
         if self._mandatory_channel_pool is not None:
             await self._mandatory_channel_pool.release(channel)
+
+    async def close_publisher_channels(self) -> None:
+        """Close both publisher channel pools but keep the connections.
+
+        Used by the publisher shutdown: every publish still waiting for a
+        channel is released (``ChannelPoolClosedError``), every publish still
+        waiting for a confirm sees its channel close, and later acquires fail
+        at once, without anything reconnecting.
+        """
+        for pool in (self._publisher_channel_pool, self._mandatory_channel_pool):
+            if pool is not None:
+                await pool.close_all()
 
     async def close_all(self) -> None:
         """Close all channel pools and connections."""

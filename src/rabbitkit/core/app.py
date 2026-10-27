@@ -17,6 +17,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from rabbitkit.core.signals import is_loop_signal_handler, loop_signal_handler_is
 from rabbitkit.core.types import AppState
 
 logger = logging.getLogger(__name__)
@@ -191,16 +192,35 @@ class RabbitApp:
         Installs SIGINT/SIGTERM handlers for graceful shutdown. Falls back to
         ``signal.signal`` on platforms/threads where ``loop.add_signal_handler``
         is unavailable (e.g. Windows, non-main-thread).
+
+        G-24: the handlers in place before are kept. The Python-level handler
+        (``signal.getsignal``) is captured and put back on exit:
+        ``loop.remove_signal_handler`` alone resets the signal to its
+        default, which dropped e.g. an application's SIGTERM handler or
+        ``asyncio.run()``'s SIGINT handler. A signal that already has an
+        ``loop.add_signal_handler`` handler (asyncio cannot hand it back) is
+        left alone with a WARNING; that handler should call
+        :meth:`request_shutdown`. A handler installed by someone else while
+        the app runs is not removed.
         """
         self._shutdown_event = asyncio.Event()
 
         loop = asyncio.get_running_loop()
         self._loop = loop
-        installed = False
+        installed: dict[signal.Signals, Any] = {}
         try:
             for sig in (signal.SIGINT, signal.SIGTERM):
+                prev = signal.getsignal(sig)
+                if is_loop_signal_handler(prev):
+                    logger.warning(
+                        "RabbitApp: an asyncio handler for %s is already installed; not replacing it, "
+                        "because asyncio cannot hand it back afterwards. That handler should call "
+                        "app.request_shutdown().",
+                        sig.name,
+                    )
+                    continue
                 loop.add_signal_handler(sig, self._signal_handler)
-            installed = True
+                installed[sig] = prev
         except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
             # Not supported on this platform/thread — fall back to signal.signal.
             # The handler runs in a signal context; schedule the set via the loop.
@@ -215,20 +235,30 @@ class RabbitApp:
             await self._shutdown_event.wait()
         finally:
             await self.stop_async()
-            # Restore signal handlers
-            if installed:
-                for sig in (signal.SIGINT, signal.SIGTERM):
-                    try:
-                        loop.remove_signal_handler(sig)
-                    except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-                        pass
-            else:  # pragma: no cover
-                for sig, prev in self._original_handlers.items():
-                    try:
-                        signal.signal(sig, prev)
-                    except (ValueError, OSError):  # pragma: no cover
-                        pass
-                self._original_handlers.clear()
+            self._restore_signal_handlers(loop, installed)
+
+    def _restore_signal_handlers(self, loop: asyncio.AbstractEventLoop, installed: dict[signal.Signals, Any]) -> None:
+        """Remove the handlers ``run_async`` installed and put back what was there before (G-24)."""
+        for sig, prev in installed.items():
+            if not loop_signal_handler_is(loop, sig, self._signal_handler):
+                logger.info("RabbitApp: %s handler was replaced while running; leaving it in place", sig.name)
+                continue
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
+                continue
+            if prev is None:
+                continue  # installed outside Python: nothing to put back
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError, TypeError):
+                logger.warning("RabbitApp: could not restore the previous %s handler", sig.name, exc_info=True)
+        for sig, prev in self._original_handlers.items():  # pragma: no cover
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):  # pragma: no cover
+                pass
+        self._original_handlers.clear()
 
     def _signal_handler_sync(self, signum: int, frame: Any) -> None:  # pragma: no cover
         """signal.signal fallback handler — schedule shutdown on the loop."""

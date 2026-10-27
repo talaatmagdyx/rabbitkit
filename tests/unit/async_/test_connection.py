@@ -747,3 +747,23 @@ class TestForcedReconnectScope:
         assert monitor.is_blocked
         underlay.close.assert_not_awaited()
         assert monitor.forced_reconnects == 0
+
+
+class TestGetInfrastructureErrors:
+    def test_aiormq_channel_and_connection_errors(self) -> None:
+        import aiormq.exceptions
+
+        from rabbitkit.async_.connection import get_infrastructure_errors
+
+        errors = get_infrastructure_errors()
+        assert aiormq.exceptions.AMQPConnectionError in errors
+        assert aiormq.exceptions.ChannelClosed in errors
+        assert aiormq.exceptions.ChannelInvalidStateError in errors
+
+    def test_empty_without_aiormq(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        from rabbitkit.async_.connection import get_infrastructure_errors
+
+        monkeypatch.setitem(sys.modules, "aiormq.exceptions", None)
+        assert get_infrastructure_errors() == ()

@@ -22,6 +22,29 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded to avoid import errors when pika is not installed.
 
 
+def get_infrastructure_errors() -> tuple[type[BaseException], ...]:
+    """pika errors that mean "the broker (a dependency) is unavailable":
+    connection loss and channel closure (pika's are not ``OSError``
+    subclasses, so without this they classified PERMANENT).
+
+    Registered with :func:`rabbitkit.core.errors.register_infrastructure_errors`
+    by :class:`~rabbitkit.sync.broker.SyncBroker`. Empty when pika is not
+    installed.
+    """
+    try:
+        import pika.exceptions
+    except ImportError:
+        return ()
+    return (
+        pika.exceptions.StreamLostError,
+        pika.exceptions.AMQPConnectionError,
+        pika.exceptions.ConnectionClosedByBroker,
+        pika.exceptions.ChannelWrongStateError,
+        pika.exceptions.ChannelClosedByBroker,
+        pika.exceptions.AMQPChannelError,
+    )
+
+
 def get_connection_errors() -> tuple[type[BaseException], ...]:
     """Get pika-specific connection error tuple.
 
@@ -36,21 +59,7 @@ def get_connection_errors() -> tuple[type[BaseException], ...]:
         EOFError,
         OSError,
     )
-
-    try:
-        import pika.exceptions
-
-        pika_errors: tuple[type[BaseException], ...] = (
-            pika.exceptions.StreamLostError,
-            pika.exceptions.AMQPConnectionError,
-            pika.exceptions.ConnectionClosedByBroker,
-            pika.exceptions.ChannelWrongStateError,
-            pika.exceptions.ChannelClosedByBroker,
-            pika.exceptions.AMQPChannelError,
-        )
-        return pika_errors + base_errors
-    except ImportError:
-        return base_errors
+    return get_infrastructure_errors() + base_errors
 
 
 def build_ssl_context(ssl_config: SSLConfig) -> ssl.SSLContext | None:

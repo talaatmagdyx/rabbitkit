@@ -32,7 +32,12 @@ from rabbitkit.core.config import (
     RetryDisabled,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
+from rabbitkit.core.errors import (
+    BackpressureError,
+    BrokerNotStartedError,
+    MessageTooLargeError,
+    register_infrastructure_errors,
+)
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
@@ -56,7 +61,7 @@ from rabbitkit.core.types import (
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
-from rabbitkit.sync.connection import get_connection_errors
+from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
 from rabbitkit.sync.transport import SyncTransport
 
 if TYPE_CHECKING:
@@ -106,6 +111,9 @@ class SyncBroker:
         self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
+        # The client library's connection/channel errors classify as
+        # INFRASTRUCTURE (retried) — core/ cannot import them itself.
+        register_infrastructure_errors(*get_infrastructure_errors())
         self._pipeline = HandlerPipeline(
             serializer=serializer,
             di_resolver=di_resolver,

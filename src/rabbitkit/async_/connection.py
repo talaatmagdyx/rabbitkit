@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 # ── Transport-specific connection errors ──────────────────────────────────
 
 
+def get_infrastructure_errors() -> tuple[type[BaseException], ...]:
+    """aio-pika / aiormq errors that mean "the broker (a dependency) is
+    unavailable": connection loss and channel closure.
+
+    Registered with :func:`rabbitkit.core.errors.register_infrastructure_errors`
+    by :class:`~rabbitkit.async_.broker.AsyncBroker`, so a handler that hits
+    one (e.g. while publishing) is classified ``INFRASTRUCTURE`` and retried
+    instead of dead-lettered. ``ChannelClosed`` is aiormq's base for every
+    channel-level close, so a 403/404/406 raised inside a handler is retried
+    too (bounded by the route's ``RetryConfig``). Empty when aio-pika is not
+    installed.
+    """
+    try:
+        import aiormq.exceptions
+    except ImportError:
+        return ()
+    return (
+        aiormq.exceptions.AMQPConnectionError,
+        aiormq.exceptions.ChannelClosed,
+        aiormq.exceptions.ChannelInvalidStateError,
+    )
+
+
 def get_connection_errors() -> tuple[type[BaseException], ...]:
     """Get aio-pika-specific connection error tuple.
 

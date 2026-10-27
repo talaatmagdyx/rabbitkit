@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from rabbitkit.async_.connection import get_infrastructure_errors
 from rabbitkit.async_.transport import AsyncTransportImpl
 from rabbitkit.concurrency import AsyncWorkerPool
 from rabbitkit.core.bulk import BulkPublishItem, BulkPublishOptions, BulkPublishResult, PublishPreparer
@@ -37,7 +38,12 @@ from rabbitkit.core.config import (
     WorkerConfig,
 )
 from rabbitkit.core.dead_letter import DeadLetterGuard
-from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
+from rabbitkit.core.errors import (
+    BackpressureError,
+    BrokerNotStartedError,
+    MessageTooLargeError,
+    register_infrastructure_errors,
+)
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
@@ -111,6 +117,9 @@ class AsyncBroker:
         self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
+        # The client library's connection/channel errors classify as
+        # INFRASTRUCTURE (retried) — core/ cannot import them itself.
+        register_infrastructure_errors(*get_infrastructure_errors())
         # F17: verify a route's DLQ exists before dead-lettering into it.
         self._dead_letter_guard = DeadLetterGuard(self._queue_exists_for_guard)
         self._pipeline = HandlerPipeline(

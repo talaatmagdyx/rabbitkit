@@ -13,13 +13,18 @@ See Contract 7 in the plan for evaluation order and rationale.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 
 # Re-export: defined in message.py to avoid an import cycle (errors -> types -> message).
 # The `as` form marks it an explicit re-export for mypy --strict.
 from rabbitkit.core.message import SettlementError as SettlementError
-from rabbitkit.core.types import ClassifiedError, ErrorSeverity
+from rabbitkit.core.types import ClassifiedError, ErrorCategory, ErrorSeverity
+
+#: Attribute an exception (class or instance) carries to declare its own
+#: :class:`ErrorCategory`. Checked before predicates and the type tuples.
+ERROR_CATEGORY_ATTR = "rabbitkit_error_category"
 
 # ── Missing DI dependency (H10) ──────────────────────────────────────────
 # Defined before PERMANENT_ERRORS below so it can be listed there directly.
@@ -39,8 +44,11 @@ class MissingDependencyError(Exception):
     :func:`classify_error` (see ``PERMANENT_ERRORS`` below), matching the
     ``KeyError`` classification it replaces: a missing required value means
     the message itself is malformed for this handler — retrying will not fix
-    it, so it settles straight to the DLQ rather than looping.
+    it, so it settles straight to the DLQ rather than looping. Its category
+    is ``INVALID_MESSAGE``.
     """
+
+    rabbitkit_error_category = ErrorCategory.INVALID_MESSAGE
 
     def __init__(self, marker_repr: str, param_name: str) -> None:
         super().__init__(
@@ -81,6 +89,77 @@ class HandlerTimeoutError(TimeoutError):
         self.timeout_seconds = timeout_seconds
 
 
+# ── Typed exceptions for the failure taxonomy ───────────────────────────
+
+
+class InvalidMessageError(ValueError):
+    """Raise from a handler when the message itself is unusable: it cannot
+    be decoded or validated, or a required field is missing.
+
+    Category ``INVALID_MESSAGE``, severity ``PERMANENT``: never retried,
+    dead-lettered with ``x-rabbitkit-error-category: invalid_message``.
+    Subclasses ``ValueError`` so existing ``except ValueError`` code keeps
+    working. rabbitkit applies the same category to body-decode failures and
+    ``on_receive`` failures (decompression, signature) on its own.
+    """
+
+    rabbitkit_error_category = ErrorCategory.INVALID_MESSAGE
+
+
+class InfrastructureError(Exception):
+    """Raise (or wrap) from a handler when a dependency is unavailable:
+    a database, an HTTP service, a cache.
+
+    Category ``INFRASTRUCTURE``, severity ``TRANSIENT``: retried with the
+    route's ``RetryConfig``, and labelled separately from ordinary transient
+    failures in headers and metrics, so an outage of one dependency is
+    visible as such.
+    """
+
+    rabbitkit_error_category = ErrorCategory.INFRASTRUCTURE
+
+
+def mark_invalid_message(exc: BaseException) -> None:
+    """Tag *exc* as ``INVALID_MESSAGE`` unless it already declares a category.
+
+    Used by the pipeline on body-decode and ``on_receive`` failures. An
+    exception type that refuses new attributes is left alone (it then
+    classifies as before, which is still terminal for decode errors).
+    """
+    if isinstance(getattr(exc, ERROR_CATEGORY_ATTR, None), ErrorCategory):
+        return
+    try:
+        setattr(exc, ERROR_CATEGORY_ATTR, ErrorCategory.INVALID_MESSAGE)
+    except (AttributeError, TypeError):
+        pass
+
+
+# ── Infrastructure errors registered by the transports ──────────────────
+# core/ never imports a transport. sync/ and async_/ register their client
+# library's connection and channel errors here (the brokers do it at
+# construction), so classify_error() labels them INFRASTRUCTURE -- and
+# retries them -- without core knowing pika or aio-pika exist.
+
+_infrastructure_errors: tuple[type[BaseException], ...] = ()
+
+
+def register_infrastructure_errors(*types: type[BaseException]) -> None:
+    """Add exception types :func:`classify_error` treats as
+    ``INFRASTRUCTURE`` (severity ``TRANSIENT``). Idempotent; order kept."""
+    global _infrastructure_errors
+    new = tuple(t for t in types if t not in _infrastructure_errors)
+    if new:
+        _infrastructure_errors = _infrastructure_errors + new
+
+
+def infrastructure_errors() -> tuple[type[BaseException], ...]:
+    """The exception types currently registered as ``INFRASTRUCTURE``."""
+    return _infrastructure_errors
+
+
+#: Never a handler failure: requeue and let the cancellation propagate.
+SHUTDOWN_ERRORS: tuple[type[BaseException], ...] = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+
 # Generic (stdlib) error categories — transport layers extend these
 TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     TimeoutError,
@@ -98,8 +177,9 @@ PERMANENT_ERRORS: tuple[type[BaseException], ...] = (
     MissingDependencyError,
 )
 
-# Type alias for error predicates
-ErrorPredicate = Callable[[BaseException], bool | None]
+# Type alias for error predicates: True = transient, False = permanent,
+# an ErrorCategory = that category (and its severity), None = no opinion.
+ErrorPredicate = Callable[[BaseException], bool | ErrorCategory | None]
 
 
 def classify_error(
@@ -109,14 +189,25 @@ def classify_error(
     transient: tuple[type[BaseException], ...] = TRANSIENT_ERRORS,
     permanent: tuple[type[BaseException], ...] = PERMANENT_ERRORS,
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT,
+    infrastructure: tuple[type[BaseException], ...] | None = None,
 ) -> ClassifiedError:
-    """Classify exception severity.
+    """Classify an exception: severity (retry or not) and category (why).
 
     Evaluation order:
-    1. User predicates (first non-None wins)
-    2. transient tuple (isinstance check)
-    3. permanent tuple (isinstance check)
-    4. unknown_policy (configurable, default=PERMANENT)
+    0. Shutdown (``CancelledError``, ``KeyboardInterrupt``, ``SystemExit``)
+       → ``SHUTDOWN``
+    1. A category the exception declares itself (``rabbitkit_error_category``
+       on its class or instance: :class:`InvalidMessageError`,
+       :class:`InfrastructureError`, :class:`MissingDependencyError`, and
+       body-decode / ``on_receive`` failures, which the pipeline tags
+       ``INVALID_MESSAGE``)
+    2. User predicates (first non-None wins; ``True`` / ``False`` /
+       an :class:`ErrorCategory`)
+    3. infrastructure tuple (default: what the transports registered via
+       :func:`register_infrastructure_errors`) → ``INFRASTRUCTURE``
+    4. transient tuple (isinstance check) → ``RETRYABLE``
+    5. permanent tuple (isinstance check) → ``PERMANENT``
+    6. unknown_policy (configurable, default=PERMANENT)
 
     DEFAULT IS PERMANENT, NOT TRANSIENT.
     Reason: unknown errors include malformed payloads, business validation
@@ -130,18 +221,27 @@ def classify_error(
     Args:
         exc: The exception to classify.
         predicates: User-provided classification functions.
-            Return True=transient, False=permanent, None=no opinion.
+            Return True=transient, False=permanent, an ErrorCategory, or
+            None=no opinion.
         transient: Exception types considered transient.
         permanent: Exception types considered permanent.
         unknown_policy: Severity for unclassified exceptions.
+        infrastructure: Exception types labelled ``INFRASTRUCTURE``
+            (transient). ``None`` uses the registered set.
 
     Returns:
-        ClassifiedError with severity, original exception, and reason.
-        ``outcome_unknown`` is set when *exc* carries a truthy
-        ``outcome_unknown`` attribute (:class:`HandlerTimeoutError` does).
+        ClassifiedError with severity, category, original exception, and
+        reason. ``outcome_unknown`` is set when *exc* carries a truthy
+        ``outcome_unknown`` attribute (:class:`HandlerTimeoutError` does);
+        a transient one is then categorised ``UNKNOWN_OUTCOME``.
     """
     classified = _classify(
-        exc, predicates=predicates, transient=transient, permanent=permanent, unknown_policy=unknown_policy
+        exc,
+        predicates=predicates,
+        transient=transient,
+        permanent=permanent,
+        unknown_policy=unknown_policy,
+        infrastructure=_infrastructure_errors if infrastructure is None else infrastructure,
     )
     if getattr(exc, "outcome_unknown", False) is True:
         return ClassifiedError(
@@ -149,8 +249,15 @@ def classify_error(
             original=exc,
             reason=f"{classified.reason}; outcome unknown (side effects may have happened)",
             outcome_unknown=True,
+            category=classified.category,
         )
     return classified
+
+
+def _result(exc: BaseException, category: ErrorCategory, reason: str) -> ClassifiedError:
+    return ClassifiedError(
+        severity=category.severity, original=exc, reason=f"{reason}: {type(exc).__name__}", category=category
+    )
 
 
 def _classify(
@@ -160,45 +267,42 @@ def _classify(
     transient: tuple[type[BaseException], ...],
     permanent: tuple[type[BaseException], ...],
     unknown_policy: ErrorSeverity,
+    infrastructure: tuple[type[BaseException], ...],
 ) -> ClassifiedError:
-    # 1. User predicates (first non-None wins)
+    # 0. Shutdown is never a handler failure.
+    if isinstance(exc, SHUTDOWN_ERRORS):
+        return _result(exc, ErrorCategory.SHUTDOWN, "shutdown")
+
+    # 1. A category the exception declares itself.
+    declared = getattr(exc, ERROR_CATEGORY_ATTR, None)
+    if isinstance(declared, ErrorCategory):
+        return _result(exc, declared, f"declared {declared.value}")
+
+    # 2. User predicates (first non-None wins)
     for predicate in predicates:
         result = predicate(exc)
         if result is True:
-            return ClassifiedError(
-                severity=ErrorSeverity.TRANSIENT,
-                original=exc,
-                reason=f"predicate classified as transient: {type(exc).__name__}",
-            )
+            return _result(exc, ErrorCategory.RETRYABLE, "predicate classified as transient")
         if result is False:
-            return ClassifiedError(
-                severity=ErrorSeverity.PERMANENT,
-                original=exc,
-                reason=f"predicate classified as permanent: {type(exc).__name__}",
-            )
+            return _result(exc, ErrorCategory.PERMANENT, "predicate classified as permanent")
+        if isinstance(result, ErrorCategory):
+            return _result(exc, result, f"predicate classified as {result.value}")
 
-    # 2. Transient tuple (isinstance check)
+    # 3. Transport connection/channel errors (registered, see above)
+    if infrastructure and isinstance(exc, infrastructure):
+        return _result(exc, ErrorCategory.INFRASTRUCTURE, "infrastructure error")
+
+    # 4. Transient tuple (isinstance check)
     if isinstance(exc, transient):
-        return ClassifiedError(
-            severity=ErrorSeverity.TRANSIENT,
-            original=exc,
-            reason=f"transient error: {type(exc).__name__}",
-        )
+        return _result(exc, ErrorCategory.RETRYABLE, "transient error")
 
-    # 3. Permanent tuple (isinstance check)
+    # 5. Permanent tuple (isinstance check)
     if isinstance(exc, permanent):
-        return ClassifiedError(
-            severity=ErrorSeverity.PERMANENT,
-            original=exc,
-            reason=f"permanent error: {type(exc).__name__}",
-        )
+        return _result(exc, ErrorCategory.PERMANENT, "permanent error")
 
-    # 4. Unknown policy
-    return ClassifiedError(
-        severity=unknown_policy,
-        original=exc,
-        reason=f"unknown error classified as {unknown_policy.value}: {type(exc).__name__}",
-    )
+    # 6. Unknown policy
+    category = ErrorCategory.RETRYABLE if unknown_policy is ErrorSeverity.TRANSIENT else ErrorCategory.PERMANENT
+    return _result(exc, category, f"unknown error classified as {unknown_policy.value}")
 
 
 # ── Configuration error (single canonical location) ─────────────────────

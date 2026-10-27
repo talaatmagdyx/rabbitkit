@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from rabbitkit.core.errors import HandlerTimeoutError, classify_error
+from rabbitkit.core.errors import HandlerTimeoutError, classify_error, mark_invalid_message
 from rabbitkit.core.message import (
     AckMessage,
     NackMessage,
@@ -893,8 +893,12 @@ class HandlerPipeline:
         if not middlewares:
             return self._invoke_handler_sync(route, message)
 
-        for mw in reversed(middlewares):
-            mw.on_receive(message)
+        try:
+            for mw in reversed(middlewares):
+                mw.on_receive(message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # unreadable/untrusted delivery: INVALID_MESSAGE
+            raise
 
         # M-P1: cache the composed chain per route — closures are allocated once
         # per route, not per message.
@@ -925,8 +929,12 @@ class HandlerPipeline:
         if not middlewares:
             return await self._invoke_handler_async(route, message)
 
-        for mw in reversed(middlewares):
-            await mw.on_receive_async(message)
+        try:
+            for mw in reversed(middlewares):
+                await mw.on_receive_async(message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # see _run_consume_sync
+            raise
 
         chain = self._consume_chain_async_cache.get(id(route))
         if chain is None:
@@ -975,7 +983,11 @@ class HandlerPipeline:
         failure still tears down any generators opened earlier in the same call.
         """
         # Deserialize body if serializer is available
-        body = self._deserialize_body(route, message)
+        try:
+            body = self._deserialize_body(route, message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # a body that cannot decode is INVALID_MESSAGE
+            raise
 
         # Create scope whenever the effective resolver (explicit or auto) is in
         # play — this is the fix for the auto-DI generator-teardown leak.
@@ -1002,7 +1014,11 @@ class HandlerPipeline:
 
     async def _invoke_handler_async(self, route: RouteDefinition, message: RabbitMessage) -> Any:
         """Deserialize, resolve params, call handler (async)."""
-        body = await self._deserialize_body_async(route, message)
+        try:
+            body = await self._deserialize_body_async(route, message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # see _invoke_handler_sync
+            raise
 
         resolver = self._effective_resolver(route.handler)
         scope: DependencyScope | None = None
@@ -1587,17 +1603,19 @@ class HandlerPipeline:
         """
         error_type = type(exc).__name__ if exc is not None else "-"
         outcome_unknown = bool(getattr(exc, "outcome_unknown", False))
+        category = classify_error(exc).category.value if exc is not None else "-"
         self._failure_log.emit(
             (route.queue.name, error_type, action),
             level,
             "Handler failed: queue=%s message_id=%s correlation_id=%s delivery_tag=%s redelivered=%s "
-            "error=%s reason=%s outcome_unknown=%s action=%s%s",
+            "error=%s category=%s reason=%s outcome_unknown=%s action=%s%s",
             route.queue.name,
             message.message_id,
             message.correlation_id,
             message.delivery_tag,
             message.redelivered,
             error_type,
+            category,
             reason,
             outcome_unknown,
             action,

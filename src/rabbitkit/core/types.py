@@ -196,6 +196,48 @@ class ErrorSeverity(str, Enum):
     PERMANENT = "permanent"
 
 
+class ErrorCategory(str, Enum):
+    """What kind of failure a handler error is (the failure taxonomy).
+
+    :class:`ErrorSeverity` still decides retry versus dead-letter; the
+    category says *why*, for the ``x-rabbitkit-error-category`` header on
+    retry and DLQ copies and as a bounded metric label.
+
+    * ``RETRYABLE``: transient; a retry may succeed (``TimeoutError``,
+      ``ConnectionError``/``OSError``, ``EOFError``).
+    * ``PERMANENT``: a retry cannot succeed (business rule violation,
+      handler bug). The default for unclassified exceptions.
+    * ``INVALID_MESSAGE``: the message itself cannot be decoded or
+      validated (body decode or validation failure, missing required
+      header, unreadable compressed body, bad signature). Terminal.
+    * ``UNKNOWN_OUTCOME``: the handler's side effects may or may not have
+      happened (a processing deadline expired). Retried; the handler must
+      be idempotent.
+    * ``INFRASTRUCTURE``: a dependency is unavailable (AMQP client
+      connection/channel errors, or an application's
+      :class:`~rabbitkit.core.errors.InfrastructureError`). Retried, counted
+      separately.
+    * ``SHUTDOWN``: cancellation or interpreter shutdown
+      (``asyncio.CancelledError``, ``KeyboardInterrupt``, ``SystemExit``).
+      Never retried by rabbitkit: the delivery is requeued and the
+      cancellation propagates.
+    """
+
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
+    INVALID_MESSAGE = "invalid_message"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+    INFRASTRUCTURE = "infrastructure"
+    SHUTDOWN = "shutdown"
+
+    @property
+    def severity(self) -> ErrorSeverity:
+        """The retry decision this category implies."""
+        if self in (ErrorCategory.PERMANENT, ErrorCategory.INVALID_MESSAGE):
+            return ErrorSeverity.PERMANENT
+        return ErrorSeverity.TRANSIENT
+
+
 class PublishStatus(str, Enum):
     """Result status of a publish operation."""
 
@@ -530,12 +572,27 @@ class ClassifiedError:
     have been half done or fully done. Such a failure is still ``TRANSIENT``
     (it is worth retrying), but a redelivery runs the handler again on top of
     whatever the first attempt did, so the handler must be idempotent.
+
+    ``category`` refines ``severity`` (see :class:`ErrorCategory`). When it
+    is omitted, or contradicts ``severity``, it is derived from ``severity``
+    (``TRANSIENT`` → ``RETRYABLE``, or ``UNKNOWN_OUTCOME`` with
+    ``outcome_unknown``; ``PERMANENT`` → ``PERMANENT``), so code that builds
+    a ``ClassifiedError`` from a severity alone stays consistent.
     """
 
     severity: ErrorSeverity
     original: BaseException
     reason: str
     outcome_unknown: bool = False
+    category: ErrorCategory = ErrorCategory.PERMANENT
+
+    def __post_init__(self) -> None:
+        category = self.category
+        if category.severity is not self.severity:
+            category = ErrorCategory.RETRYABLE if self.severity is ErrorSeverity.TRANSIENT else ErrorCategory.PERMANENT
+        if self.outcome_unknown and category is ErrorCategory.RETRYABLE:
+            category = ErrorCategory.UNKNOWN_OUTCOME
+        object.__setattr__(self, "category", category)
 
 
 @runtime_checkable

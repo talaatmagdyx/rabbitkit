@@ -343,8 +343,11 @@ def commit_batch(successful: list[RabbitMessage], failed: list[RabbitMessage]) -
 
 Opt-in **reliability profiles** (`critical_config()`, `broker.preflight("critical",
 management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
-cap, quorum queues and a quorum retry chain — and report anything they cannot
-verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
+cap, bounded in-flight publish bytes, quorum queues with at-least-once
+dead-lettering, a quorum retry chain with a metadata-stamped DLQ copy, a
+required processing deadline and no `ACK_FIRST` — and report anything they
+cannot verify as *unverified*, never green
+([reliable messaging contract](docs/reliable-messaging.md)). Retry/DLQ triage headers are sanitized by
 default, and a failing delay-queue handoff backs off instead of hot-looping.
 `CoalescingAcker` (and `AsyncCoalescingAcker`) is the only place a cumulative
 `basic.ack(multiple=True)` may originate: it knows every delivery on the
@@ -404,6 +407,7 @@ duplicates). The rule is simple:
 | Infrastructure-managed topology | `TopologyMode.PASSIVE_ONLY` performs no writes; `broker.verify_topology(management_client)` detects type/argument/binding drift |
 | DLQ replay publish fails | DLQ message is **not** removed as if replay succeeded |
 | Message unroutable | Mandatory publishing returns a distinct `RETURNED` outcome |
+| Oversized delivery (`ConsumerConfig.max_body_bytes`) | Dead-lettered as `invalid_message` before any middleware or the handler runs |
 | Broker blips | Readiness changes; liveness does **not** kill the pod |
 | Pod gets SIGTERM | Consumers stop first, in-flight work drains |
 | CI has no RabbitMQ | `TestBroker` runs the real pipeline in memory |
@@ -499,6 +503,7 @@ validates it.
 | Middleware | Job |
 |---|---|
 | `RetryMiddleware` | Broker-side retry ladder (auto-wired with `retry=`) |
+| `EventMetadataMiddleware` | Opt-in [event metadata](docs/event-metadata.md) validation (type, version, source, idempotency key, …); bad or unknown-version events are dead-lettered |
 | `DeduplicationMiddleware` | Redis-backed duplicate suppression; `claim` policy is crash-safe; `store_results` replays the original answer to duplicates |
 | `MetricsMiddleware` | Counters + latency histograms, cardinality-guarded labels |
 | `OTelTracingMiddleware` | Standard OpenTelemetry spans + W3C propagation |
@@ -663,6 +668,8 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Full Guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/guide/full-guide.md)
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
+- [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
+- [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)

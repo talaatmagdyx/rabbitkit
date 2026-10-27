@@ -279,6 +279,19 @@ prefer **quorum queues** for the source queue and set `x-delivery-limit` — the
 broker itself dead-letters a message after that many redeliveries, with no
 dependency on any header at all.
 
+### Stripping reserved headers from application publishes (G-19)
+
+`RetryConfig(trust_retry_header=False)` ignores the header and counts only the
+broker's `x-death` history, but a producer can put a forged `x-death` (or
+`x-rabbitkit-first-failed-at`, which drives `max_retry_age`) on a publish too.
+`PublisherConfig(strip_reserved_headers=True)` removes rabbitkit's
+retry/DLQ/replay headers, `x-death` and a custom `retry_header` from every
+`broker.publish()` (and `publish_many` / `iter_publish`), logging one WARNING
+per header name. rabbitkit's own retry and DLQ copies and `DLQInspector`
+replays do not go through `broker.publish()` and keep them. Both settings are
+off by default and on in the CRITICAL profile (see
+[Reliable Messaging](reliable-messaging.md#reserved-headers)).
+
 ### Crash-loop backstop (M5)
 
 The header count only advances on the delay-queue round trip

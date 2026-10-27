@@ -20,6 +20,7 @@
 
 ::: rabbitkit.core.types.PublishOutcome
 ::: rabbitkit.core.types.PublishStatus
+::: rabbitkit.core.types.PublishReason
 
 ## Settlement exceptions
 

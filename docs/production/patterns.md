@@ -219,7 +219,7 @@ async def publish_order_event(broker, order_id: str, payload: bytes) -> None:
         # Store the payload externally and publish a reference instead.
         raise
 
-    outcome.raise_for_status()                             # NACKED/TIMEOUT/RETURNED/ERROR → PublishError
+    outcome.raise_for_status()                             # anything but CONFIRMED/SENT → PublishError
 
     # If something else is settled on the strength of this publish
     # (e.g. acking an inbound message), require a REAL broker confirm:

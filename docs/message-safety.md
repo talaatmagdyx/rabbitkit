@@ -58,17 +58,44 @@ Without publisher confirms, there is no way to distinguish a successful publish 
 silently dropping it when no queue is bound to match the routing key. `broker.publish()`
 reports this via `PublishOutcome.status`:
 
-| Status | Meaning |
-|---|---|
-| `PublishStatus.CONFIRMED` | Broker accepted and routed the message. `outcome.ok` is `True`. |
-| `PublishStatus.RETURNED` | `mandatory=True` and the broker could not route it to any queue (`Basic.Return`). |
-| `PublishStatus.NACKED` | Broker rejected the message (`Basic.Nack`) — e.g. an internal broker error. |
-| `PublishStatus.TIMEOUT` | No confirm arrived within `confirm_timeout`. |
-| `PublishStatus.ERROR` | Any other publish-time failure (connection error, serialization, etc). |
+| Status | Meaning | Publish again? |
+|---|---|---|
+| `PublishStatus.CONFIRMED` | Broker accepted and routed the message. `outcome.ok` is `True`. | No |
+| `PublishStatus.RETURNED` | `mandatory=True` and the broker could not route it to any queue (`Basic.Return`). `reply_code` / `reply_text` hold the broker's answer (e.g. `312` / `NO_ROUTE`). | After fixing routing |
+| `PublishStatus.NACKED` | Broker rejected the message (`Basic.Nack`) — e.g. an internal broker error. | Yes, by policy |
+| `PublishStatus.NOT_SENT` | The message definitely never left the client: publisher closed, admission timed out (no free channel or byte budget), no connection, flow-control drop. | Yes |
+| `PublishStatus.UNKNOWN` | The frames may have reached the broker, but no confirm, return or nack was seen (connection or channel lost mid-publish, shutdown). | Only with the **same `message_id`** |
+| `PublishStatus.TIMEOUT` | No confirm arrived within `confirm_timeout` (or the per-call `timeout`). A kind of unknown outcome. | Only with the same `message_id` |
+| `PublishStatus.ERROR` | The broker refused this publish (`reason` says why: `exchange_not_found`, `access_refused`, `precondition_failed`), invalid input, or an unclassified failure. | After fixing the cause |
 
-`PublishOutcome.ok` is `True` only for `CONFIRMED` — treat `RETURNED`/`NACKED`/`TIMEOUT`/`ERROR`
-the same way you would treat a failed publish (e.g. don't ack an upstream message on the
-strength of an outcome that isn't `.ok`).
+`outcome.reason` is a bounded code (`rabbitkit.PublishReason`), safe as a metric label.
+`outcome.is_unknown` is `True` for `UNKNOWN` and `TIMEOUT`.
+
+`PublishOutcome.ok` is `True` only for `CONFIRMED` (and `SENT` with confirms off) — treat
+every other status the same way you would treat a failed publish (e.g. don't ack an upstream
+message on the strength of an outcome that isn't `.ok`).
+
+The async broker never publishes a message again on its own once its frames may have left
+the client: a lost connection is reported `UNKNOWN` instead of being retried behind your
+back (that retry could deliver a duplicate reported as `CONFIRMED`). To republish after an
+unknown outcome, reuse the message id — `MessageEnvelope.message_id`, or
+`broker.publish(..., message_id=...)` in the keyword form — so consumers can deduplicate.
+
+**Admission and timeouts (async broker).** Each confirmed publish holds one pooled channel
+until its confirm arrives. When all `PoolConfig.channel_pool_size` channels are busy, a
+publish waits up to `PoolConfig.channel_acquire_timeout` and then returns `NOT_SENT`
+(`admission_timeout`); a busy pool never rebuilds the connection. With
+`PublisherConfig.max_in_flight_bytes` set, a publish also waits (same bound) for its body to
+fit in the in-flight byte budget. `broker.publish(..., timeout=2.0)` bounds the whole call —
+admission, send and confirm: on expiry the outcome is `NOT_SENT` if nothing was sent yet,
+otherwise `TIMEOUT` (`publish_timeout`). Cancelling a publish never leaks its channel or
+bytes; treat a cancelled publish as unknown.
+
+**Publisher shutdown (async broker).** `stop()` first drains consumers, then closes publish
+admission (a later `publish()` raises `BrokerNotStartedError`; it never reconnects), waits for
+in-flight confirms within what is left of the stop timeout, and reports the rest: still
+waiting for a channel or still queued in the batch publisher → `NOT_SENT`
+(`publisher_closed`); sent but unconfirmed → `UNKNOWN` (`shutdown`).
 
 **Sync transport residual limitation:** pika's `BlockingChannel.basic_publish()` has no
 timeout parameter of its own. `confirm_timeout` bounds every publish path *except* one: a
@@ -150,4 +177,7 @@ With `AckPolicy.MANUAL`, RabbitKit does **not** touch the ack state after your h
 | `stop()` with a handler past `graceful_timeout` | Handler cancelled; nacked for redelivery; abandoned after 1 s more if it ignores cancellation, so `stop()` stays bounded |
 | Connection drops mid-processing | Broker redelivers; duplicate delivery is possible and expected |
 | Publisher confirms disabled (unsupported path) | Not supported for retry/DLQ paths; confirms are always required |
-| `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED`; `.ok` is `False` — never reported as `CONFIRMED` |
+| `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED` on every path (direct, batch, reply-to); `.ok` is `False` — never reported as `CONFIRMED` |
+| Connection lost after the publish frame left (async) | `UNKNOWN`; never republished by the library |
+| Publisher channel pool exhausted (async) | Waits `channel_acquire_timeout`, then `NOT_SENT` (`admission_timeout`); connection untouched |
+| Publish after `stop()` (async) | `BrokerNotStartedError`; nothing is sent, nothing reconnects |

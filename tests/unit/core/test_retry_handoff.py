@@ -114,3 +114,30 @@ class TestRetryHandoffTracker:
         yields a strictly positive backoff."""
         t, _ = _tracker()
         assert all(t.record_failure() > 0 for _ in range(10))
+
+
+class TestBackoffNeverOverflows:
+    """R-D4: a long streak of handoff failures must never raise. The old
+    ``initial * 2 ** (n - 1)`` overflowed a float after ~1,025 consecutive
+    failures and the failure path itself crashed."""
+
+    @pytest.mark.parametrize("failures", [1, 2, 10, 64, 65, 66, 1024, 1025, 1026, 5000, 10**6])
+    def test_any_failure_count_gives_finite_delay_within_max(self, failures: int) -> None:
+        from rabbitkit.core.retry_handoff import _capped_exponential
+
+        delay = _capped_exponential(0.5, 30.0, failures)
+        assert 0 < delay <= 30.0
+
+    @pytest.mark.parametrize(("initial", "maximum"), [(0.001, 0.001), (0.001, 1e9), (0.5, 30.0), (1e-9, 1e300)])
+    def test_extreme_configs_stay_finite(self, initial: float, maximum: float) -> None:
+        from rabbitkit.core.retry_handoff import _capped_exponential
+
+        for failures in (1, 50, 1100, 100_000):
+            delay = _capped_exponential(initial, maximum, failures)
+            assert initial <= delay <= maximum
+
+    def test_tracker_survives_long_streak(self) -> None:
+        t, _ = _tracker(max_consecutive_failures=10**9, recovery_deadline=10**9)
+        delays = [t.record_failure() for _ in range(1_100)]
+        assert all(0 < d <= t.config.backoff_max for d in delays)
+        assert delays[-1] == t.config.backoff_max * (1 - t.config.jitter + 2 * t.config.jitter * 0.5)

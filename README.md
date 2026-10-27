@@ -444,14 +444,19 @@ handlers. Migrating existing classic queues to quorum? There's a tool:
 ## Observability
 
 Structured logs carry message context (`message_id`, `correlation_id`,
-routing, queue, handler, retry count, settlement, duration, error type) with
-secret redaction on by default. Metrics cover consumed/acked/nacked/
+routing, queue, handler, retry count, settlement, duration, error type) and
+redact secrets once logging is configured
+(`RabbitConfig(logging=LoggingConfig())`; redaction is opt-in). Metrics cover consumed/acked/nacked/
 retried/dead-lettered counts, publish outcomes, handler latency,
 redeliveries, reconnects, confirm latency, in-flight handlers, broker/consumer
 lifecycle gauges, bulk-publish and settlement outcomes, retry-handoff
 failures, and — via the management API poller — queue depth and consumer lag. Tracing is standard OpenTelemetry
 (`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
-one continuous trace from publish to consume.
+one continuous trace from publish to consume. Prometheus alert rules with
+`promtool` tests ship in `deploy/prometheus/rabbitkit-alerts.yaml`, each linked
+to a runbook in `docs/runbooks/`. For the full reliability contract (publish
+outcomes, settlement, failure taxonomy, durability scope) see
+`docs/reliable-messaging.md`.
 
 ## Advanced & experimental
 

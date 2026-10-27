@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Reliability foundation for the async (aio-pika) path. Every gap from the
+RabbitMQ Async Messaging Foundation audit is closed or documented; see
+`docs/reliable-messaging.md` for the resulting contract. Several defaults
+change behaviour: read **Changed (behaviour)** before upgrading.
+
 ### Changed (behaviour)
+
+#### Earlier consumer and retry hardening
 
 - **Transient failures on routes without retry are bounded by default.**
   `ConsumerConfig.reject_transient_on_redelivery` now defaults to `True`: a
@@ -44,80 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MetricsConfig.settlement_outcome_unknown_total`), and nothing else is
   sent for that delivery (§11.3).
 
-### Added
-
-- **`ConsumerConfig.processing_timeout`** (default `None`, off): a
-  per-delivery handler deadline on the async broker. On expiry the handler
-  task is cancelled and `HandlerTimeoutError` goes through the normal failure
-  settlement. The sync broker ignores it and logs a warning (use
-  `TimeoutMiddleware`).
-- **`HandlerTimeoutError` marks an unknown outcome.** It moved to
-  `rabbitkit.core.errors` (re-exported from `rabbitkit.middleware.timeout`
-  and now from the package root), carries `outcome_unknown = True`, and
-  `classify_error` copies that to the new `ClassifiedError.outcome_unknown`
-  field and the reason string, so logs and classifiers can tell "timed out,
-  side effects unknown" apart from an ordinary transient failure. It is
-  still `TRANSIENT`.
-- Every handler failure now logs one structured line (queue, message id,
-  correlation id, delivery tag, `redelivered`, exception class, reason,
-  `outcome_unknown`, action taken). No body, headers or exception text; the
-  traceback is at DEBUG. Repeats are collapsed to one line per queue, error
-  class and action per 10 s window, with a count. Previously a failure that
-  was dead-lettered under `AUTO` produced no log line at all.
-
-### Fixed
-
-- **A rejected message was silently lost when the DLQ was missing.** Classic
-  queues, and quorum queues without the at-least-once dead-letter strategy,
-  dead-letter at most once: rejecting into a missing DLQ drops the message.
-  Reproduced on 3.13 and 4.1 with the default topology after deleting the
-  auto-provisioned `{queue}.dlq` (classic and quorum), and with retry after
-  exhaustion. The async broker now verifies that the DLQ exists (passive
-  declare on a throwaway channel, positive answers cached 5 s) before any
-  dead-lettering settlement: handler failures, retry-terminal failures,
-  `NACK_ON_ERROR`, `RejectMessage(requeue=False)` and
-  `NackMessage(requeue=False)`. If it is missing, the message is requeued
-  after a backoff (0.5 s doubling to 5 s) and an ERROR is logged; it
-  survives until the DLQ is restored. Covers dead-letter targets reached
-  through the default exchange (what rabbitkit declares); a custom
-  dead-letter exchange is not verified. Not yet on the sync broker.
-- **`TimeoutMiddleware` relabelled the handler's own `TimeoutError` as a
-  handler timeout** (`asyncio.wait_for` cannot tell them apart). Only the
-  middleware's deadline raises `HandlerTimeoutError` now.
-- **`AsyncBroker.stop()` was not bounded** when a handler swallowed
-  `CancelledError`: with `graceful_timeout=1.0` it took 6.01 s, and the
-  message was then acked by the late-finishing handler. The inline drain
-  and `AsyncWorkerPool.stop()` now wait at most 1 s for cancelled handlers
-  to unwind, log the ones that ignored cancellation, and nack their
-  deliveries for redelivery (measured: 2.01 s, message back on the queue).
-
-### Documentation
-
-- `WorkerConfig` documents what `worker_count=1` actually does: no worker
-  pool is created and `prefetch_per_worker` is ignored, so on the async
-  broker up to `prefetch_count` handlers of one queue run concurrently. It
-  does not serialize async handlers. (Sync handlers run inline, one at a
-  time.)
-
-- **A cumulative ack could acknowledge a delivery that was never processed.**
-  `SettlementCoordinator` (behind `CoalescingAcker` / `AsyncCoalescingAcker`)
-  planned `ack(N, multiple=True)` from its own ledger only. A delivery refused
-  with `LedgerFullError` (`max_pending`), or any delivery tag never registered
-  on that channel, is still unacked at the broker, and the next cumulative
-  ack above it acknowledged it. The message was lost: never processed, never
-  redelivered. Reproduced on a real broker (`max_pending=2`: the third
-  delivery was refused, then `ack(5, multiple=True)` swept it). The
-  coordinator now records the lowest unregistered tag of the channel
-  generation (`gap_floor`, also in `stats`, with `unregistered_gaps`) and
-  never coalesces at or past it; deliveries above a gap are acked
-  individually until the channel is rebuilt. Because tags start at 1 on
-  every channel, a coordinator whose first registered tag is not 1 no longer
-  coalesces at all.
-- The `AsyncCoalescingAcker` docstring example used `msg.channel` (not a
-  `RabbitMessage` attribute) with the default `AckPolicy.AUTO`, which would
-  have settled every delivery twice. It now uses `AckPolicy.MANUAL` and
-  `msg.raw_message.channel`, and does not re-raise after `acker.fail()`.
-### Changed
 
 - **Terminal failures are dead-lettered by `RetryMiddleware` itself, with
   metadata** (`RetryConfig.terminal_action`, default `"dead_letter"`). A
@@ -160,7 +93,362 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client-controlled; a producer that strips all of them restarts the
   budget, which `max_retry_age` and a quorum `x-delivery-limit` bound.
 
+
+- **CLI and `DLQInspector` route replays the same way.** The CLI routed by
+  the original ROUTING KEY even to the default exchange (so a topic-routed
+  message replayed with target `""` was unroutable), while the inspector
+  routed by the original QUEUE even to a named exchange. Both now: explicit
+  routing key wins; default exchange → original queue; named exchange →
+  original routing key.
+- `reset_retry_count=True` / `--reset-retry-count` now also strips the
+  broker's `x-death` / `x-first-death-*` / `x-last-death-*` headers and
+  `x-rabbitkit-first-failed-at` (the retry middleware derives the budget from
+  them), keeping the old count as `x-rabbitkit-previous-retry-count`.
+
+#### Publisher
+
+- **Publish outcomes say whether the message may have been sent.**
+  `PublishStatus` gains `NOT_SENT` (the message definitely never left the
+  client) and `UNKNOWN` (its frames may have reached the broker, but no
+  confirm, return or nack was seen). On the async broker:
+  - `NOT_SENT`: publisher closed, no free channel within
+    `PoolConfig.channel_acquire_timeout` (`admission_timeout`), byte budget
+    full, no connection / the publisher connection still recovering
+    (`not_connected`), a channel could not be opened
+    (`channel_unavailable`), a `FlowController` drop
+    (`backpressure_dropped`, also on the sync broker; it was `ERROR`).
+  - `UNKNOWN`: connection or channel lost after the publish frame
+    (`connection_lost`), a sibling's refusal closed a shared channel
+    (`channel_closed`), unconfirmed at shutdown (`shutdown`). These used to
+    be `ERROR`.
+  - `ERROR` is left for a publish the broker refused (`exchange_not_found`,
+    `access_refused`, `precondition_failed`, with `reply_code` /
+    `reply_text`), invalid input (`invalid_envelope`), and unclassified
+    failures (`publish_error`).
+  - `TIMEOUT` is unchanged (`confirm_timeout`, or `publish_timeout` when the
+    new per-call timeout expired first).
+
+  Code that matched `ERROR` for connection failures should match
+  `UNKNOWN` / `NOT_SENT` (or check `not outcome.ok`, which is unchanged
+  for every failure). `ok` is still `True` only for `CONFIRMED` and `SENT`.
+  On the sync transport, a non-owner thread publishing on a dead connection
+  now gets `NOT_SENT` (`not_connected`) instead of `ERROR`; the sync
+  transport's other outcomes are unchanged.
+- **No hidden republish after a connection error (async).** A confirmed
+  publish that hit a connection-class error waited for recovery and
+  published again; if the first copy had reached the broker, the message
+  was delivered twice and reported `CONFIRMED`. It is now reported
+  `UNKNOWN` and never republished. Republish yourself with the same
+  `message_id` if needed. Failures before the frame (no channel) are still
+  healed by rebuilding the publisher connection and retrying the acquire,
+  which cannot duplicate anything. A publish that finds the publisher
+  connection mid-reconnect now waits (up to 5 s or its timeout) before
+  sending instead of after failing.
+- **A missing exchange is an error, sent once (async).** A 404 on publish
+  was treated as a connection error: retried once (two publishes, two
+  closed channels) and then reported as a generic `ERROR`. It is now
+  `ERROR` with `reason="exchange_not_found"` and `reply_code=404`, not
+  retried; the broken channel is discarded.
+- **Pool exhaustion waits and reports, it does not rebuild (async).** When
+  every publisher channel was busy for `channel_acquire_timeout`, the
+  publisher connection was rebuilt, closing every in-use channel and
+  failing healthy in-flight publishes. Now the caller gets `NOT_SENT`
+  (`admission_timeout`) and the connection is untouched. Only a failure to
+  open a channel rebuilds it.
+- **`AsyncBroker.stop()` shuts the publisher down.** After the consumer
+  drain, publish admission closes: a later `publish()` raises
+  `BrokerNotStartedError` (it used to reconnect silently and publish). The
+  batch queue is flushed and in-flight confirms are awaited within what is
+  left of the stop timeout; whatever remains is reported, never dropped:
+  still queued or waiting for a channel → `NOT_SENT` (`publisher_closed`),
+  sent but unconfirmed → `UNKNOWN` (`shutdown`). Then the broker
+  disconnects.
+- **`AsyncBatchPublisher` outcomes and bounds.** Callers still queued at
+  `stop()` get `NOT_SENT` instead of a bare `RuntimeError`; a publish that
+  raises mid-flush is `UNKNOWN` instead of an exception at the caller.
+  Every wait is bounded: queue admission by `channel_acquire_timeout`
+  (`NOT_SENT`), the whole call by the per-call `timeout` or admission +
+  flush interval + confirm timeout (still queued → withdrawn, `NOT_SENT`;
+  being flushed → `TIMEOUT`). Flush workers retry channel acquisition for
+  at most `channel_acquire_timeout` and then fail the batch `NOT_SENT`
+  (`channel_unavailable`) instead of retrying forever.
+  `AsyncBatchPublisher.stop()` takes `timeout` (default `0.0`, the old
+  "don't wait" behaviour).
+- **`PoolConfig` is validated:** `channel_pool_size >= 1` (0 made the pool
+  unbounded) and `channel_acquire_timeout > 0`; invalid values raise
+  `ConfigValidationError`. `publisher_connections` / `consumer_connections`
+  are documented as reserved and ignored.
+- `AsyncChannelPool.release()` ignores a channel it does not own (released
+  twice, or checked out before `close_all()` / a connection rebuild); it
+  used to decrement the pool's counter anyway, so after a rebuild the pool
+  could open more channels than `channel_pool_size`.
+- `AsyncChannelPool.acquire()` raises `ChannelPoolExhaustedError` (a
+  `TimeoutError` subclass, so existing `except TimeoutError` still works)
+  on exhaustion and `ChannelPoolClosedError` once the pool is closed.
+
+#### Connection recovery
+
+- **Permanent connection failures fail fast instead of being retried
+  (async).** A refused login (`ACCESS_REFUSED`), a refused vhost
+  (`NOT_ALLOWED` at `connection.open`: missing vhost or no permissions) and a
+  TLS failure that retrying cannot fix (certificate verification, hostname
+  mismatch, a broker-rejected client certificate, a non-TLS port) used to be
+  retried like a refused socket: 30 attempts at startup (6 to 12 minutes;
+  reproduced: still retrying after 15 s) and forever after any later drop.
+  Now `AsyncBroker.start()` raises `AuthenticationFailedError`,
+  `VhostAccessRefusedError` or `TLSVerificationError` at once (measured on a
+  real broker: under 5 s, typically tens of milliseconds). After startup, a
+  reconnect attempt that hits one stops that connection for good (see
+  "terminal connection failure" below). These are `ConnectionError`s, like
+  the aiormq/ssl errors they replace, so `except ConnectionError` /
+  `except OSError` around `start()` still catches them. A `NOT_ALLOWED` that
+  says the vhost "is down" stays retryable. Credential rotation must make the
+  new secret available to `credentials_provider` before the old one is
+  revoked.
+- **Reconnects after the first connect back off exponentially with full
+  jitter (async).** aio-pika retried at one fixed interval per process
+  (in `[base, 2*base]`) forever. Each failed reconnect attempt now waits
+  `uniform(0, min(reconnect_backoff_max, reconnect_backoff_base * 2**(n-1)))`,
+  and the counter resets when a reconnect succeeds. Still unlimited by
+  default (see the new budgets below).
+- **`ConnectionConfig` rejects timing values that broke reconnects:**
+  `reconnect_backoff_base <= 0` (every retry was immediate),
+  `reconnect_backoff_max < reconnect_backoff_base`, `socket_timeout <= 0`
+  and `heartbeat < 0` raise `ConfigValidationError`; `heartbeat=0` (which
+  disables dead-peer detection) warns.
+- **`AsyncBroker.run()` raises a terminal connection failure** after
+  stopping the broker, so the process exits and its supervisor restarts it.
+  Under bare `start()` nothing stops by itself; health turns false and
+  `on_connection_failed` hooks fire.
+- **`broker_liveness()` is False once a connection has failed for good**
+  (it ignored connectivity before): only a restart recovers. A transient
+  disconnect still counts as alive.
+- **The async broker emits `rabbitkit_reconnects_total` again** (with a
+  `MetricsMiddleware` on a route), like the sync broker. It counts
+  connections: one outage counts two (publisher and consumer). The startup
+  log line saying it was not emitted is gone.
+
+#### Consumer
+
+- **Async settlement is claimed before the network write (G-15).**
+  `RabbitMessage.ack_async()` / `nack_async()` / `reject_async()` set the
+  disposition before awaiting the transport. Before, the guard set it only
+  after the await, so two coroutines (a concurrent ack and nack, or `stop()`
+  nacking a handler cancelled mid-ack) could both pass it and send two frames
+  for one delivery tag. RabbitMQ answers the second with
+  `PRECONDITION_FAILED - unknown delivery tag`, closes the channel and
+  redelivers everything unacked on it (reproduced on a real broker: messages
+  were handled twice). Now one frame is sent and the channel stays open.
+  **Observable change:** when the write raises or is cancelled, the message
+  is no longer left `pending`: `disposition` keeps the claimed value,
+  `is_settled` is `True`, and the new `settlement_outcome_unknown` is `True`.
+  A later settlement call on that message is a no-op (it could contradict a
+  frame that landed); if the frame was lost, the broker redelivers when the
+  channel closes. The exception still propagates. The settlement metric
+  (`messages_acked_total` etc.) is not emitted for such a message. The sync
+  methods (`ack()`, `nack()`, `reject()`) are unchanged.
+- **`AsyncBroker.start(install_signal_handlers=True)` no longer clobbers the
+  application's signal handlers (G-24).** The default stays `True`. The
+  Python-level SIGINT/SIGTERM handler in place is captured with
+  `signal.getsignal` and restored by `stop()` (before, `stop()` reset it to
+  the default, so e.g. `asyncio.run()`'s SIGINT handler or an application's
+  SIGTERM handler was lost); replacing a custom one logs a WARNING. A handler
+  registered with `loop.add_signal_handler` (the application's, or
+  `RabbitApp.run_async()`'s) cannot be read back through asyncio's public
+  API, so the broker now leaves that signal alone and logs a WARNING; that
+  handler must call `broker.request_shutdown()` or `await broker.stop()`.
+  `stop()` also no longer removes a handler the application installed after
+  `start()`. Embedding applications should pass
+  `install_signal_handlers=False` (see `docs/kubernetes.md`).
+- **`rabbitkit_lifespan` starts an `AsyncBroker` with
+  `install_signal_handlers=False`** (G-24). The ASGI server owns
+  SIGINT/SIGTERM and runs the lifespan teardown on them; with the broker's
+  handlers installed over the server's, SIGTERM stopped only the broker and
+  the server kept running.
+- **`AsyncBroker.stop()` hands not-started worker-pool deliveries back at
+  once.** With `WorkerConfig(worker_count > 1)`, deliveries that were
+  prefetched into the pool but were still waiting for a worker slot are now
+  cancelled before their handler starts and nacked with `requeue=True` at the
+  beginning of `stop()`. Before, `stop()` ran them during the grace period
+  (and cut them off at the deadline). In-flight handlers keep the
+  `graceful_timeout` grace. Verified on a real broker: 2 in flight, 4 queued
+  → the 4 are back on the queue while the 2 still run.
+- **Per-route `prefetch_count` is validated at registration (CONSUMER-005).**
+  `@broker.subscriber(..., prefetch_count=0)` silently fell back to the
+  global value, and a negative value was sent to the broker. It now raises
+  `ConfigurationError` unless it is `None` (inherit) or an `int >= 1`.
+
+#### Retry, dead-lettering and failure taxonomy
+
+- **`x-rabbitkit-error-category` carries the failure category**, not the
+  severity: a transient failure now reads `retryable` (was `transient`), and
+  the new values `invalid_message`, `unknown_outcome` and `infrastructure`
+  appear; `permanent` is unchanged. Update any triage script or alert that
+  matched `transient`.
+- `rabbitkit_messages_retried_total` and `rabbitkit_messages_dead_lettered_total`
+  gain a bounded `category` label (the six values above). Aggregations by
+  `queue` are unaffected; a selector on the exact label set needs the new
+  label.
+- **pika and aiormq connection/channel errors raised inside a handler are
+  retried** (`INFRASTRUCTURE`, transient). pika's are not `OSError`
+  subclasses and aiormq's `ChannelClosed` / `ChannelInvalidStateError`
+  aren't either, so they used to classify `PERMANENT` and go straight to the
+  DLQ. A 403/404/406 `ChannelClosed` raised in a handler is retried too,
+  bounded by `max_retries`.
+- **Body-decode and `on_receive` failures are `INVALID_MESSAGE` and always
+  terminal.** The pipeline tags them; a declared category wins over
+  predicates and `unknown_policy`, so a decode error is no longer retried by
+  a predicate that returns `True` for it, nor under
+  `unknown_policy=TRANSIENT` when a custom decoder raises something that is
+  not a `ValueError`.
+- The pipeline's "Handler failed" log line gains `category=`.
+- A quorum source declared with `dead_letter_strategy="at-least-once"` is no
+  longer probed for its DLQ before a dead-lettering settlement: the broker
+  keeps the message until the DLQ exists, so it is rejected once and the
+  handler is not re-run. Other sources keep the requeue-with-backoff.
+- `ExceptionMiddleware` re-raises a terminal exception whose DLQ copy was
+  attempted and not confirmed (`_rabbitkit_dead_letter_failed`), even with
+  `swallow_permanent=True` or a matching fallback handler. Its log lines are
+  sanitized (they printed raw exception text).
+
+#### Event metadata and the CRITICAL profile
+
+- **The CRITICAL reliability profile enforces the reliable-messaging
+  contract (ADR-M1/M4).** `apply_profile(..., "critical")` /
+  `critical_config()` now also set `publisher.max_in_flight_bytes`
+  (64 MiB unless set), `publisher.strip_reserved_headers=True`, and on the
+  retry config `delay_queue_dead_letter_strategy="at-least-once"`,
+  `terminal_action="dead_letter"`, `trust_retry_header=False` (besides
+  quorum delay queues and DLQ, as before). They now **raise
+  `ConfigValidationError` when `consumer.processing_timeout` is unset**
+  (it has no safe default): `critical_config()` with no base, or a base
+  without a deadline, used to succeed and now raises; pass
+  `RabbitConfig(consumer=ConsumerConfig(processing_timeout=...))`. New
+  pinned contradictions: `terminal_action="reject"`,
+  `delay_queue_dead_letter_strategy="at-most-once"`,
+  `reject_transient_on_redelivery=False`, `manual_settle_on_error=False`.
+  `validate_profile(..., "critical")` / `preflight()` report all of these
+  and, per route: `AckPolicy.ACK_FIRST`, `RETRY_DISABLED`, a route
+  `RetryConfig` missing the retry requirements, and (warning) a quorum
+  source queue not declared `x-dead-letter-strategy=at-least-once`; with a
+  management client, `preflight()` verifies that on the broker instead and
+  drops the warning. A previously compliant CRITICAL config therefore now
+  reports violations until it adopts the new settings. Event-metadata
+  validation is not forced. STANDARD is unchanged. Connection
+  reconnect/backoff settings are not covered yet (TODO for the connection
+  stream).
+
+#### Observability
+
+- **`rabbitkit_messages_published_total` gains a bounded `reason` label**
+  (`PublishReason` code; `none` for a success, `exception` when the call
+  raised, `other` for an unknown code). Aggregations by `exchange`/`status`
+  are unaffected; a selector on the exact old label set needs the new label.
+- **`rabbitkit_publish_confirm_latency_seconds` measures send-to-confirm**,
+  timed by the transport from handing the frame to the client library until
+  the broker's confirm (async: the `exchange.publish()` await; sync: pika's
+  `basic_publish()` call). It used to time the whole `broker.publish()` call
+  (admission, channel wait, middleware). It now also covers retry and DLQ
+  copies, and is emitted whenever any collector is configured. Under
+  `TestBroker` / a custom publish function it still times the whole call.
+- **`rabbitkit_broker_connected` follows drops and reconnects** (it was only
+  set at `start()`/`stop()` and stayed 1 through an outage). It is 1 only
+  while every connection is up.
+- **Connection and channel metrics no longer need a `MetricsMiddleware` on a
+  route**: a publish-only broker with one in `middlewares=[...]` gets
+  `reconnects_total`, `channels_opened_total`, `channel_rebuilds_total` and
+  the new ones. They are wired before the first connect, so the initial
+  connections and channels are counted (before, counting started after
+  topology declaration): expect `channels_opened_total` to be a few higher
+  right after start.
+- **The broker no longer replaces an application's structlog configuration.**
+  With `RabbitConfig(logging=LoggingConfig(...))`, `start()` used to call
+  `structlog.configure()` unconditionally, clobbering e.g. obskit's setup in
+  an embedding application. Now, if structlog was configured by someone else,
+  the broker keeps it and only attaches rabbitkit's value redaction to the
+  `rabbitkit.*` loggers. `LoggingConfig(override_existing=True)` restores the
+  old behaviour. A direct `configure_structlog()` call is unchanged.
+- **The PRODUCER span records the publish outcome.** `broker.publish()`
+  returns failures instead of raising, so the span used to look successful
+  for NOT_SENT / UNKNOWN / TIMEOUT / RETURNED / NACKED / ERROR. It now gets
+  `messaging.rabbitmq.publish.status`, `messaging.rabbitmq.publish.reason`,
+  `error.type` and an `ERROR` status for every outcome that is not `ok`.
+
+#### Sync parity, documentation drift and dead-letter metadata
+
+- **SyncBroker publish outcomes follow the async contract, and nothing is
+  republished once frames may have left.** The sync transport used to
+  reconnect and publish once more after any connection-class error, even
+  when the first copy had reached the broker (a duplicate reported
+  `CONFIRMED`); from inside a handler it did so on the I/O thread, leaving
+  the consume loop on a new connection without its consumers (reproduced:
+  no redelivery afterwards). Now, on `SyncBroker` / `SyncTransport.publish`:
+  - `NOT_SENT`: no connection could be (re)established, or the publishing
+    thread may not reconnect (a worker thread, or a handler running inside
+    the consume loop) (`not_connected`; this used to raise the reconnect
+    error out of `publish()` after the bounded reconnect loop); the channel
+    was closed before `basic_publish` or confirm mode could not be enabled
+    (`channel_unavailable`); a worker-thread publish the I/O loop never
+    picked up within `confirm_timeout` (`admission_timeout`; was `TIMEOUT`).
+  - `UNKNOWN`: connection (`connection_lost`) or channel (`channel_closed`)
+    lost after `basic_publish` (was `ERROR`). Republish with the same
+    `message_id` if needed.
+  - `ERROR` with `reason`, `reply_code`, `reply_text`: `exchange_not_found`
+    (404), `access_refused` (403), `precondition_failed` (406), sent once
+    (a 404 used to be published twice); `invalid_envelope`; `publish_error`
+    for anything unclassified. `RETURNED` carries `312 NO_ROUTE`, `NACKED`
+    and `TIMEOUT` (`confirm_timeout`) carry their reasons.
+  - A publish-only connection the broker closed while idle is detected
+    before sending (a zero-time read of the socket) and replaced, so the
+    first publish after a quiet period is still `CONFIRMED` (M4) without a
+    republish.
+- `RPCClient.call()` / `AsyncRPCClient.call()` raise `PublishError` at once
+  when the request was definitely not delivered (`NOT_SENT`, `RETURNED`,
+  `NACKED`, `ERROR`) instead of waiting for the reply timeout
+  (`RPCTimeoutError`). `UNKNOWN` / `TIMEOUT` still wait for the reply.
+- **The CRITICAL profile covers the connection.** `validate_profile` /
+  `preflight` report `connection.heartbeat <= 0` as an error and
+  `apply_profile` / `critical_config` raise `ConfigValidationError` for
+  `heartbeat=0`. A `reconnect_budget_seconds` below `reconnect_backoff_max`
+  and enabled TLS with `cert_reqs="CERT_NONE"` are warnings. The reconnect
+  budget stays unlimited by default and TLS is not required (rationale in
+  `docs/reliable-messaging.md`).
+- **The CRITICAL profile turns on `SafetyConfig.dead_letter_with_metadata`**
+  (see Added) and `validate_profile` reports it as an error when off: a
+  hand-built CRITICAL config that was compliant reports one more violation.
+  Under CRITICAL a delivery over `max_body_bytes` therefore reaches the DLQ
+  as a metadata-stamped copy (`x-rabbitkit-error-category: invalid_message`,
+  no `x-death`), superseding changelog.d/profile.md's "The DLQ copy carries
+  `x-death` only" for that profile.
+- `rabbitkit_messages_dead_lettered_total` counts completed dead-letters
+  only: a confirmed DLQ copy, or the dead-lettering reject the pipeline
+  actually sent. It used to be recorded when `RetryMiddleware` handed a
+  terminal failure back, so a delivery requeued because its DLQ was missing
+  was counted on every redelivery.
+
 ### Added
+
+#### Earlier consumer and retry hardening
+
+- **`ConsumerConfig.processing_timeout`** (default `None`, off): a
+  per-delivery handler deadline on the async broker. On expiry the handler
+  task is cancelled and `HandlerTimeoutError` goes through the normal failure
+  settlement. The sync broker ignores it and logs a warning (use
+  `TimeoutMiddleware`).
+- **`HandlerTimeoutError` marks an unknown outcome.** It moved to
+  `rabbitkit.core.errors` (re-exported from `rabbitkit.middleware.timeout`
+  and now from the package root), carries `outcome_unknown = True`, and
+  `classify_error` copies that to the new `ClassifiedError.outcome_unknown`
+  field and the reason string, so logs and classifiers can tell "timed out,
+  side effects unknown" apart from an ordinary transient failure. It is
+  still `TRANSIENT`.
+- Every handler failure now logs one structured line (queue, message id,
+  correlation id, delivery tag, `redelivered`, exception class, reason,
+  `outcome_unknown`, action taken). No body, headers or exception text; the
+  traceback is at DEBUG. Repeats are collapsed to one line per queue, error
+  class and action per 10 s window, with a count. Previously a failure that
+  was dead-lettered under `AUTO` produced no log line at all.
+
 
 - `RetryConfig.max_retry_age` (seconds since the first failure; exceeded →
   terminal, category `retry-age-exceeded`), `RetryConfig.terminal_action`
@@ -217,28 +505,289 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `replay_count`. Authorization stays with RabbitMQ permissions (documented:
   run replays as a dedicated user).
 
-### Deprecated
+#### Publisher
 
-- `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
-  `<queue>.dlq` via the default exchange); a non-empty value now emits a
-  `DeprecationWarning`. `jitter_factor` is documented as effective only with
-  `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
-  classic queue only expires its head message (head-of-line blocking).
+- `PublishStatus.NOT_SENT`, `PublishStatus.UNKNOWN`; `PublishOutcome.reason`
+  (bounded code), `reply_code`, `reply_text` (default `None`) and
+  `PublishOutcome.is_unknown` (`UNKNOWN` or `TIMEOUT`); `PublishReason`
+  (the reason codes, exported from `rabbitkit`).
+- `AsyncBroker.publish(..., timeout=None)`: bounds admission (flow
+  control, byte budget, a free channel), send and confirm. Expiry before
+  sending is `NOT_SENT` (`admission_timeout`), after sending `TIMEOUT`
+  (`publish_timeout`). Async only: the sync transport cannot bound an
+  owner-thread publish (see `docs/message-safety.md`).
+- `publish(..., message_id=None)` for the keyword form on `AsyncBroker`
+  and `SyncBroker`, so the same logical message can be republished after
+  an unknown outcome and deduplicated downstream. Passing it together with
+  an envelope raises `ValueError`.
+- `PublisherConfig.max_in_flight_bytes` (default `None`, no bound): caps
+  the body bytes of async publishes between admission and their outcome,
+  shared by `publish()` and the batch publisher. A publish waits (bounded,
+  cancellable, no polling) and then returns `NOT_SENT`
+  (`admission_timeout`); a body larger than the whole budget is `NOT_SENT`
+  (`exceeds_max_in_flight_bytes`). Must be `>= max_message_bytes` when
+  that is set.
+- `AsyncTransportImpl.close_publishing(timeout)`,
+  `AsyncTransportImpl.publishes_in_flight`,
+  `AsyncConnectionPool.close_publisher_channels()`,
+  `discard_publisher_channel()` / `discard_mandatory_channel()`,
+  `AsyncChannelPool.discard()` / `owns()` / `in_use_count` / `closed`,
+  `InFlightByteLimiter` (transport internals used by the above).
 
-### Changed (DLQ replay)
+#### Connection recovery
 
-- **CLI and `DLQInspector` route replays the same way.** The CLI routed by
-  the original ROUTING KEY even to the default exchange (so a topic-routed
-  message replayed with target `""` was unroutable), while the inspector
-  routed by the original QUEUE even to a named exchange. Both now: explicit
-  routing key wins; default exchange → original queue; named exchange →
-  original routing key.
-- `reset_retry_count=True` / `--reset-retry-count` now also strips the
-  broker's `x-death` / `x-first-death-*` / `x-last-death-*` headers and
-  `x-rabbitkit-first-failed-at` (the retry middleware derives the budget from
-  them), keeping the old count as `x-rabbitkit-previous-retry-count`.
+- `ConnectionConfig.reconnect_budget_attempts` / `reconnect_budget_seconds`
+  (default `None`, unlimited: the old availability-first behaviour): bound
+  one outage of the async broker by consecutive failed reconnect attempts
+  and/or seconds since the connection was lost. When spent, the connection
+  stops for good with `ReconnectBudgetExhaustedError`. The sync broker
+  ignores both; its `reconnect_max_attempts` is unchanged.
+- Exceptions (in `rabbitkit.core.errors`, exported from `rabbitkit`):
+  `TerminalConnectionError` (a `ConnectionError`) with
+  `PermanentConnectionError` (`AuthenticationFailedError`,
+  `VhostAccessRefusedError`, `TLSVerificationError`) and
+  `ReconnectBudgetExhaustedError`. Each has a bounded snake_case `reason`
+  and the failing `endpoint`; messages never contain credentials.
+- **Terminal connection failure (async).** When a connection stops
+  reconnecting for good (permanent failure or spent budget) it is closed,
+  `AsyncTransportImpl.connection_failure` holds the error, `is_connected()`
+  is False and stays False (no connection is attempted again, so publishes
+  fail before anything is sent), `broker_health_check` reports
+  `connection failed for good (<reason>); restart required`, and a CRITICAL
+  line is logged.
+- Transport hooks for the reconnect lifecycle:
+  `AsyncTransportImpl.on_reconnect_attempt(cb)` (after every failed
+  reconnect attempt; receives a `ReconnectAttempt` with `role`
+  ("publisher"/"consumer"), `attempt`, `delay`, `elapsed`, `endpoint`,
+  `error`) and `on_connection_failed(cb)` (once, with the
+  `TerminalConnectionError`), next to the existing `on_reconnect`.
+
+#### Consumer
+
+- **Broker-cancelled consumers are detected, reported and re-subscribed
+  (G-26).** RabbitMQ cancels a consumer itself (`basic.cancel`) when its
+  queue is deleted, a quorum leader moves or an operator closes it; aiormq
+  < 7 only drops the tag, so rabbitkit kept reporting the route as consuming
+  and never subscribed again. The async transport now detects it (aiormq's
+  consumer-cancel callback on aiormq 7, otherwise by checking the channel's
+  consumer table every second), logs a WARNING, and re-subscribes with the
+  same tag once a passive declare finds the queue again (backoff 1 s,
+  doubling, capped at 30 s). It never re-creates the queue. New:
+  `RouteRuntimeState.consumer_cancelled` (health and readiness count the
+  route as not consuming while it is `True`), `AsyncBroker.on_consumer_cancelled`
+  and `AsyncBroker.on_consumer_resumed` hooks (`Callable[[str], None]`, called
+  with the queue name), and on `AsyncTransportImpl`
+  `on_consumer_cancelled(cb)`, `on_consumer_resumed(cb)` and
+  `cancelled_consumers`. aio-pika 10 also re-subscribes such consumers;
+  whichever runs first wins. Verified on a real broker with aio-pika 10.2.1
+  (with and without aio-pika's own recovery) and 9.6.2.
+- `RabbitMessage.settlement_outcome_unknown` (see Changed).
+
+#### Retry, dead-lettering and failure taxonomy
+
+- **Failure taxonomy** (`rabbitkit.ErrorCategory`): `RETRYABLE`,
+  `PERMANENT`, `INVALID_MESSAGE`, `UNKNOWN_OUTCOME`, `INFRASTRUCTURE`,
+  `SHUTDOWN`, each with the `ErrorSeverity` it implies
+  (`ErrorCategory.severity`). `ClassifiedError` gains a `category` field;
+  when omitted (or contradicting `severity`) it is derived from `severity`,
+  so existing code that builds a `ClassifiedError` from a severity alone
+  stays consistent. `classify_error` evaluates: shutdown signals
+  (`CancelledError`, `KeyboardInterrupt`, `SystemExit` → `SHUTDOWN`), then a
+  category the exception declares itself (`rabbitkit_error_category` on the
+  class or instance), then predicates (which may now return an
+  `ErrorCategory` as well as `True`/`False`/`None`), then registered
+  infrastructure errors, the transient and permanent tuples, and
+  `unknown_policy`. The unclassified default stays `PERMANENT`.
+- Typed exceptions `rabbitkit.InvalidMessageError` (a `ValueError`;
+  `INVALID_MESSAGE`, never retried) and `rabbitkit.InfrastructureError`
+  (`INFRASTRUCTURE`, retried). `MissingDependencyError` declares
+  `INVALID_MESSAGE`.
+- `rabbitkit.core.errors.register_infrastructure_errors(*types)` /
+  `infrastructure_errors()`: the transports register their client's
+  connection and channel errors (aiormq `AMQPConnectionError`,
+  `ChannelClosed`, `ChannelInvalidStateError`; pika's `StreamLostError`,
+  `AMQPConnectionError`, `ConnectionClosedByBroker`, `ChannelWrongStateError`,
+  `ChannelClosedByBroker`, `AMQPChannelError`) when a broker is constructed,
+  so `core/` stays transport-free. New helpers
+  `rabbitkit.async_.connection.get_infrastructure_errors()` and
+  `rabbitkit.sync.connection.get_infrastructure_errors()`.
+- `RabbitMessage.wire_body` / `wire_content_encoding`: the body and encoding
+  exactly as delivered, before any `on_receive` hook rewrote them.
+- `RetryConfig.trust_retry_header` (default `True`, the previous behaviour).
+  `False` counts attempts only from the broker's `x-death` history, so a
+  producer that sets `x-rabbitkit-retry-count` cannot skip retries. The
+  header is still written.
+- **DLQ authorization.** `DLQInspector(..., authorizer=fn)`: `fn` receives a
+  `rabbitkit.ReplayRequest` (operation `replay`/`purge`, actor,
+  `actor_explicit`, queue, target, `reset_retry_count`, `max_replays`,
+  `limit`, predicate) before every replay and purge; `False` or an
+  exception raises the new `rabbitkit.DLQOperationDeniedError` (a
+  `PermissionError`) before anything is read, and writes a `DENIED` record
+  to the `rabbitkit.dlq.audit` logger. `purge` / `purge_async` take an
+  optional `actor` and are audited. CLI: `rabbitkit dlq replay
+  --require-actor` (env `RABBITKIT_REPLAY_REQUIRE_ACTOR`) refuses (exit 2,
+  audited) a replay without `--actor`.
+
+#### Event metadata and the CRITICAL profile
+
+- **Event metadata (G-20, ADR-M5), optional and generic.**
+  `rabbitkit.EventMetadata` (frozen, `core/event_metadata.py`) maps
+  `message_id` (AMQP `message_id`), `idempotency_key` (header
+  `idempotency-key`), `event_type` (`type`), `event_version` (header
+  `event-version`, int >= 1), `source` (`app_id`), `occurred_at` (header
+  `occurred-at`, RFC 3339 UTC), `correlation_id` and optional `tenant_id`
+  (header `tenant-id`). Trace context stays with `OTelTracingMiddleware`.
+  Construction validates and raises the new `rabbitkit.EventMetadataError`
+  (an `InvalidMessageError`, so `INVALID_MESSAGE`; names the bad fields,
+  never their values). `EventMetadata.create()` fills in `message_id`,
+  `correlation_id` (= `message_id`) and `occurred_at`; `to_envelope()` /
+  `apply_to()` build a `MessageEnvelope` (no change to `MessageEnvelope`),
+  refuse to overwrite different values and set the AMQP `timestamp` when
+  missing; `from_message()` / `from_envelope()` read and validate;
+  `check_supported_version()` applies a supported-versions policy.
+- `rabbitkit.EventMetadataMiddleware` (opt-in): validates deliveries before
+  the handler (missing/invalid metadata or an unsupported `event_version` /
+  event type → `EventMetadataError`: dead-lettered, never retried; with
+  retry the DLQ copy carries `x-rabbitkit-error-category: invalid_message`),
+  and validates envelopes before publish (`validate_publish=False` to skip
+  on a route whose results are not events), setting `timestamp` when
+  missing. Retry, DLQ and replay copies keep the metadata (tested).
+- `ConsumerConfig.max_body_bytes` (§15.6, default `None` = no cap): a
+  delivery whose wire body is larger is `INVALID_MESSAGE` and rejected
+  without requeue (the source's DLX moves it to the DLQ; the async broker
+  checks the DLQ exists first) before the filter, any middleware, decode or
+  the handler runs, under every `AckPolicy`. New
+  `rabbitkit.InboundMessageTooLargeError`. The DLQ copy carries `x-death`
+  only, not rabbitkit's failure headers.
+- `PublisherConfig.strip_reserved_headers` (G-19, default `False`):
+  `broker.publish()` (sync and async, and `publish_many` / `iter_publish`)
+  drops rabbitkit's retry/DLQ/replay bookkeeping headers
+  (`x-rabbitkit-retry-count`, `-first-failed-at`, `-original-*`,
+  `-error-*`, `-replay-*`, ...), `x-death` and a custom
+  `RetryConfig.retry_header` from application publishes, logging one
+  WARNING per header name. Retry/DLQ copies and DLQ replays bypass
+  `broker.publish()` and keep them. Handler-result publishes are not
+  stripped. `rabbitkit.core.reserved_headers` (`RESERVED_HEADERS`,
+  `strip_reserved_headers()`, `ReservedHeaderStripper`).
+- `rabbitkit.core.profiles.CRITICAL_MAX_IN_FLIGHT_BYTES` (64 MiB).
+- `rabbitkit.core.signals` (`is_loop_signal_handler`,
+  `is_default_signal_handler`, `loop_signal_handler_is`): the signal
+  ownership helpers `AsyncBroker` used privately, now shared with
+  `RabbitApp`.
+
+#### Observability
+
+- **Broker metrics (`rabbitkit.middleware.BrokerMetrics`, G-22).** Both
+  brokers now emit, through the first `MetricsMiddleware` with a collector
+  (publish middlewares first, then any route):
+  `connection_up{role}`, `connections_active`, `channels_active`,
+  `connection_failures_total{role,reason}` (bounded reasons: a lost
+  connection, a failed reconnect attempt, a terminal give-up),
+  `reconnect_attempts_total{role}` (failed attempts),
+  `connection_blocked` (`connection.blocked` / `unblocked`),
+  `consumer_cancelled_total{queue}` and `route_consuming{queue}` (broker
+  cancels, async), `publish_routing_failures_total{exchange,reason}`
+  (`returned` / `exchange_not_found`, every transport publish including
+  retry and DLQ copies), `publish_in_flight`, `publish_in_flight_bytes`
+  (when `max_in_flight_bytes` is set) and `publish_channels_in_use`.
+  `role` is `publisher`/`consumer` (async) or `shared` (sync). Gauges that
+  change per publish are sampled every 5 s, never on the hot path.
+- `rabbitkit_messages_failed_total{queue,category}`: handler failures by
+  `ErrorCategory` (emitted by `MetricsMiddleware`).
+- `PrometheusCollector(registry=...)`: register in an application's own
+  `CollectorRegistry` (default: the global `REGISTRY`, as before). A second
+  collector on the same registry reuses the existing metrics instead of
+  raising "Duplicated timeseries"; a conflicting registration still raises.
+- `metric_inventory()` / `MetricSpec` / `bounded_label_values()` /
+  `connection_failure_reason()` in `rabbitkit.middleware.metrics` (the first
+  two also from `rabbitkit.middleware`): the code's list of every metric,
+  type and label set. `docs/observability.md` is generated from it and a unit
+  test keeps them in sync; another drives every emission path and checks each
+  label against the bounded allow-list.
+- Transport hooks: `AsyncTransportImpl.on_connection_state(cb(role, up, error))`,
+  `on_publish_outcome(cb(outcome, seconds))`, `connection_states()`,
+  `channels_active`, `publish_channels_in_use`;
+  `AsyncConnectionPool(on_connection_state=...)`, `channel_counts()`;
+  `ReconnectPolicy(on_lost=..., on_restored=...)`;
+  `SyncTransport.on_connection_state`, `on_reconnect_attempt(cb(attempt, error))`,
+  `on_publish_outcome`, `channels_active`; `SyncTransport.reconnect(cause=None)`.
+  `TerminalConnectionError.role` (`""` by default).
+- `OTelTracingMiddleware(consumer_context="parent" | "link")`: `"link"`
+  starts the CONSUMER span from the consumer's own context with a span link
+  to the producer (OpenTelemetry messaging conventions for decoupled
+  consumption). `"parent"` (default) is the previous behaviour.
+- `LoggingConfig.override_existing` (default `False`), `configure_structlog(...,
+  override_existing=True)` (returns whether it configured) and
+  `structlog_configured_elsewhere()`.
+- **Alert rules and runbooks (G-23).** `deploy/prometheus/rabbitkit-alerts.yaml`
+  (plain Prometheus rules; wrap in a `PrometheusRule` for the Operator):
+  PublisherConfirmFailures, PublisherUnknownOutcomes,
+  PublisherUnroutableMessages, RabbitMQBrokerUnavailable,
+  RabbitMQConnectionFailures, RabbitMQConnectionTerminalFailure,
+  RabbitMQConnectionBlocked, ConsumerProcessingFailures,
+  ConsumerNotConsuming, ConsumerBacklogGrowing, ConsumerUnackedHigh,
+  DeadLetterQueueGrowing, RetryStormDetected, and broker-side (needs the
+  `rabbitmq_prometheus` plugin) RabbitMQDiskAlarm, RabbitMQMemoryAlarm,
+  RabbitMQQuorumUnhealthy. Thresholds are placeholders to tune from measured
+  workloads. Behaviour tests in `deploy/prometheus/tests/` run with
+  `promtool test rules`. Every alert links a runbook under `docs/runbooks/`.
+
+#### Sync parity, documentation drift and dead-letter metadata
+
+- `async with AsyncBroker(config) as broker:` starts the broker with
+  `install_signal_handlers=False` (the surrounding code owns SIGINT/SIGTERM,
+  as with `rabbitkit_lifespan`) and stops it when the block exits, also on
+  an exception or cancellation. Standalone processes keep using
+  `await broker.run()`.
+- `SafetyConfig.dead_letter_with_metadata` (G-17; default `False`, async
+  broker only; `SyncBroker` logs that it ignores it): failures that never
+  reach `RetryMiddleware` (an `on_receive` failure such as a bad gzip body
+  or signature, a body over `ConsumerConfig.max_body_bytes`, a failure on a
+  route without retry, a transient failure on redelivery) get a confirmed,
+  `mandatory` DLQ copy with the same failure metadata as a retry terminal
+  copy (wire body and encoding, every property and header, stable
+  `message_id`, `x-rabbitkit-error-category` / `-error-class` /
+  `-error-message` (sanitized) / `-failure-category` / `-attempts` /
+  `-first-failed-at` / `-last-failed-at` / `-original-queue` /
+  `-original-exchange` / `-original-routing-key` / `-original-message-id` /
+  `-dead-lettered-at` and the retry count) before the delivery is acked. If
+  the copy is not confirmed, the existing path runs (reject into the DLX
+  after the DLQ check, reject for a quorum at-least-once source, requeue
+  with backoff for a missing DLQ): a delivery is never acked without a
+  confirmed copy. Only a DLQ reached through the default exchange (the retry
+  DLQ or the `auto_provision` safety DLQ) is addressed. Such a DLQ entry has
+  no `x-death`. Handler-requested and `filter_fn` rejects are not copied.
+- `rabbitkit.core.failure_copy` (the retry/DLQ copy builder, shared by
+  `RetryMiddleware` and the new `rabbitkit.core.dead_letter.DeadLetterCopier`).
 
 ### Fixed
+
+#### Earlier consumer and retry hardening
+
+- **A rejected message was silently lost when the DLQ was missing.** Classic
+  queues, and quorum queues without the at-least-once dead-letter strategy,
+  dead-letter at most once: rejecting into a missing DLQ drops the message.
+  Reproduced on 3.13 and 4.1 with the default topology after deleting the
+  auto-provisioned `{queue}.dlq` (classic and quorum), and with retry after
+  exhaustion. The async broker now verifies that the DLQ exists (passive
+  declare on a throwaway channel, positive answers cached 5 s) before any
+  dead-lettering settlement: handler failures, retry-terminal failures,
+  `NACK_ON_ERROR`, `RejectMessage(requeue=False)` and
+  `NackMessage(requeue=False)`. If it is missing, the message is requeued
+  after a backoff (0.5 s doubling to 5 s) and an ERROR is logged; it
+  survives until the DLQ is restored. Covers dead-letter targets reached
+  through the default exchange (what rabbitkit declares); a custom
+  dead-letter exchange is not verified. Not yet on the sync broker.
+- **`TimeoutMiddleware` relabelled the handler's own `TimeoutError` as a
+  handler timeout** (`asyncio.wait_for` cannot tell them apart). Only the
+  middleware's deadline raises `HandlerTimeoutError` now.
+- **`AsyncBroker.stop()` was not bounded** when a handler swallowed
+  `CancelledError`: with `graceful_timeout=1.0` it took 6.01 s, and the
+  message was then acked by the late-finishing handler. The inline drain
+  and `AsyncWorkerPool.stop()` now wait at most 1 s for cancelled handlers
+  to unwind, log the ones that ignored cancellation, and nack their
+  deliveries for redelivery (measured: 2.01 s, message back on the queue).
+
 
 - **`RetryMiddleware` retried handler settlement signals.** With
   `unknown_policy=TRANSIENT` (or a predicate returning `True`), a handler
@@ -290,6 +839,262 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself (seen as thousands of "Exception after settlement" warnings while
   the backoff brake silently stopped working). The exponent is now capped;
   any failure count yields a finite delay `<= backoff_max`.
+
+#### Publisher
+
+- **Batch mode reported an unroutable mandatory publish as `CONFIRMED`**
+  (and so did a mandatory publish on the direct reply-to channel). Those
+  channels resolve the confirm with the returned message; it is now
+  `RETURNED` with `reply_code=312`, `reply_text="NO_ROUTE"` on every path.
+- **A cancelled confirmed publish leaked its pool channel.** After
+  `channel_pool_size` cancellations every publish stalled for
+  `channel_acquire_timeout` and then rebuilt the connection (reproduced: 3
+  cancels, next publish took 3.02 s). The channel is now released on every
+  path; one cancelled mid-publish is discarded (its confirm state is
+  unknown) and its slot freed at once. Its bytes are released too.
+- A channel slot freed by a discarded or closed channel now wakes a
+  publish waiting for a channel; it used to wait until its timeout.
+- The rebuilt publisher channel pool lost the channel metric hooks, so
+  `channels_opened_total` / `channel_rebuilds_total` stopped counting after
+  the first rebuild.
+- `publish_many` / `iter_publish` (async) dropped an item when a publish
+  raised `CancelledError` without the task being cancelled (aio-pika closes
+  channels that way); it is now `UNKNOWN` (`cancelled`). A task that queued
+  its outcome just as the overall deadline abandoned it could yield two
+  items for one index; every index now yields exactly one item, and an
+  invariant check reports any admitted index without an outcome as
+  `UNKNOWN` (`no_outcome`) with an ERROR log.
+
+#### Connection recovery
+
+- **Credential rotation and failover did not apply to aio-pika's in-place
+  reconnects.** `credentials_provider` and `ConnectionConfig.nodes` were only
+  used when rabbitkit built a connection itself; after a drop aio-pika
+  reconnected with the first URL, so a rotated password failed forever
+  (reproduced) and a connection stayed pinned to a dead node. Both are now
+  re-resolved before every reconnect attempt: after a drop the connection
+  retries its node with fresh credentials, then moves to the next endpoint
+  after each failed attempt. aio-pika still restores channels, QoS,
+  topology and consumers. `docs/security.md` described this behaviour
+  already; it is now true.
+- **A failed `AsyncBroker.start()` leaked everything it had started.**
+  If start() failed part-way (a 403/404/406 during topology, a refused
+  consume, a cancellation), both connections, their blocked-connection
+  monitors, the batch publisher's workers and any consumer already started
+  kept running, and `stop()` was a no-op. Reproduced: 2 connections left
+  behind per failed start. start() now undoes what it created (consumers,
+  worker pool, in-flight handlers, batch publisher, heartbeat, signal
+  handlers, connections) before re-raising, so it can simply be retried.
+  `AsyncTransportImpl.connect()` and `AsyncConnectionPool.connect()` are
+  all-or-nothing as well.
+- A cancelled initial connect left aio-pika's background reconnect task
+  running forever; the abandoned connection object is now closed.
+- `AsyncBroker.stop()` hung after a terminal connection failure: cancelling
+  a consumer on a connection closed for good waited forever for a
+  reconnect. The AMQP cancel is skipped there.
+
+#### Consumer
+
+- **A reconnect during `AsyncBroker.stop()`'s drain could re-subscribe a
+  cancelled consumer (CONSUMER-007).** `cancel_consumer()` cancelled through
+  a fresh `get_queue()` wrapper, so aio-pika's robust-restore record stayed
+  on the original queue object and a reconnect restored the consumer; it then
+  took new deliveries during shutdown. Reproduced on a real broker (connection
+  kill during the drain → consumer count back to 1). The cancel now goes
+  through the queue object the consumer was started on, the restore record is
+  dropped even if the cancel itself fails (aio-pika 9 forgets it only after
+  `CancelOk`), and a delivery that still reaches a cancelled consumer is
+  requeued and that consumer cancelled again instead of running the handler.
+
+#### Retry, dead-lettering and failure taxonomy
+
+- **Compression + retry dead-lettered every retried message** (G-07, repro
+  S3). `CompressionMiddleware` decompresses `message.body` in place and
+  keeps `content_encoding`; `RetryMiddleware` republished that decoded body
+  under `content_encoding=gzip`, so attempt 2 failed to decompress and went
+  to the DLQ. The terminal DLQ copy had the same defect (undecodable). Retry
+  and DLQ copies are now built from `wire_body` / `wire_content_encoding`.
+  Verified on a real broker: the compressed message succeeds on attempt 2,
+  and its DLQ copy decompresses. `SigningMiddleware` stays incompatible with
+  retry (the signature also covers exchange and routing key).
+- **A failed DLQ handoff could be acked away.** When `RetryMiddleware`'s
+  confirmed DLQ publish failed, an outer `ExceptionMiddleware(swallow_permanent=True)`
+  (or a fallback handler) swallowed the exception and the pipeline acked a
+  message that existed nowhere else. It is now handed back to the pipeline.
+- **A cancelled handler left its dedup claim in flight.**
+  `DeduplicationMiddleware(mark_policy="claim")` released the claim on
+  `except Exception`, which `CancelledError` skips: after a shutdown or
+  `processing_timeout` cancel, the requeued redelivery was treated as an
+  in-flight duplicate for up to `processing_timeout` (300 s by default). The
+  claim is now released on cancellation too (bounded to 1 s); the
+  cancellation still propagates.
+- Two real-broker tests that disagreed with the merged behaviour:
+  `test_replay_preserves_properties` (now checks the original headers plus
+  the replay audit headers) and
+  `test_quorum_at_least_once_keeps_message_when_dlq_missing` (now asserts no
+  loss for both strategies, the declared strategy, bounded redelivery, and
+  that the at-most-once message reaches the restored DLQ with metadata).
+
+#### Event metadata and the CRITICAL profile
+
+- **`RabbitApp.run_async()` reset the application's signal handlers
+  (G-24).** `loop.remove_signal_handler()` restores `SIG_DFL`, not the
+  previous handler, so on exit an application's SIGTERM handler and
+  `asyncio.run()`'s SIGINT handler were lost. It now captures and restores
+  the previous Python-level handler, leaves a signal alone (WARNING) when an
+  asyncio handler is already installed, and does not remove a handler
+  installed by someone else while the app ran — the same rules as
+  `AsyncBroker`.
+
+#### Observability
+
+- `docs/observability.md` told users to alert on
+  `messages_published_total{status="failure"}`, a value that was never
+  emitted (G-28); and it claimed the first connection predates the metrics
+  wiring.
+
+#### Sync parity, documentation drift and dead-letter metadata
+
+- **A broker refusal of a sync publish replaced the whole connection.**
+  After a 404/403/406 closed the publisher channel, the next publish built a
+  new connection and left the old one open with its consumer channels while
+  the consume loop moved on. The publisher channel is now reopened on the
+  same connection (marshalled to the I/O thread for worker threads).
+- `AsyncTransportImpl` recorded a binding again on every `bind_queue` /
+  `bind_exchange` call, so the post-reconnect re-apply list grew without
+  bound; each binding is recorded once.
+- Flaky real-broker tests: `test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer`
+  (and `test_prefetch_is_reapplied_after_reconnect`) failed about 3 runs in
+  10 with "connections were never seen dropping". Not a product bug: a
+  connection killed through the management API is restored within 2-5 ms
+  (the first reconnect attempt after a loss is immediate), often before the
+  killing HTTP call returned, so polling `is_connected()` every 20 ms after
+  the kill missed it. The tests now count `on_reconnect` callbacks
+  registered before the kill; `test_is_connected_is_false_while_reconnecting`
+  watches from before the kill. 10/10 consecutive passes.
+
+### Deprecated
+
+#### Earlier consumer and retry hardening
+
+- `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
+  `<queue>.dlq` via the default exchange); a non-empty value now emits a
+  `DeprecationWarning`. `jitter_factor` is documented as effective only with
+  `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
+  classic queue only expires its head message (head-of-line blocking).
+
+### Documentation
+
+#### Earlier consumer and retry hardening
+
+- `WorkerConfig` documents what `worker_count=1` actually does: no worker
+  pool is created and `prefetch_per_worker` is ignored, so on the async
+  broker up to `prefetch_count` handlers of one queue run concurrently. It
+  does not serialize async handlers. (Sync handlers run inline, one at a
+  time.)
+
+- **A cumulative ack could acknowledge a delivery that was never processed.**
+  `SettlementCoordinator` (behind `CoalescingAcker` / `AsyncCoalescingAcker`)
+  planned `ack(N, multiple=True)` from its own ledger only. A delivery refused
+  with `LedgerFullError` (`max_pending`), or any delivery tag never registered
+  on that channel, is still unacked at the broker, and the next cumulative
+  ack above it acknowledged it. The message was lost: never processed, never
+  redelivered. Reproduced on a real broker (`max_pending=2`: the third
+  delivery was refused, then `ack(5, multiple=True)` swept it). The
+  coordinator now records the lowest unregistered tag of the channel
+  generation (`gap_floor`, also in `stats`, with `unregistered_gaps`) and
+  never coalesces at or past it; deliveries above a gap are acked
+  individually until the channel is rebuilt. Because tags start at 1 on
+  every channel, a coordinator whose first registered tag is not 1 no longer
+  coalesces at all.
+- The `AsyncCoalescingAcker` docstring example used `msg.channel` (not a
+  `RabbitMessage` attribute) with the default `AckPolicy.AUTO`, which would
+  have settled every delivery twice. It now uses `AckPolicy.MANUAL` and
+  `msg.raw_message.channel`, and does not re-raise after `acker.fail()`.
+
+#### Publisher
+
+- `docs/message-safety.md`: the publish outcome table (when to publish
+  again), admission and timeouts, publisher shutdown, and new guarantee
+  rows. `docs/production/checklist.md`: handling unknown outcomes.
+  `docs/api/messages.md`: `PublishReason`.
+
+#### Connection recovery
+
+- `docs/security.md` (rotation order, permanent failures),
+  `docs/observability.md` (new "Async reconnects" section replacing "Async
+  does not emit reconnects_total"; reconnect hooks),
+  `docs/kubernetes.md` (async failover on reconnect, liveness after a
+  terminal failure), `docs/concurrency-model.md`,
+  `docs/production/scale.md`, `docs/production/checklist.md`,
+  `docs/guide/full-guide.md` (ConnectionConfig table).
+
+#### Consumer
+
+- `docs/message-safety.md`: one settlement frame per delivery and the unknown
+  outcome; failure settlement verified on a real broker (AUTO transient,
+  MANUAL raise, processing timeout); inline handlers are cancelled by aiormq
+  when their channel closes, pool handlers are not (and are processed twice);
+  the worker pool is shared by all routes; the `stop()` sequence;
+  broker-cancelled consumers and their limitation; the MANUAL example uses
+  the async settlement methods.
+- `docs/kubernetes.md`: who owns SIGTERM (`broker.run()` standalone,
+  `install_signal_handlers=False` when embedded), what `start()` does to
+  existing handlers, and `terminationGracePeriodSeconds` vs
+  `graceful_timeout` (the defaults, 30 s and 30 s, leave no margin); the
+  `rabbitkit_lifespan` example passes `broker=` (it passed the broker as the
+  `app` argument).
+
+#### Retry, dead-lettering and failure taxonomy
+
+- `docs/retry-and-dlq.md`: failure taxonomy (replaces the stale
+  `PermanentError` example, which never existed), wire-body copies, the
+  composed DLQ-missing behaviour per source type, `trust_retry_header`,
+  replay authorization.
+
+#### Event metadata and the CRITICAL profile
+
+- New `docs/reliable-messaging.md` (in the mkdocs nav under Production):
+  the contract as implemented — publish outcome table with reasons,
+  consumer settlement table, failure taxonomy, retry/DLQ guarantees,
+  remaining loss windows, durability scope, idempotency and the
+  application-owned durable inbox, ordering, shutdown and signals, and the
+  CRITICAL profile's requirement table. Gaps are marked "Not implemented"
+  (producer outbox, exhausted handoff → DLQ, connection settings in the
+  profile) and the SyncBroker's retry-once-after-dead-connection publish is
+  called out.
+- New `docs/event-metadata.md` (nav: User Guide); API entries in
+  `docs/api/messages.md` and `docs/api/middleware.md`.
+- `docs/bulk-operations.md`: CRITICAL table and example
+  (`processing_timeout`); `docs/retry-and-dlq.md`: stripping reserved
+  headers; `docs/message-safety.md`: two guarantee rows.
+- `examples/bulk_operations/05_reliability_profile_preflight.py` passes a
+  `processing_timeout` to `critical_config()`.
+
+#### Observability
+
+- `docs/observability.md` rewritten: the generated metric inventory, bounded
+  label values, metric notes, the trace model, logging, the alert table with
+  runbook links. New `docs/runbooks/` (10 runbooks + index) in the mkdocs nav.
+
+#### Sync parity, documentation drift and dead-letter metadata
+
+- `docs/reliable-messaging.md`: the SyncBroker publish caveat is replaced by
+  its (now matching) outcome list; CRITICAL connection rows and their
+  rationale; `dead_letter_with_metadata` in the settlement table and the
+  CRITICAL table; what `messages_dead_lettered_total` counts; `async with`.
+- `docs/retry-and-dlq.md` ("Failures that never reach RetryMiddleware"),
+  `docs/message-safety.md` (sync no-republish, idle-connection row, G-17
+  rows), `docs/production/scale.md`, `docs/production/patterns.md` (idle
+  sync publish wording).
+- Documentation drift (G-28) fixed in `docs/guide/full-guide.md`,
+  `docs/guide/getting-started.md`, `docs/guide/overview.md`, `docs/index.md`,
+  `docs/ordering-guarantees.md`, `docs/retry-and-dlq.md`,
+  `docs/message-safety.md`, `docs/security.md`, `docs/production/patterns.md`,
+  `docs/production/checklist.md` (log redaction is opt-in via
+  `RabbitConfig.logging`, not on by default), `docs/bulk-operations.md`,
+  `docs/rabbitmq-retry-architecture.md`, and the `rabbitkit.streams`
+  docstring (no `subscriber(stream_config=)`; streams stay experimental).
 
 ## [0.19.2] — 2026-10-02
 

@@ -53,13 +53,23 @@ Rules the async broker follows:
 - It never publishes again on its own once frames may have left the client.
   A connection lost mid-publish is `UNKNOWN`. Failures before the frame (no
   channel) are healed by reconnecting and re-acquiring, which cannot duplicate.
-- **SyncBroker exception:** a publish that hits a dead connection from the
-  owner thread is reconnected and sent **once more** (an idle connection
-  closed by heartbeat would otherwise fail the first publish of the day). If
-  the first attempt had reached the broker, that is a duplicate. The sync
-  transport also reports connection failures as `ERROR`, not
-  `NOT_SENT` / `UNKNOWN` (except `NOT_SENT` / `not_connected` from a
-  non-owner thread).
+- `SyncBroker` follows the same contract. `NOT_SENT`: no connection and none
+  could be made, or the publishing thread may not reconnect (`not_connected`:
+  a worker thread, or a handler running inside the consume loop, whose
+  connection is down); the channel already closed before `basic_publish`
+  (`channel_unavailable`); a worker-thread publish the I/O loop did not pick
+  up within `confirm_timeout` (`admission_timeout`). `UNKNOWN`: the
+  connection (`connection_lost`) or channel (`channel_closed`) was lost after
+  `basic_publish`. `TIMEOUT` (`confirm_timeout`): no confirm in time. `ERROR`
+  with `reply_code` / `reply_text`: `exchange_not_found` (404),
+  `access_refused` (403), `precondition_failed` (406), sent once; the next
+  publish reopens the publisher channel on the same connection. A
+  publish-only `SyncBroker` whose connection the broker closed while it sat
+  idle notices that before sending (it reads the socket first) and
+  reconnects, so the first publish after a quiet period is `CONFIRMED`, not
+  `UNKNOWN`. The sync transport no longer republishes after a dead
+  connection (it used to, once, which could duplicate a message and still
+  report `CONFIRMED`).
 - Admission is bounded: a free pooled channel within
   `PoolConfig.channel_acquire_timeout`, the byte budget
   `PublisherConfig.max_in_flight_bytes` when set, and the per-call

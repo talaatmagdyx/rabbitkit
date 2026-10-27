@@ -75,7 +75,7 @@ reports this via `PublishOutcome.status`:
 every other status the same way you would treat a failed publish (e.g. don't ack an upstream
 message on the strength of an outcome that isn't `.ok`).
 
-The async broker never publishes a message again on its own once its frames may have left
+Neither broker publishes a message again on its own once its frames may have left
 the client: a lost connection is reported `UNKNOWN` instead of being retried behind your
 back (that retry could deliver a duplicate reported as `CONFIRMED`). To republish after an
 unknown outcome, reuse the message id — `MessageEnvelope.message_id`, or
@@ -273,7 +273,8 @@ route on that connection waits for the queue to come back.
 | Connection drops mid-processing | Broker redelivers; duplicate delivery is possible and expected |
 | Publisher confirms disabled (unsupported path) | Not supported for retry/DLQ paths; confirms are always required |
 | `mandatory=True` publish, no matching binding | `PublishOutcome.status == RETURNED` on every path (direct, batch, reply-to); `.ok` is `False` — never reported as `CONFIRMED` |
-| Connection lost after the publish frame left (async) | `UNKNOWN`; never republished by the library |
+| Connection lost after the publish frame left (async and sync) | `UNKNOWN`; never republished by the library |
+| Publish-only `SyncBroker` connection closed by the broker while idle | Noticed before sending; reconnected; the publish is sent once |
 | Publisher channel pool exhausted (async) | Waits `channel_acquire_timeout`, then `NOT_SENT` (`admission_timeout`); connection untouched |
 | Publish after `stop()` (async) | `BrokerNotStartedError`; nothing is sent, nothing reconnects |
 | Delivery body over `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE`: rejected into the DLX before the filter, middleware or handler run |

@@ -7,6 +7,8 @@
         ``infrastructure``; a decode failure is ``invalid_message``
 * G-19  with ``trust_retry_header=False`` a producer-set retry count does
         not skip retries; the broker's x-death history still ends them
+* G-18  an at-least-once retry chain (quorum source, delay queues, DLQ) is
+        declared as configured and round-trips a retry
 """
 
 from __future__ import annotations
@@ -282,3 +284,68 @@ async def test_producer_set_retry_count_does_not_skip_retries(rabbit: dict[str, 
         with contextlib.suppress(Exception):
             await broker.stop()
         _delete(rabbit, *_retry_queues(q, 2))
+
+
+# ── G-18 ──────────────────────────────────────────────────────────────────
+
+
+def _mgmt_get(rabbit: dict[str, Any], path: str) -> Any:
+    import json
+    import urllib.request
+    from base64 import b64encode
+
+    req = urllib.request.Request(f"{rabbit['mgmt']}/api{path}")  # noqa: S310
+    req.add_header("Authorization", "Basic " + b64encode(b"guest:guest").decode())
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        return json.loads(resp.read())
+
+
+@pytest.mark.asyncio
+async def test_at_least_once_retry_chain_is_declared_and_round_trips(rabbit: dict[str, Any]) -> None:
+    """Quorum source, quorum delay queues and DLQ, every dead-letter hop
+    declared at-least-once: the topology is accepted by the broker and a
+    retried message comes back through it."""
+    from rabbitkit import AsyncBroker, QueueType, RabbitQueue, RetryConfig
+    from rabbitkit.core.types import DeadLetterStrategy
+
+    q = _name("rk-alo-chain")
+    source = RabbitQueue(
+        q, queue_type=QueueType.QUORUM, dead_letter_strategy=DeadLetterStrategy.AT_LEAST_ONCE, overflow="reject-publish"
+    )
+    retry = RetryConfig(
+        max_retries=1,
+        delays=(1,),
+        delay_queue_type="quorum",
+        dlq_queue_type="quorum",
+        delay_queue_dead_letter_strategy="at-least-once",
+    )
+    broker = AsyncBroker(_config(rabbit, retry=retry))
+    calls = {"n": 0}
+
+    @broker.subscriber(source)
+    async def handle(body: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("flaky")
+
+    try:
+        async with asyncio.timeout(45):
+            await broker.start(install_signal_handlers=False)
+            await await_consumers(rabbit["url"], q)
+            _publish(rabbit, q, message_id="alo-1")
+            assert await _wait(lambda: calls["n"] >= 2, 20)
+            await broker.stop()
+        src = _mgmt_get(rabbit, f"/queues/%2F/{q}")
+        delay = _mgmt_get(rabbit, f"/queues/%2F/{q}.retry.1")
+        dlq = _mgmt_get(rabbit, f"/queues/%2F/{q}.dlq")
+        assert src["arguments"]["x-dead-letter-strategy"] == "at-least-once"
+        assert src["arguments"]["x-dead-letter-routing-key"] == f"{q}.dlq"
+        assert delay["type"] == "quorum"
+        assert delay["arguments"]["x-dead-letter-strategy"] == "at-least-once"
+        assert delay["arguments"]["x-overflow"] == "reject-publish"
+        assert dlq["type"] == "quorum"
+        assert calls["n"] == 2
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.stop()
+        _delete(rabbit, *_retry_queues(q, 1))

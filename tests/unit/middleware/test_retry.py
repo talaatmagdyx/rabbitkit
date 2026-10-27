@@ -8,13 +8,13 @@ import pytest
 
 from rabbitkit.core.config import RetryConfig
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.pipeline import _note_dead_lettered
 from rabbitkit.core.types import (
     ErrorSeverity,
     MessageEnvelope,
     PublishOutcome,
     PublishStatus,
 )
-from rabbitkit.core.pipeline import _note_dead_lettered
 from rabbitkit.middleware.retry import RetryMiddleware, RetryRouter
 
 # ── helpers ───────────────────────────────────────────────────────────────

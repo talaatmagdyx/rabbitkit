@@ -550,7 +550,12 @@ class RetryConfig:
     count and the broker's ``x-death`` history for this queue's delay
     tiers, and clamps to ``max_retries``; a producer that strips every
     header restarts the budget — ``max_retry_age`` and a quorum source's
-    ``x-delivery-limit`` bound that case.
+    ``x-delivery-limit`` bound that case. A producer that sets the header
+    HIGH skips retries; ``trust_retry_header=False`` closes that by counting
+    only the ``x-death`` entries the broker adds when a copy expires out of
+    a ``<queue>.retry.<n>`` delay queue (the header is then informational).
+    Leave it ``True`` for ``TestBroker`` suites that simulate later attempts
+    by setting the header, since the in-memory broker writes no ``x-death``.
     """
 
     max_retries: int = 4
@@ -588,6 +593,11 @@ class RetryConfig:
     # expired message on the delay queue until the source queue confirms it
     # (also sets x-overflow=reject-publish on them, which RabbitMQ requires).
     delay_queue_dead_letter_strategy: str | None = None
+    # G-19: True (legacy) = the attempt count is the larger of the
+    # retry_header value and the broker's x-death history. False = only the
+    # x-death history counts: a producer cannot skip (or restart) retries by
+    # setting the header. The header is still written for observability.
+    trust_retry_header: bool = True
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:

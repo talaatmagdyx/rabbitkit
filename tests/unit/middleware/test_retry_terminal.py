@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from rabbitkit.core.config import RetryConfig, RetryHandoffConfig
-from rabbitkit.core.errors import ConfigValidationError
+from rabbitkit.core.errors import ConfigValidationError, classify_error
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.types import (
     REQUEUED_FOR_RETRY,
@@ -310,7 +310,7 @@ class TestRetryCopyIdentity:
         second = mw._build_retry_envelope(second_msg, 1, ConnectionError("x"))
         assert second.message_id == first.message_id
         assert second.headers["x-rabbitkit-original-message-id"] == first.message_id
-        dlq = mw._build_dlq_envelope(second_msg, 3, ValueError("x"), ErrorSeverity.PERMANENT, _cat("permanent"))
+        dlq = mw._build_dlq_envelope(second_msg, 3, ValueError("x"), classify_error(ValueError("x")), _cat("permanent"))
         assert dlq is not None and dlq.message_id == first.message_id
 
     def test_count_and_first_failure_never_lowered(self) -> None:

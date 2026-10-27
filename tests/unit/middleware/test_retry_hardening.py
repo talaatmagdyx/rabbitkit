@@ -83,7 +83,7 @@ class TestSanitizedTriageHeaders:
         assert SECRET not in h["x-rabbitkit-error-message"]
         assert "amqp://***:***@host/" in h["x-rabbitkit-error-message"]
         assert h["x-rabbitkit-error-type"] == "ConnectionError"
-        assert h["x-rabbitkit-error-category"] == "transient"
+        assert h["x-rabbitkit-error-category"] == "retryable"
         assert SECRET not in repr(h)
 
     def test_permanent_category(self) -> None:

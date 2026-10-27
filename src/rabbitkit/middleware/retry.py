@@ -27,6 +27,8 @@ from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.topology import RabbitQueue
 from rabbitkit.core.types import (
     REQUEUED_FOR_RETRY,
+    ClassifiedError,
+    ErrorCategory,
     ErrorSeverity,
     FailureCategory,
     HandoffState,
@@ -57,6 +59,7 @@ _H_ATTEMPTS = "x-rabbitkit-attempts"
 _H_ERROR_CLASS = "x-rabbitkit-error-class"
 _H_FAILURE_CATEGORY = "x-rabbitkit-failure-category"
 _H_DEAD_LETTERED_AT = "x-rabbitkit-dead-lettered-at"
+_H_ERROR_CATEGORY = "x-rabbitkit-error-category"
 
 
 def _header_text(value: Any) -> str:
@@ -321,11 +324,17 @@ class RetryMiddleware(BaseMiddleware):
         if self._publish_async_fn is None and publish_async_fn is not None:
             self._publish_async_fn = publish_async_fn
 
-    def _record_metric(self, metric_name: str | None, message: RabbitMessage) -> None:
+    def _record_metric(
+        self, metric_name: str | None, message: RabbitMessage, category: ErrorCategory | None = None
+    ) -> None:
         if self._metrics_collector is None or metric_name is None:
             return
         queue = message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown"
-        self._metrics_collector.inc_counter(metric_name, {"queue": str(queue)})
+        labels = {"queue": str(queue)}
+        if category is not None:
+            # Bounded: one of the six ErrorCategory values.
+            labels["category"] = category.value
+        self._metrics_collector.inc_counter(metric_name, labels)
 
     @property
     def config(self) -> RetryConfig:
@@ -447,36 +456,36 @@ class RetryMiddleware(BaseMiddleware):
             await self._handle_retry_async(exc, message)
             return REQUEUED_FOR_RETRY
 
-    def _decide(self, exc: Exception, message: RabbitMessage) -> tuple[ErrorSeverity, int, FailureCategory | None]:
-        """Classify *exc*: ``(severity, retry_count, terminal_category)``.
+    def _decide(self, exc: Exception, message: RabbitMessage) -> tuple[ClassifiedError, int, FailureCategory | None]:
+        """Classify *exc*: ``(classified, retry_count, terminal_category)``.
 
         ``terminal_category`` is ``None`` when the failure should be retried.
         """
-        severity = self._classifier.classify(exc).severity
+        classified = self._classifier.classify(exc)
         retry_count = self._get_retry_count(message)
-        if severity is not ErrorSeverity.TRANSIENT:
-            return severity, retry_count, FailureCategory.PERMANENT
+        if classified.severity is not ErrorSeverity.TRANSIENT:
+            return classified, retry_count, FailureCategory.PERMANENT
         if retry_count >= self._config.max_retries:
-            return severity, retry_count, FailureCategory.EXHAUSTED
+            return classified, retry_count, FailureCategory.EXHAUSTED
         if self._retry_age_exceeded(message):
-            return severity, retry_count, FailureCategory.RETRY_AGE_EXCEEDED
-        return severity, retry_count, None
+            return classified, retry_count, FailureCategory.RETRY_AGE_EXCEEDED
+        return classified, retry_count, None
 
     def _handle_retry_sync(self, exc: Exception, message: RabbitMessage) -> None:
         """Handle exception in sync context."""
-        severity, retry_count, terminal = self._decide(exc, message)
+        classified, retry_count, terminal = self._decide(exc, message)
         if terminal is None:
-            self._route_to_delay_queue_sync(message, retry_count, exc)
+            self._route_to_delay_queue_sync(message, retry_count, exc, classified=classified)
             return
-        self._terminal_sync(exc, severity, terminal, retry_count, message)
+        self._terminal_sync(exc, classified, terminal, retry_count, message)
 
     async def _handle_retry_async(self, exc: Exception, message: RabbitMessage) -> None:
         """Handle exception in async context."""
-        severity, retry_count, terminal = self._decide(exc, message)
+        classified, retry_count, terminal = self._decide(exc, message)
         if terminal is None:
-            await self._route_to_delay_queue_async(message, retry_count, exc)
+            await self._route_to_delay_queue_async(message, retry_count, exc, classified=classified)
             return
-        await self._terminal_async(exc, severity, terminal, retry_count, message)
+        await self._terminal_async(exc, classified, terminal, retry_count, message)
 
     def _get_retry_count(self, message: RabbitMessage) -> int:
         """Get current retry count, clamped to ``[0, max_retries]`` (H5).
@@ -501,12 +510,18 @@ class RetryMiddleware(BaseMiddleware):
         header claims. A malformed (non-numeric) header value is treated the
         same as missing (0) rather than raising.
 
+        With ``RetryConfig.trust_retry_header=False`` the header is not
+        read at all: only the broker's ``x-death`` history counts, so a
+        producer cannot skip retries by claiming a high count (G-19).
+
         For a broker-enforced backstop on top of this (e.g. against a
         misbehaving consumer that never expires/dead-letters a message),
         prefer quorum source queues with ``x-delivery-limit`` — see
         ``docs/retry-and-dlq.md``. ``max_retry_age`` bounds the total time.
         """
-        retry_count = _header_int(message.headers.get(self._config.retry_header, 0))
+        retry_count = 0
+        if self._config.trust_retry_header:
+            retry_count = _header_int(message.headers.get(self._config.retry_header, 0))
         source_queue = _header_text(message.headers.get(_H_ORIGINAL_QUEUE))
         if source_queue:
             retry_count = max(retry_count, _xdeath_retry_floor(message.headers, source_queue))
@@ -546,7 +561,7 @@ class RetryMiddleware(BaseMiddleware):
         headers: dict[str, Any],
         message: RabbitMessage,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         category: FailureCategory,
         attempts: int,
         now: str,
@@ -563,8 +578,11 @@ class RetryMiddleware(BaseMiddleware):
         # ``"raw"`` is the legacy opt-in. A previous attempt's message header
         # is dropped so a sanitized copy cannot carry forward stale raw text.
         headers.pop("x-rabbitkit-error-message", None)
-        sanitized = self._sanitizer.sanitize(exc, severity)
+        sanitized = self._sanitizer.sanitize(exc, classified.severity)
         headers.update(sanitized.as_headers())
+        # The failure taxonomy (retryable / permanent / invalid_message /
+        # unknown_outcome / infrastructure / shutdown), not just the severity.
+        headers[_H_ERROR_CATEGORY] = classified.category.value
         headers[_H_ERROR_CLASS] = sanitized.code
         headers[_H_FAILURE_CATEGORY] = category.value
         # Attempts = handler executions so far, including this one. Never
@@ -582,16 +600,26 @@ class RetryMiddleware(BaseMiddleware):
         self, message: RabbitMessage, *, routing_key: str, headers: dict[str, Any], message_id: str
     ) -> MessageEnvelope:
         """A republish of *message* that keeps every AMQP property except
-        ``expiration`` (see the note in the body)."""
+        ``expiration`` (see the note in the body).
+
+        The body and ``content_encoding`` are the WIRE values (G-07): an
+        ``on_receive`` hook may have rewritten ``message.body`` in place
+        (``CompressionMiddleware`` decompresses it but leaves
+        ``content_encoding="gzip"``). Republishing that decoded body under
+        the original encoding made every retried compressed message
+        undecodable on its next delivery, so it was dead-lettered instead of
+        retried. The wire bytes are also what a signature covers and what
+        the size limits were checked against.
+        """
         return MessageEnvelope(
             routing_key=routing_key,
-            body=message.body,
+            body=message.wire_body,
             exchange="",  # direct to the queue by name
             headers=headers,
             message_id=message_id,
             correlation_id=message.correlation_id,
             content_type=message.content_type or "application/octet-stream",
-            content_encoding=message.content_encoding,
+            content_encoding=message.wire_content_encoding,
             # Preserve the remaining original message properties -- these used
             # to be silently dropped on every retry republish, so e.g. a
             # priority-queue message lost its priority on its first retry, and
@@ -626,11 +654,12 @@ class RetryMiddleware(BaseMiddleware):
         message: RabbitMessage,
         retry_count: int,
         exc: Exception,
-        severity: ErrorSeverity | None = None,
+        *,
+        classified: ClassifiedError | None = None,
     ) -> MessageEnvelope:
         """Build envelope for the delay queue."""
-        if severity is None:
-            severity = self._classifier.classify(exc).severity
+        if classified is None:
+            classified = self._classifier.classify(exc)
         attempt = retry_count + 1
         # Always per-queue (shared mode is rejected by RetryConfig — H3).
         source_queue = message.headers.get(_H_ORIGINAL_QUEUE, "unknown")
@@ -649,7 +678,7 @@ class RetryMiddleware(BaseMiddleware):
             attempt, _header_int(message.headers.get(self._config.retry_header, 0))
         )
         category = FailureCategory.TIMEOUT_UNKNOWN if _is_timeout(exc) else FailureCategory.TRANSIENT
-        self._stamp_failure(headers, message, exc, severity, category, attempt, datetime.now(UTC).isoformat())
+        self._stamp_failure(headers, message, exc, classified, category, attempt, datetime.now(UTC).isoformat())
         return self._copy_envelope(message, routing_key=delay_queue_rk, headers=headers, message_id=message_id)
 
     def _build_dlq_envelope(
@@ -657,7 +686,7 @@ class RetryMiddleware(BaseMiddleware):
         message: RabbitMessage,
         retry_count: int,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         category: FailureCategory,
     ) -> MessageEnvelope | None:
         """The metadata-stamped DLQ copy, or ``None`` when the source queue
@@ -668,15 +697,19 @@ class RetryMiddleware(BaseMiddleware):
         headers = dict(message.headers)
         message_id = self._stable_message_id(message, headers)
         now = datetime.now(UTC).isoformat()
-        self._stamp_failure(headers, message, exc, severity, category, retry_count + 1, now)
+        self._stamp_failure(headers, message, exc, classified, category, retry_count + 1, now)
         headers[_H_DEAD_LETTERED_AT] = now
         return self._copy_envelope(message, routing_key=f"{source_queue}.dlq", headers=headers, message_id=message_id)
 
     # ── retry handoff ─────────────────────────────────────────────────────
 
-    def _route_to_delay_queue_sync(self, message: RabbitMessage, retry_count: int, exc: Exception) -> None:
+    def _route_to_delay_queue_sync(
+        self, message: RabbitMessage, retry_count: int, exc: Exception, *, classified: ClassifiedError | None = None
+    ) -> None:
         """Publish to delay queue and ack source (sync)."""
-        envelope = self._build_retry_envelope(message, retry_count, exc)
+        if classified is None:
+            classified = self._classifier.classify(exc)
+        envelope = self._build_retry_envelope(message, retry_count, exc, classified=classified)
 
         if self._publish_fn is None:
             # No sync publish fn wired (manual middleware construction, or a
@@ -716,11 +749,15 @@ class RetryMiddleware(BaseMiddleware):
         # Ack source message (it's safely in the delay queue now)
         if not message.is_settled:
             message.ack()
-        self._record_retried(message, retry_count, envelope)
+        self._record_retried(message, retry_count, envelope, classified.category)
 
-    async def _route_to_delay_queue_async(self, message: RabbitMessage, retry_count: int, exc: Exception) -> None:
+    async def _route_to_delay_queue_async(
+        self, message: RabbitMessage, retry_count: int, exc: Exception, *, classified: ClassifiedError | None = None
+    ) -> None:
         """Publish to delay queue and ack source (async)."""
-        envelope = self._build_retry_envelope(message, retry_count, exc)
+        if classified is None:
+            classified = self._classifier.classify(exc)
+        envelope = self._build_retry_envelope(message, retry_count, exc, classified=classified)
 
         if self._publish_async_fn is None:
             # See the sync variant: acking without a publish would DROP the
@@ -761,7 +798,7 @@ class RetryMiddleware(BaseMiddleware):
 
         if not message.is_settled:
             await message.ack_async()
-        self._record_retried(message, retry_count, envelope)
+        self._record_retried(message, retry_count, envelope, classified.category)
 
     def _safe_publish_sync(self, envelope: MessageEnvelope) -> Any:
         assert self._publish_fn is not None
@@ -783,10 +820,12 @@ class RetryMiddleware(BaseMiddleware):
             logger.warning("Retry publish raised %s; treating as handoff failure", type(exc_pub).__name__)
             return None
 
-    def _record_retried(self, message: RabbitMessage, retry_count: int, envelope: MessageEnvelope) -> None:
+    def _record_retried(
+        self, message: RabbitMessage, retry_count: int, envelope: MessageEnvelope, category: ErrorCategory
+    ) -> None:
         self._record_handoff_success(message)
         if self._metrics_config is not None:
-            self._record_metric(self._metrics_config.messages_retried_total, message)
+            self._record_metric(self._metrics_config.messages_retried_total, message, category)
         logger.info(
             "Retrying message (attempt %d/%d): routing_key=%s",
             retry_count + 1,
@@ -799,7 +838,7 @@ class RetryMiddleware(BaseMiddleware):
     def _terminal_envelope(
         self,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         category: FailureCategory,
         retry_count: int,
         message: RabbitMessage,
@@ -807,17 +846,19 @@ class RetryMiddleware(BaseMiddleware):
     ) -> MessageEnvelope | None:
         if self._config.terminal_action is not TerminalAction.DEAD_LETTER or not have_publisher:
             return None
-        return self._build_dlq_envelope(message, retry_count, exc, severity, category)
+        return self._build_dlq_envelope(message, retry_count, exc, classified, category)
 
     def _terminal_sync(
         self,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         category: FailureCategory,
         retry_count: int,
         message: RabbitMessage,
     ) -> None:
-        envelope = self._terminal_envelope(exc, severity, category, retry_count, message, self._publish_fn is not None)
+        envelope = self._terminal_envelope(
+            exc, classified, category, retry_count, message, self._publish_fn is not None
+        )
         dead_lettered = False
         if envelope is not None and _outcome_ok(self._safe_publish_sync(envelope)):
             if not message.is_settled:
@@ -825,18 +866,26 @@ class RetryMiddleware(BaseMiddleware):
             dead_lettered = True
         elif envelope is not None:
             self._log_dlq_fallback(envelope)
-        self._mark_terminal_and_raise(exc, severity, retry_count, message, category, dead_lettered=dead_lettered)
+        self._mark_terminal_and_raise(
+            exc,
+            classified,
+            retry_count,
+            message,
+            category,
+            dead_lettered=dead_lettered,
+            handoff_failed=envelope is not None and not dead_lettered,
+        )
 
     async def _terminal_async(
         self,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         category: FailureCategory,
         retry_count: int,
         message: RabbitMessage,
     ) -> None:
         envelope = self._terminal_envelope(
-            exc, severity, category, retry_count, message, self._publish_async_fn is not None
+            exc, classified, category, retry_count, message, self._publish_async_fn is not None
         )
         dead_lettered = False
         if envelope is not None and _outcome_ok(await self._safe_publish_async(envelope)):
@@ -845,58 +894,79 @@ class RetryMiddleware(BaseMiddleware):
             dead_lettered = True
         elif envelope is not None:
             self._log_dlq_fallback(envelope)
-        self._mark_terminal_and_raise(exc, severity, retry_count, message, category, dead_lettered=dead_lettered)
+        self._mark_terminal_and_raise(
+            exc,
+            classified,
+            retry_count,
+            message,
+            category,
+            dead_lettered=dead_lettered,
+            handoff_failed=envelope is not None and not dead_lettered,
+        )
 
     @staticmethod
     def _log_dlq_fallback(envelope: MessageEnvelope) -> None:
         logger.warning(
-            "DLQ handoff to %r failed or unverified; falling back to broker dead-lettering "
-            "(reject). The DLQ copy will carry only the broker's x-death, not the terminal "
-            "failure metadata.",
+            "DLQ handoff to %r failed or unverified; handing the delivery back to the pipeline, which "
+            "dead-letters it through the broker (reject) if the DLQ exists and requeues it otherwise. "
+            "A broker dead-lettered copy carries only x-death, not the terminal failure metadata.",
             envelope.routing_key,
         )
 
     def _mark_terminal_and_raise(
         self,
         exc: Exception,
-        severity: ErrorSeverity,
+        classified: ClassifiedError,
         retry_count: int,
         message: RabbitMessage,
         category: FailureCategory | None = None,
         *,
         dead_lettered: bool = False,
+        handoff_failed: bool = False,
     ) -> None:
         """Mark exception as terminal and re-raise.
 
         M2: this is the point where a message is committed to being
         dead-lettered -- permanent errors dead-letter on the first attempt,
         exhausted-retry errors dead-letter after ``max_retries`` -- so
-        ``messages_dead_lettered_total`` is recorded here.
+        ``messages_dead_lettered_total`` is recorded here (labelled with the
+        error category).
 
         With ``dead_lettered=True`` the confirmed DLQ copy exists and the
         source is already acked: ``_rabbitkit_dead_lettered`` tells the
         pipeline there is nothing left to settle. Otherwise the pipeline
-        rejects (``requeue=False``) and the source queue's DLX moves it.
+        settles it: reject (``requeue=False``) so the source queue's DLX
+        moves it, after checking that the DLQ exists where the transport can
+        (a missing DLQ means requeue with backoff, never a drop).
+
+        ``handoff_failed=True`` (``_rabbitkit_dead_letter_failed``) means a
+        DLQ copy was attempted and NOT confirmed: an outer
+        ``ExceptionMiddleware(swallow_permanent=True)`` must not swallow it,
+        or the pipeline would ack a message that exists nowhere else.
 
         The log line uses the same sanitizer as the headers (F30): raw
         exception text routinely embeds credentials.
         """
         if category is None:
             category = (
-                FailureCategory.PERMANENT if severity is not ErrorSeverity.TRANSIENT else FailureCategory.EXHAUSTED
+                FailureCategory.PERMANENT
+                if classified.severity is not ErrorSeverity.TRANSIENT
+                else FailureCategory.EXHAUSTED
             )
         exc._rabbitkit_terminal = True  # type: ignore[attr-defined]
         exc._rabbitkit_dead_lettered = dead_lettered  # type: ignore[attr-defined]
+        exc._rabbitkit_dead_letter_failed = handoff_failed  # type: ignore[attr-defined]
         if self._metrics_config is not None:
-            self._record_metric(self._metrics_config.messages_dead_lettered_total, message)
-        sanitized = self._sanitizer.sanitize(exc, severity)
+            self._record_metric(self._metrics_config.messages_dead_lettered_total, message, classified.category)
+        sanitized = self._sanitizer.sanitize(exc, classified.severity)
         logger.warning(
-            "Terminal failure (%s, attempts=%d, retries=%d/%d, %s): %s: %s",
+            "Terminal failure (%s, category=%s, attempts=%d, retries=%d/%d, %s): %s: %s",
             category.value,
+            classified.category.value,
             retry_count + 1,
             retry_count,
             self._config.max_retries,
-            "dead-lettered with metadata" if dead_lettered else "rejecting to broker DLX",
+            "dead-lettered with metadata" if dead_lettered else "handing back to the pipeline (reject to DLX)",
             sanitized.code,
             sanitized.summary or "<omitted>",
         )

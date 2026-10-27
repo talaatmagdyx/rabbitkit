@@ -276,7 +276,7 @@ class TestRetryMetrics:
         mw.consume_scope(failing_handler, msg)
 
         collector.inc_counter.assert_called_once_with(
-            "rabbitkit_messages_retried_total", {"queue": "orders-queue"}
+            "rabbitkit_messages_retried_total", {"queue": "orders-queue", "category": "retryable"}
         )
 
     @pytest.mark.asyncio
@@ -303,7 +303,7 @@ class TestRetryMetrics:
         await mw.consume_scope_async(failing_handler, msg)
 
         collector.inc_counter.assert_called_once_with(
-            "rabbitkit_messages_retried_total", {"queue": "orders-queue"}
+            "rabbitkit_messages_retried_total", {"queue": "orders-queue", "category": "retryable"}
         )
 
     def test_permanent_error_emits_messages_dead_lettered_total(self) -> None:
@@ -321,7 +321,7 @@ class TestRetryMetrics:
             mw.consume_scope(failing_handler, msg)
 
         collector.inc_counter.assert_called_once_with(
-            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue"}
+            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue", "category": "permanent"}
         )
 
     def test_exhausted_retries_emits_messages_dead_lettered_total(self) -> None:
@@ -341,7 +341,7 @@ class TestRetryMetrics:
             mw.consume_scope(failing_handler, msg)
 
         collector.inc_counter.assert_called_once_with(
-            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue"}
+            "rabbitkit_messages_dead_lettered_total", {"queue": "orders-queue", "category": "retryable"}
         )
 
     def test_no_metrics_config_is_noop(self) -> None:

@@ -65,6 +65,8 @@ class RabbitMessage:
         "_nack_fn",
         "_reject_async_fn",
         "_reject_fn",
+        "_wire_body",
+        "_wire_content_encoding",
         "app_id",
         "body",
         "consumer_tag",
@@ -136,6 +138,11 @@ class RabbitMessage:
         self.consumer_tag = consumer_tag
         self.path: dict[str, str] = path or {}
         self.raw_message = raw_message
+        # The body and encoding as delivered, before any on_receive hook
+        # (decompression, decryption) rewrites them: retry and DLQ copies
+        # republish these, so the copy decodes like the original (G-07).
+        self._wire_body = body
+        self._wire_content_encoding = content_encoding
 
         # Transport-injected settlement functions (internal)
         self._ack_fn: Callable[[], None] | None = None
@@ -152,6 +159,21 @@ class RabbitMessage:
         # issuing a tag onto a rebuilt channel (where it would settle a
         # DIFFERENT message). ``None`` = unknown (TestBroker, hand-built).
         self._channel_alive: Callable[[], bool] | None = None
+
+    @property
+    def wire_body(self) -> bytes:
+        """The body exactly as the broker delivered it.
+
+        ``body`` may have been rewritten by an ``on_receive`` hook
+        (``CompressionMiddleware`` decompresses it in place); this is the
+        original, still matching :attr:`wire_content_encoding`.
+        """
+        return self._wire_body
+
+    @property
+    def wire_content_encoding(self) -> str | None:
+        """``content_encoding`` exactly as the broker delivered it."""
+        return self._wire_content_encoding
 
     @property
     def is_settled(self) -> bool:

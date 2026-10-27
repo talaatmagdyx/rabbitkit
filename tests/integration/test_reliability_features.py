@@ -211,7 +211,7 @@ async def test_retry_envelope_headers_are_sanitized_on_the_wire(rabbit: dict[str
     assert peeked is not None
     headers = peeked.headers
     assert secret not in repr(headers)
-    assert headers["x-rabbitkit-error-category"] == "transient"
+    assert headers["x-rabbitkit-error-category"] == "retryable"
     assert headers["x-rabbitkit-error-type"] == "ConnectionError"
     assert "***" in headers["x-rabbitkit-error-message"]
     assert headers["x-rabbitkit-retry-count"] == 1

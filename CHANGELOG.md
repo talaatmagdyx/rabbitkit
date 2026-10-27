@@ -172,7 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value raises `TopologyValidationError`).
 - **The "Terminal failure" log printed raw exception text** (e.g.
   `password=hunter2`) while the headers were sanitized. It now uses the same
-  `ErrorSanitizer`.
+  `ErrorSanitizer`, as does `ExceptionMiddleware`'s "Terminal exception" log.
 - **`RetryHandoffTracker` crashed after ~1,025 consecutive handoff
   failures.** The backoff was `initial * 2 ** (n - 1)` with an uncapped
   exponent, so a long outage of the delay queue raised

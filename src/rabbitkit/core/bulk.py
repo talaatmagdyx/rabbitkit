@@ -49,7 +49,7 @@ from rabbitkit.core.errors import (
     ConfigValidationError,
     MessageTooLargeError,
 )
-from rabbitkit.core.types import BulkPublishStatus, MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.core.types import BulkPublishStatus, MessageEnvelope, PublishOutcome, PublishReason, PublishStatus
 
 # ── Status vocabulary ──────────────────────────────────────────────────────
 
@@ -74,6 +74,20 @@ REASON_INVALID_TYPE = "invalid_type"
 REASON_INVALID_HEADERS = "invalid_headers"
 REASON_INVALID_ENVELOPE = "invalid_envelope"
 REASON_NO_OUTCOME = "no_outcome"
+REASON_NOT_SENT = "not_sent"
+# Transport reason codes (``PublishOutcome.reason``, see PublishReason) that a
+# bulk item can carry as-is.
+REASON_PUBLISHER_CLOSED = PublishReason.PUBLISHER_CLOSED
+REASON_NOT_CONNECTED = PublishReason.NOT_CONNECTED
+REASON_CHANNEL_UNAVAILABLE = PublishReason.CHANNEL_UNAVAILABLE
+REASON_EXCEEDS_BYTE_BUDGET = PublishReason.EXCEEDS_BYTE_BUDGET
+REASON_CONNECTION_LOST = PublishReason.CONNECTION_LOST
+REASON_CHANNEL_CLOSED = PublishReason.CHANNEL_CLOSED
+REASON_SHUTDOWN = PublishReason.SHUTDOWN
+REASON_PUBLISH_TIMEOUT = PublishReason.PUBLISH_TIMEOUT
+REASON_EXCHANGE_NOT_FOUND = PublishReason.EXCHANGE_NOT_FOUND
+REASON_ACCESS_REFUSED = PublishReason.ACCESS_REFUSED
+REASON_PRECONDITION_FAILED = PublishReason.PRECONDITION_FAILED
 
 ALL_REASONS: frozenset[str] = frozenset(
     {
@@ -95,7 +109,10 @@ ALL_REASONS: frozenset[str] = frozenset(
         REASON_INVALID_HEADERS,
         REASON_INVALID_ENVELOPE,
         REASON_NO_OUTCOME,
+        REASON_NOT_SENT,
     }
+    # Every transport reason code is bounded too.
+    | PublishReason.ALL
 )
 
 
@@ -293,15 +310,22 @@ def classify_publish_outcome(outcome: PublishOutcome | None) -> tuple[BulkPublis
     * ``RETURNED`` wins over everything — an unroutable message is not a
       successful routed publication even though the broker also confirms it.
     * ``SENT`` (confirms disabled) is ``UNKNOWN``, not confirmed.
-    * ``TIMEOUT`` is ``UNKNOWN`` — the frame may have reached the broker.
-    * ``ERROR`` is ``UNKNOWN`` unless the error proves nothing was submitted
-      (backpressure drop, broker not started) or that the input itself was
-      invalid (oversized body / ``ValueError``/``TypeError`` from validation).
+    * ``TIMEOUT`` and ``UNKNOWN`` are ``UNKNOWN`` — the frame may have
+      reached the broker.
+    * ``NOT_SENT`` is ``NOT_SENT`` — the transport proved nothing left.
+    * ``ERROR`` with reason ``exchange_not_found`` is ``UNROUTABLE`` (the
+      broker refused to route it); any other ``ERROR`` is ``UNKNOWN`` unless
+      the error proves nothing was submitted (backpressure drop, broker not
+      started) or that the input itself was invalid (oversized body /
+      ``ValueError``/``TypeError`` from validation).
     * ``None`` (a duck-typed publish fn returned nothing) is ``UNKNOWN``.
+
+    The transport's own ``reason`` code is kept when it has one.
     """
     if outcome is None:
         return BulkPublishStatus.UNKNOWN, REASON_NO_OUTCOME
     status = outcome.status
+    reason = outcome.reason if outcome.reason in PublishReason.ALL else None
     if status is PublishStatus.RETURNED:
         return BulkPublishStatus.UNROUTABLE, REASON_RETURNED
     if status is PublishStatus.CONFIRMED:
@@ -311,8 +335,16 @@ def classify_publish_outcome(outcome: PublishOutcome | None) -> tuple[BulkPublis
     if status is PublishStatus.NACKED:
         return BulkPublishStatus.NACKED, REASON_NACKED
     if status is PublishStatus.TIMEOUT:
-        return BulkPublishStatus.UNKNOWN, REASON_CONFIRM_TIMEOUT
+        return BulkPublishStatus.UNKNOWN, reason or REASON_CONFIRM_TIMEOUT
+    if status is PublishStatus.UNKNOWN:
+        return BulkPublishStatus.UNKNOWN, reason or REASON_PUBLISH_ERROR
+    if status is PublishStatus.NOT_SENT:
+        if reason is None and isinstance(outcome.error, BackpressureError):
+            reason = REASON_BACKPRESSURE
+        return BulkPublishStatus.NOT_SENT, reason or REASON_NOT_SENT
     # ERROR
+    if reason == REASON_EXCHANGE_NOT_FOUND:
+        return BulkPublishStatus.UNROUTABLE, REASON_EXCHANGE_NOT_FOUND
     err = outcome.error
     if isinstance(err, BackpressureError):
         return BulkPublishStatus.NOT_SENT, REASON_BACKPRESSURE
@@ -322,7 +354,7 @@ def classify_publish_outcome(outcome: PublishOutcome | None) -> tuple[BulkPublis
         return BulkPublishStatus.INVALID, REASON_BODY_TOO_LARGE
     if isinstance(err, (ValueError, TypeError)):
         return BulkPublishStatus.INVALID, REASON_INVALID_ENVELOPE
-    return BulkPublishStatus.UNKNOWN, REASON_PUBLISH_ERROR
+    return BulkPublishStatus.UNKNOWN, reason or REASON_PUBLISH_ERROR
 
 
 def classify_publish_exception(exc: BaseException) -> tuple[BulkPublishStatus, str]:

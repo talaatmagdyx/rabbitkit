@@ -174,6 +174,9 @@ class TestClassifyPublishOutcome:
             (PublishStatus.ERROR, MessageTooLargeError("x"), BulkPublishStatus.INVALID, REASON_BODY_TOO_LARGE),
             (PublishStatus.ERROR, ValueError("x"), BulkPublishStatus.INVALID, REASON_INVALID_ENVELOPE),
             (PublishStatus.ERROR, TypeError("x"), BulkPublishStatus.INVALID, REASON_INVALID_ENVELOPE),
+            (PublishStatus.NOT_SENT, None, BulkPublishStatus.NOT_SENT, "not_sent"),
+            (PublishStatus.NOT_SENT, BackpressureError("x"), BulkPublishStatus.NOT_SENT, REASON_BACKPRESSURE),
+            (PublishStatus.UNKNOWN, None, BulkPublishStatus.UNKNOWN, REASON_PUBLISH_ERROR),
         ],
     )
     def test_mapping(
@@ -185,6 +188,28 @@ class TestClassifyPublishOutcome:
 
     def test_none_outcome_is_unknown(self) -> None:
         assert classify_publish_outcome(None) == (BulkPublishStatus.UNKNOWN, REASON_NO_OUTCOME)
+
+    @pytest.mark.parametrize(
+        ("status", "reason", "expected"),
+        [
+            (PublishStatus.NOT_SENT, "admission_timeout", BulkPublishStatus.NOT_SENT),
+            (PublishStatus.NOT_SENT, "publisher_closed", BulkPublishStatus.NOT_SENT),
+            (PublishStatus.UNKNOWN, "connection_lost", BulkPublishStatus.UNKNOWN),
+            (PublishStatus.UNKNOWN, "shutdown", BulkPublishStatus.UNKNOWN),
+            (PublishStatus.TIMEOUT, "publish_timeout", BulkPublishStatus.UNKNOWN),
+            (PublishStatus.ERROR, "exchange_not_found", BulkPublishStatus.UNROUTABLE),
+            (PublishStatus.ERROR, "access_refused", BulkPublishStatus.UNKNOWN),
+        ],
+    )
+    def test_transport_reasons_are_kept(self, status: PublishStatus, reason: str, expected: BulkPublishStatus) -> None:
+        """G-03: the new statuses map one-to-one and keep the transport's reason."""
+        got = classify_publish_outcome(PublishOutcome(status=status, reason=reason))
+        assert got == (expected, reason)
+        assert reason in ALL_REASONS
+
+    def test_an_unbounded_reason_is_not_propagated(self) -> None:
+        got = classify_publish_outcome(PublishOutcome(status=PublishStatus.UNKNOWN, reason="free text!"))
+        assert got == (BulkPublishStatus.UNKNOWN, REASON_PUBLISH_ERROR)
 
     def test_sent_is_never_confirmed(self) -> None:
         """Safety invariant 2: fire-and-forget must not be reported as confirmed."""

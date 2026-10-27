@@ -417,6 +417,42 @@ class TestPoolConfig:
         assert config.publisher_connections == 1
         assert config.consumer_connections == 1
 
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_pool_size_must_be_positive(self, size: int) -> None:
+        """G-25: channel_pool_size=0 made the pool unbounded."""
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="channel_pool_size"):
+            PoolConfig(channel_pool_size=size)
+
+    @pytest.mark.parametrize("timeout", [0, -1.0, float("nan")])
+    def test_acquire_timeout_must_be_positive(self, timeout: float) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="channel_acquire_timeout"):
+            PoolConfig(channel_acquire_timeout=timeout)
+
+
+class TestPublisherConfigInFlightBytes:
+    def test_default_is_unbounded(self) -> None:
+        assert PublisherConfig().max_in_flight_bytes is None
+
+    def test_accepts_a_budget_at_least_the_message_cap(self) -> None:
+        assert PublisherConfig(max_message_bytes=1024, max_in_flight_bytes=1024).max_in_flight_bytes == 1024
+        assert PublisherConfig(max_message_bytes=0, max_in_flight_bytes=1).max_in_flight_bytes == 1
+
+    def test_rejects_a_non_positive_budget(self) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="max_in_flight_bytes"):
+            PublisherConfig(max_in_flight_bytes=0)
+
+    def test_rejects_a_budget_below_the_message_cap(self) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="max_message_bytes"):
+            PublisherConfig(max_in_flight_bytes=1024)  # default cap is 16 MiB
+
 
 # ── RetryConfig ───────────────────────────────────────────────────────────
 

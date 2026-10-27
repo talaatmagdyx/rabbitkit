@@ -14,6 +14,7 @@ from rabbitkit.core.types import (
     ExchangeType,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     QueueType,
     TopologyMode,
@@ -105,9 +106,11 @@ class TestPublishStatus:
         assert PublishStatus.TIMEOUT == "timeout"
         assert PublishStatus.RETURNED == "returned"
         assert PublishStatus.ERROR == "error"
+        assert PublishStatus.NOT_SENT == "not_sent"
+        assert PublishStatus.UNKNOWN == "unknown"
 
     def test_all_values(self) -> None:
-        assert len(PublishStatus) == 6
+        assert len(PublishStatus) == 8
 
 
 # ── PublishOutcome ────────────────────────────────────────────────────────
@@ -379,3 +382,49 @@ class TestClassifiedError:
         )
         with pytest.raises(AttributeError):
             classified.severity = ErrorSeverity.PERMANENT  # type: ignore[misc]
+
+
+class TestPublishOutcomeContract:
+    """G-03: NOT_SENT / UNKNOWN statuses and the typed reason fields."""
+
+    @pytest.mark.parametrize(
+        ("status", "unknown"),
+        [
+            (PublishStatus.UNKNOWN, True),
+            (PublishStatus.TIMEOUT, True),
+            (PublishStatus.NOT_SENT, False),
+            (PublishStatus.CONFIRMED, False),
+            (PublishStatus.ERROR, False),
+        ],
+    )
+    def test_is_unknown(self, status: PublishStatus, unknown: bool) -> None:
+        assert PublishOutcome(status=status).is_unknown is unknown
+
+    def test_new_statuses_are_never_ok(self) -> None:
+        assert not PublishOutcome(status=PublishStatus.NOT_SENT).ok
+        assert not PublishOutcome(status=PublishStatus.UNKNOWN).ok
+
+    def test_optional_fields_default_to_none(self) -> None:
+        outcome = PublishOutcome(status=PublishStatus.CONFIRMED)
+        assert (outcome.reason, outcome.reply_code, outcome.reply_text) == (None, None, None)
+        assert "reason=" not in repr(outcome)
+
+    def test_repr_shows_reason_and_reply_fields(self) -> None:
+        outcome = PublishOutcome(
+            status=PublishStatus.RETURNED, reason=PublishReason.RETURNED, reply_code=312, reply_text="NO_ROUTE"
+        )
+        text = repr(outcome)
+        assert "reason='returned'" in text
+        assert "reply_code=312, reply_text='NO_ROUTE'" in text
+
+    def test_reason_codes_are_bounded_snake_case_strings(self) -> None:
+        assert PublishReason.ADMISSION_TIMEOUT in PublishReason.ALL
+        for code in PublishReason.ALL:
+            assert isinstance(code, str)
+            assert code == code.lower() and " " not in code
+
+    def test_raise_for_status_raises_for_not_sent(self) -> None:
+        from rabbitkit.core.errors import PublishError
+
+        with pytest.raises(PublishError):
+            PublishOutcome(status=PublishStatus.NOT_SENT, reason="admission_timeout").raise_for_status()

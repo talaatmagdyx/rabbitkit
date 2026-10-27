@@ -98,10 +98,13 @@ class TestConsumeScope:
         with pytest.raises(ValueError, match="boom"):
             mw.consume_scope(call_next, msg)
 
-        assert len(collector.counter_calls) == 1
+        assert len(collector.counter_calls) == 2
         cc = collector.counter_calls[0]
         assert cc.name == MESSAGES_CONSUMED_TOTAL
         assert cc.labels == {"queue": "test.queue", "status": "error"}
+        failed = collector.counter_calls[1]
+        assert failed.name == "rabbitkit_messages_failed_total"
+        assert failed.labels == {"queue": "test.queue", "category": "permanent"}
 
     def test_redelivered_message_increments_redelivered_counter(self) -> None:
         """Broker-redelivery rate: a redelivered=True consume increments the
@@ -115,9 +118,7 @@ class TestConsumeScope:
 
         mw.consume_scope(MagicMock(return_value="ok"), msg)
 
-        redelivered_calls = [
-            c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")
-        ]
+        redelivered_calls = [c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")]
         assert len(redelivered_calls) == 1
         assert redelivered_calls[0].labels == {"queue": "test.queue"}
 
@@ -128,9 +129,7 @@ class TestConsumeScope:
 
         mw.consume_scope(MagicMock(return_value="ok"), msg)
 
-        assert not any(
-            c.name.endswith("_messages_redelivered_total") for c in collector.counter_calls
-        )
+        assert not any(c.name.endswith("_messages_redelivered_total") for c in collector.counter_calls)
 
     @pytest.mark.asyncio
     async def test_redelivered_counter_async(self) -> None:
@@ -143,9 +142,7 @@ class TestConsumeScope:
 
         await mw.consume_scope_async(handler, msg)
 
-        redelivered_calls = [
-            c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")
-        ]
+        redelivered_calls = [c for c in collector.counter_calls if c.name.endswith("_messages_redelivered_total")]
         assert len(redelivered_calls) == 1
         assert redelivered_calls[0].labels == {"queue": "test.queue"}
 
@@ -347,9 +344,10 @@ class TestConsumeScopeAsync:
         with pytest.raises(ValueError, match="async-boom"):
             await mw.consume_scope_async(call_next, msg)
 
-        assert len(collector.counter_calls) == 1
+        assert len(collector.counter_calls) == 2
         cc = collector.counter_calls[0]
         assert cc.labels["status"] == "error"
+        assert collector.counter_calls[1].labels == {"queue": "test.queue", "category": "permanent"}
 
     async def test_consume_async_records_histogram(self) -> None:
         """Async consume records processing duration in histogram."""
@@ -387,7 +385,7 @@ class TestPublishScope:
         assert len(collector.counter_calls) == 1
         cc = collector.counter_calls[0]
         assert cc.name == MESSAGES_PUBLISHED_TOTAL
-        assert cc.labels == {"exchange": "test.exchange", "status": "success"}
+        assert cc.labels == {"exchange": "test.exchange", "status": "success", "reason": "none"}
 
     def test_publish_error(self) -> None:
         """Failed publish increments counter with status=error and re-raises."""
@@ -401,7 +399,7 @@ class TestPublishScope:
 
         assert len(collector.counter_calls) == 1
         cc = collector.counter_calls[0]
-        assert cc.labels == {"exchange": "test.exchange", "status": "error"}
+        assert cc.labels == {"exchange": "test.exchange", "status": "error", "reason": "exception"}
 
     def test_publish_records_histogram(self) -> None:
         """Publish records duration in histogram."""
@@ -462,7 +460,7 @@ class TestPublishScopeAsync:
         assert len(collector.counter_calls) == 1
         cc = collector.counter_calls[0]
         assert cc.name == MESSAGES_PUBLISHED_TOTAL
-        assert cc.labels == {"exchange": "test.exchange", "status": "success"}
+        assert cc.labels == {"exchange": "test.exchange", "status": "success", "reason": "none"}
 
     async def test_publish_async_error(self) -> None:
         """Async failed publish increments counter with status=error and re-raises."""
@@ -530,7 +528,7 @@ class TestPublishStatusLabelReflectsOutcome:
 
         assert result is outcome
         cc = collector.counter_calls[0]
-        assert cc.labels == {"exchange": "test.exchange", "status": status.value}
+        assert cc.labels == {"exchange": "test.exchange", "status": status.value, "reason": "none"}
 
     @pytest.mark.parametrize(
         "status",
@@ -556,7 +554,7 @@ class TestPublishStatusLabelReflectsOutcome:
 
         assert result is outcome
         cc = collector.counter_calls[0]
-        assert cc.labels == {"exchange": "test.exchange", "status": status.value}
+        assert cc.labels == {"exchange": "test.exchange", "status": status.value, "reason": "none"}
 
     def test_non_publishoutcome_result_falls_back_to_success(self) -> None:
         """A custom/duck-typed publish_fn that doesn't return a PublishOutcome

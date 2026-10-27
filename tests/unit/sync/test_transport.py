@@ -2806,3 +2806,101 @@ class TestInspectionPrimitivesSync:
         assert props.message_id is None
         assert props.content_type is None
         assert props.delivery_mode == 1
+
+
+# ── G-22: metrics hooks (connection state, reconnect attempts, publish outcome) ──
+
+
+class TestObservabilityHooks:
+    @pytest.fixture(autouse=True)
+    def _check_pika(self) -> None:
+        pytest.importorskip("pika")
+
+    @staticmethod
+    def _connect(transport: SyncTransport) -> MagicMock:
+        channel = MagicMock()
+        channel.is_open = True
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as conn:
+                conn.return_value.channel.return_value = channel
+                conn.return_value.is_open = True
+                transport.connect()
+        return channel
+
+    def test_connect_reports_up_and_a_reconnect_reports_the_loss_once(self) -> None:
+        transport = _make_transport()
+        states: list[tuple[str, bool, object]] = []
+        transport.on_connection_state(lambda role, up, error: states.append((role, up, error)))
+        self._connect(transport)
+        assert states == [("shared", True, None)]
+
+        cause = ConnectionResetError("reset")
+        with patch.object(transport, "connect", side_effect=lambda: transport._fire_connection_state(True, None)):
+            transport._connected = False
+            transport.reconnect(cause)
+        assert states[1:] == [("shared", False, cause), ("shared", True, None)]
+
+    def test_a_raising_state_hook_never_breaks_connect(self, caplog: pytest.LogCaptureFixture) -> None:
+        transport = _make_transport()
+
+        def boom(_role: str, _up: bool, _error: object) -> None:
+            raise RuntimeError("hook bug")
+
+        transport.on_connection_state(boom)
+        self._connect(transport)
+        assert transport.is_connected()
+        assert "connection_state callback raised" in caplog.text
+
+    def test_failed_reconnect_attempts_are_reported_only_after_the_first_connect(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        transport = _make_transport()
+        transport.max_reconnect_attempts = 2
+        attempts: list[tuple[int, BaseException]] = []
+
+        def boom(_attempt: int, _error: BaseException) -> None:
+            raise RuntimeError("hook bug")
+
+        transport.on_reconnect_attempt(boom)
+        transport.on_reconnect_attempt(lambda attempt, error: attempts.append((attempt, error)))
+        refused = ConnectionRefusedError("refused")
+        with patch.object(transport, "connect", side_effect=refused), patch("time.sleep"):
+            with pytest.raises(ConnectionRefusedError):
+                transport._ensure_connected()
+        assert attempts == []  # never connected: startup failures are not reconnects
+
+        transport._ever_connected = True
+        with patch.object(transport, "connect", side_effect=refused), patch("time.sleep"):
+            with pytest.raises(ConnectionRefusedError):
+                transport._ensure_connected()
+        assert [a for a, _ in attempts] == [1, 2]
+        assert "reconnect_attempt callback raised" in caplog.text
+
+    def test_publish_outcome_reports_the_basic_publish_time_for_a_broker_answer(self) -> None:
+        import pika.exceptions
+
+        transport = _make_transport()
+        channel = self._connect(transport)
+        seen: list[tuple[PublishStatus, float | None]] = []
+
+        def boom(_outcome: object, _seconds: float | None) -> None:
+            raise RuntimeError("metrics bug")
+
+        transport.on_publish_outcome(boom)
+        transport.on_publish_outcome(lambda outcome, seconds: seen.append((outcome.status, seconds)))
+        assert transport.publish(MessageEnvelope(routing_key="rk", body=b"x")).status is PublishStatus.CONFIRMED
+        channel.basic_publish.side_effect = pika.exceptions.UnroutableError([])
+        transport.publish(MessageEnvelope(routing_key="rk", body=b"x", mandatory=True))
+        channel.basic_publish.side_effect = RuntimeError("boom")
+        transport.publish(MessageEnvelope(routing_key="rk", body=b"x"))
+        statuses = [status for status, _ in seen]
+        assert statuses == [PublishStatus.CONFIRMED, PublishStatus.RETURNED, PublishStatus.ERROR]
+        assert seen[0][1] is not None and seen[1][1] is not None
+        assert seen[2][1] is None
+
+    def test_channels_active_counts_open_channels(self) -> None:
+        transport = _make_transport()
+        assert transport.channels_active == 0
+        self._connect(transport)
+        transport._consumer_channels = {"a": MagicMock(is_open=True), "b": MagicMock(is_open=False)}
+        assert transport.channels_active == 2

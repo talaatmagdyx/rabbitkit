@@ -28,22 +28,8 @@ def registry() -> object:
 
 
 @pytest.fixture
-def collector(registry: object, monkeypatch: pytest.MonkeyPatch) -> PrometheusCollector:
-    coll = PrometheusCollector()
-    original = coll._prometheus_client
-
-    class Scoped:
-        def Counter(self, *a: object, **k: object) -> object:  # noqa: N802 — mirrors prometheus_client
-            return original.Counter(*a, registry=registry, **k)
-
-        def Histogram(self, *a: object, **k: object) -> object:  # noqa: N802
-            return original.Histogram(*a, registry=registry, **k)
-
-        def Gauge(self, *a: object, **k: object) -> object:  # noqa: N802
-            return original.Gauge(*a, registry=registry, **k)
-
-    coll._prometheus_client = Scoped()
-    return coll
+def collector(registry: object) -> PrometheusCollector:
+    return PrometheusCollector(registry=registry)
 
 
 def _dump(registry: object) -> str:
@@ -151,3 +137,39 @@ class TestRepeatedUse:
         dump = _dump(registry)
         assert "rk_test_plain_total 1.0" in dump
         assert 'rk_test_tagged_total{queue="q"} 1.0' in dump
+
+
+class TestInjectableRegistry:
+    """G-22: the collector no longer forces the global registry, and a second
+    collector on the same registry reuses metrics instead of raising."""
+
+    def test_default_is_the_global_registry(self) -> None:
+        assert PrometheusCollector().registry is prometheus_client.REGISTRY
+
+    def test_metrics_go_to_the_injected_registry_only(self, registry: object) -> None:
+        collector = PrometheusCollector(registry=registry)
+        collector.inc_counter("rk_test_injected_total", {"queue": "orders"})
+        assert collector.registry is registry
+        assert 'rk_test_injected_total{queue="orders"} 1.0' in _dump(registry)
+        assert "rk_test_injected_total" not in prometheus_client.generate_latest().decode()
+
+    def test_two_collectors_share_one_registry(self, registry: object) -> None:
+        first = PrometheusCollector(registry=registry)
+        second = PrometheusCollector(registry=registry)
+        first.inc_counter("rk_test_shared_total", {"queue": "a"})
+        second.inc_counter("rk_test_shared_total", {"queue": "a"})
+        second.observe_histogram("rk_test_shared_seconds", {}, 1.0)
+        first.observe_histogram("rk_test_shared_seconds", {}, 1.0)
+        first.set_gauge("rk_test_shared_gauge", {}, 1.0)
+        second.set_gauge("rk_test_shared_gauge", {}, 3.0)
+        dump = _dump(registry)
+        assert 'rk_test_shared_total{queue="a"} 2.0' in dump
+        assert "rk_test_shared_seconds_count 2.0" in dump
+        assert "rk_test_shared_gauge 3.0" in dump
+
+    def test_a_conflicting_registration_still_raises(self, registry: object) -> None:
+        PrometheusCollector(registry=registry).inc_counter("rk_test_conflict_total", {"queue": "a"})
+        with pytest.raises(ValueError, match="Duplicated"):
+            PrometheusCollector(registry=registry).inc_counter("rk_test_conflict_total", {"exchange": "a"})
+        with pytest.raises(ValueError, match="Duplicated"):
+            PrometheusCollector(registry=registry).set_gauge("rk_test_conflict_total", {"queue": "a"}, 1.0)

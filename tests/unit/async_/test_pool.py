@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1252,3 +1252,70 @@ class TestPoolConnectionFoundation:
         with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
             await pool.connect()
         assert pool._connected_once
+
+
+# ── G-22: connection state and channel counts for the metrics ───────────
+
+
+class TestPoolObservability:
+    @staticmethod
+    def _pool(**kw: Any) -> AsyncConnectionPool:
+        config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.002)
+        return AsyncConnectionPool(connection_config=config, security_config=SecurityConfig(), **kw)
+
+    @pytest.mark.asyncio
+    async def test_a_created_connection_reports_up_and_the_policy_reports_drops(self) -> None:
+        states: list[tuple[str, bool, Any]] = []
+        pool = self._pool(on_connection_state=lambda role, up, error: states.append((role, up, error)))
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=AsyncMock()) as connect:
+            await pool._create_connection(role="consumer")
+        assert states == [("consumer", True, None)]
+        policy = connect.call_args.kwargs["connection_class"].keywords["rk_policy"]
+        error = ConnectionResetError("reset")
+        policy.on_lost("consumer", error)
+        policy.on_restored("consumer")
+        assert states[1:] == [("consumer", False, error), ("consumer", True, None)]
+
+    def test_without_a_hook_state_changes_are_ignored(self) -> None:
+        pool = self._pool()
+        pool._connection_lost("publisher", None)
+        pool._connection_restored("publisher")
+
+    def test_a_raising_state_hook_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        def boom(_role: str, _up: bool, _error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        pool = self._pool(on_connection_state=boom)
+        pool._connection_lost("publisher", None)
+        assert "on_connection_state callback raised" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_after_startup_names_the_role(self) -> None:
+        from aiormq.exceptions import ProbableAuthenticationError
+
+        failures: list[Any] = []
+        pool = self._pool(on_connection_failed=failures.append)
+        pool._connected_once = True
+        with patch(
+            "aio_pika.connect_robust", new_callable=AsyncMock, side_effect=ProbableAuthenticationError("ACCESS_REFUSED")
+        ):
+            with pytest.raises(ConnectionError):
+                await pool._create_connection(role="consumer")
+        assert failures[0].role == "consumer"
+
+    def test_channel_counts_cover_both_publisher_pools(self) -> None:
+        pool = self._pool()
+        assert pool.channel_counts() == (0, 0)
+        publisher = AsyncChannelPool(MagicMock(), pool_size=4)
+        publisher._created = 3
+        publisher._in_use = {object(), object()}
+        mandatory = AsyncChannelPool(MagicMock(), pool_size=4)
+        mandatory._created = 1
+        closed = AsyncChannelPool(MagicMock(), pool_size=4)
+        closed._created = 4
+        closed._closed = True
+        pool._publisher_channel_pool = publisher
+        pool._mandatory_channel_pool = mandatory
+        assert pool.channel_counts() == (4, 2)
+        pool._mandatory_channel_pool = closed
+        assert pool.channel_counts() == (3, 2)

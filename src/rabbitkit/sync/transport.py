@@ -167,6 +167,14 @@ class SyncTransport:
         # Fired on every successful connect() AFTER the first (see connect()).
         self._reconnect_callbacks: list[Callable[[], None]] = []
         self._ever_connected = False
+        # G-22 metrics hooks: connection up/down (role "shared": one pika
+        # connection serves publishing and consuming), failed reconnect
+        # attempts, and publish outcomes with the send-to-confirm latency.
+        self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
+        self._reconnect_attempt_callbacks: list[Callable[[int, BaseException], None]] = []
+        self._publish_outcome_callbacks: list[Callable[[PublishOutcome, float | None], None]] = []
+        self._loss_reported = False
+        self._loss_cause: BaseException | None = None
 
         # Channel-lifecycle signal (item 3): channels_opened_total counts
         # every new channel this transport creates; channel_rebuilds_total
@@ -186,6 +194,39 @@ class SyncTransport:
                 cb()
             except Exception:  # pragma: no cover — never let a cb break connect
                 logger.exception("reconnect callback raised")
+
+    def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
+        """Register ``callback(role, up, error)`` (G-22). ``role`` is always
+        ``"shared"``: fired with ``up=True`` after every successful connect and
+        with ``up=False`` once when a connection that was up is found down
+        (before the reconnect starts). ``disconnect()`` does not fire it."""
+        self._connection_state_callbacks.append(callback)
+
+    def _fire_connection_state(self, up: bool, error: BaseException | None) -> None:
+        for cb in list(self._connection_state_callbacks):
+            try:
+                cb("shared", up, error)
+            except Exception:  # never let a metrics hook break a connect
+                logger.exception("connection_state callback raised")
+
+    def on_reconnect_attempt(self, callback: Callable[[int, BaseException], None]) -> None:
+        """Register ``callback(attempt, error)`` fired after every FAILED
+        reconnect attempt of a connection that had been up (G-22)."""
+        self._reconnect_attempt_callbacks.append(callback)
+
+    def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
+        """Register ``callback(outcome, seconds)`` for every publish handed to
+        pika (G-22). ``seconds`` is the ``basic_publish`` call alone (frame
+        write plus, in confirm mode, the wait for the broker's confirm, nack
+        or return) when the broker answered, else ``None``."""
+        self._publish_outcome_callbacks.append(callback)
+
+    @property
+    def channels_active(self) -> int:
+        """Open channels: the publisher/topology channel plus one per consumed
+        queue (and cancelled ones still draining)."""
+        channels = (self._channel, *self._consumer_channels.values(), *self._cancelled_channels)
+        return sum(1 for channel in channels if channel is not None and bool(getattr(channel, "is_open", False)))
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -307,6 +348,8 @@ class SyncTransport:
         if self._ever_connected:
             self._fire_reconnect()  # connection-churn metric hook
         self._ever_connected = True
+        self._loss_reported = False
+        self._fire_connection_state(True, None)
         logger.info("Connected to RabbitMQ")
 
     def __enter__(self) -> SyncTransport:
@@ -411,6 +454,10 @@ class SyncTransport:
             )
 
         self._connected = False
+        if self._ever_connected and not self._loss_reported:
+            self._loss_reported = True
+            self._fire_connection_state(False, self._loss_cause)
+        self._loss_cause = None
         backoff = self._connection_config.reconnect_backoff_base
         max_backoff = self._connection_config.reconnect_backoff_max
         connection_errors = get_connection_errors()
@@ -426,6 +473,12 @@ class SyncTransport:
                 return
             except connection_errors as e:
                 attempts += 1
+                if self._ever_connected:
+                    for cb in list(self._reconnect_attempt_callbacks):
+                        try:
+                            cb(attempts, e)
+                        except Exception:  # never let a metrics hook break the reconnect loop
+                            logger.exception("reconnect_attempt callback raised")
                 # H3 (architect review): each backoff iteration is provable
                 # forward progress — refresh the liveness heartbeat so a
                 # broker outage longer than wedged_timeout doesn't flip
@@ -451,8 +504,13 @@ class SyncTransport:
                     )
                     raise
 
-    def reconnect(self) -> None:
-        """Force a fresh connection + channel (used by consumer recovery)."""
+    def reconnect(self, cause: BaseException | None = None) -> None:
+        """Force a fresh connection + channel (used by consumer recovery).
+
+        *cause* is the error that showed the connection was lost; it is
+        passed to :meth:`on_connection_state` hooks.
+        """
+        self._loss_cause = cause
         self.disconnect()
         self._ensure_connected()
 
@@ -505,9 +563,7 @@ class SyncTransport:
         # (_owner_ident None, _ever_consumed reset) a worker thread must keep
         # marshaling (and fail loudly if nothing pumps) rather than touch the
         # connection inline, cross-thread, while the owner is reconnecting.
-        if threading.get_ident() == self._owner_ident or not (
-            self._ever_consumed or self._ever_consumed_any
-        ):
+        if threading.get_ident() == self._owner_ident or not (self._ever_consumed or self._ever_consumed_any):
             return fn()
 
         result: list[_T] = []
@@ -690,9 +746,9 @@ class SyncTransport:
             and outcome.error is not None
             and isinstance(outcome.error, get_connection_errors())
         ):
-            allowed_to_reconnect = not (
-                self._ever_consumed or self._ever_consumed_any
-            ) or threading.get_ident() == self._owner_ident
+            allowed_to_reconnect = (
+                not (self._ever_consumed or self._ever_consumed_any) or threading.get_ident() == self._owner_ident
+            )
             if allowed_to_reconnect:
                 logger.warning(
                     "Publish hit a dead connection (%s); reconnecting and retrying once",
@@ -738,6 +794,24 @@ class SyncTransport:
 
     def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish *envelope* on a specific already-open channel."""
+        if not self._publish_outcome_callbacks:
+            return self._publish_on_channel_unreported(channel, envelope, None)
+        timing: list[float] = []
+        outcome = self._publish_on_channel_unreported(channel, envelope, timing)
+        answered = outcome.status in (PublishStatus.CONFIRMED, PublishStatus.NACKED, PublishStatus.RETURNED)
+        seconds = timing[0] if answered and timing else None
+        for cb in list(self._publish_outcome_callbacks):
+            try:
+                cb(outcome, seconds)
+            except Exception:  # never let a metrics hook fail a publish
+                logger.exception("publish_outcome callback raised")
+        return outcome
+
+    def _publish_on_channel_unreported(
+        self, channel: Any, envelope: MessageEnvelope, timing: list[float] | None
+    ) -> PublishOutcome:
+        """:meth:`_publish_on_channel` without the outcome hooks. When *timing*
+        is a list, the duration of the ``basic_publish`` call is appended."""
         try:
             import pika
 
@@ -769,14 +843,21 @@ class SyncTransport:
             # m4: honor the configured confirm_timeout as-is — the old
             # min(30, x) silently clamped an operator's deliberate 60 s to 30.
             publish_timeout = self._confirm_timeout
+
             def do_publish() -> None:
-                channel.basic_publish(
-                    exchange=envelope.exchange,
-                    routing_key=envelope.routing_key,
-                    body=envelope.body,
-                    properties=properties,
-                    mandatory=envelope.mandatory,
-                )
+                started = time.monotonic()
+                try:
+                    channel.basic_publish(
+                        exchange=envelope.exchange,
+                        routing_key=envelope.routing_key,
+                        body=envelope.body,
+                        properties=properties,
+                        mandatory=envelope.mandatory,
+                    )
+                finally:
+                    if timing is not None:
+                        timing.append(time.monotonic() - started)
+
             if threading.get_ident() == self._owner_ident and self._ever_consumed:
                 # I-11: this thread also owns dispatching further deliveries
                 # via start_consuming() -- cannot safely bound this wait on a
@@ -819,8 +900,7 @@ class SyncTransport:
 
         except pika.exceptions.UnroutableError as e:
             logger.warning(
-                "Publish returned as unroutable (mandatory=True, no matching binding): "
-                "exchange=%s routing_key=%s",
+                "Publish returned as unroutable (mandatory=True, no matching binding): exchange=%s routing_key=%s",
                 envelope.exchange,
                 envelope.routing_key,
             )
@@ -1177,9 +1257,7 @@ class SyncTransport:
                     if self._connection.is_closed or "Timeout closed before call" in str(exc):
                         import pika.exceptions
 
-                        raise pika.exceptions.AMQPConnectionError(
-                            f"connection lost mid-poll: {exc}"
-                        ) from exc
+                        raise pika.exceptions.AMQPConnectionError(f"connection lost mid-poll: {exc}") from exc
                     raise
                 # L14: process_data_events returning (rather than raising a
                 # connection error) is itself evidence the I/O loop is alive

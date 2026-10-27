@@ -3,18 +3,21 @@
 Protocol-based approach: works with any Prometheus-compatible client
 (prometheus_client, StatsD, custom implementations, etc.).
 
-Metric names:
-- rabbitkit_messages_consumed_total   Counter(queue, status)
-                                      status: success | error
-- rabbitkit_message_processing_seconds Histogram(queue)
-- rabbitkit_messages_published_total  Counter(exchange, status)
-                                      status: confirmed | sent | nacked |
-                                      timeout | returned | error |
-                                      not_sent | unknown (the real
-                                      PublishOutcome.status value -- a
-                                      raised exception escaping the publish
-                                      call itself is also labeled "error")
-- rabbitkit_message_publish_seconds   Histogram(exchange)
+The full metric inventory (name, type, labels, meaning) is
+:func:`metric_inventory`; ``docs/observability.md`` is generated from it and
+a unit test keeps the two in sync. Every label is bounded: either an
+enumerated value set (:func:`bounded_label_values`) or a declared topology
+name (``queue`` / ``exchange``). Message ids, routing keys and tenant ids
+are never labels.
+
+Two emitters share one collector:
+
+* :class:`MetricsMiddleware` — per-message consume and publish metrics on
+  the routes / publish middlewares it is attached to.
+* :class:`BrokerMetrics` — connection, channel, flow-control, consumer
+  cancel and transport-level publish metrics. Both brokers build one from
+  the first ``MetricsMiddleware`` with a collector (publish middlewares
+  first, then any route), so a publish-only broker gets them too.
 """
 
 from __future__ import annotations
@@ -22,12 +25,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from rabbitkit.core.config import MetricsConfig
+from rabbitkit.core.errors import classify_error
 from rabbitkit.core.message import RabbitMessage
-from rabbitkit.core.types import MessageEnvelope, PublishOutcome, PublishStatus
+from rabbitkit.core.types import ErrorCategory, MessageEnvelope, PublishOutcome, PublishReason, PublishStatus
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
@@ -57,6 +62,93 @@ def _publish_status_label(result: Any) -> str:
     if isinstance(result, PublishOutcome):
         return result.status.value
     return "success"
+
+
+#: ``reason`` label of ``messages_published_total`` when the outcome carries
+#: no reason (a success), when the publish call raised, or when a custom
+#: transport returned a reason outside :class:`PublishReason`.
+REASON_NONE = "none"
+REASON_EXCEPTION = "exception"
+REASON_OTHER = "other"
+
+
+def _publish_reason_label(result: Any) -> str:
+    """Bounded ``reason`` label for a publish result (G-22)."""
+    reason = getattr(result, "reason", None) if isinstance(result, PublishOutcome) else None
+    if reason is None:
+        return REASON_NONE
+    return reason if reason in PublishReason.ALL else REASON_OTHER
+
+
+#: Bounded ``reason`` values of ``connection_failures_total``.
+CONNECTION_FAILURE_REASONS: frozenset[str] = frozenset(
+    {
+        # terminal (TerminalConnectionError.reason)
+        "authentication_failed",
+        "vhost_access_refused",
+        "tls_verification_failed",
+        "tls_handshake_rejected",
+        "reconnect_budget_exhausted",
+        # transient
+        "connection_refused",
+        "connection_reset",
+        "timeout",
+        "dns_failure",
+        "tls_error",
+        "broker_closed",
+        "connection_lost",
+        "other",
+    }
+)
+
+# Client-library exception class names (aiormq / pika), matched by name so
+# this module stays transport-free.
+_BROKER_CLOSED_NAMES = frozenset({"ConnectionClosed", "ConnectionClosedByBroker"})
+_LOST_NAMES = frozenset(
+    {"AMQPConnectionError", "StreamLostError", "ConnectionWrongStateError", "IncompatibleProtocolError", "AMQPError"}
+)
+_MAX_CAUSE_DEPTH = 4
+
+
+def connection_failure_reason(error: BaseException | None) -> str:
+    """Bounded reason code for a connection failure (a metric label, G-22).
+
+    A :class:`~rabbitkit.core.errors.TerminalConnectionError` keeps its own
+    ``reason``. Otherwise *error* and its ``__cause__`` chain are mapped to
+    one of :data:`CONNECTION_FAILURE_REASONS`; ``None`` (a drop with no
+    error) is ``connection_lost``. Never returns exception text.
+    """
+    if error is None:
+        return "connection_lost"
+    from rabbitkit.core.errors import TerminalConnectionError
+
+    if isinstance(error, TerminalConnectionError):
+        return error.reason if error.reason in CONNECTION_FAILURE_REASONS else "other"
+    import socket
+    import ssl
+
+    current: BaseException | None = error
+    fallback = "other"
+    for _ in range(_MAX_CAUSE_DEPTH):
+        if current is None:
+            break
+        if isinstance(current, ConnectionRefusedError):
+            return "connection_refused"
+        if isinstance(current, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return "connection_reset"
+        if isinstance(current, TimeoutError):
+            return "timeout"
+        if isinstance(current, socket.gaierror):
+            return "dns_failure"
+        if isinstance(current, ssl.SSLError):
+            return "tls_error"
+        names = {cls.__name__ for cls in type(current).__mro__}
+        if names & _BROKER_CLOSED_NAMES:
+            return "broker_closed"
+        if fallback == "other" and (names & _LOST_NAMES or isinstance(current, (ConnectionError, EOFError))):
+            fallback = "connection_lost"
+        current = current.__cause__
+    return fallback
 
 
 def _queue_label(message: RabbitMessage) -> str:
@@ -109,11 +201,23 @@ class PrometheusCollector:
 
     Usage::
 
-        collector = PrometheusCollector()
-        middleware = MetricsMiddleware(collector)
+        collector = PrometheusCollector()                      # global REGISTRY
+        collector = PrometheusCollector(registry=my_registry)  # an app's own
+
+    Args:
+        registry: The ``prometheus_client.CollectorRegistry`` to register
+            metrics in. ``None`` (the default) uses the global
+            ``prometheus_client.REGISTRY``, as before. Pass your own to keep
+            rabbitkit's metrics in an application's (e.g. obskit's) registry,
+            or a fresh one per test.
+
+    Two collectors on the same registry share the metrics: a metric another
+    collector (or anything else) already registered under the same name and
+    type is reused instead of raising prometheus_client's "Duplicated
+    timeseries" error.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, registry: Any = None) -> None:
         try:
             import prometheus_client
         except ImportError as exc:
@@ -127,32 +231,39 @@ class PrometheusCollector:
         self._histograms: dict[str, Any] = {}
         self._gauges: dict[str, Any] = {}
         self._prometheus_client = prometheus_client
+        self._registry = registry if registry is not None else prometheus_client.REGISTRY
+
+    @property
+    def registry(self) -> Any:
+        """The registry this collector registers its metrics in."""
+        return self._registry
+
+    def _create(self, kind: str, name: str, label_names: tuple[str, ...]) -> Any:
+        factory = getattr(self._prometheus_client, kind)
+        try:
+            return factory(name, f"rabbitkit {name}", label_names, registry=self._registry)
+        except ValueError:
+            # Already registered (a second collector on this registry): reuse
+            # it if it is the same kind of metric with the same labels.
+            existing = getattr(self._registry, "_names_to_collectors", {}).get(name)
+            same_kind = type(existing).__name__ == kind
+            if existing is None or not same_kind or tuple(getattr(existing, "_labelnames", ())) != label_names:
+                raise
+            return existing
 
     def _get_counter(self, name: str, label_names: tuple[str, ...]) -> Any:
         if name not in self._counters:
-            self._counters[name] = self._prometheus_client.Counter(
-                name,
-                f"rabbitkit {name}",
-                label_names,
-            )
+            self._counters[name] = self._create("Counter", name, label_names)
         return self._counters[name]
 
     def _get_histogram(self, name: str, label_names: tuple[str, ...]) -> Any:
         if name not in self._histograms:
-            self._histograms[name] = self._prometheus_client.Histogram(
-                name,
-                f"rabbitkit {name}",
-                label_names,
-            )
+            self._histograms[name] = self._create("Histogram", name, label_names)
         return self._histograms[name]
 
     def _get_gauge(self, name: str, label_names: tuple[str, ...]) -> Any:
         if name not in self._gauges:
-            self._gauges[name] = self._prometheus_client.Gauge(
-                name,
-                f"rabbitkit {name}",
-                label_names,
-            )
+            self._gauges[name] = self._create("Gauge", name, label_names)
         return self._gauges[name]
 
     def inc_counter(self, name: str, labels: dict[str, str], value: float = 1.0) -> None:
@@ -224,6 +335,10 @@ class MetricsMiddleware(BaseMiddleware):
         # and publish the gauge on every enter/exit.
         self._in_flight: dict[str, int] = {}
         self._in_flight_lock = threading.Lock()
+        # G-22: set by the broker when its transport reports the real
+        # send-to-confirm latency (BrokerMetrics); this middleware then stops
+        # timing the whole publish call as "confirm latency".
+        self._confirm_latency_from_transport = False
 
     @property
     def collector(self) -> MetricsCollector | None:
@@ -251,18 +366,21 @@ class MetricsMiddleware(BaseMiddleware):
     def _observe_publish(self, exchange: str, result: Any, elapsed: float) -> None:
         """Publish-side counters + histograms shared by both scopes.
 
-        ``publish_confirm_latency_seconds`` (declared, previously never
-        emitted) is observed only when the outcome is a real broker
-        CONFIRMED — for SENT/fire-and-forget there is no confirm to time.
+        ``messages_published_total`` carries the outcome's ``status`` and a
+        bounded ``reason`` (G-22). ``publish_confirm_latency_seconds`` is
+        observed here only when no transport reports it (TestBroker, a
+        custom publish fn): then it is the whole call for a CONFIRMED
+        outcome. Under ``SyncBroker`` / ``AsyncBroker`` the transport times
+        send-to-confirm itself (see :class:`BrokerMetrics`).
         """
         assert self._collector is not None
         self._collector.inc_counter(
             self._cfg.published_total,
-            {"exchange": exchange, "status": _publish_status_label(result)},
+            {"exchange": exchange, "status": _publish_status_label(result), "reason": _publish_reason_label(result)},
         )
         self._collector.observe_histogram(self._cfg.publish_seconds, {"exchange": exchange}, elapsed)
         status = getattr(result, "status", None)
-        if status is PublishStatus.CONFIRMED:
+        if status is PublishStatus.CONFIRMED and not self._confirm_latency_from_transport:
             self._collector.observe_histogram(
                 self._cfg.publish_confirm_latency_seconds, {"exchange": exchange}, elapsed
             )
@@ -295,6 +413,14 @@ class MetricsMiddleware(BaseMiddleware):
             return
         self._collector.inc_counter(self._cfg.settlement_outcome_unknown_total, {"queue": _queue_label(message)})
 
+    def _record_failure(self, queue: str, exc: BaseException) -> None:
+        """``messages_failed_total{queue, category}``: the handler failure's
+        category (one of the six ``ErrorCategory`` values), classified the
+        same way as the pipeline's "Handler failed" log line."""
+        assert self._collector is not None
+        category = classify_error(exc).category.value
+        self._collector.inc_counter(self._cfg.messages_failed_total, {"queue": queue, "category": category})
+
     # ── Consume-side ──────────────────────────────────────────────────
 
     def consume_scope(
@@ -319,11 +445,12 @@ class MetricsMiddleware(BaseMiddleware):
         self._in_flight_delta(queue, +1)
         try:
             result = call_next(message)
-        except BaseException:
+        except BaseException as exc:
             self._collector.inc_counter(
                 self._cfg.consumed_total,
                 {"queue": queue, "status": "error"},
             )
+            self._record_failure(queue, exc)
             self._collector.observe_histogram(
                 self._cfg.processing_seconds,
                 {"queue": queue},
@@ -364,11 +491,12 @@ class MetricsMiddleware(BaseMiddleware):
         self._in_flight_delta(queue, +1)
         try:
             result = await call_next(message)
-        except BaseException:
+        except BaseException as exc:
             self._collector.inc_counter(
                 self._cfg.consumed_total,
                 {"queue": queue, "status": "error"},
             )
+            self._record_failure(queue, exc)
             self._collector.observe_histogram(
                 self._cfg.processing_seconds,
                 {"queue": queue},
@@ -407,7 +535,7 @@ class MetricsMiddleware(BaseMiddleware):
         except BaseException:
             self._collector.inc_counter(
                 self._cfg.published_total,
-                {"exchange": exchange, "status": "error"},
+                {"exchange": exchange, "status": "error", "reason": REASON_EXCEPTION},
             )
             self._collector.observe_histogram(
                 self._cfg.publish_seconds,
@@ -435,7 +563,7 @@ class MetricsMiddleware(BaseMiddleware):
         except BaseException:
             self._collector.inc_counter(
                 self._cfg.published_total,
-                {"exchange": exchange, "status": "error"},
+                {"exchange": exchange, "status": "error", "reason": REASON_EXCEPTION},
             )
             self._collector.observe_histogram(
                 self._cfg.publish_seconds,
@@ -446,6 +574,386 @@ class MetricsMiddleware(BaseMiddleware):
         else:
             self._observe_publish(exchange, result, time.monotonic() - start)
             return result
+
+
+# ── Broker/transport metrics (G-22) ───────────────────────────────────────
+
+#: Connection roles: the async broker's two connections, the sync broker's
+#: one shared connection, and a terminal failure with no role.
+CONNECTION_ROLES: frozenset[str] = frozenset({"publisher", "consumer", "shared", "connection"})
+#: ``reason`` values of ``publish_routing_failures_total``.
+ROUTING_FAILURE_REASONS: frozenset[str] = frozenset({PublishReason.RETURNED, PublishReason.EXCHANGE_NOT_FOUND})
+_EXCHANGE_NOT_FOUND_CODE = 404
+
+
+def _routing_failure_reason(outcome: PublishOutcome) -> str | None:
+    if outcome.status is PublishStatus.RETURNED:
+        return PublishReason.RETURNED
+    if outcome.status is PublishStatus.ERROR:
+        if outcome.reason == PublishReason.EXCHANGE_NOT_FOUND:
+            return PublishReason.EXCHANGE_NOT_FOUND
+        # The sync transport attaches no reason: pika's ChannelClosedByBroker
+        # carries the 404 as reply_code.
+        if outcome.reason is None and getattr(outcome.error, "reply_code", None) == _EXCHANGE_NOT_FOUND_CODE:
+            return PublishReason.EXCHANGE_NOT_FOUND
+    return None
+
+
+class BrokerMetrics:
+    """Connection, channel, flow-control and transport-publish metrics (G-22).
+
+    Transport-free: the brokers feed it from their transport's hooks
+    (``on_connection_state``, ``on_reconnect_attempt``,
+    ``on_connection_failed``, ``on_reconnect``, ``on_channel_opened`` /
+    ``on_channel_rebuilt``, ``on_blocked`` / ``on_unblocked``,
+    ``on_consumer_cancelled`` / ``on_consumer_resumed``,
+    ``on_publish_outcome``) and sample the gauges that change on every
+    publish (in flight, channels) periodically instead of on the hot path.
+
+    Args:
+        collector: Where to emit (the first ``MetricsMiddleware``'s collector).
+        config: Metric names.
+        roles: The connection roles this broker has (``("publisher",
+            "consumer")`` for async, ``("shared",)`` for sync).
+    """
+
+    def __init__(self, collector: MetricsCollector, config: MetricsConfig, roles: tuple[str, ...]) -> None:
+        self._collector = collector
+        self._cfg = config
+        self._roles = roles
+        self._set_gauge: Callable[[str, dict[str, str], float], None] | None = getattr(collector, "set_gauge", None)
+        self._up: dict[str, bool] = dict.fromkeys(roles, False)
+        self._lock = threading.Lock()
+
+    @property
+    def config(self) -> MetricsConfig:
+        return self._cfg
+
+    def _gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+        if self._set_gauge is not None:
+            self._set_gauge(name, labels, value)
+
+    # ── connections ───────────────────────────────────────────────────
+
+    def connection_state(self, role: str, up: bool, error: BaseException | None = None) -> None:
+        """A connection came up or dropped. A drop counts one
+        ``connection_failures_total`` with the classified reason."""
+        if role not in CONNECTION_ROLES:
+            role = "connection"
+        with self._lock:
+            self._up[role] = up
+            states = dict(self._up)
+        if not up:
+            self._collector.inc_counter(
+                self._cfg.connection_failures_total, {"role": role, "reason": connection_failure_reason(error)}
+            )
+        self._publish_states(states)
+
+    def set_states(self, states: dict[str, bool]) -> None:
+        """Overwrite the per-role state from a sample (no failure counted)."""
+        with self._lock:
+            for role, up in states.items():
+                if role in self._up:
+                    self._up[role] = up
+            current = dict(self._up)
+        self._publish_states(current)
+
+    def _publish_states(self, states: dict[str, bool]) -> None:
+        for role, up in states.items():
+            self._gauge(self._cfg.connection_up, {"role": role}, 1.0 if up else 0.0)
+        self._gauge(self._cfg.connections_active, {}, float(sum(states.values())))
+        self._gauge(self._cfg.broker_connected, {}, 1.0 if states and all(states.values()) else 0.0)
+
+    def reconnected(self) -> None:
+        """A connection reconnected (``reconnects_total``)."""
+        self._collector.inc_counter(self._cfg.reconnects_total, {})
+
+    def reconnect_failed(self, role: str, error: BaseException | None) -> None:
+        """A reconnect attempt failed."""
+        if role not in CONNECTION_ROLES:
+            role = "connection"
+        self._collector.inc_counter(self._cfg.reconnect_attempts_total, {"role": role})
+        self._collector.inc_counter(
+            self._cfg.connection_failures_total, {"role": role, "reason": connection_failure_reason(error)}
+        )
+
+    def connection_failed(self, error: BaseException) -> None:
+        """A connection stopped reconnecting for good (terminal)."""
+        role = getattr(error, "role", "") or "connection"
+        if role not in CONNECTION_ROLES:
+            role = "connection"
+        self._collector.inc_counter(
+            self._cfg.connection_failures_total, {"role": role, "reason": connection_failure_reason(error)}
+        )
+        with self._lock:
+            if role in self._up:
+                self._up[role] = False
+            states = dict(self._up)
+        self._publish_states(states)
+
+    def stopped(self, routes: Iterable[str] = ()) -> None:
+        """The broker stopped: every sampled gauge goes to zero."""
+        with self._lock:
+            self._up = dict.fromkeys(self._roles, False)
+            states = dict(self._up)
+        self._publish_states(states)
+        for name in (self._cfg.channels_active, self._cfg.publish_in_flight, self._cfg.connection_blocked):
+            self._gauge(name, {}, 0.0)
+        for queue in routes:
+            self._gauge(self._cfg.route_consuming, {"queue": queue}, 0.0)
+
+    # ── channels / flow control ───────────────────────────────────────
+
+    def channel_opened(self) -> None:
+        self._collector.inc_counter(self._cfg.channels_opened_total, {})
+
+    def channel_rebuilt(self) -> None:
+        self._collector.inc_counter(self._cfg.channel_rebuilds_total, {})
+
+    def blocked(self, is_blocked: bool) -> None:
+        """``connection.blocked`` / ``connection.unblocked`` from RabbitMQ."""
+        self._gauge(self._cfg.connection_blocked, {}, 1.0 if is_blocked else 0.0)
+
+    # ── consumers ─────────────────────────────────────────────────────
+
+    def consumer_cancelled(self, queue: str) -> None:
+        """The broker cancelled the consumer of *queue* (``basic.cancel``)."""
+        self._collector.inc_counter(self._cfg.consumer_cancelled_total, {"queue": queue})
+        self._gauge(self._cfg.route_consuming, {"queue": queue}, 0.0)
+
+    def consumer_resumed(self, queue: str) -> None:
+        self._gauge(self._cfg.route_consuming, {"queue": queue}, 1.0)
+
+    # ── publishing ────────────────────────────────────────────────────
+
+    def publish_outcome(self, outcome: PublishOutcome, seconds: float | None) -> None:
+        """A transport publish finished. *seconds* is send-to-broker-answer."""
+        exchange = outcome.exchange or "default"
+        if seconds is not None and outcome.status is PublishStatus.CONFIRMED:
+            self._collector.observe_histogram(
+                self._cfg.publish_confirm_latency_seconds, {"exchange": exchange}, seconds
+            )
+        reason = _routing_failure_reason(outcome)
+        if reason is not None:
+            self._collector.inc_counter(
+                self._cfg.publish_routing_failures_total, {"exchange": exchange, "reason": reason}
+            )
+
+    def sample(
+        self,
+        *,
+        channels_active: int | None = None,
+        publish_in_flight: int | None = None,
+        publish_in_flight_bytes: int | None = None,
+        publish_channels_in_use: int | None = None,
+        connection_blocked: bool | None = None,
+        consuming: dict[str, bool] | None = None,
+    ) -> None:
+        """Set the sampled gauges (``None`` = not available, not emitted)."""
+        for name, value in (
+            (self._cfg.channels_active, channels_active),
+            (self._cfg.publish_in_flight, publish_in_flight),
+            (self._cfg.publish_in_flight_bytes, publish_in_flight_bytes),
+            (self._cfg.publish_channels_in_use, publish_channels_in_use),
+        ):
+            if value is not None:
+                self._gauge(name, {}, float(value))
+        if connection_blocked is not None:
+            self.blocked(connection_blocked)
+        for queue, active in (consuming or {}).items():
+            self._gauge(self._cfg.route_consuming, {"queue": queue}, 1.0 if active else 0.0)
+
+    def sample_worker_pool(self, pending: int) -> None:
+        """Set ``worker_pool_pending``."""
+        self._gauge(self._cfg.worker_pool_pending, {}, float(pending))
+
+    def take_over_confirm_latency(self, middlewares: Iterable[object]) -> None:
+        """The transport reports send-to-confirm latency: every
+        ``MetricsMiddleware`` in *middlewares* stops timing the whole call."""
+        for mw in middlewares:
+            if isinstance(mw, MetricsMiddleware):
+                mw._confirm_latency_from_transport = True
+
+
+# ── Inventory (code truth for docs/observability.md) ─────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class MetricSpec:
+    """One metric rabbitkit emits.
+
+    Attributes:
+        name: Full metric name (namespace applied).
+        kind: ``counter``, ``gauge`` or ``histogram``.
+        labels: The exact label names every sample carries.
+        emitter: Who emits it.
+        help: What it means.
+    """
+
+    name: str
+    kind: str
+    labels: tuple[str, ...]
+    emitter: str
+    help: str
+
+
+_MW = "MetricsMiddleware"
+_BROKER = "broker (BrokerMetrics)"
+_RETRY = "RetryMiddleware"
+_BULK = "broker bulk API"
+_ACKER = "coalescing acker"
+_POLLER = "QueueMetricsPoller"
+
+# (MetricsConfig property, kind, labels, emitter, help)
+_SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
+    # consume
+    ("consumed_total", "counter", ("queue", "status"), _MW, "Handler executions; status success or error."),
+    ("messages_failed_total", "counter", ("queue", "category"), _MW, "Handler failures by ErrorCategory."),
+    ("processing_seconds", "histogram", ("queue",), _MW, "Handler duration."),
+    ("in_flight_messages", "gauge", ("queue",), _MW, "Handlers running now."),
+    ("messages_redelivered_total", "counter", ("queue",), _MW, "Deliveries the broker flagged redelivered."),
+    ("messages_acked_total", "counter", ("queue",), _MW, "Messages acked by the pipeline."),
+    ("messages_nacked_total", "counter", ("queue",), _MW, "Messages nacked by the pipeline."),
+    ("messages_rejected_total", "counter", ("queue",), _MW, "Messages rejected by the pipeline."),
+    (
+        "settlement_outcome_unknown_total",
+        "counter",
+        ("queue",),
+        _MW,
+        "Settlements whose frame may not have reached the broker (redelivery possible).",
+    ),
+    ("messages_retried_total", "counter", ("queue", "category"), _RETRY, "Failures handed to a retry delay queue."),
+    ("messages_dead_lettered_total", "counter", ("queue", "category"), _RETRY, "Terminal failures sent to the DLQ."),
+    ("retry_handoff_failures_total", "counter", ("queue",), _RETRY, "Retry/DLQ copy publishes that failed."),
+    ("retry_handoff_paused", "gauge", ("queue",), _RETRY, "1 while a route's retry handoff is backing off."),
+    (
+        "dedup_fallback_total",
+        "counter",
+        ("queue",),
+        "DeduplicationMiddleware",
+        "Messages processed despite a Redis error.",
+    ),
+    (
+        "rate_limit_dropped_total",
+        "counter",
+        ("reason",),
+        "RateLimitMiddleware",
+        "Messages settled without running the handler.",
+    ),
+    ("consumer_cancelled_total", "counter", ("queue",), _BROKER, "Consumers the broker cancelled (basic.cancel)."),
+    ("route_consuming", "gauge", ("queue",), _BROKER, "1 while the route's consumer is subscribed."),
+    ("consumer_active", "gauge", (), _BROKER, "Routes registered while started."),
+    ("worker_pool_pending", "gauge", (), _BROKER, "Deliveries waiting for a worker."),
+    # publish
+    (
+        "published_total",
+        "counter",
+        ("exchange", "status", "reason"),
+        _MW,
+        "broker.publish() outcomes by PublishStatus and PublishReason.",
+    ),
+    ("publish_seconds", "histogram", ("exchange",), _MW, "Whole publish call, including admission."),
+    (
+        "publish_confirm_latency_seconds",
+        "histogram",
+        ("exchange",),
+        _BROKER,
+        "Send to broker confirm for CONFIRMED publishes (transport-timed).",
+    ),
+    (
+        "publish_routing_failures_total",
+        "counter",
+        ("exchange", "reason"),
+        _BROKER,
+        "Unroutable publishes: returned or exchange_not_found (all transport publishes).",
+    ),
+    ("publish_in_flight", "gauge", (), _BROKER, "Async publishes between admission and outcome (sampled)."),
+    ("publish_in_flight_bytes", "gauge", (), _BROKER, "Bytes held by max_in_flight_bytes (sampled; only when set)."),
+    ("publish_channels_in_use", "gauge", (), _BROKER, "Async publisher channels checked out (sampled)."),
+    ("bulk_publish_items_total", "counter", ("status", "reason"), _BULK, "publish_many/iter_publish item outcomes."),
+    ("bulk_publish_batch_size", "histogram", (), _BULK, "publish_many input sizes."),
+    ("settlement_items_total", "counter", ("action", "status"), _BULK, "ack_many/nack_many item outcomes."),
+    # connection
+    ("broker_connected", "gauge", (), _BROKER, "1 while every connection is up; follows reconnects."),
+    ("connection_up", "gauge", ("role",), _BROKER, "1 while the connection of this role is up."),
+    ("connections_active", "gauge", (), _BROKER, "Connections up."),
+    ("channels_active", "gauge", (), _BROKER, "Channels held open (sampled)."),
+    ("channels_opened_total", "counter", (), _BROKER, "Channels created."),
+    ("channel_rebuilds_total", "counter", (), _BROKER, "Channels created to replace a lost one."),
+    ("reconnects_total", "counter", (), _BROKER, "Successful reconnects (one per connection)."),
+    ("reconnect_attempts_total", "counter", ("role",), _BROKER, "Failed reconnect attempts."),
+    (
+        "connection_failures_total",
+        "counter",
+        ("role", "reason"),
+        _BROKER,
+        "Connections lost, reconnect attempts failed, terminal give-ups.",
+    ),
+    ("connection_blocked", "gauge", (), _BROKER, "1 while RabbitMQ blocks the connection (memory/disk alarm)."),
+    # settlement coordinator / coalescing acker
+    ("settlement_pending", "gauge", (), _ACKER, "Registered deliveries not yet settled."),
+    ("settlement_ack_ready", "gauge", (), _ACKER, "Deliveries approved for ack, not yet sent."),
+    ("settlement_frontier", "gauge", (), _ACKER, "Highest tag a cumulative ack could cover."),
+    ("settlement_gap_count", "gauge", (), _ACKER, "Blocking deliveries below an ack-ready one."),
+    ("settlement_oldest_pending_age_seconds", "gauge", (), _ACKER, "Age of the oldest unsettled delivery."),
+    ("settlement_coalescing_ratio", "gauge", (), _ACKER, "Deliveries settled per frame."),
+    ("settlement_coalesced_total", "counter", (), _ACKER, "Tags settled through a cumulative ack."),
+    # broker-side (management API poller)
+    ("queue_messages_ready", "gauge", ("queue",), _POLLER, "Messages ready (backlog)."),
+    ("queue_messages_unacked", "gauge", ("queue",), _POLLER, "Messages delivered, not yet acked."),
+    ("queue_messages_total", "gauge", ("queue",), _POLLER, "Ready plus unacked."),
+    ("queue_consumers", "gauge", ("queue",), _POLLER, "Consumers attached to the queue."),
+)
+
+#: ``HealthWatcher``'s default gauge (its name is a constructor argument).
+HEALTH_STATE_GAUGE = "rabbitkit_health_state"
+
+
+def metric_inventory(config: MetricsConfig | None = None) -> tuple[MetricSpec, ...]:
+    """Every metric rabbitkit can emit, with its exact label names.
+
+    Declared ``bulk_publish_admission_wait_seconds`` is not emitted and not
+    listed. ``HealthWatcher``'s gauge is listed under its default name.
+    """
+    cfg = config or MetricsConfig()
+    specs = [
+        MetricSpec(getattr(cfg, attr), kind, labels, emitter, text) for attr, kind, labels, emitter, text in _SPECS
+    ]
+    specs.append(
+        MetricSpec(
+            HEALTH_STATE_GAUGE, "gauge", (), "HealthWatcher", "Debounced health: 0 healthy, 1 degraded, 2 unhealthy."
+        )
+    )
+    return tuple(specs)
+
+
+def bounded_label_values() -> dict[str, frozenset[str] | None]:
+    """Allowed values per label name. ``None`` marks a declared topology name
+    (``queue`` / ``exchange``): bounded by the application's topology, never
+    by message content."""
+    from rabbitkit.core.bulk import ALL_REASONS
+    from rabbitkit.core.types import BulkPublishStatus, SettlementAction, SettlementItemStatus
+
+    statuses = (
+        {s.value for s in PublishStatus}
+        | {s.value for s in BulkPublishStatus}
+        | {s.value for s in SettlementItemStatus}
+        | {"success", "error"}
+    )
+    return {
+        "queue": None,
+        "exchange": None,
+        "status": frozenset(statuses),
+        "reason": frozenset(
+            PublishReason.ALL
+            | ALL_REASONS
+            | CONNECTION_FAILURE_REASONS
+            | {REASON_NONE, REASON_EXCEPTION, REASON_OTHER, "nack", "drop", "wait_deadline_exceeded"}
+        ),
+        "category": frozenset(c.value for c in ErrorCategory),
+        "role": CONNECTION_ROLES,
+        "action": frozenset(a.value for a in SettlementAction),
+    }
 
 
 # ── Prometheus exposition (M-SRE1) ────────────────────────────────────────

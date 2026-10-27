@@ -208,11 +208,12 @@ class TestPreflight:
         assert report.ok
 
     def test_preflight_critical_unverified_without_management(self) -> None:
+        from rabbitkit.core.config import ConsumerConfig, RabbitConfig
         from rabbitkit.core.profiles import critical_config
         from rabbitkit.core.topology import RabbitQueue
         from rabbitkit.core.types import QueueType
 
-        broker = SyncBroker(critical_config())
+        broker = SyncBroker(critical_config(RabbitConfig(consumer=ConsumerConfig(processing_timeout=30))))
 
         @broker.subscriber(queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM))
         def handle(body: bytes) -> None:

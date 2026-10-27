@@ -1294,7 +1294,6 @@ class SyncBroker:
         )
         route.runtime_state.consumer_tag = consumer_tag
 
-
     # ── Public topology API (16.6) — additive, retry/topology owner ─────
 
     def declare_exchange(self, exchange: RabbitExchange) -> None:

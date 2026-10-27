@@ -473,7 +473,5 @@ def dlq_replay(
     if not dry_run:
         typer.echo(f"\nReplayed {replayed} message(s) from {queue!r} → {target!r}.")
         if failed or skipped or refused:
-            typer.echo(
-                f"{failed + skipped + refused} message(s) were not replayed and remain on {queue!r}.", err=True
-            )
+            typer.echo(f"{failed + skipped + refused} message(s) were not replayed and remain on {queue!r}.", err=True)
             raise typer.Exit(1)

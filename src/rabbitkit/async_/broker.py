@@ -1502,7 +1502,7 @@ class AsyncBroker:
 
     def _wire_consumer_state(self) -> None:
         """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
-        transport = self._transport  # set: _start_consumer returns early without one
+        transport: Any = self._transport  # set: _start_consumer returns early without one
         if self._consumer_state_wired is transport:
             return
         self._consumer_state_wired = transport

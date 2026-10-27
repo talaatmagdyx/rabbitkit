@@ -626,7 +626,7 @@ class AsyncBroker:
         its supervisor restarts it.
         """
         logger.critical(
-            "RabbitMQ connection failed for good (%s): %s. Readiness and liveness are now false.",
+            "RabbitMQ connection failed for good (%s); readiness and liveness are now false: %s",
             error.reason,
             error,
         )

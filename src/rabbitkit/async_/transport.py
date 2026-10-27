@@ -646,6 +646,8 @@ class AsyncTransportImpl:
         Polls rather than awaiting a callback since aio-pika exposes no
         awaitable "reconnected" event.
         """
+        if self._conn_pool.terminal_error is not None:
+            return False  # G-08: closed for good, nothing will recover
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._publisher_live():

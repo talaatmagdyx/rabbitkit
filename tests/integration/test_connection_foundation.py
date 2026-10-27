@@ -180,6 +180,7 @@ async def test_tls_verification_failure_fails_start_fast(
 
 async def _assert_terminal(rabbit: dict[str, Any], broker: Any, events: _Events, user: str, expected: type) -> None:
     from rabbitkit import broker_liveness, broker_readiness
+    from rabbitkit.core.types import MessageEnvelope
 
     await _wait_until(lambda: _true(bool(events.failures)), 20, "the terminal failure")
     assert len(events.failures) == 1
@@ -193,6 +194,12 @@ async def _assert_terminal(rabbit: dict[str, Any], broker: Any, events: _Events,
     attempts = len(events.attempts)
     await asyncio.sleep(2)
     assert len(events.attempts) == attempts
+    assert await _connections_of(rabbit, user) == 0
+    # A publish fails without reconnecting (no new connection with the bad credentials).
+    started = time.monotonic()
+    outcome = await broker.publish(MessageEnvelope(routing_key="anywhere", body=b"x"))
+    assert not outcome.ok
+    assert time.monotonic() - started < 2
     assert await _connections_of(rabbit, user) == 0
 
 

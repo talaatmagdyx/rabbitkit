@@ -2952,3 +2952,16 @@ class TestConnectionFoundation:
                 await task
         connection.close.assert_awaited()
         assert transport._conn_pool._publisher_connection is None
+
+
+class TestRecoveryWaitAfterTerminalFailure:
+    @pytest.mark.asyncio
+    async def test_does_not_wait_for_a_connection_closed_for_good(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        transport = _make_transport()
+        transport._conn_pool._record_terminal(AuthenticationFailedError("refused", reason="authentication_failed"))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        assert await transport._wait_for_recovery(timeout=5.0) is False
+        assert loop.time() - started < 1.0

@@ -93,6 +93,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `at-least-once` a terminally failed message whose DLQ is missing stays on
   the source (`messages_dlx=1`); with `at-most-once` it is dropped.
 
+- **DLQ replay audit and loop prevention.** Every replayed copy (inspector
+  and CLI) carries `x-rabbitkit-replay-count` (incremented),
+  `x-rabbitkit-replayed-at` and `x-rabbitkit-replayed-by`. A message already
+  replayed `max_replays` times (default 3) is refused and stays on the DLQ
+  (`ReplayResult.refused`; CLI `REFUSED` + exit 1) unless the limit is lifted
+  (`max_replays=None` / `--ignore-replay-limit`). Each run writes start and
+  finish records (actor, queue, target, predicate, limit, counts) to the
+  `rabbitkit.dlq.audit` logger. New: `DLQInspector.replay(...,
+  max_replays=3, actor=None)`, CLI `--max-replays`, `--ignore-replay-limit`,
+  `--actor` (env `RABBITKIT_REPLAY_ACTOR`), and helpers
+  `rabbitkit.dlq.resolve_replay_routing_key` / `prepare_replay_headers` /
+  `replay_count`. Authorization stays with RabbitMQ permissions (documented:
+  run replays as a dedicated user).
+
 ### Deprecated
 
 - `RetryConfig.dead_letter_exchange` was never used (the DLQ is always
@@ -100,6 +114,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DeprecationWarning`. `jitter_factor` is documented as effective only with
   `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
   classic queue only expires its head message (head-of-line blocking).
+
+### Changed (DLQ replay)
+
+- **CLI and `DLQInspector` route replays the same way.** The CLI routed by
+  the original ROUTING KEY even to the default exchange (so a topic-routed
+  message replayed with target `""` was unroutable), while the inspector
+  routed by the original QUEUE even to a named exchange. Both now: explicit
+  routing key wins; default exchange → original queue; named exchange →
+  original routing key.
+- `reset_retry_count=True` / `--reset-retry-count` now also strips the
+  broker's `x-death` / `x-first-death-*` / `x-last-death-*` headers and
+  `x-rabbitkit-first-failed-at` (the retry middleware derives the budget from
+  them), keeping the old count as `x-rabbitkit-previous-retry-count`.
 
 ### Fixed
 

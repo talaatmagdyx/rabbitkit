@@ -168,9 +168,11 @@ connection), `connection_lost` (any other drop), `other`, and the terminal
   its publish up; the sync broker publishes on one channel, one publish at a
   time, so a value above 1 means publishes are queued behind the I/O thread.
   **`publish_in_flight_bytes`** is the `PublisherConfig.max_in_flight_bytes`
-  budget in use (publish and batch); it is only emitted when that budget is
-  set, which only `AsyncBroker` enforces. **`publish_channels_in_use`** is
-  async only: the sync broker has a single publisher channel, not a pool.
+  budget in use, on both brokers (async: publish and the batch publisher;
+  sync: every transport publish, including worker-thread publishes waiting
+  for the I/O thread); it is only emitted when that budget is set.
+  **`publish_channels_in_use`** is async only: the sync broker has a single
+  publisher channel, not a pool.
 - **`broker_connected`** is 1 only while every connection is up and follows
   drops and reconnects (it used to be set only at `start()`/`stop()`);
   `connection_up{role}` and `connections_active` break it down.

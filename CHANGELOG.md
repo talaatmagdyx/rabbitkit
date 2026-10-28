@@ -1048,6 +1048,34 @@ fixes (see below).
   `.github/workflows/dependency-matrix.yml`'s `integration-aio-pika-9` job is
   now a matrix over 9.1.0 and 9.6.2.
 
+#### Sync byte budget
+
+- **`PublisherConfig.max_in_flight_bytes` on `SyncBroker`.** The sync broker
+  now enforces the in-flight publish byte budget with the async rules: a body
+  larger than the whole budget is `NOT_SENT`
+  (`exceeds_max_in_flight_bytes`) at once; any other publish waits, first
+  come first served so a large message is not starved by smaller ones, up to
+  `PoolConfig.channel_acquire_timeout` and then returns `NOT_SENT`
+  (`admission_timeout`); its bytes are released on every terminal path
+  (outcome, failure, exception). It covers every `SyncTransport.publish()`
+  (`broker.publish()`, the bulk APIs, result / retry / DLQ copies), including
+  worker-thread publishes waiting for the I/O thread. New
+  `rabbitkit.sync.pool.InFlightByteLimiter` (thread-safe, FIFO) and
+  `SyncTransport(max_in_flight_bytes=, admission_timeout=)` /
+  `SyncTransport.byte_limiter`. Default `None`: no budget, unchanged
+  behaviour. The CRITICAL profile's budget (`CRITICAL_MAX_IN_FLIGHT_BYTES`,
+  64 MiB unless set) now bounds `SyncBroker` too.
+- **No owner-thread deadlock.** Worker-thread publishes run on the owner
+  (I/O) thread, so an owner-thread publish that slept waiting for bytes held
+  by a waiting worker would stall both until the timeout. The owner thread of
+  a connection that has run a consume loop drives `process_data_events`
+  (<= 10 ms slices) between admission checks instead, which runs those
+  worker publishes. Proven on a real broker by
+  `test_an_owner_thread_publish_waiting_for_budget_runs_the_workers_publishes`
+  (fails, about 5 s per round, without it).
+- The sync broker samples `rabbitkit_publish_in_flight_bytes` (when the budget
+  is set), like the async broker.
+
 ### Fixed
 
 #### Earlier consumer and retry hardening
@@ -1521,6 +1549,16 @@ fixes (see below).
   it from an SLO, examples). Runbooks updated (flow control, quorum,
   consumer backlog, connection storm, publisher). `docs/troubleshooting.md`:
   the two aio-pika 9.x notes.
+
+#### Sync byte budget
+
+- `docs/reliable-messaging.md`, `docs/observability.md`,
+  `docs/message-safety.md`, the `PublisherConfig` / `PoolConfig` docs and the
+  CRITICAL profile constant no longer say the byte budget is async-only.
+  `docs/concurrency-model.md` explains how the sync owner thread waits for
+  budget (it keeps the I/O loop running) and the one case where it cannot
+  (an inline handler, which has no worker publishes to wait on).
+  `publish_channels_in_use` stays async-only (one sync publisher channel).
 
 ## [0.19.2] — 2026-10-02
 

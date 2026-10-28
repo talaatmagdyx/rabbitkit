@@ -334,6 +334,8 @@ class SyncBroker:
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,
             on_topology_conflict=self._config.safety.on_topology_conflict,
+            max_in_flight_bytes=self._config.publisher.max_in_flight_bytes,
+            admission_timeout=self._config.pool.channel_acquire_timeout,
         )
         # Reconnect-attempts bound: previously hardcoded on the transport
         # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
@@ -854,15 +856,18 @@ class SyncBroker:
 
     def _sample_metrics(self) -> None:
         """Refresh the sampled broker gauges (G-22): connection state, open
-        channels, blocked state, per-route consuming, worker-pool backlog."""
+        channels, publishes and bytes in flight, blocked state, per-route
+        consuming, worker-pool backlog."""
         metrics, transport = self._broker_metrics, self._transport
         if metrics is None or transport is None:
             return
         try:
             metrics.set_states({"shared": transport.is_connected()})
+            limiter = transport.byte_limiter
             metrics.sample(
                 channels_active=transport.channels_active,
                 publish_in_flight=transport.publishes_in_flight,
+                publish_in_flight_bytes=limiter.used if limiter is not None else None,
                 connection_blocked=transport.is_blocked,
                 connection_blocked_reason=transport.blocked_reason,
                 consuming={

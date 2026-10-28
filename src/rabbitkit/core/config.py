@@ -407,11 +407,14 @@ class PublisherConfig:
     # head-of-line blocking, slow recovery) — consider a tighter cap
     # (e.g. 1_048_576 for 1 MiB) and storing payloads externally.
     max_message_bytes: int = 16_777_216
-    # Async broker only: cap on the sum of body bytes of publishes between
-    # admission and their terminal outcome (single ``publish()`` and the
-    # batch publisher share it). A publish waits (bounded by
-    # PoolConfig.channel_acquire_timeout or its per-call ``timeout``) for
-    # room and then returns NOT_SENT(reason="admission_timeout"). None (the
+    # Both brokers: cap on the sum of body bytes of publishes between
+    # admission and their terminal outcome (async: single ``publish()`` and
+    # the batch publisher share it; sync: every transport publish, including
+    # worker-thread publishes waiting for the I/O thread). A body larger
+    # than the budget is NOT_SENT(reason="exceeds_max_in_flight_bytes"); any
+    # other publish waits FIFO (bounded by PoolConfig.channel_acquire_timeout
+    # or, async only, its per-call ``timeout``) for room and then returns
+    # NOT_SENT(reason="admission_timeout"). None (the
     # default) = no byte bound, the previous behaviour. Must be >= 1 and,
     # when ``max_message_bytes`` is set, >= ``max_message_bytes`` so every
     # admissible message fits.
@@ -555,7 +558,9 @@ class PoolConfig:
         channel_acquire_timeout: Admission bound in seconds (> 0). A publish
             that cannot get a channel (pool exhausted) within it returns
             ``NOT_SENT`` with reason ``admission_timeout``; exhaustion never
-            rebuilds the connection. Also bounds opening one channel.
+            rebuilds the connection. Also bounds opening one channel, and
+            (both brokers) the wait for room in
+            ``PublisherConfig.max_in_flight_bytes``.
         prewarm_channels: Pre-create all pool channels on ``connect()``.
     """
 

@@ -37,6 +37,7 @@ from rabbitkit.core.types import (
 )
 from rabbitkit.sync.connection import get_connection_errors, make_pika_connection_params
 from rabbitkit.sync.consumers import SyncConsumerRecord, SyncConsumerSupervisor
+from rabbitkit.sync.pool import InFlightByteLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,8 @@ class SyncTransport:
         confirm_delivery: bool = True,
         confirm_timeout: float = 5.0,
         on_topology_conflict: str = "raise",
+        max_in_flight_bytes: int | None = None,
+        admission_timeout: float = 10.0,
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._socket_config = socket_config or SocketConfig()
@@ -104,6 +107,14 @@ class SyncTransport:
         # a worker forever. Brokers should pass ``config.publisher.confirm_timeout``
         # here; the default is a sane fallback.
         self._confirm_timeout = float(confirm_timeout)
+        # PublisherConfig.max_in_flight_bytes (None = no byte bound): body
+        # bytes of publish() calls between admission and their outcome. A
+        # publish waits up to *admission_timeout* (the broker passes
+        # PoolConfig.channel_acquire_timeout) for room; see _admit_bytes.
+        self._byte_limiter: InFlightByteLimiter | None = (
+            InFlightByteLimiter(max_in_flight_bytes) if max_in_flight_bytes is not None else None
+        )
+        self._admission_timeout = float(admission_timeout)
 
         self._connection: Any = None  # pika.BlockingConnection
         self._channel: Any = None  # pika.channel.Channel (publisher/topology)
@@ -286,6 +297,11 @@ class SyncTransport:
         than one means publishes are queued behind the I/O thread.
         """
         return self._publishes_in_flight
+
+    @property
+    def byte_limiter(self) -> InFlightByteLimiter | None:
+        """The ``PublisherConfig.max_in_flight_bytes`` budget (None = unbounded)."""
+        return self._byte_limiter
 
     def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
         """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
@@ -825,14 +841,77 @@ class SyncTransport:
 
     def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ (see :meth:`_publish`); counted in
-        :attr:`publishes_in_flight` until its outcome is known."""
+        :attr:`publishes_in_flight` until its outcome is known.
+
+        With a byte budget (``max_in_flight_bytes``) the body's bytes are
+        reserved first and held until the outcome is known, on every path:
+        a body larger than the whole budget is ``NOT_SENT``
+        (``exceeds_max_in_flight_bytes``); no room within the admission
+        timeout is ``NOT_SENT`` (``admission_timeout``).
+        """
         with self._publishes_lock:
             self._publishes_in_flight += 1
+        limiter = self._byte_limiter
+        reserved = 0
         try:
+            if limiter is not None:
+                size = len(envelope.body)
+                refused = self._admit_bytes(limiter, envelope, size)
+                if refused is not None:
+                    return refused
+                reserved = size
             return self._publish(envelope)
         finally:
+            if reserved:
+                assert limiter is not None
+                limiter.release(reserved)
             with self._publishes_lock:
                 self._publishes_in_flight -= 1
+
+    def _admit_bytes(self, limiter: InFlightByteLimiter, envelope: MessageEnvelope, size: int) -> PublishOutcome | None:
+        """Reserve *size* bytes of the budget; the NOT_SENT outcome when refused.
+
+        The owner thread of a connection that worker threads marshal their
+        publishes onto must not sleep while it waits: the bytes it needs may
+        be held by a worker whose publish only the owner can run. It drives
+        the I/O loop instead (which runs those marshalled publishes), between
+        admission checks, until it is admitted or the timeout expires. Every
+        other thread sleeps on the limiter's condition.
+        """
+        if size > limiter.limit:
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.EXCEEDS_BYTE_BUDGET)
+        owner_must_pump = threading.get_ident() == self._owner_ident and (
+            self._ever_consumed or self._ever_consumed_any
+        )
+        lost: tuple[type[BaseException], ...] = (*get_connection_errors(), ValueError)
+        try:
+            admitted = limiter.acquire(
+                size, self._admission_timeout, pump=self._pump_for_budget if owner_must_pump else None
+            )
+        except lost as e:
+            # Pumping found the connection dead: nothing of this message was sent.
+            if isinstance(e, ValueError) and not self._connection_died(e):
+                raise
+            logger.warning("Publish not sent: the connection failed while waiting for byte budget (%s)", e)
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.NOT_CONNECTED, e)
+        if not admitted:
+            logger.warning(
+                "Publish not sent: no room in max_in_flight_bytes within the admission timeout "
+                "(exchange=%s routing_key=%s bytes=%d)",
+                envelope.exchange,
+                envelope.routing_key,
+                size,
+            )
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.ADMISSION_TIMEOUT)
+        return None
+
+    def _pump_for_budget(self, seconds: float) -> bool:
+        """Drive the I/O loop for up to *seconds* (owner thread); False if closed."""
+        conn = self._connection
+        if conn is None or not conn.is_open:
+            return False
+        conn.process_data_events(time_limit=seconds)
+        return True
 
     def _publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.

@@ -91,6 +91,12 @@ admission, send and confirm: on expiry the outcome is `NOT_SENT` if nothing was 
 otherwise `TIMEOUT` (`publish_timeout`). Cancelling a publish never leaks its channel or
 bytes; treat a cancelled publish as unknown.
 
+**Byte budget (sync broker).** `SyncBroker` enforces `PublisherConfig.max_in_flight_bytes`
+the same way: a body larger than the budget is `NOT_SENT` (`exceeds_max_in_flight_bytes`),
+and a publish waits first come first served, up to `PoolConfig.channel_acquire_timeout`, for
+room before it returns `NOT_SENT` (`admission_timeout`). Worker-thread publishes waiting for
+the I/O thread hold their bytes too, so the budget bounds them.
+
 **Publisher shutdown (async broker).** `stop()` first drains consumers, then closes publish
 admission (a later `publish()` raises `BrokerNotStartedError`; it never reconnects), waits for
 in-flight confirms within what is left of the stop timeout, and reports the rest: still

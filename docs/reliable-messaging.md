@@ -75,8 +75,15 @@ Rules the async broker follows:
   `PublisherConfig.max_in_flight_bytes` when set, and the per-call
   `publish(..., timeout=)`. Expiry before sending is `NOT_SENT`
   (`admission_timeout`); after sending, `TIMEOUT` (`publish_timeout`). A busy
-  pool never rebuilds the connection. `timeout=` and the byte budget are
-  async-only.
+  pool never rebuilds the connection. `timeout=` is async-only. The byte
+  budget is enforced by both brokers with the same rules: a body larger than
+  the whole budget is `NOT_SENT` (`exceeds_max_in_flight_bytes`) at once;
+  otherwise the publish waits, first come first served, up to
+  `channel_acquire_timeout` for room; its bytes are held until its outcome
+  is known, whatever it is. On `SyncBroker` the budget covers worker-thread
+  publishes waiting for the I/O thread too, and the I/O (owner) thread keeps
+  running those publishes while it waits for room itself, so it never waits
+  on a worker that is waiting on it.
 - To republish the same logical message after an unknown outcome, reuse its
   id: `MessageEnvelope.message_id` or `publish(..., message_id=...)`.
 
@@ -506,7 +513,6 @@ not perform as `UNVERIFIED`, never as passed. `policy_templates()` renders
 policies (at-least-once dead-lettering, `reject-publish`, delivery limits) for
 whoever owns the cluster to apply.
 
-`max_in_flight_bytes` is enforced by `AsyncBroker` only. `processing_timeout`
-is enforced by both brokers; on `SyncBroker` the timed-out handler thread
+`max_in_flight_bytes` and `processing_timeout` are enforced by both brokers; on `SyncBroker` the timed-out handler thread
 keeps running until it returns (see
 [Processing deadline](#processing-deadline-processing_timeout)).

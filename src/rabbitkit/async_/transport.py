@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.async_.connection import get_connection_errors
@@ -149,6 +150,21 @@ def _connection_live(conn: Any) -> bool:
     except Exception:  # pragma: no cover — defensive
         return False
     return True
+
+
+def _utc_timestamp(value: Any) -> datetime | None:
+    """The AMQP ``timestamp`` property as an AWARE UTC datetime, like the sync
+    transport surfaces it.
+
+    The wire value is Unix seconds. pamqp >= 3.3 decodes it to an aware UTC
+    datetime, but pamqp 3.2 (what aio-pika 9.1 resolves) returns a NAIVE one
+    from ``utcfromtimestamp``. ``naive.timestamp()`` reads it as LOCAL time,
+    so on any host not on UTC a consumer saw the producer's timestamp shifted
+    by the host's UTC offset. A naive value is UTC by construction: tag it.
+    """
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value if isinstance(value, datetime) else None
 
 
 class AsyncTransportImpl:
@@ -1826,7 +1842,7 @@ class AsyncTransportImpl:
             expiration=(str(round(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
             user_id=aio_message.user_id,
             delivery_mode=(int(aio_message.delivery_mode) if aio_message.delivery_mode is not None else None),
-            timestamp=aio_message.timestamp,  # was never surfaced on consume
+            timestamp=_utc_timestamp(aio_message.timestamp),
             routing_key=aio_message.routing_key,
             exchange=aio_message.exchange or "",
             delivery_tag=aio_message.delivery_tag,

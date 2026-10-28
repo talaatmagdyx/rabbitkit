@@ -201,6 +201,7 @@ async def test_identity_and_attempts_survive_every_retry(rabbit: dict[str, Any])
         for msg in seen:
             assert msg.message_id == "id-1" and msg.correlation_id == "corr-1"
             assert msg.timestamp is not None and int(msg.timestamp.timestamp()) == ts
+            assert msg.timestamp.tzinfo is not None  # pamqp 3.2 (aio-pika 9.1) decodes a naive datetime
             assert msg.headers["traceparent"].startswith("00-0af7")
         assert [int(m.headers.get("x-rabbitkit-retry-count", 0)) for m in seen] == [0, 1, 2]
         [(props, _)] = _drain(rabbit, f"{q}.dlq")

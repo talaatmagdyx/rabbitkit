@@ -998,6 +998,33 @@ class TestBuildMessage:
 
         assert message.timestamp == ts
 
+    def test_build_message_tags_a_naive_timestamp_as_utc(self) -> None:
+        """pamqp 3.2 (aio-pika 9.1) decodes the AMQP timestamp to a NAIVE UTC
+        datetime; ``.timestamp()`` on it read it as local time, shifting the
+        producer's epoch by the host's UTC offset."""
+        from datetime import UTC, datetime
+
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = datetime(2026, 1, 1)
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.timestamp == datetime(2026, 1, 1, tzinfo=UTC)
+        assert message.timestamp is not None
+        assert int(message.timestamp.timestamp()) == 1767225600
+
+    def test_build_message_without_timestamp(self) -> None:
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = None
+
+        assert transport._build_message(mock_aio_msg).timestamp is None
+
     def test_build_message_from_aio_pika(self) -> None:
         transport = _make_transport()
 

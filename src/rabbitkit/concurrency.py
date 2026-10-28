@@ -166,8 +166,13 @@ class SyncWorkerPool:
         pool.stop()
     """
 
-    def __init__(self, config: WorkerConfig | None = None) -> None:
+    def __init__(self, config: WorkerConfig | None = None, *, threaded: bool = False) -> None:
+        """``threaded=True`` runs handlers on worker threads even when
+        ``worker_count`` is 1 (one dedicated thread instead of inline on the
+        caller): ``SyncBroker`` uses it for ``ConsumerConfig.processing_timeout``,
+        which needs the I/O thread free while a handler runs."""
         self._config = config or WorkerConfig()
+        self._threaded = threaded
         self._executor: _DaemonWorkerPool | None = None
         self._futures: set[concurrent.futures.Future[Any]] = set()
         # H12: message associated with each in-flight future, so a future
@@ -189,7 +194,7 @@ class SyncWorkerPool:
         k8s graceful shutdown where ``terminationGracePeriodSeconds`` must be
         honored without relying on SIGKILL.
         """
-        if self._config.worker_count <= 1:
+        if self._config.worker_count <= 1 and not self._threaded:
             return  # No pool needed for single worker
         self._executor = _DaemonWorkerPool(
             max_workers=self._config.worker_count,

@@ -398,3 +398,66 @@ class TestDeadLetterTargetMissing:
             _wire(msg)
             await pipeline.process_async(route, msg)
         assert delays == [0.001, 0.002, 0.004, 0.004, 0.001]
+
+
+# ── CONSUMER-006 on the sync broker: settling an expired delivery ─────────
+
+
+class TestSettleExpiredSync:
+    def test_first_delivery_requeues_with_an_outcome_unknown_log(self) -> None:
+        pipeline = HandlerPipeline()
+        log = _captured(pipeline)
+        msg = _msg()
+        _ack, nack, reject = _wire_sync(msg)
+        assert pipeline.settle_expired_sync(_route(_raiser(TimeoutError())), msg, HandlerTimeoutError(2.0)) is True
+        nack.assert_called_once_with(True)
+        reject.assert_not_called()
+        rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
+        assert "error=HandlerTimeoutError" in rendered and "category=unknown_outcome" in rendered
+        assert "outcome_unknown=True" in rendered
+
+    def test_a_redelivery_is_dead_lettered(self) -> None:
+        msg = _msg(redelivered=True)
+        _ack, _nack, reject = _wire_sync(msg)
+        assert HandlerPipeline().settle_expired_sync(_route(_raiser(TimeoutError())), msg, HandlerTimeoutError(1.0))
+        reject.assert_called_once_with(False)
+
+    def test_manual_without_settle_on_error_leaves_it_to_the_handler(self) -> None:
+        msg = _msg()
+        ack, nack, reject = _wire_sync(msg)
+        pipeline = HandlerPipeline(manual_settle_on_error=False)
+        route = _route(_raiser(TimeoutError()), AckPolicy.MANUAL)
+        assert pipeline.settle_expired_sync(route, msg, HandlerTimeoutError(1.0)) is False
+        ack.assert_not_called()
+        nack.assert_not_called()
+        reject.assert_not_called()
+
+    def test_an_unexpected_settlement_error_propagates(self) -> None:
+        msg = _msg()
+        _ack, nack, _reject = _wire_sync(msg)
+        nack.side_effect = SettlementError("wiring bug")
+        with pytest.raises(SettlementError):
+            HandlerPipeline().settle_expired_sync(_route(_raiser(TimeoutError())), msg, HandlerTimeoutError(1.0))
+
+    def test_a_different_handler_timeout_from_the_settlement_propagates(self) -> None:
+        msg = _msg()
+        _ack, nack, _reject = _wire_sync(msg)
+        nack.side_effect = HandlerTimeoutError(9.0)
+        with pytest.raises(HandlerTimeoutError) as info:
+            HandlerPipeline().settle_expired_sync(_route(_raiser(TimeoutError())), msg, HandlerTimeoutError(1.0))
+        assert info.value.timeout_seconds == 9.0
+
+    def test_the_settlement_metric_is_counted_once_across_two_reporters(self) -> None:
+        from rabbitkit.core.config import MetricsConfig
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+        from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+
+        collector = RecordingCollector()
+        route = _route(_raiser(TimeoutError()))
+        route.route_middlewares.append(MetricsMiddleware(collector))
+        msg = _msg()
+        _wire_sync(msg)
+        msg._settlement_metric_once = [None]
+        HandlerPipeline().settle_expired_sync(route, msg, HandlerTimeoutError(1.0))
+        pipeline_mod._emit_settlement_metric(route, msg)  # the late handler's finally
+        assert collector.count(MetricsConfig().messages_nacked_total) == 1

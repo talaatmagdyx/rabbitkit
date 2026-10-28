@@ -16,11 +16,10 @@
   (``downstream``) one, where the broker never closes anything and only the
   client's heartbeat can notice.
 
-Three product defects the partition scenario exposed are pinned as
-``xfail(strict=True)`` tests (a fix turns them into a loud XPASS): queued
-publishes resolving one admission timeout after another, readiness not
-recovering without publish traffic, and ``stop(timeout)`` not being bounded
-during a partition. Their reasons name the code involved.
+The partition scenario also covers three defects it originally exposed, now
+fixed: queued publishes resolving one admission timeout after another,
+readiness not recovering without publish traffic, and ``stop(timeout)`` not
+being bounded during a partition.
 
 These tests start their own containers on a private Docker network and are
 SLOW (cluster formation and node restarts dominate), so they carry the
@@ -728,22 +727,15 @@ async def test_async_heartbeat_detects_a_silent_partition(partition: Partition, 
         await _until(lambda: {"warm", "after"} <= set(received), 30, "the consumer to resume")
 
 
-# ── F20: known defects, pinned as strict xfails ─────────────────────────────
+# ── F20: bounded admission, readiness recovery and stop() during a partition ──
 #
-# All fail today. ``strict=True`` turns the fix into a visible XPASS failure,
-# so whoever fixes the product must also drop the marker.
+# These were strict xfails pinning three defects; fixed in the publish path
+# (pool deadline-bounded reconnects, background publisher restore, bounded
+# stop()), so they now run as ordinary tests.
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "publishes queued during a partition resolve one ACQUIRE_TIMEOUT after another: "
-        "AsyncConnectionPool._acquire_healing / _rebuild_publisher_connection serialise "
-        "reconnects under the pool lock and do not bound them by the caller's admission deadline"
-    ),
-)
 async def test_async_publishes_queued_during_partition_resolve_within_their_own_budget(
     partition: Partition,
 ) -> None:
@@ -765,14 +757,6 @@ async def test_async_publishes_queued_during_partition_resolve_within_their_own_
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "after a partition the publisher connection is rebuilt only by the next publish: "
-        "a failed AsyncConnectionPool._rebuild_publisher_connection leaves it None, so "
-        "transport.is_connected() / readiness stay False with the network back and no traffic"
-    ),
-)
 async def test_async_readiness_recovers_after_partition_without_publish_traffic(partition: Partition) -> None:
     from rabbitkit.core.types import PublishStatus
 
@@ -799,14 +783,6 @@ async def test_async_readiness_recovers_after_partition_without_publish_traffic(
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AsyncBroker.stop(timeout) is not bounded during a partition: consumer cancel "
-        "(transport.cancel_consumer) waits for the reconnect, and the publisher close / "
-        "disconnect that follows also overruns the deadline"
-    ),
-)
 async def test_async_stop_during_partition_honours_its_timeout(partition: Partition) -> None:
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.message import RabbitMessage

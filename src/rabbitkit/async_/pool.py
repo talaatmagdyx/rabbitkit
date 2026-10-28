@@ -16,7 +16,7 @@ import functools
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -26,7 +26,7 @@ from rabbitkit.async_.connection import (
     permanent_connection_error,
 )
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
-from rabbitkit.core.errors import TerminalConnectionError
+from rabbitkit.core.errors import PermanentConnectionError, TerminalConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,21 @@ async def _close_quietly(channel: Any) -> None:
     with contextlib.suppress(Exception):
         async with asyncio.timeout(_DISCARD_CLOSE_TIMEOUT):
             await channel.close()
+
+
+def _close_detached(closable: Any) -> None:
+    """Close a channel or connection without waiting for the broker.
+
+    A dead peer never answers Close, so awaiting it blocks for the whole
+    bound. aio-pika marks a connection closed (which stops its reconnect loop)
+    synchronously at the start of ``close()``, so starting the close is what
+    matters; the task itself is bounded and tracked.
+    """
+    if getattr(closable, "is_closed", True) is True:
+        return
+    task = asyncio.get_running_loop().create_task(_close_quietly(closable))
+    _DETACHED_CLOSES.add(task)
+    task.add_done_callback(_DETACHED_CLOSES.discard)
 
 
 class ChannelPoolExhaustedError(TimeoutError):
@@ -458,6 +473,26 @@ class AsyncChannelPool:
             except Exception:  # best effort — the connection may already be gone
                 pass
 
+    def abandon(self) -> None:
+        """:meth:`close_all` without waiting for the broker (a dead connection).
+
+        Same bookkeeping, at once: the pool is closed, waiters are woken with
+        :class:`ChannelPoolClosedError`, and every channel's close is started
+        in the background instead of awaited.
+        """
+        self._closed = True
+        self._wake_all()
+        channels = list(self._in_use)
+        self._in_use.clear()
+        while True:
+            try:
+                channels.append(self._pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        self._created = 0
+        for channel in channels:
+            _close_detached(channel)
+
     @property
     def size(self) -> int:
         """Number of channels currently in the pool (available)."""
@@ -534,6 +569,11 @@ class AsyncConnectionPool:
         self._mandatory_channel_pool: AsyncChannelPool | None = None
         self._lock = asyncio.Lock()
         self._prewarmed = False
+        # Bug 2 (F20): a rebuild that cannot connect leaves the publisher
+        # connection None; this task restores it in the background (backoff +
+        # jitter) so readiness recovers without publish traffic.
+        self._restore_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     @property
     def terminal_error(self) -> TerminalConnectionError | None:
@@ -585,6 +625,7 @@ class AsyncConnectionPool:
         All or nothing (G-10): if the second connection fails, the first is
         closed before the error propagates.
         """
+        self._closing = False
         try:
             await self._connect_unguarded()
         except BaseException:
@@ -732,9 +773,9 @@ class AsyncConnectionPool:
                 raise
         except Exception as exc:
             logger.warning("%s channel acquire failed (%s); rebuilding connection", label, exc)
-            await self._rebuild_publisher_connection(stale=conn)
+            await self._within(deadline, self._rebuild_publisher_connection(stale=conn))
         if self._publisher_connection is None:
-            await self.get_publisher_connection()
+            await self._within(deadline, self.get_publisher_connection())
         retry_pool = current_pool()
         if retry_pool is None:  # pragma: no cover — defensive; a failed rebuild raises above
             raise ChannelPoolClosedError(f"{label} channel pool is not available")
@@ -742,6 +783,54 @@ class AsyncConnectionPool:
         if remaining <= 0:
             raise ChannelPoolExhaustedError("publish deadline expired while rebuilding the publisher connection")
         return await retry_pool.acquire(timeout=remaining)
+
+    async def _within(self, deadline: float, step: Coroutine[Any, Any, Any]) -> None:
+        """Run a reconnect step bounded by the caller's own admission deadline.
+
+        Without this, callers queued behind a reconnect that cannot succeed
+        (a partition) resolved one ``channel_acquire_timeout`` after another
+        instead of each within its own budget. Running out of time is an
+        admission timeout; a reconnect that fails on its own still raises.
+        """
+        loop = asyncio.get_running_loop()
+        bound = asyncio.timeout(max(deadline - loop.time(), 0.0))
+        try:
+            async with bound:
+                await step
+        except TimeoutError:
+            if bound.expired():
+                raise ChannelPoolExhaustedError(
+                    "publish deadline expired while reconnecting the publisher connection"
+                ) from None
+            raise
+
+    def _schedule_publisher_restore(self) -> None:
+        """Restore a missing publisher connection in the background (bug 2)."""
+        if self._closing or self._terminal_error is not None:
+            return
+        if self._restore_task is not None and not self._restore_task.done():
+            return
+        self._restore_task = asyncio.get_running_loop().create_task(
+            self._restore_publisher_connection(), name="rabbitkit.publisher-restore"
+        )
+
+    async def _restore_publisher_connection(self) -> None:
+        backoff = self._connection_config.reconnect_backoff_base
+        cap = self._connection_config.reconnect_backoff_max
+        while self._publisher_connection is None and not self._closing and self._terminal_error is None:
+            await asyncio.sleep(random.uniform(0.0, backoff))  # noqa: S311 - jitter, not crypto
+            if self._closing or self._publisher_connection is not None:
+                return
+            try:
+                await self.get_publisher_connection()
+            except PermanentConnectionError as exc:
+                self._record_terminal(exc)
+                return
+            except Exception as exc:  # broker still unreachable: back off and retry
+                logger.warning("Publisher connection restore failed (%s); retrying", type(exc).__name__)
+                backoff = min(backoff * 2, cap)
+            else:
+                logger.info("Publisher connection restored")
 
     async def _rebuild_publisher_connection(self, stale: Any) -> None:
         """Replace the (likely dead) publisher connection + channel pool.
@@ -766,14 +855,19 @@ class AsyncConnectionPool:
             old_pool, self._publisher_channel_pool = self._publisher_channel_pool, None
             old_mandatory, self._mandatory_channel_pool = self._mandatory_channel_pool, None
             old_conn, self._publisher_connection = self._publisher_connection, None
+            # The old connection is presumed dead: closing it (and its
+            # channels) in the background keeps a peer that never answers
+            # Close from holding the lock, and with it every waiting caller.
             for stale_pool in (old_pool, old_mandatory):
                 if stale_pool is not None:
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(stale_pool.close_all(), timeout=timeout)
-            if old_conn is not None and not old_conn.is_closed:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(old_conn.close(), timeout=timeout)
-            self._publisher_connection = await asyncio.wait_for(self._create_connection(), timeout=timeout)
+                    stale_pool.abandon()
+            if old_conn is not None:
+                _close_detached(old_conn)
+            try:
+                self._publisher_connection = await asyncio.wait_for(self._create_connection(), timeout=timeout)
+            except BaseException:
+                self._schedule_publisher_restore()
+                raise
             self._publisher_channel_pool = AsyncChannelPool(
                 self._publisher_connection,
                 pool_size=self._pool_config.channel_pool_size,
@@ -863,8 +957,37 @@ class AsyncConnectionPool:
             if pool is not None:
                 await pool.close_all()
 
-    async def close_all(self) -> None:
-        """Close all channel pools and connections."""
+    async def close_all(self, timeout: float | None = None) -> None:
+        """Close all channel pools and connections, within *timeout* seconds.
+
+        Past the timeout (a partition: the broker never answers Close) the
+        rest is abandoned: pools are marked closed and the connections' close
+        is started in the background, which stops their reconnect loops.
+        """
+        self._closing = True
+        if self._restore_task is not None:
+            self._restore_task.cancel()
+            self._restore_task = None
+        try:
+            async with asyncio.timeout(timeout):
+                await self._close_all_locked()
+        except TimeoutError:
+            logger.warning("Closing RabbitMQ connections timed out after %ss; abandoning them", timeout)
+            self._abandon_all()
+
+    def _abandon_all(self) -> None:
+        for pool in (self._publisher_channel_pool, self._mandatory_channel_pool):
+            if pool is not None:
+                pool.abandon()
+        for conn in (self._publisher_connection, self._consumer_connection):
+            if conn is not None:
+                _close_detached(conn)
+        self._publisher_channel_pool = None
+        self._mandatory_channel_pool = None
+        self._publisher_connection = None
+        self._consumer_connection = None
+
+    async def _close_all_locked(self) -> None:
         async with self._lock:
             if self._publisher_channel_pool is not None:
                 await self._publisher_channel_pool.close_all()

@@ -4,6 +4,7 @@ generation-safe release, exhaustion without rebuild (G-04, G-05, G-14)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -631,3 +632,156 @@ class TestCoverageEdges:
 
     def test_no_mandatory_pool_without_a_connection(self) -> None:
         assert _connection_pool()._current_mandatory_pool() is None
+
+
+def _fast_retry_pool(**pool_kwargs: Any) -> AsyncConnectionPool:
+    return AsyncConnectionPool(
+        connection_config=ConnectionConfig(reconnect_backoff_base=0.01, reconnect_backoff_max=0.02),
+        security_config=SecurityConfig(),
+        pool_config=PoolConfig(**pool_kwargs),
+    )
+
+
+def _with_publisher(pool: AsyncConnectionPool, conn: Any) -> None:
+    pool._publisher_connection = conn
+    pool._publisher_channel_pool = AsyncChannelPool(conn, pool_size=1)
+
+
+async def _never(*_: Any, **__: Any) -> None:
+    await asyncio.Event().wait()
+
+
+class TestPartitionRecovery:
+    """F20: a partitioned broker never answers; every wait is the caller's own."""
+
+    @pytest.mark.asyncio
+    async def test_a_step_running_out_of_the_callers_time_is_admission_timeout(self) -> None:
+        pool = _fast_retry_pool()
+        loop = asyncio.get_running_loop()
+        with pytest.raises(ChannelPoolExhaustedError):
+            await pool._within(loop.time() + 0.02, _never())
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_times_out_on_its_own_is_not_an_admission_timeout(self) -> None:
+        pool = _fast_retry_pool()
+
+        async def gives_up() -> None:
+            raise TimeoutError("connect timed out")
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await pool._within(asyncio.get_running_loop().time() + 30, gives_up())
+        assert not isinstance(excinfo.value, ChannelPoolExhaustedError)
+
+    @pytest.mark.asyncio
+    async def test_a_rebuild_that_cannot_connect_is_bounded_by_the_caller(self) -> None:
+        pool = _fast_retry_pool(channel_acquire_timeout=5.0)
+        broken = AsyncMock()
+        broken.acquire = AsyncMock(side_effect=RuntimeError("dead"))
+        broken.try_acquire_idle = MagicMock(return_value=None)
+        broken.closed = False
+        pool._publisher_connection = _conn()
+        pool._publisher_channel_pool = broken
+        with patch.object(AsyncConnectionPool, "_create_connection", new=_never):
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ChannelPoolExhaustedError):
+                await pool.acquire_publisher_channel(timeout=0.1)
+            assert asyncio.get_running_loop().time() - started < 1.0
+        await pool.close_all(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rebuild_restores_the_connection_in_the_background(self) -> None:
+        pool = _fast_retry_pool(channel_acquire_timeout=1.0)
+        old, new = _conn(), _conn()
+        _with_publisher(pool, old)
+        create = AsyncMock(side_effect=[OSError("down"), OSError("still down"), new])
+        with patch.object(AsyncConnectionPool, "_create_connection", new=create):
+            with pytest.raises(OSError):
+                await pool._rebuild_publisher_connection(stale=old)
+            assert pool._publisher_connection is None
+            for _ in range(200):
+                if pool._publisher_connection is new:
+                    break
+                await asyncio.sleep(0.01)
+        assert pool._publisher_connection is new
+        assert pool._publisher_channel_pool is not None
+        assert create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_the_restore_stops_on_a_permanent_failure(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        failed: list[BaseException] = []
+        pool = AsyncConnectionPool(
+            connection_config=ConnectionConfig(reconnect_backoff_base=0.01, reconnect_backoff_max=0.02),
+            security_config=SecurityConfig(),
+            on_connection_failed=failed.append,
+        )
+        refused = AuthenticationFailedError("refused", reason="authentication_failed")
+        with patch.object(AsyncConnectionPool, "_create_connection", new=AsyncMock(side_effect=refused)):
+            pool._schedule_publisher_restore()
+            assert pool._restore_task is not None
+            await asyncio.wait_for(pool._restore_task, timeout=2.0)
+        assert pool.terminal_error is refused
+        assert failed == [refused]
+        pool._schedule_publisher_restore()  # terminal: never restarted
+        assert pool._restore_task.done()
+
+    @pytest.mark.asyncio
+    async def test_close_all_stops_the_restore(self) -> None:
+        pool = _fast_retry_pool(channel_acquire_timeout=0.05)
+        create = AsyncMock(side_effect=OSError("down"))
+        with patch.object(AsyncConnectionPool, "_create_connection", new=create):
+            pool._schedule_publisher_restore()
+            task = pool._restore_task
+            assert task is not None
+            await asyncio.sleep(0.05)
+            await pool.close_all(timeout=1.0)
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            attempts = create.await_count
+            pool._schedule_publisher_restore()  # closing: not restarted
+            await asyncio.sleep(0.05)
+        assert task.done()
+        assert pool._restore_task is None
+        assert create.await_count == attempts
+
+    @pytest.mark.asyncio
+    async def test_close_all_past_its_timeout_abandons_the_connections(self) -> None:
+        pool = _fast_retry_pool()
+        pub, con = _conn(), _conn()
+        pub.close = AsyncMock(side_effect=_never)
+        con.close = AsyncMock(side_effect=_never)
+        _with_publisher(pool, pub)
+        pool._consumer_connection = con
+        await asyncio.wait_for(pool.close_all(timeout=0.05), timeout=2.0)
+        await asyncio.sleep(0)  # let the detached closes start
+        assert pool._publisher_connection is None and pool._consumer_connection is None
+        assert pool._publisher_channel_pool is None
+        assert pub.close.await_count >= 1 and con.close.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_connect_after_close_allows_restores_again(self) -> None:
+        pool = _fast_retry_pool()
+        await pool.close_all(timeout=1.0)
+        assert pool._closing
+        with patch.object(AsyncConnectionPool, "_create_connection", new=AsyncMock(side_effect=lambda **_: _conn())):
+            await pool.connect()
+        assert not pool._closing
+        await pool.close_all(timeout=1.0)
+
+
+class TestAbandon:
+    @pytest.mark.asyncio
+    async def test_abandon_closes_the_pool_wakes_waiters_and_closes_channels(self) -> None:
+        held = _channel()
+        pool = AsyncChannelPool(_conn(held), pool_size=1, acquire_timeout=5.0)
+        assert await pool.acquire() is held
+        waiter = asyncio.create_task(pool.acquire())
+        await asyncio.sleep(0)
+        pool.abandon()
+        with pytest.raises(ChannelPoolClosedError):
+            await asyncio.wait_for(waiter, timeout=1.0)
+        await asyncio.sleep(0)
+        held.close.assert_awaited()
+        assert pool.closed
+        assert pool.in_use_count == 0

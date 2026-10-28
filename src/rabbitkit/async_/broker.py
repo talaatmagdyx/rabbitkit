@@ -983,9 +983,12 @@ class AsyncBroker:
         # anything, so nothing new arrives while the pool/in-flight drain runs.
         if self._transport is None:  # pragma: no cover — defensive (assert was stripped under -O)
             return
+        # Every step below is bounded by the overall deadline, including the
+        # ones that talk to the broker: during a partition a cancel or a close
+        # is never answered, and stop() used to wait for the network to heal.
         for route in self._registry.routes:
             if route.consumer_tag:
-                await self._transport.cancel_consumer(route.consumer_tag)
+                await self._transport.cancel_consumer(route.consumer_tag, timeout=self._remaining(deadline))
 
         # Drain the worker pool (let in-flight pooled tasks finish), bounded by
         # the outer deadline.
@@ -1012,12 +1015,14 @@ class AsyncBroker:
 
         # Close RPC client if used
         if self._rpc_client is not None:
-            await self._rpc_client.close()
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(self._remaining(deadline)):
+                    await self._rpc_client.close()
             self._rpc_client = None
 
         # Disconnect
         if self._transport:
-            await self._transport.disconnect()
+            await self._transport.disconnect(timeout=self._remaining(deadline))
 
         self._started = False
         self._set_lifecycle_gauges(connected=False)

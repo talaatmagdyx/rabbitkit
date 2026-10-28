@@ -1282,6 +1282,26 @@ class TestDisconnectEdgeCases:
         await transport.disconnect()
         assert not transport.is_connected()
 
+    async def test_disconnect_is_bounded_when_channel_closes_hang(self) -> None:
+        """F20: a partitioned broker never answers Close. disconnect(timeout)
+        skips the remaining channel closes and still closes the connections."""
+        transport = await self._connected_transport()
+        stuck = MagicMock()
+        stuck.is_closed = False
+
+        async def never() -> None:
+            await asyncio.Event().wait()
+
+        stuck.close = never
+        transport._consumer_channels["q1"] = stuck
+        transport._consumer_tags["q1"] = "tag"
+        with patch.object(transport._conn_pool, "close_all", new_callable=AsyncMock) as close_all:
+            await asyncio.wait_for(transport.disconnect(timeout=0.05), timeout=2.0)
+        close_all.assert_awaited_once()
+        assert close_all.call_args.kwargs["timeout"] is not None
+        assert transport._consumer_channels == {} and transport._consumer_tags == {}
+        assert not transport.is_connected()
+
     async def test_disconnect_outer_exception_is_logged(self) -> None:
         """Lines 115-116: exception from close_all() is caught by outer handler."""
         transport = await self._connected_transport()
@@ -1494,6 +1514,29 @@ class TestCancelConsumerEdgeCases:
         assert not transport.is_connected()
         # Should not raise
         await transport.cancel_consumer("rabbitkit.some-tag")
+
+    async def test_cancel_consumer_that_is_never_answered_is_bounded_and_forgotten(self) -> None:
+        """F20: during a partition Basic.CancelOk never arrives; the cancel
+        gives up at its timeout, forgets the consumer and drops aio-pika's
+        restore record so a reconnect cannot bring it back."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+
+        mock_queue = AsyncMock()
+
+        async def never(tag: str) -> None:
+            await asyncio.Event().wait()
+
+        mock_queue.cancel = never
+        channel.get_queue = AsyncMock(return_value=mock_queue)
+        tag = await transport.consume("orders", AsyncMock())
+        transport._consumer_supervisor.unregister("orders")  # cancel via get_queue()
+        mock_queue._consumers = {tag: object()}
+
+        await asyncio.wait_for(transport.cancel_consumer(tag, timeout=0.05), timeout=2.0)
+
+        assert tag not in mock_queue._consumers
+        assert "orders" not in transport._consumer_tags
 
     async def test_cancel_consumer_exception_is_logged(self) -> None:
         """Lines 305-306: exception from q.cancel() is caught and logged."""

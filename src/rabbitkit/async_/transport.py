@@ -675,51 +675,75 @@ class AsyncTransportImpl:
         # method must be __aexit__.
         await self.disconnect()
 
-    async def disconnect(self) -> None:
-        """Close all channels and connections."""
+    async def disconnect(self, timeout: float | None = None) -> None:
+        """Close all channels and connections, within *timeout* seconds.
+
+        Channels are closed first; if the broker stops answering (a
+        partition) the remaining channel closes are skipped and the
+        connections are closed, or abandoned, within what is left.
+        """
         if not self._connected:
             return
 
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+
+        def left() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
         try:
-            await self._consumer_supervisor.stop()
-            for monitor in self._blocked_monitors:
-                await monitor.stop()
-            self._blocked_monitors.clear()
-            self._blocked_state = False
-
-            # Close per-queue consumer channels
-            for ch in list(self._consumer_channels.values()):
-                try:
-                    if not ch.is_closed:
-                        await ch.close()
-                except Exception:
-                    pass
-            self._consumer_channels.clear()
-            self._consumer_tags.clear()
-            self._reply_to_channel = None
-
-            # Close topology channel
-            if self._topology_channel is not None and not self._topology_channel.is_closed:
-                try:
-                    await self._topology_channel.close()
-                except Exception:
-                    pass
-            self._topology_channel = None
-
-            # Close fast publish channel (no-confirm persistent path)
-            if self._fast_publish_channel is not None and not self._fast_publish_channel.is_closed:
-                try:
-                    await self._fast_publish_channel.close()
-                except Exception:  # pragma: no cover — best effort close, network errors only
-                    pass
-            self._fast_publish_channel = None
-
-            await self._conn_pool.close_all()  # includes the mandatory-publish channels
+            try:
+                async with asyncio.timeout(left()):
+                    await self._close_channels()
+            except TimeoutError:
+                logger.warning("Closing RabbitMQ channels timed out; closing the connections")
+            finally:
+                self._consumer_channels.clear()
+                self._consumer_tags.clear()
+                self._reply_to_channel = None
+                self._topology_channel = None
+                self._fast_publish_channel = None
+            await self._conn_pool.close_all(timeout=left())  # includes the mandatory-publish channels
         except Exception as e:
             logger.warning("Error during disconnect: %s", e)
         finally:
             self._connected = False
             logger.info("Disconnected from RabbitMQ (async)")
+
+    async def _close_channels(self) -> None:
+        """Stop the consumer supervisor and blocked monitors, then close every channel."""
+        await self._consumer_supervisor.stop()
+        for monitor in self._blocked_monitors:
+            await monitor.stop()
+        self._blocked_monitors.clear()
+        self._blocked_state = False
+
+        # Close per-queue consumer channels
+        for ch in list(self._consumer_channels.values()):
+            try:
+                if not ch.is_closed:
+                    await ch.close()
+            except Exception:
+                pass
+        self._consumer_channels.clear()
+        self._consumer_tags.clear()
+        self._reply_to_channel = None
+
+        # Close topology channel
+        if self._topology_channel is not None and not self._topology_channel.is_closed:
+            try:
+                await self._topology_channel.close()
+            except Exception:
+                pass
+        self._topology_channel = None
+
+        # Close fast publish channel (no-confirm persistent path)
+        if self._fast_publish_channel is not None and not self._fast_publish_channel.is_closed:
+            try:
+                await self._fast_publish_channel.close()
+            except Exception:  # pragma: no cover — best effort close, network errors only
+                pass
+        self._fast_publish_channel = None
 
     def is_connected(self) -> bool:
         """Check if connected to RabbitMQ, right now.
@@ -1603,8 +1627,12 @@ class AsyncTransportImpl:
         # m3: recorded for post-reconnect re-apply — see bind_queue.
         self._record_binding(("exchange", destination, source, routing_key, arguments))
 
-    async def cancel_consumer(self, consumer_tag: str) -> None:
-        """Cancel a consumer by tag.
+    async def cancel_consumer(self, consumer_tag: str, *, timeout: float | None = None) -> None:
+        """Cancel a consumer by tag, waiting at most *timeout* for the broker.
+
+        A cancel the broker does not answer in time (a partition) is handled
+        like a failed one: the consumer is forgotten locally and aio-pika's
+        restore record is dropped, so a later reconnect cannot resurrect it.
 
         CONSUMER-007: the cancel goes through the queue object the consumer
         was started on. aio-pika's robust restore re-subscribes every
@@ -1640,7 +1668,8 @@ class AsyncTransportImpl:
                             q = record.queue_obj
                         else:
                             q = await channel.get_queue(queue_name, ensure=False)
-                        await q.cancel(consumer_tag)
+                        async with asyncio.timeout(timeout):
+                            await q.cancel(consumer_tag)
                     except Exception as e:
                         logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
                         # aio-pika 9.x drops its restore record only after

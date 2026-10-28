@@ -210,9 +210,12 @@ loss but a duplicate (the broker redelivers): see [Idempotency](#idempotency).
 does not resubscribe them); hand prefetched-but-not-started worker-pool
 deliveries back at once (nack, requeue); give in-flight handlers
 `graceful_timeout`; then cancel them, wait at most 1 s more, and nack the rest
-for redelivery. Then the publisher shuts down (above). `stop()` is bounded
-even if a handler swallows cancellation, but **not during a network
-partition**: see [Verified failure scenarios](#verified-failure-scenarios).
+for redelivery. Then the publisher shuts down (above). Every step is bounded
+by the `stop()` deadline, including the ones that talk to the broker, so
+`stop()` returns on time even if a handler swallows cancellation or the
+network is partitioned (a consumer cancel or connection close the broker
+never answers is abandoned at the deadline, and the abandoned connection
+cannot reconnect): see [Verified failure scenarios](#verified-failure-scenarios).
 
 Signals: `broker.run()` and `start(install_signal_handlers=True)` install
 SIGINT/SIGTERM handlers and `stop()` restores the previous ones; a handler an
@@ -266,7 +269,7 @@ request; the multi-node scenarios are slow and run nightly
 |---|---|
 | Broker `basic.nack` (a full `x-overflow=reject-publish` queue) | `NACKED`, reason `nacked`, never republished; `publish_many` reports `NACKED` per item. Async and sync |
 | Quorum loss: 2 of 3 nodes of a 3-replica quorum queue stopped | Publishes resolve `TIMEOUT` at `confirm_timeout`, never `CONFIRMED`, and do not hang. Once the nodes return, publishing confirms again (10 to 18 s after the loss began, in local runs). Every `CONFIRMED` message is in the queue exactly once. Async and sync |
-| Network partition (toxiproxy blackhole: bytes dropped, TCP left open), both directions or broker-to-client only | The publish on the wire resolves `TIMEOUT`, never `CONFIRMED`. Publishes queued behind it resolve `NOT_SENT`. Readiness reports not connected. After the partition heals, the consumer reconnects and resubscribes on its own, publishing confirms again, and no `CONFIRMED` message is lost. Async |
+| Network partition (toxiproxy blackhole: bytes dropped, TCP left open), both directions or broker-to-client only | The publish on the wire resolves `TIMEOUT`, never `CONFIRMED`. Publishes queued behind it resolve `NOT_SENT`, each within its own admission budget however many are queued. Readiness reports not connected. After the partition heals, the consumer reconnects and resubscribes on its own, the publisher connection is restored in the background (readiness recovers with no publish traffic), publishing confirms again, and no `CONFIRMED` message is lost. `stop(timeout)` during the partition returns within its timeout. Async |
 | Silent partition, no traffic | Detected only by the heartbeat. With `heartbeat=2`, about 9 s when only the broker-to-client direction is cut (aiormq gives up after `(heartbeat + 1) × 3` s), and about 6 s when both are cut (the broker drops its side after 2 missed heartbeats). Budget about 5 × `heartbeat`, not 2 × |
 
 A `TIMEOUT` or `UNKNOWN` publish really can be on the broker. In these runs,
@@ -274,24 +277,13 @@ publishes that timed out during a quorum loss were committed once the
 majority returned. With a one-way partition, the timed-out publish was
 delivered after the reconnect. Republish only with the same `message_id`.
 
-Known defects (async), pinned by strict-xfail tests in the same module:
-
-- **Queued publishes are slow to resolve during a partition.** They resolve
-  one `channel_acquire_timeout` after another rather than each within its own
-  budget: 5 concurrent publishes took 8 to 20 s with a 3 s acquire timeout.
-  The publisher-connection rebuild runs under the pool lock and is not bounded
-  by the caller's deadline.
-- **Readiness needs a publish to recover.** After a partition in which a
-  publisher-connection rebuild failed, the broker reports not connected (and
-  readiness stays down) until the next publish rebuilds the connection, even
-  though the network and the consumer are back. A pod that only publishes
-  when it receives traffic can stay unready.
-- **`stop(timeout)` is not bounded during a partition.** Cancelling the
-  consumers waits for the reconnect, so `stop()` returns only after the
-  network heals. Bounding that step still left `stop(timeout=10)` taking
-  about 34 s. Until this is fixed, bound shutdown from outside (Kubernetes
-  `terminationGracePeriodSeconds`). Killing the process is safe, because
-  unacked deliveries are redelivered.
+Three async defects the partition tests first exposed are fixed and covered by
+the same module: queued publishes now resolve each within its own budget (the
+reconnect is bounded by the caller's deadline instead of serialising callers
+behind one another); a publisher-connection rebuild that fails during a
+partition is retried in the background with the connection's backoff, so
+readiness recovers without publish traffic; and every step of `stop()` is
+bounded by its deadline.
 
 ## Idempotency
 

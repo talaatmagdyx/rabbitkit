@@ -190,7 +190,9 @@ class TestLifecycle:
             await broker.start()
             await broker.stop()
 
-            mock_transport.cancel_consumer.assert_called_once_with("consumer-tag-1")
+            mock_transport.cancel_consumer.assert_called_once()
+            assert mock_transport.cancel_consumer.call_args.args == ("consumer-tag-1",)
+            assert 0 < mock_transport.cancel_consumer.call_args.kwargs["timeout"] <= 30.0  # bounded by stop()
             mock_transport.disconnect.assert_called_once()
 
     @pytest.mark.asyncio

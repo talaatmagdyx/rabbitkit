@@ -83,6 +83,7 @@ updates the moment a connection drops or comes back.
 | `rabbitkit_reconnect_attempts_total` | counter | `role` | broker (BrokerMetrics) | Failed reconnect attempts. |
 | `rabbitkit_connection_failures_total` | counter | `role`, `reason` | broker (BrokerMetrics) | Connections lost, reconnect attempts failed, terminal give-ups. |
 | `rabbitkit_connection_blocked` | gauge | — | broker (BrokerMetrics) | 1 while RabbitMQ blocks the connection (memory/disk alarm). |
+| `rabbitkit_connection_blocked_reason` | gauge | `reason` | broker (BrokerMetrics) | 1 per alarm (disk, memory, other) the active connection.blocked reason names. |
 | `rabbitkit_settlement_pending` | gauge | — | coalescing acker | Registered deliveries not yet settled. |
 | `rabbitkit_settlement_ack_ready` | gauge | — | coalescing acker | Deliveries approved for ack, not yet sent. |
 | `rabbitkit_settlement_frontier` | gauge | — | coalescing acker | Highest tag a cumulative ack could cover. |
@@ -94,6 +95,8 @@ updates the moment a connection drops or comes back.
 | `rabbitkit_queue_messages_unacked` | gauge | `queue` | QueueMetricsPoller | Messages delivered, not yet acked. |
 | `rabbitkit_queue_messages_total` | gauge | `queue` | QueueMetricsPoller | Ready plus unacked. |
 | `rabbitkit_queue_consumers` | gauge | `queue` | QueueMetricsPoller | Consumers attached to the queue. |
+| `rabbitkit_queue_quorum_members` | gauge | `queue` | QueueMetricsPoller | Quorum queues: Raft members configured. |
+| `rabbitkit_queue_quorum_online` | gauge | `queue` | QueueMetricsPoller | Quorum queues: members online (majority = available). |
 | `rabbitkit_health_state` | gauge | — | HealthWatcher | Debounced health: 0 healthy, 1 degraded, 2 unhealthy. |
 <!-- metric-inventory:end -->
 
@@ -113,7 +116,7 @@ emission path and checks each label against it).
 | `queue` | the bound queue name (`x-rabbitkit-original-queue`), never the routing key |
 | `exchange` | the exchange name, `default` for `""` |
 | `status` | `PublishStatus` values (`confirmed`, `sent`, `returned`, `nacked`, `timeout`, `not_sent`, `unknown`, `error`); `success`/`error` on `messages_consumed_total`; the bulk and settlement item statuses |
-| `reason` | `PublishReason` codes, plus `none` (no reason: a success), `exception` (the publish call raised) and `other` (a reason outside `PublishReason`); connection failure reasons (below); bulk reason codes; rate-limit reasons |
+| `reason` | `PublishReason` codes, plus `none` (no reason: a success), `exception` (the publish call raised) and `other` (a reason outside `PublishReason`); connection failure reasons (below); bulk reason codes; rate-limit reasons; `disk` / `memory` / `other` on `connection_blocked_reason` |
 | `category` | `ErrorCategory`: `retryable`, `permanent`, `invalid_message`, `unknown_outcome`, `infrastructure`, `shutdown` |
 | `role` | `publisher`, `consumer` (async, two connections), `shared` (sync, one connection), `connection` (a terminal failure without a role) |
 | `action` | `ack`, `nack`, `reject` |
@@ -163,6 +166,21 @@ connection), `connection_lost` (any other drop), `other`, and the terminal
   `reconnects_total` counts successful ones (one per connection).
 - **`connection_blocked`** is 1 between RabbitMQ's `connection.blocked` and
   `connection.unblocked` (a memory or disk alarm).
+  **`connection_blocked_reason{reason}`** says which: RabbitMQ's blocked
+  reason is `"low on disk"` or `"low on memory"` (both alarms name both), so
+  `reason="disk"` / `"memory"` is 1 while that alarm blocks the connection,
+  and `other` covers any other text. All three are 0 while unblocked. This is
+  the client-side form of the broker's disk and memory alarm metrics; no
+  `rabbitmq_prometheus` plugin is needed. `transport.blocked_reason` has the
+  broker's text. The async transport reads the reason from aiormq, which
+  otherwise only logs it (rabbitkit wraps aiormq's private
+  `connection.blocked` handler to keep it; on an aiormq without that handler
+  the reason is `other`). Limits: RabbitMQ blocks a connection when it next
+  publishes, and sends the reason once, so an alarm raised while the
+  connection is already blocked is not announced again. The sync transport
+  sees `connection.blocked` only when pika runs its callbacks (the consume
+  loop, `pump_idle()`, a publish without confirms); a publish waiting for a
+  confirm on a blocked connection times out first.
 - **`consumer_cancelled_total` / `route_consuming`**: RabbitMQ cancelled a
   consumer (`basic.cancel`); the async broker re-subscribes when the queue
   exists again. The sync broker samples `route_consuming` but cannot detect a
@@ -187,6 +205,13 @@ or died; queue depth lives on the broker, not in your process.
 | `rabbitkit_queue_messages_unacked` | Gauge | `queue` | Delivered but not yet acked. |
 | `rabbitkit_queue_messages_total` | Gauge | `queue` | `ready + unacked`. |
 | `rabbitkit_queue_consumers` | Gauge | `queue` | Consumer count on that queue — `0` means nothing is draining it. |
+| `rabbitkit_queue_quorum_members` | Gauge | `queue` | Quorum queues only: Raft members of the queue. |
+| `rabbitkit_queue_quorum_online` | Gauge | `queue` | Quorum queues only: members online. The queue works while more than half are online. |
+
+The quorum gauges count the `members` and `online` node lists the management
+API reports for every quorum queue (verified on RabbitMQ 3.13 and 4.1; on a
+3-node cluster `online` drops as soon as a member's node stops). They count
+nodes and never label by them, so the only label stays `queue`.
 
 ```python
 from rabbitkit import RabbitManagementClient, QueueMetricsPoller
@@ -199,8 +224,9 @@ poller = QueueMetricsPoller(
 poller.start()  # background daemon thread (sync); poller.start_async() for async brokers
 ```
 
-Alert on `queue_messages_ready` growth and `queue_consumers == 0` — those are
-exactly the signals the in-process counters above cannot provide on their own.
+Alert on `queue_messages_ready` growth, `queue_consumers == 0` and quorum
+members offline: exactly the signals the in-process counters above cannot
+provide on their own.
 
 ## Bulk operations, settlement & retry handoff
 
@@ -322,32 +348,89 @@ logged at CRITICAL.
 is a plain Prometheus rules file (wrap its `groups:` in a `PrometheusRule`
 for the Prometheus Operator). It is checked with `promtool check rules` and
 behaviour-tested with `promtool test rules`
-(`deploy/prometheus/tests/rabbitkit-alerts.test.yaml`). **Every threshold is a
-placeholder** to be tuned from measured workloads.
+(`deploy/prometheus/tests/rabbitkit-alerts.test.yaml`, a positive and a
+negative case per alert). Every threshold is a reasoned default and every
+alert carries a one-line `rationale` annotation saying where its number
+comes from; [Tuning the alerts](#tuning-the-alerts) says how to fit them to
+your SLOs.
+
+Every group except the last needs only rabbitkit's own metrics (plus a
+`QueueMetricsPoller` for the queue rules). The alerts carry
+`source: rabbitkit`.
 
 | Alert | Fires on | Runbook |
 |---|---|---|
-| `PublisherConfirmFailures` | `messages_published_total{status=~"nacked\|error"}` rising | [publisher confirm failures](runbooks/publisher-confirm-timeout.md) |
-| `PublisherUnknownOutcomes` | `messages_published_total{status=~"unknown\|timeout"}` rising | [publisher confirm failures](runbooks/publisher-confirm-timeout.md) |
-| `PublisherUnroutableMessages` | `publish_routing_failures_total` rising | [unroutable](runbooks/unroutable.md) |
+| `PublisherConfirmFailures` | `messages_published_total{status=~"nacked\|error"}` above 0, for 5m | [publisher confirm failures](runbooks/publisher-confirm-timeout.md) |
+| `PublisherUnknownOutcomes` | over 1% of publishes `unknown`/`timeout`, for 10m | [publisher confirm failures](runbooks/publisher-confirm-timeout.md) |
+| `PublisherConfirmLatencyHigh` | confirm latency p99 over 250 ms, for 10m | [publisher confirm failures](runbooks/publisher-confirm-timeout.md) |
+| `PublisherUnroutableMessages` | `publish_routing_failures_total` above 0, for 5m | [unroutable](runbooks/unroutable.md) |
 | `RabbitMQBrokerUnavailable` | `broker_connected == 0` for 2m | [broker unavailable](runbooks/broker-unavailable.md) |
-| `RabbitMQConnectionFailures` | > 5 failed reconnect attempts in 10m, for 10m | [connection storm](runbooks/connection-storm.md) |
+| `RabbitMQConnectionFailures` | over 10 failed reconnect attempts in 5m, for 5m | [connection storm](runbooks/connection-storm.md) |
 | `RabbitMQConnectionTerminalFailure` | a terminal `connection_failures_total` reason | [connection storm](runbooks/connection-storm.md) |
-| `RabbitMQConnectionBlocked` | `connection_blocked == 1` for 1m | [flow control](runbooks/flow-control.md) |
-| `ConsumerProcessingFailures` | > 5% of handler runs raise, for 10m | [consumer failures](runbooks/consumer-failures.md) |
+| `RabbitMQDiskAlarm` | `connection_blocked_reason{reason="disk"}` for most of 2m, for 1m | [flow control](runbooks/flow-control.md) |
+| `RabbitMQMemoryAlarm` | `connection_blocked_reason{reason="memory"}` for most of 2m, for 1m | [flow control](runbooks/flow-control.md) |
+| `RabbitMQConnectionBlocked` | `connection_blocked` for most of 2m, for 1m, when not a disk or memory alarm | [flow control](runbooks/flow-control.md) |
+| `ConsumerProcessingFailures` | over 5% of handler runs raise, for 10m (at least 1 run/min) | [consumer failures](runbooks/consumer-failures.md) |
 | `ConsumerNotConsuming` | `route_consuming == 0` while connected, for 5m | [consumer failures](runbooks/consumer-failures.md) |
-| `ConsumerBacklogGrowing` | `queue_messages_ready` > 1000 and growing, for 15m | [consumer backlog](runbooks/consumer-backlog.md) |
-| `ConsumerUnackedHigh` | `queue_messages_unacked` > 5000 for 15m | [consumer backlog](runbooks/consumer-backlog.md) |
-| `DeadLetterQueueGrowing` | `messages_dead_lettered_total` or a `*.dlq` backlog rising | [DLQ growth](runbooks/dlq-growth.md) |
-| `RetryStormDetected` | retried / consumed > 50%, or `retry_handoff_paused == 1` | [retry storm](runbooks/retry-storm.md) |
-| `RabbitMQDiskAlarm` | broker metric `rabbitmq_alarms_free_disk_space_watermark == 1` | [flow control](runbooks/flow-control.md) |
-| `RabbitMQMemoryAlarm` | broker metric `rabbitmq_alarms_memory_used_watermark == 1` | [flow control](runbooks/flow-control.md) |
-| `RabbitMQQuorumUnhealthy` | broker metrics: fewer nodes than expected, or Raft term churn | [quorum unavailable](runbooks/quorum-unavailable.md) |
+| `ConsumerBacklogGrowing` | backlog drain time over 10 min and growing, for 15m | [consumer backlog](runbooks/consumer-backlog.md) |
+| `ConsumerUnackedHigh` | unacked deliveries while no handler finishes, for 10m | [consumer backlog](runbooks/consumer-backlog.md) |
+| `DeadLetterQueueGrowing` | `messages_dead_lettered_total` or a `*.dlq` backlog rising, for 5m | [DLQ growth](runbooks/dlq-growth.md) |
+| `RetryStormDetected` | over 0.5 retries per handler run (at least 1 run/min), or `retry_handoff_paused == 1`, for 10m | [retry storm](runbooks/retry-storm.md) |
+| `RabbitMQQuorumMajorityLost` | `queue_quorum_online <= queue_quorum_members / 2`, for 1m | [quorum unavailable](runbooks/quorum-unavailable.md) |
+| `RabbitMQQuorumUnhealthy` | `queue_quorum_online < queue_quorum_members` (majority kept), for 5m | [quorum unavailable](runbooks/quorum-unavailable.md) |
 
-The last three use the **broker's** `rabbitmq_prometheus` plugin metrics, not
-rabbitkit's: a client only sees `connection.blocked`, not which alarm caused
-it, and cannot see Raft state. Verify those metric names against your
-RabbitMQ version.
+The `rabbitkit-recording` group records the ratios the alerts compare
+(`job_exchange:rabbitkit_publish_unknown_ratio:rate5m`,
+`job_exchange:rabbitkit_publish_confirm_latency_seconds:p99_5m`,
+`job_queue:rabbitkit_consume_error_ratio:rate5m`,
+`job_queue:rabbitkit_retry_ratio:rate5m`, ...); they are also the series to
+put on a dashboard.
+
+**Alternative: the broker's `rabbitmq_prometheus` plugin.** The last group,
+`rabbitmq-broker-plugin`, has `RabbitMQDiskAlarm`, `RabbitMQMemoryAlarm` and
+a cluster-level `RabbitMQQuorumUnhealthy` on the plugin's own metrics, with
+`source: rabbitmq_prometheus`. Load it only when Prometheus scrapes the
+plugin; it sees an alarm before any client publishes, the client-side rules
+see what actually blocks your services. With both loaded, route or inhibit
+on `source`. Verify the metric names against your RabbitMQ version.
+
+## Tuning the alerts
+
+The defaults come from three places: the documented contract (a `NACKED`
+publish, an unroutable publish and a dead-lettered message never happen in a
+healthy system, so their threshold is any), `ConnectionConfig` defaults
+(`reconnect_backoff_base=1`, `reconnect_backoff_max=30`,
+`blocked_connection_timeout=60`, `heartbeat=30`) and the measured numbers in
+[benchmarking](benchmarking.md) and
+[reliable messaging](reliable-messaging.md#verified-failure-scenarios)
+(quorum end-to-end p99 27.5 ms at 2,778 msg/s, a 200,000-message burst
+drained in 5–7.5 s, quorum loss recovered 10–18 s after the nodes return,
+silent-partition detection about 5 × `heartbeat`). Those numbers come from
+a single-node broker on one machine; measure your own cluster before
+paging on anything tighter.
+
+Most thresholds are ratios or times, so they do not depend on traffic.
+What to change, and how:
+
+| Knob | Default | Derive it from |
+|---|---|---|
+| `PublisherUnknownOutcomes` ratio | 1% | Your publish success SLO, as a burn rate. For "99.9% of publishes confirmed" over 30 days, a ratio above `14.4 × 0.001` held for an hour spends 2% of the month's error budget: the usual fast-burn page. |
+| `PublisherConfirmLatencyHigh` p99 | 250 ms | Your publish latency SLO, and at most a fraction of `PublisherConfig.confirm_timeout` (5 s): when p99 nears the timeout, publishes start resolving `TIMEOUT`. Multi-node quorum clusters add Raft round trips; measure p99 there first. |
+| `RabbitMQBrokerUnavailable` `for:` | 2m | Your availability SLO's tolerance for a broker restart. Keep it above the time a restart takes to recover (backoff caps at `reconnect_backoff_max`); a silent partition is only detected after about 5 × `heartbeat`, before this timer starts. |
+| `RabbitMQConnectionFailures` count | > 10 per 5m | `reconnect_backoff_base` / `reconnect_backoff_max`: full-jitter backoff averages `min(max, base × 2ⁿ) / 2` per attempt, about 8 attempts in the first 60 s with the defaults and 60 / (max / 2) a minute after that. Set the count above what one restart costs. |
+| Blocked / alarm alerts | most of 2m, for 1m | `blocked_connection_timeout`: keep the averaging window above it, because the forced reconnect it triggers unblocks the gauge until the next publish. |
+| `ConsumerProcessingFailures` ratio | 5% | The handler error budget; each failure is re-run by retries, so the ratio is also extra load. |
+| `ConsumerBacklogGrowing` drain time | 600 s | Your end-to-end latency SLO: a backlog that takes longer than the SLO to drain is already violating it. |
+| `ConsumerUnackedHigh` window | 10m | Longer than your slowest legitimate handler run (and its timeout). |
+| `RetryStormDetected` ratio | 0.5 retries per run | `RetryConfig.max_retries`: with N retries a permanently failing input produces up to N retries per new message, so lower the ratio for a large N. |
+| `RabbitMQQuorumUnhealthy` `for:` | 5m | How long one node of a rolling restart takes to rejoin. |
+| Minimum traffic guards | 1 handler run/min, 0.1 confirms/s | Below these a ratio or a p99 rests on a handful of samples. Lower them for low-volume queues, or alert on counts instead. |
+
+Example: a service with a "95% of messages processed within 30 s" objective
+sets the drain-time threshold to 30 and `for: 5m`, and keeps the rest.
+Another that publishes 5 messages an hour drops both minimum-traffic guards
+and alerts on `increase(...[1h]) > 0` for the error counters instead of
+ratios.
 
 ## High-cardinality routing keys / queue names
 

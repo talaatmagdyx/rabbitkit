@@ -117,7 +117,7 @@ middlewares).
 | Returns, but its result publish is not `ok` | — | nack(requeue) | same |
 | Raises a transient error (`TimeoutError`, `OSError`/`ConnectionError`, `EOFError`) | `RETRYABLE` | copy to `<queue>.retry.<n>` (mandatory, confirmed), then ack | first delivery: nack(requeue); redelivery (`redelivered=True`): reject → DLQ (`reject_transient_on_redelivery`, default on) |
 | Raises an AMQP client error or `InfrastructureError` | `INFRASTRUCTURE` | as `RETRYABLE` | as `RETRYABLE` |
-| Exceeds `ConsumerConfig.processing_timeout` (async only) | `UNKNOWN_OUTCOME` | task cancelled, then as `RETRYABLE` | as `RETRYABLE` |
+| Exceeds `ConsumerConfig.processing_timeout` | `UNKNOWN_OUTCOME` | async: task cancelled; sync: settled at the deadline, handler thread left running (see [Processing deadline](#processing-deadline-processing_timeout)). Then first delivery: nack(requeue); redelivery: reject → DLQ. The deadline wraps the retry middleware, so no retry copy is made | same |
 | Raises anything else (unclassified) or a permanent error | `PERMANENT` | confirmed DLQ copy with failure metadata, then ack | reject → source queue's DLX → `<queue>.dlq` |
 | Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
 | Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler (copy with metadata first when `dead_letter_with_metadata`, e.g. under CRITICAL) | same |
@@ -149,6 +149,51 @@ Rules:
 - If the ack after a successful handler fails, the outcome is unknown: logged
   and counted, nothing else is sent; the handler runs again if the broker
   redelivers.
+
+### Processing deadline (`processing_timeout`)
+
+`ConsumerConfig.processing_timeout` (seconds, default off; the CRITICAL
+profile requires it) bounds each handler run on both brokers. The deadline
+starts when the handler starts (not while a delivery waits for a worker) and
+covers the route's middlewares and the handler. When it passes, the delivery
+is settled as a `HandlerTimeoutError` (`UNKNOWN_OUTCOME`, transient): the
+first delivery is nack-requeued, a redelivery is rejected into the DLQ, and
+the failure line logs `outcome_unknown=True`. Handlers must be idempotent:
+the timed-out run's side effects may or may not have happened.
+
+- **`AsyncBroker`** cancels the handler task.
+- **`SyncBroker`** cannot interrupt a thread. Handlers run off the I/O thread
+  (on the worker pool; with `worker_count=1`, on one dedicated handler thread
+  that keeps the inline path's order and one-at-a-time processing), and the
+  I/O thread settles the delivery at the deadline, within about
+  `min(1 s, processing_timeout / 4)` of it. The handler thread is **not
+  stopped**: it keeps its worker until it returns, so at most `worker_count`
+  handlers ever run, and a handler that never returns holds its worker for
+  good (with `worker_count=1` the route then stops taking deliveries). When
+  it returns, its result is discarded and logged: settlement is claimed once
+  per delivery, so its ack/nack/reject is dropped, and its handler-result,
+  retry and DLQ publishes are refused (`NOT_SENT`, reason `cancelled`).
+  Publishes the handler makes itself (`broker.publish()`) are its own side
+  effects and are not blocked. While a deadline is set, sync handlers never
+  run on the I/O thread, so a handler that relies on running on the thread
+  that called `start()` (thread-local state, `broker.request()`) needs the
+  deadline off. `TimeoutMiddleware` remains available but starts a thread per
+  message; prefer `processing_timeout`.
+
+### Broker-cancelled consumers
+
+RabbitMQ cancels a consumer itself (`basic.cancel`) when its queue is
+deleted, a quorum queue's leader moves, or an operator closes it. Both
+brokers detect it at once (the sync broker through pika's channel cancel
+callback), log a WARNING, report the route as not consuming
+(`RouteRuntimeState.consumer_cancelled`: health and readiness drop it,
+`route_consuming` goes to 0, `consumer_cancelled_total` counts it), call
+`broker.on_consumer_cancelled(queue)`, and re-subscribe with the same
+consumer tag once a passive declare finds the queue again (probes back off
+from 1 s, doubling, to 30 s), then call `broker.on_consumer_resumed(queue)`.
+They never re-create the queue. `SyncBroker` probes and re-subscribes on its
+I/O thread, from the consume loop (`run()`), never from a worker thread, and
+calls both hooks there.
 
 ### Retry and DLQ guarantees
 
@@ -271,6 +316,8 @@ request; the multi-node scenarios are slow and run nightly
 | Broker `basic.nack` (a full `x-overflow=reject-publish` queue) | `NACKED`, reason `nacked`, never republished; `publish_many` reports `NACKED` per item. Async and sync |
 | Quorum loss: 2 of 3 nodes of a 3-replica quorum queue stopped | Publishes resolve `TIMEOUT` at `confirm_timeout`, never `CONFIRMED`, and do not hang. Once the nodes return, publishing confirms again (10 to 18 s after the loss began, in local runs). Every `CONFIRMED` message is in the queue exactly once. Async and sync |
 | Network partition (toxiproxy blackhole: bytes dropped, TCP left open), both directions or broker-to-client only | The publish on the wire resolves `TIMEOUT`, never `CONFIRMED`. Publishes queued behind it resolve `NOT_SENT`, each within its own admission budget however many are queued. Readiness reports not connected. After the partition heals, the consumer reconnects and resubscribes on its own, the publisher connection is restored in the background (readiness recovers with no publish traffic), publishing confirms again, and no `CONFIRMED` message is lost. `stop(timeout)` during the partition returns within its timeout. Async |
+| A queue deleted under a running consumer, then re-created | Health and readiness report the route as not consuming and `on_consumer_cancelled` fires; nothing re-creates the queue; once it is declared again the consumer re-subscribes, `on_consumer_resumed` fires and new messages are handled by exactly one consumer. Async (aio-pika 9 and 10) and sync (inline and worker pool; the hooks run on the I/O thread) |
+| A handler that sleeps past `processing_timeout` | The first delivery is requeued and the redelivery dead-lettered within about the deadline of each run; with one sync worker the redelivery waits for the timed-out handler to return. Sync: both late returns settle nothing (the consumer's channel stays open and keeps consuming), and a late result publish is not sent. Async and sync |
 | Silent partition, no traffic | Detected only by the heartbeat. With `heartbeat=2`, about 9 s when only the broker-to-client direction is cut (aiormq gives up after `(heartbeat + 1) × 3` s), and about 6 s when both are cut (the broker drops its side after 2 missed heartbeats). Budget about 5 × `heartbeat`, not 2 × |
 
 A `TIMEOUT` or `UNKNOWN` publish really can be on the broker. In these runs,
@@ -429,6 +476,7 @@ not perform as `UNVERIFIED`, never as passed. `policy_templates()` renders
 policies (at-least-once dead-lettering, `reject-publish`, delivery limits) for
 whoever owns the cluster to apply.
 
-`processing_timeout` and `max_in_flight_bytes` are enforced by `AsyncBroker`
-only. `SyncBroker` logs that it ignores `processing_timeout`; use
-`TimeoutMiddleware` there.
+`max_in_flight_bytes` is enforced by `AsyncBroker` only. `processing_timeout`
+is enforced by both brokers; on `SyncBroker` the timed-out handler thread
+keeps running until it returns (see
+[Processing deadline](#processing-deadline-processing_timeout)).

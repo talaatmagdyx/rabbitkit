@@ -183,8 +183,7 @@ class ConnectionConfig:
             _, sep, port = node.partition(":")
             if sep and not port.isdigit():
                 raise ConfigValidationError(
-                    f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; "
-                    "use 'host' or 'host:port'."
+                    f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; use 'host' or 'host:port'."
                 )
         if self.reconnect_max_attempts < 1:
             raise ConfigValidationError(
@@ -206,8 +205,7 @@ class ConnectionConfig:
                 )
             if not isinstance(key, str) or not isinstance(cp_value, str):
                 raise ConfigValidationError(
-                    f"ConnectionConfig.client_properties keys and values must be "
-                    f"strings, got {key!r}={cp_value!r}."
+                    f"ConnectionConfig.client_properties keys and values must be strings, got {key!r}={cp_value!r}."
                 )
             if len(cp_value) > _CLIENT_PROPERTY_VALUE_MAX_LEN:
                 raise ConfigValidationError(
@@ -481,13 +479,16 @@ class ConsumerConfig:
             through something other than ``RabbitMessage`` (a raw channel or
             a coalescing acker) and then re-raises: the pipeline cannot see
             that settlement and would settle the delivery a second time.
-        processing_timeout: per-delivery handler deadline in seconds,
-            async broker only (``None`` = off, the default). On expiry the
-            handler task is cancelled and ``HandlerTimeoutError``
+        processing_timeout: per-delivery handler deadline in seconds
+            (``None`` = off, the default). On expiry ``HandlerTimeoutError``
             (``outcome_unknown=True``, transient) goes through the normal
-            failure settlement. The sync broker ignores it (Python cannot
-            interrupt a thread) and logs a warning; use
-            ``TimeoutMiddleware`` there.
+            failure settlement. Async: the handler task is cancelled. Sync:
+            the I/O thread settles the delivery at the deadline, but Python
+            cannot interrupt a thread, so the handler keeps running (and
+            keeps its worker) until it returns; its late result is
+            discarded. With it set, sync handlers always run off the I/O
+            thread: on the worker pool, or with ``worker_count=1`` on one
+            dedicated handler thread (see ``docs/concurrency-model.md``).
         max_body_bytes: raw-body cap for deliveries, in bytes (``None`` =
             no cap, the default). A delivery whose body as received (before
             decompression or any ``on_receive`` hook) is larger is
@@ -520,9 +521,7 @@ class ConsumerConfig:
                 "buffered in process memory)."
             )
         if self.graceful_timeout <= 0:
-            raise ConfigValidationError(
-                f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}"
-            )
+            raise ConfigValidationError(f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}")
         if self.processing_timeout is not None and self.processing_timeout <= 0:
             raise ConfigValidationError(
                 f"ConsumerConfig.processing_timeout must be > 0 or None, got {self.processing_timeout}"
@@ -607,9 +606,7 @@ class RetryHandoffConfig:
 
     def __post_init__(self) -> None:
         if self.backoff_initial <= 0:
-            raise ConfigValidationError(
-                f"RetryHandoffConfig.backoff_initial must be > 0, got {self.backoff_initial}"
-            )
+            raise ConfigValidationError(f"RetryHandoffConfig.backoff_initial must be > 0, got {self.backoff_initial}")
         if self.backoff_max < self.backoff_initial:
             raise ConfigValidationError(
                 f"RetryHandoffConfig.backoff_max ({self.backoff_max}) must be >= backoff_initial "
@@ -779,14 +776,11 @@ class RetryConfig:
                 f"RetryConfig.error_detail must be 'sanitized', 'omit' or 'raw', got {self.error_detail!r}"
             )
         if self.jitter_mode not in ("off", "sharded"):
-            raise ConfigValidationError(
-                f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}"
-            )
+            raise ConfigValidationError(f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}")
         if self.jitter_mode == "sharded":
             if self.jitter_shards < 2:
                 raise ConfigValidationError(
-                    f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', "
-                    f"got {self.jitter_shards}"
+                    f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', got {self.jitter_shards}"
                 )
             if not (0 < self.jitter_factor < 1):
                 raise ConfigValidationError(
@@ -819,7 +813,6 @@ class RetryConfig:
             if self.strict_delays:
                 raise ConfigValidationError(msg)
             warnings.warn(msg, UserWarning, stacklevel=2)
-
 
     @classmethod
     def exponential(
@@ -1437,8 +1430,7 @@ class DeduplicationConfig:
             )
         if self.on_in_flight not in ("nack_requeue", "ack_skip"):
             raise ConfigValidationError(
-                f"DeduplicationConfig.on_in_flight must be 'nack_requeue' or "
-                f"'ack_skip'; got {self.on_in_flight!r}"
+                f"DeduplicationConfig.on_in_flight must be 'nack_requeue' or 'ack_skip'; got {self.on_in_flight!r}"
             )
         if self.processing_timeout <= 0:
             raise ConfigValidationError(
@@ -1549,13 +1541,9 @@ class BatchPublishConfig:
                 f"BatchPublishConfig.flush_interval_ms must be >= 0, got {self.flush_interval_ms}"
             )
         if self.max_in_flight <= 0:
-            raise ConfigValidationError(
-                f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}"
-            )
+            raise ConfigValidationError(f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}")
         if self.flush_workers < 0:
-            raise ConfigValidationError(
-                f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}"
-            )
+            raise ConfigValidationError(f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}")
 
 
 #: Settlement modes accepted by ``BatchAckConfig.mode``.
@@ -1623,7 +1611,9 @@ class WorkerConfig:
       handlers of one queue run concurrently -- ``worker_count=1`` does
       **not** serialize async handlers. Use ``prefetch_count=1`` (or a
       lock in the handler) for one-at-a-time processing. On the **sync**
-      broker handlers run inline on the I/O thread, one at a time.
+      broker handlers run inline on the I/O thread, one at a time (with
+      ``ConsumerConfig.processing_timeout`` set: one at a time on one
+      dedicated handler thread, so the I/O thread can enforce the deadline).
 
     ``stop_timeout`` (H12): a FALLBACK drain deadline for the worker pool's
     ``stop()`` — consulted only when no explicit timeout is passed. On the

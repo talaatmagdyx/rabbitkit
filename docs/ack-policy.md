@@ -107,10 +107,11 @@ Never use `ACK_FIRST` for financial transactions, order processing, or any flow 
 
 ## Handler deadline (`processing_timeout`)
 
-`ConsumerConfig(processing_timeout=30.0)` gives every handler on an async
-broker a deadline (default `None`, off). When it expires the handler task is
-cancelled and `HandlerTimeoutError` goes through the failure settlement
-above. It is transient, and it carries `outcome_unknown=True`: the handler
+`ConsumerConfig(processing_timeout=30.0)` gives every handler a deadline
+(default `None`, off). When it expires, `HandlerTimeoutError` goes through the
+failure settlement above: the async broker cancels the handler task; the sync
+broker settles the delivery from its I/O thread and lets the handler thread
+run to its end, discarding its late result. It is transient, and it carries `outcome_unknown=True`: the handler
 was cut off part-way, so its side effects may or may not have happened. The
 failure log says so (`outcome_unknown=True`), and `classify_error` reports
 it on `ClassifiedError.outcome_unknown`. Retrying it is only safe for
@@ -118,9 +119,11 @@ idempotent handlers.
 
 Only the deadline produces `HandlerTimeoutError`. A `TimeoutError` raised by
 the handler's own code (an HTTP client timeout, say) stays an ordinary
-transient error. The sync broker cannot interrupt a running thread, so it
-ignores `processing_timeout` and logs a warning; use `TimeoutMiddleware`
-there (it abandons the thread rather than stopping it).
+transient error. The sync broker cannot interrupt a running thread: with a
+deadline set it runs handlers off the I/O thread (one dedicated thread when
+`worker_count=1`), and a timed-out handler keeps its worker until it
+returns. See
+[Reliable Messaging](reliable-messaging.md#processing-deadline-processing_timeout).
 
 ## When the ack itself fails
 

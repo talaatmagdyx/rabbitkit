@@ -1051,3 +1051,29 @@ class TestAsyncWorkerPoolReleasesQueued:
             await pool.stop(timeout=0.05)
         assert frames == ["ack"]
         assert message.settlement_outcome_unknown is True
+
+
+class TestSyncWorkerPoolThreaded:
+    """``threaded=True``: one worker still runs off the caller's thread (the
+    sync broker's processing_timeout needs the I/O thread free)."""
+
+    def test_single_worker_runs_on_a_dedicated_thread(self) -> None:
+        import threading
+
+        from rabbitkit.core.message import RabbitMessage
+
+        pool = SyncWorkerPool(config=WorkerConfig(worker_count=1), threaded=True)
+        pool.start()
+        ran_on: list[int] = []
+        done = threading.Event()
+
+        def callback(message: RabbitMessage) -> None:
+            ran_on.append(threading.get_ident())
+            done.set()
+
+        try:
+            pool.submit(callback, RabbitMessage(body=b""))
+            assert done.wait(5)
+            assert ran_on and ran_on[0] != threading.get_ident()
+        finally:
+            pool.stop(timeout=2)

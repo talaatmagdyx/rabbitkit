@@ -68,6 +68,7 @@ class RabbitMessage:
         "_reject_async_fn",
         "_reject_fn",
         "_settle_unknown",
+        "_settlement_metric_once",
         "_wire_body",
         "_wire_content_encoding",
         "app_id",
@@ -158,6 +159,10 @@ class RabbitMessage:
         # G-15: True when a claimed async settlement's transport call raised
         # or was cancelled -- the frame may or may not have reached the broker.
         self._settle_unknown = False
+        # One-element token taken (``pop()``) by the first settlement-metric
+        # emission when two threads may report the same delivery (the sync
+        # processing deadline and its late handler); None = no such race.
+        self._settlement_metric_once: list[None] | None = None
         # Transport-injected liveness probe for the channel this delivery
         # arrived on (``lambda: channel.is_open``). Delivery tags are only
         # meaningful on their own channel generation; ``ack_many`` /

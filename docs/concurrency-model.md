@@ -16,7 +16,10 @@ them from.
 |---|---|---|
 | `SyncBroker.start()/run()/stop()` / transport ops | the **owner thread** (the thread that called `start()`) | owner thread only |
 | Sync handlers (default, `worker_count=1`) | the owner/I-O thread, inline | n/a (invoked by the broker) |
+| Sync handlers (`worker_count=1` with `ConsumerConfig.processing_timeout`) | one dedicated `SyncWorkerPool` daemon thread (same order, one at a time) | n/a |
 | Sync handlers (`worker_count>1`) | `SyncWorkerPool` daemon threads | n/a |
+| Sync `processing_timeout` checks and settlement of an expired delivery | the owner/I-O thread (consume-loop tick, and the `stop()` drain) | internal |
+| Sync re-subscription of a broker-cancelled consumer, `on_consumer_cancelled` / `on_consumer_resumed` hooks | the owner/I-O thread (pika's cancel callback, consume-loop tick) | internal |
 | `message.ack()/nack()/reject()` (sync) | any handler thread — marshalled to the I/O thread internally | the thread running that handler |
 | `SyncBroker.pump_idle()` | — | owner thread only |
 | `broker.publish()` (sync) | — | owner thread only |
@@ -69,6 +72,45 @@ this is why one was deliberately not added.
   `add_callback_threadsafe` and block for the result (bounded by an
   I/O-stall timeout). Handlers never touch the channel directly.
 
+### Processing deadline (`processing_timeout`)
+
+A thread cannot be killed, so the sync deadline works by keeping the I/O
+thread free and letting it settle on the handler's behalf:
+
+- With `ConsumerConfig.processing_timeout` set, handlers never run inline:
+  `worker_count>1` uses the pool as usual, and `worker_count=1` gets a
+  one-thread `SyncWorkerPool`, so deliveries keep their order and run one at
+  a time, exactly like the inline path, but off the I/O thread. That also
+  means heartbeats keep flowing during a long handler and the M5 limit below
+  does not apply.
+- The deadline starts when a worker starts the handler. The I/O thread
+  checks deadlines on every consume-loop tick (`process_data_events` waits at
+  most `min(1 s, processing_timeout / 4)` while a deadline is set) and during
+  the `stop()` drain. An expired delivery is settled there, through the
+  pipeline's failure path.
+- Settlement is claimed atomically per delivery (a lock in a
+  `DeliveryClaim`): the first of the handler and the deadline to settle owns
+  it; the other's ack/nack/reject never reaches the channel (on the handler
+  thread it raises an internal `BaseException`, `LateSettlementError`, which
+  the broker catches around the handler run). A late handler's internal
+  publishes (result, retry and DLQ copies) are refused through a
+  thread-local check.
+- The timed-out handler thread keeps running and keeps its worker until it
+  returns, so concurrency never exceeds `worker_count`; a handler that never
+  returns holds its worker forever.
+- The cost: handlers no longer run on the thread that called `start()`.
+  Thread-local state set up there, and owner-thread-only calls such as
+  `broker.request()`, are not available to them, as with any worker pool.
+
+### Broker-cancelled consumers
+
+pika dispatches a server `basic.cancel` to the consumer channel's cancel
+callback inside `process_data_events`, i.e. on the owner thread. The consume
+loop then probes the queue (a passive declare on a throwaway channel) and
+re-subscribes with the same tag, also on the owner thread, after every tick
+whose backoff has elapsed. Nothing reconnects from there: a dead connection
+is left to `run()`'s recovery loop.
+
 ### Startup/shutdown hooks
 
 With a timeout, each hook runs on a **fresh single-worker executor**.
@@ -80,8 +122,8 @@ bounds the *caller*, not the hook.
 
 ### Single-worker confirm waits are unbounded (M5)
 
-With `worker_count=1`, a handler publishing with confirms runs ON the
-connection's owner thread — `confirm_timeout` cannot be enforced there
+With `worker_count=1` (and no `processing_timeout`), a handler publishing
+with confirms runs ON the connection's owner thread — `confirm_timeout` cannot be enforced there
 (pika's `BlockingChannel` offers no owner-thread way to bound the confirm
 wait), so a broker that never confirms wedges the consumer with a live
 heartbeat. A startup `RuntimeWarning` calls this out. With

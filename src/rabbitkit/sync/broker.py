@@ -65,6 +65,7 @@ from rabbitkit.middleware.metrics import BrokerMetrics
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
+from rabbitkit.sync.deadlines import LateSettlementError, SyncDeadlines
 from rabbitkit.sync.transport import SyncTransport
 
 if TYPE_CHECKING:
@@ -131,12 +132,12 @@ class SyncBroker:
             manual_settle_on_error=self._config.consumer.manual_settle_on_error,
             max_body_bytes=self._config.consumer.max_body_bytes,
         )
-        if self._config.consumer.processing_timeout is not None:
-            logger.warning(
-                "ConsumerConfig.processing_timeout=%s is not enforced by SyncBroker (a running "
-                "thread cannot be interrupted); use TimeoutMiddleware for sync handlers.",
-                self._config.consumer.processing_timeout,
-            )
+        # ConsumerConfig.processing_timeout (see sync/deadlines.py): handlers
+        # run off the I/O thread, which settles an expired delivery itself.
+        timeout = self._config.consumer.processing_timeout
+        self._deadlines: SyncDeadlines | None = (
+            SyncDeadlines(timeout, self._pipeline.settle_expired_sync) if timeout is not None else None
+        )
         if self._config.safety.dead_letter_with_metadata:
             logger.warning(
                 "SafetyConfig.dead_letter_with_metadata is applied by AsyncBroker only: SyncBroker dead-letters "
@@ -150,6 +151,15 @@ class SyncBroker:
         self._worker_pool: SyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
+
+        # G-26: optional hooks called with the queue name when the BROKER
+        # cancels a route's consumer (queue deleted, quorum leader change, ...)
+        # and when it is consuming again. The consume loop re-subscribes on
+        # its own; the route reports as not consuming in health checks
+        # meanwhile. Called on the owner thread (see AsyncBroker).
+        self.on_consumer_cancelled: Callable[[str], None] | None = None
+        self.on_consumer_resumed: Callable[[str], None] | None = None
+        self._consumer_state_wired: Any = None  # the transport the state callbacks are on
 
         # L14: liveness heartbeat (see health.broker_liveness). Read by
         # health.py via duck-typed attribute access (no formal HealthProvider
@@ -326,6 +336,9 @@ class SyncBroker:
         self._transport.connect()
         self._transport.on_io_tick(self._mark_heartbeat)
         self._transport.on_io_tick(self._sample_metrics_throttled)
+        if self._deadlines is not None:
+            self._transport.on_io_tick(self._deadlines.check)
+            self._transport.poll_interval = self._deadlines.poll_interval
 
         # Wire an opt-in FlowController's blocked/unblocked callbacks to the
         # transport now that it exists (C-6).
@@ -357,7 +370,11 @@ class SyncBroker:
         # a loop). worker_count>1 is immune (handlers run on pool threads while
         # the I/O thread keeps pumping). Warn so the failure mode is visible.
         single_worker = worker_config is None or worker_config.worker_count <= 1
-        if single_worker and self._registry.routes and self._config.connection.heartbeat > 0:
+        # processing_timeout: even a single worker runs off the I/O thread
+        # (one dedicated handler thread), so that thread can settle a
+        # delivery whose handler outran its deadline.
+        handler_thread = single_worker and self._deadlines is not None and bool(self._registry.routes)
+        if single_worker and not handler_thread and self._registry.routes and self._config.connection.heartbeat > 0:
             import warnings
 
             warnings.warn(
@@ -393,6 +410,9 @@ class SyncBroker:
                     prefetch_count=worker_config.worker_count * worker_config.prefetch_per_worker,
                 )
             self._worker_pool = SyncWorkerPool(config=worker_config)
+            self._worker_pool.start()
+        elif handler_thread:
+            self._worker_pool = SyncWorkerPool(config=worker_config, threaded=True)
             self._worker_pool.start()
 
         # Start consuming
@@ -435,7 +455,7 @@ class SyncBroker:
                 return
             while self._in_flight > 0:
                 if transport is not None:
-                    transport.pump(poll)
+                    self._pump(poll)
                 if deadline is None:
                     self._in_flight_cond.wait(timeout=poll)
                     continue
@@ -489,7 +509,7 @@ class SyncBroker:
         # cross-thread call once the consume loop has stopped.
         if self._worker_pool is not None:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            self._worker_pool.stop(timeout=remaining, pump=self._transport.pump)
+            self._worker_pool.stop(timeout=remaining, pump=self._pump)
             self._worker_pool = None
 
         # Drain inline in-flight handlers (C-2).
@@ -507,6 +527,16 @@ class SyncBroker:
         self._started = False
         self._set_lifecycle_gauges(connected=False)
         logger.info("SyncBroker stopped")
+
+    def _pump(self, time_limit: float = 0.05) -> None:
+        """Drive the I/O loop during a drain (owner thread) and keep settling
+        deliveries whose ``processing_timeout`` passed meanwhile."""
+        transport = self._transport
+        if transport is None:  # pragma: no cover — defensive; only called while started
+            return
+        transport.pump(time_limit)
+        if self._deadlines is not None:
+            self._deadlines.check()
 
     def _install_sigterm_handler(self) -> None:
         """Install a SIGTERM handler that breaks the pika consume loop (C-1).
@@ -601,6 +631,7 @@ class SyncBroker:
         self._transport.ensure_connected()
         self._transport.pump(time_limit)
         self._mark_heartbeat()
+        self._sample_metrics_throttled()
 
     # ── Publishing ────────────────────────────────────────────────────────
 
@@ -813,8 +844,12 @@ class SyncBroker:
             metrics.set_states({"shared": transport.is_connected()})
             metrics.sample(
                 channels_active=transport.channels_active,
+                publish_in_flight=transport.publishes_in_flight,
                 connection_blocked=transport.is_blocked,
-                consuming={route.queue.name: bool(route.consumer_tag) for route in self._registry.routes},
+                consuming={
+                    route.queue.name: bool(route.consumer_tag) and not route.runtime_state.consumer_cancelled
+                    for route in self._registry.routes
+                },
             )
             pool = self._worker_pool
             if pool is not None:
@@ -972,6 +1007,16 @@ class SyncBroker:
         """
         if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
             raise BrokerNotStartedError("Broker not started. Call start() first.")
+        if self._deadlines is not None and self._deadlines.current_expired():
+            # A handler past its processing_timeout: its delivery was already
+            # settled at the deadline, so its result / retry / DLQ copy would
+            # duplicate it. Never sent (the async handler is cancelled instead).
+            return PublishOutcome(
+                status=PublishStatus.NOT_SENT,
+                exchange=env.exchange,
+                routing_key=env.routing_key,
+                reason=PublishReason.CANCELLED,
+            )
         transport = self._transport
         fc = self._flow_controller
         if fc is None:
@@ -1366,22 +1411,72 @@ class SyncBroker:
             finally:
                 self._in_flight_dec()
 
+        deadlines = self._deadlines
+        handler: Callable[[RabbitMessage], None] = on_message
+        if deadlines is not None and pool is not None:
+
+            def on_message_with_deadline(message: RabbitMessage) -> None:
+                """processing_timeout (handler thread): see sync/deadlines.py."""
+                claim = deadlines.begin(route, message)
+                try:
+                    on_message(message)
+                except LateSettlementError:
+                    pass  # the deadline settled the delivery; finish() logs the late return
+                finally:
+                    deadlines.finish(claim)
+
+            handler = on_message_with_deadline
+
         if pool is not None:
 
             def on_message_pooled(message: RabbitMessage) -> None:
-                pool.submit(on_message, message)
+                pool.submit(handler, message)
 
             callback = on_message_pooled
         else:
             callback = on_message
 
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
+        self._wire_consumer_state()
+        was_cancelled = route.runtime_state.consumer_cancelled
+        route.runtime_state.consumer_cancelled = False
         consumer_tag = self._transport.consume(
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+        if was_cancelled:
+            # Re-subscribed by a reconnect while the broker had it cancelled.
+            self._consumer_state_changed(route.queue.name, cancelled=False)
+
+    def _wire_consumer_state(self) -> None:
+        """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
+        transport: Any = self._transport  # set: _start_consumer returns early without one
+        if self._consumer_state_wired is transport:
+            return
+        self._consumer_state_wired = transport
+        transport.on_consumer_cancelled(lambda queue: self._consumer_state_changed(queue, cancelled=True))
+        transport.on_consumer_resumed(lambda queue: self._consumer_state_changed(queue, cancelled=False))
+
+    def _consumer_state_changed(self, queue: str, *, cancelled: bool) -> None:
+        for route in self._registry.routes:
+            if route.queue.name == queue:
+                route.runtime_state.consumer_cancelled = cancelled
+        metrics = self._broker_metrics
+        if metrics is not None:
+            if cancelled:
+                metrics.consumer_cancelled(queue)
+            else:
+                metrics.consumer_resumed(queue)
+        hook = self.on_consumer_cancelled if cancelled else self.on_consumer_resumed
+        if hook is None:
+            return
+        try:
+            hook(queue)
+        except Exception:
+            event = "cancelled" if cancelled else "resumed"
+            logger.warning("on_consumer_%s hook raised (queue=%s)", event, queue, exc_info=True)
 
     # ── Public topology API (16.6) — additive, retry/topology owner ─────
 

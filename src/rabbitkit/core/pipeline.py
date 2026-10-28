@@ -263,6 +263,12 @@ def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> N
     """
     if message.disposition == "pending" or message.settlement_outcome_unknown:
         return
+    once = message._settlement_metric_once
+    if once is not None:
+        try:
+            once.pop()  # atomic: only the first of two racing reporters counts
+        except IndexError:
+            return
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
     for mw in route.route_middlewares:
@@ -541,7 +547,9 @@ class HandlerPipeline:
         self._reject_transient_on_redelivery = reject_transient_on_redelivery
         # MANUAL handler raised without settling: apply the failure policy.
         self._manual_settle_on_error = manual_settle_on_error
-        # Async-only per-delivery deadline (ConsumerConfig.processing_timeout).
+        # Per-delivery deadline (ConsumerConfig.processing_timeout) of the
+        # async pipeline; the sync broker enforces it around the pipeline
+        # (sync/deadlines.py) and settles through settle_expired_sync().
         self._processing_timeout = processing_timeout
         # F17: verify the dead-letter target before rejecting into it (async).
         self._dead_letter_check = dead_letter_check
@@ -1585,6 +1593,30 @@ class HandlerPipeline:
         return json.dumps(result).encode("utf-8")
 
     # ── Internal: exception handling ─────────────────────────────────────
+
+    def settle_expired_sync(self, route: RouteDefinition, message: RabbitMessage, exc: HandlerTimeoutError) -> bool:
+        """Settle a delivery whose handler outran ``processing_timeout`` (sync broker).
+
+        The sync broker cannot cancel the handler thread, so it settles the
+        delivery itself, on the connection's owner thread, through the same
+        failure path the async pipeline takes for a cancelled handler: the
+        AckPolicy decision for a transient ``UNKNOWN_OUTCOME`` failure
+        (requeue, or dead-letter on a redelivery), one log line, and the
+        settlement metric.
+
+        Returns False when the policy leaves the delivery to the handler
+        (``AckPolicy.MANUAL`` with ``manual_settle_on_error=False``, logged):
+        the handler may still settle it when it returns.
+        """
+        try:
+            self._handle_sync_exception(route, message, exc)
+        except HandlerTimeoutError as raised:
+            if raised is not exc:
+                raise
+            return False
+        finally:
+            _emit_settlement_metric(route, message)
+        return True
 
     def _handle_sync_exception(
         self,

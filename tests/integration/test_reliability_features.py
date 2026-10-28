@@ -211,7 +211,7 @@ async def test_retry_envelope_headers_are_sanitized_on_the_wire(rabbit: dict[str
     assert peeked is not None
     headers = peeked.headers
     assert secret not in repr(headers)
-    assert headers["x-rabbitkit-error-category"] == "transient"
+    assert headers["x-rabbitkit-error-category"] == "retryable"
     assert headers["x-rabbitkit-error-type"] == "ConnectionError"
     assert "***" in headers["x-rabbitkit-error-message"]
     assert headers["x-rabbitkit-retry-count"] == 1
@@ -269,7 +269,9 @@ def test_policy_templates_applied_make_critical_preflight_fully_verified(rabbit:
     from rabbitkit.sync.broker import SyncBroker
 
     queue = f"rel-policy-{uuid.uuid4().hex[:8]}"
-    config = critical_config(_config(rabbit["url"]))
+    from rabbitkit.core.config import ConsumerConfig
+
+    config = critical_config(_config(rabbit["url"], consumer=ConsumerConfig(processing_timeout=30)))
     assert config.retry is not None
     mgmt = _mgmt(rabbit)
     templates = policy_templates([queue], retry=config.retry, profile="critical")

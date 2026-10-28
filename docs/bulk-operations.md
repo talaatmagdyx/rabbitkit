@@ -247,9 +247,11 @@ The legacy `BatchAcker` now defaults to `mode="individual"`. The old
 ## Reliability profiles
 
 ```python
-from rabbitkit import RabbitConfig, ReliabilityProfile, SyncBroker, apply_profile, critical_config
+from rabbitkit import ConsumerConfig, RabbitConfig, ReliabilityProfile, SyncBroker, apply_profile, critical_config
 
-config = critical_config(RabbitConfig(connection=...))   # or apply_profile(cfg, "standard")
+config = critical_config(
+    RabbitConfig(connection=..., consumer=ConsumerConfig(processing_timeout=30.0))  # critical needs a deadline
+)                                                         # or apply_profile(cfg, "standard")
 broker = SyncBroker(config)
 
 report = broker.preflight(ReliabilityProfile.CRITICAL, management_client=mgmt)
@@ -263,10 +265,18 @@ for check in report.unverified:                           # never hidden
 |---|---|---|
 | Confirms / mandatory / persistence | on | required |
 | Body limit | bounded | ≤ 256 KiB |
+| In-flight publish bytes | explicit | bounded (64 MiB unless set) |
+| Reserved retry headers on application publishes | pass through | stripped |
 | Queue type | explicit | quorum for every durable route queue |
-| Retry topology | explicit | quorum delay chain + quorum DLQ |
+| Source dead-lettering | broker default | at-least-once + `reject-publish` (declared or by policy) |
+| Retry topology | explicit | required on every route: quorum delay chain (at-least-once) + quorum DLQ, DLQ copy with metadata, retry count from `x-death` only |
+| Processing deadline | explicit | `consumer.processing_timeout` required |
+| `AckPolicy.ACK_FIRST` | allowed | rejected |
 | Error text on DLQ headers | sanitized | sanitized or omitted |
 | Dead-letter path | auto-provisioned | never `discard` |
+
+The full list, and what each setting guarantees, is in
+[Reliable Messaging](reliable-messaging.md#enabling-the-critical-profile).
 
 `apply_profile` fills in requirements and **raises** on a contradiction (a
 value you pinned explicitly to something the profile forbids). It never
@@ -291,7 +301,8 @@ form) for the cluster owner to apply; rabbitkit never mutates policies.
 * `RetryConfig.error_detail` controls the DLQ triage headers: `sanitized`
   (default: credentials, tokens, URL passwords redacted; length-capped),
   `omit`, or `raw` (legacy). A new `x-rabbitkit-error-category` header
-  carries `transient` / `permanent`.
+  carries the failure category (`retryable`, `permanent`, `invalid_message`,
+  `unknown_outcome`, `infrastructure`).
 * `RetryConfig.handoff` (`RetryHandoffConfig`) bounds what happens when the
   **retry publish itself** fails (returned, nacked, timed out, connection
   drop). The source is nack-requeued, never acked; consecutive failures get
@@ -369,7 +380,7 @@ machine in `tests/property/`, and real-broker runs in
 
 | | Invariant | Enforced by |
 |---|---|---|
-| **I1** | Never cumulative-ack across an unsafe gap | `plan()` coalesces only contiguous ack-safe runs |
+| **I1** | Never cumulative-ack across an unsafe gap | `plan()` coalesces only contiguous ack-safe runs, and never past a delivery tag that was not registered (refused or skipped) |
 | **I2** | Never settle a delivery from another channel/generation | `channel_key` binding + per-generation ledger |
 | **I3** | Never ack a delivery that did not reach ACK_READY | `SUCCESS` reachable only from `OUTSTANDING`/`RETRY_PENDING` |
 | **I4** | A contradictory settlement is never silently accepted | transition table + `ContradictorySettlementError` |
@@ -526,7 +537,19 @@ the redelivery is simply a new delivery.
 `CoalescingAcker(max_pending=N)` caps the ledger. Exceeding it raises
 `LedgerFullError` from `register()`, so you apply backpressure (stop
 consuming, lower prefetch); the delivery stays unacked and the broker
-redelivers it. A full ledger **never** relaxes the ack rules.
+redelivers it when the channel closes. A full ledger **never** relaxes the
+ack rules.
+
+A refused tag is a *gap*: the broker still holds it unacked, so a later
+`ack(N, multiple=True)` above it would acknowledge it without it ever being
+processed. The coordinator records the lowest unregistered tag of the
+channel generation (`gap_floor`) and never coalesces at or above it; tags
+above a gap are acked individually until the channel is rebuilt
+(`on_reconnect()` / `invalidate()`). The same applies to any tag the acker
+never saw: the coordinator must own the channel from delivery tag 1, so
+registering a channel's deliveries starting anywhere else disables
+coalescing for that generation. Earlier releases swept a refused delivery
+into the next cumulative ack, losing it.
 
 Watch `oldest_pending_age` and `gap_count` to see a straggler holding the
 frontier back before the ceiling is reached.
@@ -536,7 +559,8 @@ frontier back before the ceiling is reached.
 `acker.metrics` (and `group.metrics`, summed) exposes `registered`,
 `pending`, `outstanding`, `ack_ready`, `frontier`, `gap_count`,
 `oldest_pending_age`, `settled`, `coalesced`, `frames_sent`,
-`coalescing_ratio`, `invalidations` and `dropped_on_invalidate`. Pass
+`coalescing_ratio`, `invalidations`, `dropped_on_invalidate`, `gap_floor`
+and `unregistered_gaps`. Pass
 `collector=` and `metrics_config=` to have the gauges emitted on every flush
 (see [Observability](observability.md)).
 

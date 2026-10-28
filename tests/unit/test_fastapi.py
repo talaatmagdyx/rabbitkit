@@ -63,6 +63,20 @@ class TestAsyncBroker:
 
         assert broker.stopped is True
 
+    async def test_async_broker_leaves_signal_handling_to_the_server(self) -> None:
+        """G-24: the ASGI server owns SIGINT/SIGTERM."""
+        seen: list[bool] = []
+
+        class _SignalAwareBroker(_FakeAsyncBroker):
+            async def start(self, *, install_signal_handlers: bool = True) -> None:  # type: ignore[override]
+                seen.append(install_signal_handlers)
+                self.started = True
+
+        broker = _SignalAwareBroker()
+        async with rabbitkit_lifespan(broker=broker):
+            assert broker.started is True
+        assert seen == [False]
+
 
 # ── sync broker tests ────────────────────────────────────────────────────
 
@@ -227,11 +241,13 @@ class _CoroutineRabbitApp:
     def start(self) -> object:
         async def _start() -> None:
             self.started = True
+
         return _start()
 
     def stop(self) -> object:
         async def _stop() -> None:
             self.stopped = True
+
         return _stop()
 
 

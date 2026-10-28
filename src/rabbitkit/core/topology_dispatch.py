@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import TopologyMode
 
@@ -66,9 +67,36 @@ class TopologyDispatcher:
     def binding_action(self) -> TopoAction:
         """Action to take for ``bind_queue`` / ``bind_exchange``.
 
-        Bindings have no passive variant — they are skipped only under
-        ``MANUAL`` and performed otherwise.
+        Bindings have no passive variant, and creating one is a WRITE, so
+        they are performed only under ``AUTO_DECLARE``. ``PASSIVE_ONLY``
+        means the topology is infrastructure-managed: rabbitkit must never
+        mutate it (R-D8 — it used to create missing bindings). Whether the
+        expected bindings exist can only be checked through the management
+        API: see :func:`rabbitkit.core.topology_validation.verify_topology`.
         """
-        if self._mode == TopologyMode.MANUAL:
+        if self._mode is not TopologyMode.AUTO_DECLARE:
             return TopoAction.SKIP
         return TopoAction.DECLARE
+
+
+def check_public_topology_write(mode: TopologyMode, operation: str, *, passive: bool = False) -> None:
+    """Gate for the brokers' public ``declare_*`` / ``bind_*`` API (16.6).
+
+    Only ``AUTO_DECLARE`` lets the application create topology.
+    ``PASSIVE_ONLY`` (infrastructure-managed) refuses every write — a
+    ``passive=True`` entity is still allowed, since a passive declare only
+    checks existence. ``MANUAL`` refuses too: there rabbitkit touches no
+    topology at all, and silently skipping an explicit call would be worse.
+
+    Raises:
+        ConfigurationError: the call would write under a mode that forbids it.
+    """
+    if mode is TopologyMode.AUTO_DECLARE:
+        return
+    if mode is TopologyMode.PASSIVE_ONLY and passive:
+        return
+    raise ConfigurationError(
+        f"{operation} refused: RabbitConfig.topology_mode={mode.value!r} does not allow rabbitkit to "
+        "write topology. Use TopologyMode.AUTO_DECLARE for application-managed topology, or provision it "
+        "with your infrastructure tooling (and verify it with broker.verify_topology(management_client=...))."
+    )

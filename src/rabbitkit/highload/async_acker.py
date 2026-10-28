@@ -27,26 +27,49 @@ serialises flushes.
 
 Example::
 
-    acker = AsyncCoalescingAcker(
-        ack_fn=lambda tag, multiple: channel.channel.basic_ack(tag, multiple),
-        nack_fn=lambda tag, requeue: channel.channel.basic_nack(tag, requeue=requeue),
-        reject_fn=lambda tag, requeue: channel.channel.basic_reject(tag, requeue=requeue),
-        config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
-    )
+    from rabbitkit import AckPolicy, AsyncCoalescingAcker, BatchAckConfig, RabbitMessage
 
-    @broker.subscriber(queue="orders")
+    ackers: dict[object, AsyncCoalescingAcker] = {}
+
+    async def acker_for(channel: Any) -> AsyncCoalescingAcker:
+        # One acker per consumer channel: delivery tags are per-channel.
+        # ``channel`` is the aiormq channel the delivery arrived on.
+        if channel not in ackers:
+            acker = ackers[channel] = AsyncCoalescingAcker(
+                ack_fn=lambda tag, multiple: channel.basic_ack(tag, multiple=multiple),
+                nack_fn=lambda tag, requeue: channel.basic_nack(tag, requeue=requeue),
+                reject_fn=lambda tag, requeue: channel.basic_reject(tag, requeue=requeue),
+                config=BatchAckConfig(batch_size=100, flush_interval_ms=200),
+                channel_key=channel,
+            )
+            await acker.start()  # arms the interval flush
+        return ackers[channel]
+
+    # MANUAL is required: the acker settles on the raw channel, so the
+    # pipeline must not ack/nack the message itself (that would settle the
+    # same delivery tag twice and the broker closes the channel with
+    # PRECONDITION_FAILED).
+    @broker.subscriber(queue="orders", ack_policy=AckPolicy.MANUAL)
     async def handle(body: bytes, msg: RabbitMessage) -> None:
-        acker.register(msg.delivery_tag, channel_key=msg.channel)
+        channel = msg.raw_message.channel
+        acker = await acker_for(channel)
+        acker.register(msg.delivery_tag, channel_key=channel)
         try:
             await do_work(body)
         except Exception:
-            acker.fail(msg.delivery_tag, requeue=True)
-            raise
+            acker.fail(msg.delivery_tag, requeue=False)  # dead-letter it
+            return  # settled through the acker: do NOT re-raise
         acker.complete(msg.delivery_tag)
+        await acker.maybe_flush()
 
-    await acker.start()   # arms the interval flush
-    ...
-    await acker.close()   # drains what is provably safe, leaves the rest
+    # at shutdown:
+    for acker in ackers.values():
+        await acker.close()  # drains what is provably safe, leaves the rest
+
+The coordinator only emits ``ack(N, multiple=True)`` when every delivery
+tag up to ``N`` on the channel was registered with it. A delivery refused
+with :class:`~rabbitkit.core.settlement.LedgerFullError` (``max_pending``)
+stays unacked; deliveries above it are then acked individually.
 """
 
 from __future__ import annotations

@@ -286,7 +286,7 @@ class TestManualAckPolicy:
         ack_fn.assert_called_once()
         assert msg._disposition == "acked"
 
-    def test_exception_in_manual_re_raises(self) -> None:
+    def test_exception_in_manual_re_raises_when_opted_out(self) -> None:
         msg = _make_message()
         _wire_sync(msg)
 
@@ -294,7 +294,7 @@ class TestManualAckPolicy:
             raise RuntimeError("handler bug")
 
         route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
-        pipeline = HandlerPipeline()
+        pipeline = HandlerPipeline(manual_settle_on_error=False)
 
         with pytest.raises(RuntimeError, match="handler bug"):
             pipeline.process_sync(route, msg)
@@ -483,8 +483,8 @@ class TestResultPublishing:
         reject.assert_not_called()
 
     def test_transient_redelivery_requeues_when_disabled(self) -> None:
-        """M6 default (off): transient errors requeue unbounded even on redelivery."""
-        pipeline = HandlerPipeline()  # flag defaults False
+        """M6 opt-out: transient errors requeue unbounded even on redelivery."""
+        pipeline = HandlerPipeline(reject_transient_on_redelivery=False)
         msg = _make_message(redelivered=True)
         _ack, nack, reject = _wire_sync(msg)
 
@@ -504,9 +504,7 @@ class TestResultPublishing:
         async def handler(body: bytes) -> None:
             raise ConnectionError("transient")
 
-        await HandlerPipeline(reject_transient_on_redelivery=True).process_async(
-            _make_route(handler=handler), msg
-        )
+        await HandlerPipeline(reject_transient_on_redelivery=True).process_async(_make_route(handler=handler), msg)
         msg._reject_async_fn.assert_awaited_once_with(False)
         msg._nack_async_fn.assert_not_awaited()
 
@@ -720,7 +718,7 @@ class TestAsyncPipeline:
         nack_fn.assert_called_once_with(True)
 
     @pytest.mark.asyncio
-    async def test_async_manual_exception_re_raises(self) -> None:
+    async def test_async_manual_exception_re_raises_when_opted_out(self) -> None:
         msg = _make_message()
         msg._ack_fn = MagicMock()
         msg._nack_fn = MagicMock()
@@ -729,7 +727,7 @@ class TestAsyncPipeline:
             raise RuntimeError("async handler bug")
 
         route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
-        pipeline = HandlerPipeline()
+        pipeline = HandlerPipeline(manual_settle_on_error=False)
 
         with pytest.raises(RuntimeError, match="async handler bug"):
             await pipeline.process_async(route, msg)
@@ -843,10 +841,11 @@ class TestAsyncExceptionHandling:
 
         assert msg._disposition == "acked"
 
-    async def test_async_manual_policy_reraises(self) -> None:
-        """Lines 475-477: MANUAL policy — re-raises exception."""
+    async def test_async_manual_policy_settles_an_unsettled_failure(self) -> None:
+        """MANUAL handler raised without settling: the failure policy applies
+        (permanent → dead-letter) instead of leaving it unacked forever."""
         msg = _make_message()
-        _ack, _nack, _reject = _wire_async(msg)
+        _ack, nack, reject = _wire_async(msg)
 
         def handler(body: bytes) -> None:
             raise ValueError("manual handler error")
@@ -854,10 +853,11 @@ class TestAsyncExceptionHandling:
         route = _make_route(handler=handler, ack_policy=AckPolicy.MANUAL)
         pipeline = HandlerPipeline()
 
-        with pytest.raises(ValueError, match="manual handler error"):
-            await pipeline.process_async(route, msg)
+        await pipeline.process_async(route, msg)
 
-        assert msg._disposition == "pending"
+        reject.assert_awaited_once_with(False)
+        nack.assert_not_awaited()
+        assert msg._disposition == "rejected"
 
     async def test_async_nack_on_error_policy(self) -> None:
         """Lines 479-481: NACK_ON_ERROR policy — nacks without requeue."""
@@ -2383,7 +2383,10 @@ class TestChannelGoneSettlement:
 
         route = _make_route(handler=handler)
         await HandlerPipeline().process_async(route, msg)
-        assert msg._disposition == "pending"
+        # G-15: the reject was claimed before the send; the send failed, so
+        # its outcome is unknown and nothing else is sent for this delivery.
+        assert msg._disposition == "rejected"
+        assert msg.settlement_outcome_unknown is True
 
     @pytest.mark.asyncio
     async def test_async_non_channel_settle_failure_still_raises(self) -> None:

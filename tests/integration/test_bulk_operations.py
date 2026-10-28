@@ -287,7 +287,9 @@ def test_preflight_against_live_management_api(rabbit: dict[str, str]) -> None:
     from rabbitkit.sync.broker import SyncBroker
 
     queue = f"bulk-preflight-{uuid.uuid4().hex[:8]}"
-    broker = SyncBroker(config=critical_config(_config(rabbit["url"])))
+    from rabbitkit.core.config import ConsumerConfig
+
+    broker = SyncBroker(config=critical_config(_config(rabbit["url"], consumer=ConsumerConfig(processing_timeout=30))))
 
     @broker.subscriber(queue=RabbitQueue(name=queue, queue_type=QueueType.QUORUM))
     def handle(body: bytes) -> None:

@@ -52,3 +52,32 @@ shovel drain stragglers, retire the old queue yourself.
 
 Useful flags: `--queue` (one queue), `--vhost`, `--timeout` (drain-wait
 bound, default 300s), `--state-file`, `--snapshot-file`.
+
+## After the migration: verify, and the quorum-only options
+
+Once the queues are quorum, an application that runs with
+`TopologyMode.PASSIVE_ONLY` can prove the migrated topology matches its
+declarations before it consumes:
+
+```python
+async def start_checked(broker, management_client):
+    report = await broker.verify_topology(management_client)
+    report.raise_for_failures()  # e.g. "queue 'orders' type: expected quorum, broker has classic"
+    await broker.start()
+```
+
+`verify_topology` is read-only (management API `GET`s only) and also checks
+durability, every declared argument, bindings, and for retry routes the
+dead-letter path and the delay queues / DLQ.
+
+Quorum-only `RabbitQueue` options (creation-time arguments — set them on the
+migrated declaration, since a live queue's arguments cannot change):
+
+- `quorum_initial_group_size=3` → `x-quorum-initial-group-size` (replicas).
+- `dead_letter_strategy="at-least-once"` with `overflow="reject-publish"`
+  → a dead-lettered message stays on the queue until the DLQ confirms it
+  (RabbitMQ 3.10+). rabbitkit rejects `at-least-once` without
+  `reject-publish`, which RabbitMQ would silently downgrade.
+- For the retry chain: `RetryConfig(delay_queue_type="quorum",
+  delay_queue_dead_letter_strategy="at-least-once",
+  quorum_initial_group_size=3)`.

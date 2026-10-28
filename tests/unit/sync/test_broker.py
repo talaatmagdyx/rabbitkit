@@ -596,7 +596,7 @@ class TestLoggingConfig:
 
         with patch("rabbitkit.core.logging.configure_structlog") as mock_cfg:
             self._start_broker_with_logging(broker)
-            mock_cfg.assert_called_once_with(config.logging)
+            mock_cfg.assert_called_once_with(config.logging, override_existing=False)
 
     def test_start_no_configure_structlog_when_logging_none(self) -> None:
         """start() does not call configure_structlog when config.logging is None."""
@@ -927,9 +927,9 @@ class TestDeclareTopologyEdgeCases:
                 with _warnings.catch_warnings(record=True) as caught:
                     _warnings.simplefilter("always")
                     broker.start()
-        assert not any(
-            "confirm_delivery=False" in str(w.message) for w in caught
-        ), "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        assert not any("confirm_delivery=False" in str(w.message) for w in caught), (
+            "retry context must not emit the confirms warning (mandatory=True forces confirms)"
+        )
 
     def test_start_with_retry_and_confirms_does_not_warn(self) -> None:
         """M4: confirm_delivery=True (the default) must not trigger the warning."""
@@ -1774,7 +1774,7 @@ class TestPublishWithFlowController:
         return broker
 
     def test_publish_dropped_by_backpressure(self) -> None:
-        """fc.acquire() returns False → publish returns ERROR outcome."""
+        """fc.acquire() returns False → NOT_SENT (backpressure_dropped)."""
         from rabbitkit.core.config import BackpressureConfig
         from rabbitkit.core.types import PublishStatus
         from rabbitkit.highload.backpressure import FlowController
@@ -1786,7 +1786,8 @@ class TestPublishWithFlowController:
 
         envelope = MessageEnvelope(routing_key="rk", body=b"test")
         outcome = broker.publish(envelope)
-        assert outcome.status == PublishStatus.ERROR
+        assert outcome.status == PublishStatus.NOT_SENT
+        assert outcome.reason == "backpressure_dropped"
 
     def test_publish_succeeds_with_flow_controller(self) -> None:
         """fc.acquire() returns True → publishes and releases the slot."""
@@ -2135,8 +2136,14 @@ class TestRejectTransientOnRedeliveryWiring:
         broker = SyncBroker(RabbitConfig(consumer=ConsumerConfig(reject_transient_on_redelivery=True)))
         assert broker._pipeline._reject_transient_on_redelivery is True
 
-    def test_default_off(self) -> None:
-        assert SyncBroker()._pipeline._reject_transient_on_redelivery is False
+    def test_default_on(self) -> None:
+        assert SyncBroker()._pipeline._reject_transient_on_redelivery is True
+
+    def test_manual_settle_on_error_threaded_to_pipeline(self) -> None:
+        from rabbitkit.core.config import ConsumerConfig
+
+        broker = SyncBroker(RabbitConfig(consumer=ConsumerConfig(manual_settle_on_error=False)))
+        assert broker._pipeline._manual_settle_on_error is False
 
 
 class TestPublishSizeGuard:
@@ -2178,9 +2185,7 @@ class TestQuorumDeliveryLimitBackstop:
 
         broker = SyncBroker(RabbitConfig(retry=RetryConfig(max_retries=1, delays=(5,))))
 
-        @broker.subscriber(
-            queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=10)
-        )
+        @broker.subscriber(queue=RabbitQueue(name="orders", queue_type=QueueType.QUORUM, delivery_limit=10))
         def handle(body: bytes) -> None:
             pass
 
@@ -2408,9 +2413,7 @@ class TestFlowControlledInternalPublish:
         broker._transport = MagicMock()
         broker._wire_retry_middleware()
 
-        retry_mw = next(
-            mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware)
-        )
+        retry_mw = next(mw for mw in broker.routes[0].route_middlewares if isinstance(mw, RetryMiddleware))
         assert retry_mw._publish_fn == broker._flow_controlled_internal_publish
 
     def test_result_publish_uses_flow_controlled_publish(self) -> None:
@@ -2607,3 +2610,34 @@ class TestUserSuppliedRetryMiddlewareWiring:
                 broker.start()
 
         assert user_mw._publish_fn is not None
+
+
+class TestPublishMessageIdKwarg:
+    """Parity with AsyncBroker.publish: the kwargs form can carry a stable
+    message_id so a republish after an unknown outcome can be deduplicated."""
+
+    def _broker(self) -> tuple[SyncBroker, MagicMock]:
+        broker = SyncBroker()
+        transport = MagicMock()
+        transport.publish = MagicMock(return_value=PublishOutcome(status=PublishStatus.CONFIRMED))
+        broker._transport = transport
+        return broker, transport
+
+    def test_kwargs_form_uses_the_given_message_id(self) -> None:
+        broker, transport = self._broker()
+        broker.publish(routing_key="q", body=b"x", message_id="order-42")
+        assert transport.publish.call_args.args[0].message_id == "order-42"
+
+    def test_message_id_with_an_envelope_is_rejected(self) -> None:
+        broker, _ = self._broker()
+        with pytest.raises(ValueError, match="message_id"):
+            broker.publish(MessageEnvelope(routing_key="q", body=b"x"), message_id="m")
+
+
+class TestDeadLetterWithMetadataIsAsyncOnly:
+    def test_sync_broker_logs_that_it_ignores_the_setting(self) -> None:
+        from rabbitkit.core.config import RabbitConfig, SafetyConfig
+
+        with patch("rabbitkit.sync.broker.logger") as log:
+            SyncBroker(RabbitConfig(safety=SafetyConfig(dead_letter_with_metadata=True)))
+        assert any("dead_letter_with_metadata" in str(c.args[0]) for c in log.warning.call_args_list)

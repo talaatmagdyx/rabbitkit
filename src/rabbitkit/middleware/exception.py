@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from rabbitkit.core.message import RabbitMessage
+from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.middleware.base import BaseMiddleware
 
 logger = logging.getLogger(__name__)
@@ -74,11 +75,28 @@ class ExceptionMiddleware(BaseMiddleware):
         """
         is_terminal = getattr(exc, "_rabbitkit_terminal", False)
 
+        # F30: raw str(exc) routinely embeds secrets; every log line here uses
+        # the same sanitizer as RetryMiddleware's headers.
+        sanitized = ErrorSanitizer().sanitize(exc)
+
         if is_terminal and not self._swallow_permanent:
             logger.error(
                 "Terminal exception (permanent/exhausted): %s: %s",
+                sanitized.code,
+                sanitized.summary,
+            )
+            raise
+
+        if is_terminal and getattr(exc, "_rabbitkit_dead_letter_failed", False):
+            # RetryMiddleware tried to write the DLQ copy and it was NOT
+            # confirmed. A fallback value or swallowing would make the
+            # pipeline ack a message that now exists nowhere else: let the
+            # pipeline dead-letter it through the broker (or requeue it if
+            # the DLQ is missing) instead.
+            logger.warning(
+                "Not recovering terminal exception %s: its DLQ copy was not confirmed, so the "
+                "pipeline must settle it (a fallback here would drop the message)",
                 type(exc).__name__,
-                exc,
             )
             raise
 
@@ -86,9 +104,10 @@ class ExceptionMiddleware(BaseMiddleware):
         for exc_type, handler in self._handlers.items():
             if isinstance(exc, exc_type):
                 logger.warning(
-                    "Exception handled by %s handler: %s",
+                    "Exception handled by %s handler: %s: %s",
                     exc_type.__name__,
-                    exc,
+                    sanitized.code,
+                    sanitized.summary,
                 )
                 return handler(exc)
 
@@ -96,8 +115,8 @@ class ExceptionMiddleware(BaseMiddleware):
         if is_terminal and self._swallow_permanent:
             logger.warning(
                 "Swallowing terminal exception (swallow_permanent=True): %s: %s",
-                type(exc).__name__,
-                exc,
+                sanitized.code,
+                sanitized.summary,
             )
             return None
 

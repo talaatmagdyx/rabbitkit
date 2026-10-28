@@ -197,7 +197,8 @@ Why each number:
 ## 2. The reference publisher
 
 ```python
-from rabbitkit import MessageEnvelope, MessageTooLargeError, PublishError
+from rabbitkit import MessageEnvelope, MessageTooLargeError
+from rabbitkit.core.errors import PublishError
 from rabbitkit.core.types import PublishStatus
 
 
@@ -219,7 +220,7 @@ async def publish_order_event(broker, order_id: str, payload: bytes) -> None:
         # Store the payload externally and publish a reference instead.
         raise
 
-    outcome.raise_for_status()                             # NACKED/TIMEOUT/RETURNED/ERROR → PublishError
+    outcome.raise_for_status()                             # anything but CONFIRMED/SENT → PublishError
 
     # If something else is settled on the strength of this publish
     # (e.g. acking an inbound message), require a REAL broker confirm:
@@ -319,8 +320,9 @@ need:
    `RuntimeWarning` flags both).
 2. **Publish-only processes call `broker.pump_idle()` from their idle
    loop** — nothing else services heartbeats between publishes, and the
-   first publish after a quiet night otherwise hits a dead socket (it now
-   reconnects and retries once, but proactive pumping avoids the hiccup).
+   first publish after a quiet night otherwise finds a dead socket (it
+   notices that before sending and reconnects, but proactive pumping avoids
+   the hiccup).
 3. **Everything connection-touching happens on the thread that called
    `start()`** — worker-thread settlement is marshalled for you; don't
    wire your own cross-thread calls. A non-owner thread touching a dead

@@ -177,9 +177,12 @@ async def publish_order() -> None:
     outcome.raise_for_status()
 ```
 
-A publish can be `CONFIRMED`, `SENT`, `RETURNED`, `NACKED`, `TIMEOUT`, or
-`ERROR`. Application code can treat those as different states instead of
-assuming "publish called" means "message safe".
+A publish can be `CONFIRMED`, `SENT`, `RETURNED`, `NACKED`, `NOT_SENT`
+(definitely never left the client: safe to publish again), `UNKNOWN` or
+`TIMEOUT` (may have reached the broker: publish again only with the same
+`message_id`), or `ERROR`. `outcome.reason` says why. Application code can
+treat those as different states instead of assuming "publish called" means
+"message safe".
 
 ### 3. Add retry and DLQ handling
 
@@ -210,7 +213,11 @@ orders.created
 Transient failures retry with backoff. Permanent failures skip the ladder
 and go straight to the DLQ. By default, rejected messages do not disappear
 silently — every rejecting route gets a DLQ unless you explicitly opt into
-discard behavior.
+discard behavior. A terminal failure reaches the DLQ as a broker-confirmed
+copy carrying the final attempt's error class, sanitized message, failure
+category, attempt count, timestamps and original queue/exchange/routing key;
+`RetryConfig.max_retry_age` bounds the total retry time and
+`RetryConfig.exponential(...)` builds the delay ladder.
 
 ### 4. Test it without RabbitMQ
 
@@ -339,8 +346,11 @@ def commit_batch(successful: list[RabbitMessage], failed: list[RabbitMessage]) -
 
 Opt-in **reliability profiles** (`critical_config()`, `broker.preflight("critical",
 management_client=...)`) verify confirms/mandatory/persistence, a 256 KiB body
-cap, quorum queues and a quorum retry chain — and report anything they cannot
-verify as *unverified*, never green. Retry/DLQ triage headers are sanitized by
+cap, bounded in-flight publish bytes, quorum queues with at-least-once
+dead-lettering, a quorum retry chain with a metadata-stamped DLQ copy, a
+required processing deadline and no `ACK_FIRST` — and report anything they
+cannot verify as *unverified*, never green
+([reliable messaging contract](docs/reliable-messaging.md)). Retry/DLQ triage headers are sanitized by
 default, and a failing delay-queue handoff backs off instead of hot-looping.
 `CoalescingAcker` (and `AsyncCoalescingAcker`) is the only place a cumulative
 `basic.ack(multiple=True)` may originate: it knows every delivery on the
@@ -394,9 +404,13 @@ duplicates). The rule is simple:
 | Handler raises forever | Retry ladder, then DLQ |
 | Malformed payload | Classified permanent, preserved in DLQ |
 | Reject with no DLX | Safe default auto-provisions a DLQ — no silent discard |
-| Retry publish times out | Original is **not** acked as if the retry succeeded |
+| Retry publish times out | Original is **not** acked as if the retry succeeded; the delivery is held for a capped backoff before it is requeued, so it cannot hot-loop |
+| Handler raises `AckMessage`/`RejectMessage` | Settled exactly as asked — never retried |
+| Result publish fails after dedup | The redelivery is processed again, not acked as a duplicate |
+| Infrastructure-managed topology | `TopologyMode.PASSIVE_ONLY` performs no writes; `broker.verify_topology(management_client)` detects type/argument/binding drift |
 | DLQ replay publish fails | DLQ message is **not** removed as if replay succeeded |
 | Message unroutable | Mandatory publishing returns a distinct `RETURNED` outcome |
+| Oversized delivery (`ConsumerConfig.max_body_bytes`) | Dead-lettered as `invalid_message` before any middleware or the handler runs |
 | Broker blips | Readiness changes; liveness does **not** kill the pod |
 | Pod gets SIGTERM | Consumers stop first, in-flight work drains |
 | CI has no RabbitMQ | `TestBroker` runs the real pipeline in memory |
@@ -408,8 +422,8 @@ Settlement is a decision, not a side effect hidden in a callback.
 
 | Policy | Behavior | Use case |
 |---|---|---|
-| `AUTO` | Ack on success, retry/reject on failure | Most consumers |
-| `MANUAL` | Handler owns ack/nack/reject | Custom settlement flows |
+| `AUTO` | Ack on success, retry/reject on failure (without retry: a transient failure is requeued once, then dead-lettered) | Most consumers |
+| `MANUAL` | Handler owns ack/nack/reject; if it raises without settling, the `AUTO` failure settlement applies | Custom settlement flows |
 | `NACK_ON_ERROR` | Ack on success, nack on failure | Never silently accept failed work |
 | `ACK_FIRST` | Ack before the handler runs | At-most-once workloads |
 
@@ -430,14 +444,19 @@ handlers. Migrating existing classic queues to quorum? There's a tool:
 ## Observability
 
 Structured logs carry message context (`message_id`, `correlation_id`,
-routing, queue, handler, retry count, settlement, duration, error type) with
-secret redaction on by default. Metrics cover consumed/acked/nacked/
+routing, queue, handler, retry count, settlement, duration, error type) and
+redact secrets once logging is configured
+(`RabbitConfig(logging=LoggingConfig())`; redaction is opt-in). Metrics cover consumed/acked/nacked/
 retried/dead-lettered counts, publish outcomes, handler latency,
 redeliveries, reconnects, confirm latency, in-flight handlers, broker/consumer
 lifecycle gauges, bulk-publish and settlement outcomes, retry-handoff
 failures, and — via the management API poller — queue depth and consumer lag. Tracing is standard OpenTelemetry
 (`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
-one continuous trace from publish to consume.
+one continuous trace from publish to consume. Prometheus alert rules with
+`promtool` tests ship in `deploy/prometheus/rabbitkit-alerts.yaml`, each linked
+to a runbook in `docs/runbooks/`. For the full reliability contract (publish
+outcomes, settlement, failure taxonomy, durability scope) see
+`docs/reliable-messaging.md`.
 
 ## Advanced & experimental
 
@@ -492,6 +511,7 @@ validates it.
 | Middleware | Job |
 |---|---|
 | `RetryMiddleware` | Broker-side retry ladder (auto-wired with `retry=`) |
+| `EventMetadataMiddleware` | Opt-in [event metadata](docs/event-metadata.md) validation (type, version, source, idempotency key, …); bad or unknown-version events are dead-lettered |
 | `DeduplicationMiddleware` | Redis-backed duplicate suppression; `claim` policy is crash-safe; `store_results` replays the original answer to duplicates |
 | `MetricsMiddleware` | Counters + latency histograms, cardinality-guarded labels |
 | `OTelTracingMiddleware` | Standard OpenTelemetry spans + W3C propagation |
@@ -513,7 +533,9 @@ rabbitkit health myapp.main:broker
 ```
 
 The DLQ replay acks a message only after its republish is broker-confirmed —
-the recovery tool cannot itself lose messages.
+the recovery tool cannot itself lose messages. Every replay is audit-logged
+and stamps `x-rabbitkit-replay-count`; a message replayed 3 times is refused
+unless you pass `--ignore-replay-limit`.
 
 <p align="center"><img src="https://raw.githubusercontent.com/talaatmagdyx/rabbitkit/main/assets/demo.svg" alt="rabbitkit dlq inspect and replay demo" width="720"></p>
 
@@ -654,6 +676,8 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Full Guide](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/guide/full-guide.md)
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
+- [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
+- [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)

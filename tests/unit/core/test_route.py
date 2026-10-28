@@ -436,9 +436,7 @@ class TestRejectWithoutDLXResolution:
         route = _make_route()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            result = route.resolve_safety_dlq(
-                SafetyConfig(reject_without_dlx="discard", warn_on_discard=False)
-            )
+            result = route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="discard", warn_on_discard=False))
         assert result is None
         assert caught == []
 
@@ -474,6 +472,21 @@ class TestRouteDynamic:
     def test_delete_other_field_raises(self) -> None:
         """del on any field other than consumer_tag raises FrozenInstanceError."""
         from dataclasses import FrozenInstanceError
+
         route = _make_route()
         with pytest.raises(FrozenInstanceError):
             del route.name  # type: ignore[misc]
+
+
+# ── CONSUMER-005: per-route prefetch validation ──────────────────────────
+
+
+class TestPrefetchValidation:
+    @pytest.mark.parametrize("value", [None, 1, 250])
+    def test_none_or_positive_is_accepted(self, value: int | None) -> None:
+        _make_route(prefetch_count=value).validate()
+
+    @pytest.mark.parametrize("value", [0, -1, True, 2.5, "10"])
+    def test_zero_negative_or_non_int_is_rejected(self, value: object) -> None:
+        with pytest.raises(ConfigurationError, match="prefetch_count must be None"):
+            _make_route(prefetch_count=value).validate()

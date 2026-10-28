@@ -10,11 +10,12 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from rabbitkit.core.errors import ConfigValidationError
 from rabbitkit.core.logging import LoggingConfig
-from rabbitkit.core.types import ErrorSeverity, TopologyMode
+from rabbitkit.core.types import ErrorSeverity, TerminalAction, TopologyMode
 
 # ── Connection ─────────────────────────────────────────────────────────────
 
@@ -66,25 +67,28 @@ class ConnectionConfig:
     # forever). Previously hardcoded (30 attempts) and unreachable from
     # config -- the transport constructor accepted no override and
     # RabbitConfig had no path to it at all. Async's *ongoing* reconnect
-    # (after the first successful connect) is deliberately NOT bounded here:
-    # it is owned entirely by aio-pika's connect_robust, which retries
-    # indefinitely with a jittered interval -- the correct pattern for a
-    # long-running consumer (let Kubernetes/the supervisor decide whether to
-    # kill a wedged pod via liveness, rather than have the client give up on
-    # its own). See docs/concurrency-model.md for the full reasoning.
+    # (after the first successful connect) is NOT bounded by this field: it
+    # retries with exponential backoff and full jitter (reconnect_backoff_base
+    # doubling up to reconnect_backoff_max), unlimited by default, and is
+    # bounded only by reconnect_budget_attempts / reconnect_budget_seconds
+    # below. Unlimited is the right default for a long-running consumer (let
+    # Kubernetes/the supervisor decide whether to kill a wedged pod). See
+    # docs/concurrency-model.md for the full reasoning.
     reconnect_max_attempts: int = 30
     # M13: credential rotation. When set, called at each (re)connect to fetch
     # fresh (username, password) — e.g. from Vault/short-lived secrets — so a
     # rotated credential is picked up on the next reconnect WITHOUT a redeploy
     # (the frozen username/password fields are the static fallback). Excluded
-    # from the AMQP URL/repr paths; only the connection builders call it.
+    # from the AMQP URL/repr paths; only the connection builders call it. On
+    # async this includes every in-place reconnect attempt of a live
+    # connection (G-08), not only rabbitkit-built connections.
     credentials_provider: Callable[[], tuple[str, str]] | None = None
     # M9: additional cluster nodes for failover, each "host" or "host:port".
     # The primary (host/port above) is tried first, then each node in order.
     # All share the same credentials/vhost/TLS/heartbeat. Sync (pika) tries
     # them natively via a ConnectionParameters list; async cycles endpoints on
-    # initial connect (connect_robust then pins to the chosen node — put a
-    # load balancer / DNS round-robin in front for per-reconnect failover).
+    # the initial connect AND on every reconnect attempt after a drop (G-08),
+    # moving to the next node after each failure.
     nodes: tuple[str, ...] = ()
     # Item 8: escape-hatch for extra AMQP client_properties, shown in the
     # management UI's Connections tab alongside connection_name -- e.g.
@@ -99,6 +103,18 @@ class ConnectionConfig:
     # PII here; service_name/environment/pod_name/region are fine, customer
     # IDs or API keys are not.
     client_properties: dict[str, str] = field(default_factory=dict)
+    # G-08: bounds on the ASYNC transport's reconnects after the first
+    # successful connect (an outage). Both default to None = unlimited, the
+    # availability-first behaviour rabbitkit always had. When either runs
+    # out, the connection gives up for good: ReconnectBudgetExhaustedError
+    # reaches on_connection_failed hooks, readiness and liveness go false and
+    # AsyncBroker.run() raises it. Attempts count consecutive failed
+    # reconnects within one outage; seconds count from the moment the
+    # connection was lost. The counters reset when a reconnect succeeds.
+    # The SYNC transport ignores both; its loop stays bounded by
+    # reconnect_max_attempts above (unchanged).
+    reconnect_budget_attempts: int | None = None
+    reconnect_budget_seconds: float | None = None
 
     def resolve_credentials(self) -> tuple[str, str]:
         """Return ``(username, password)`` — from ``credentials_provider`` if
@@ -176,6 +192,7 @@ class ConnectionConfig:
                 f"{self.reconnect_max_attempts} (this bounds the sync transport's "
                 "reconnect loop only -- see the field docstring)."
             )
+        self._validate_timing()
         # Item 8: basic validation for the client_properties escape hatch --
         # strings only (AMQP field-table values could otherwise smuggle
         # arbitrary types through to the broker), length-capped so a runaway
@@ -198,6 +215,50 @@ class ConnectionConfig:
                     f"{len(cp_value)} chars, exceeding the "
                     f"{_CLIENT_PROPERTY_VALUE_MAX_LEN}-char limit."
                 )
+
+    def _validate_timing(self) -> None:
+        """G-08: reject timing values that silently break reconnects.
+
+        ``reconnect_backoff_base=0`` made every retry immediate (a hot
+        reconnect loop) and ``reconnect_backoff_max < base`` capped the
+        backoff below its own starting point. ``socket_timeout <= 0`` is not
+        a usable connect timeout. ``heartbeat=0`` is legal (it disables
+        heartbeats) but means a silently dead TCP peer is never detected, so
+        it warns.
+        """
+        if not self.reconnect_backoff_base > 0:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_backoff_base must be > 0, got {self.reconnect_backoff_base}."
+            )
+        if not self.reconnect_backoff_max >= self.reconnect_backoff_base:
+            raise ConfigValidationError(
+                f"ConnectionConfig.reconnect_backoff_max ({self.reconnect_backoff_max}) must be >= "
+                f"reconnect_backoff_base ({self.reconnect_backoff_base})."
+            )
+        if not self.socket_timeout > 0:
+            raise ConfigValidationError(f"ConnectionConfig.socket_timeout must be > 0, got {self.socket_timeout}.")
+        if self.heartbeat < 0:
+            raise ConfigValidationError(
+                f"ConnectionConfig.heartbeat must be >= 0 (0 disables heartbeats), got {self.heartbeat}."
+            )
+        if self.heartbeat == 0:
+            warnings.warn(
+                "ConnectionConfig(heartbeat=0) disables AMQP heartbeats: a broker or network "
+                "that dies without closing the TCP connection is not detected, and the client "
+                "waits on a dead socket. Keep a heartbeat (the default is 30 s) in production.",
+                UserWarning,
+                stacklevel=3,
+            )
+        if self.reconnect_budget_attempts is not None and self.reconnect_budget_attempts < 1:
+            raise ConfigValidationError(
+                "ConnectionConfig.reconnect_budget_attempts must be >= 1 or None (unlimited), "
+                f"got {self.reconnect_budget_attempts}."
+            )
+        if self.reconnect_budget_seconds is not None and not self.reconnect_budget_seconds > 0:
+            raise ConfigValidationError(
+                "ConnectionConfig.reconnect_budget_seconds must be > 0 or None (unlimited), "
+                f"got {self.reconnect_budget_seconds}."
+            )
 
     @classmethod
     def from_url(cls, url: str) -> ConnectionConfig:
@@ -348,6 +409,40 @@ class PublisherConfig:
     # head-of-line blocking, slow recovery) — consider a tighter cap
     # (e.g. 1_048_576 for 1 MiB) and storing payloads externally.
     max_message_bytes: int = 16_777_216
+    # Async broker only: cap on the sum of body bytes of publishes between
+    # admission and their terminal outcome (single ``publish()`` and the
+    # batch publisher share it). A publish waits (bounded by
+    # PoolConfig.channel_acquire_timeout or its per-call ``timeout``) for
+    # room and then returns NOT_SENT(reason="admission_timeout"). None (the
+    # default) = no byte bound, the previous behaviour. Must be >= 1 and,
+    # when ``max_message_bytes`` is set, >= ``max_message_bytes`` so every
+    # admissible message fits.
+    max_in_flight_bytes: int | None = None
+    # G-19: remove rabbitkit's retry/DLQ/replay bookkeeping headers
+    # (``x-rabbitkit-retry-count``, ``x-rabbitkit-first-failed-at``,
+    # ``x-rabbitkit-original-queue`` ...) and the broker's ``x-death`` from
+    # APPLICATION publishes (``broker.publish()`` and the bulk APIs built on
+    # it), so a forged or copied header cannot make a new message skip its
+    # retries. Also strips a custom ``RetryConfig.retry_header``. rabbitkit's
+    # own retry / DLQ / replay republishes do not go through
+    # ``broker.publish()`` and keep them. Default False (headers pass
+    # through unchanged, the previous behaviour); the CRITICAL reliability
+    # profile turns it on. See ``rabbitkit.core.reserved_headers``.
+    strip_reserved_headers: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_in_flight_bytes is None:
+            return
+        if self.max_in_flight_bytes < 1:
+            raise ConfigValidationError(
+                f"PublisherConfig.max_in_flight_bytes must be >= 1 or None, got {self.max_in_flight_bytes}"
+            )
+        if self.max_message_bytes and self.max_in_flight_bytes < self.max_message_bytes:
+            raise ConfigValidationError(
+                f"PublisherConfig.max_in_flight_bytes ({self.max_in_flight_bytes}) must be >= "
+                f"max_message_bytes ({self.max_message_bytes}), otherwise a message within the "
+                "size limit could never be admitted. Lower max_message_bytes or raise the budget."
+            )
 
 
 # ── Consumer ───────────────────────────────────────────────────────────────
@@ -355,22 +450,63 @@ class PublisherConfig:
 
 @dataclass(frozen=True, slots=True)
 class ConsumerConfig:
-    """Consumer behavior tuning."""
+    """Consumer behavior tuning.
+
+    Attributes:
+        prefetch_count: AMQP QoS per consumer channel. On the async broker
+            this is also the handler concurrency per queue unless a
+            ``WorkerConfig(worker_count >= 2)`` pool is used.
+        graceful_timeout: shutdown drain budget in seconds (``stop()``).
+        reject_transient_on_redelivery: bound the transient-failure loop on
+            routes without retry (default True). A transient error
+            (``TimeoutError``, ``OSError``, ``HandlerTimeoutError``, ...) on
+            a first delivery is nack-requeued once; the same error on a
+            message the broker has already redelivered
+            (``redelivered=True``) is dead-lettered instead of requeued
+            again. This is a 2-strike cap on the broker's ``redelivered``
+            flag, the only per-message redelivery signal classic queues
+            carry. It also counts a redelivery caused by a crash or a lost
+            connection, so one transient failure after a reconnect goes to
+            the DLQ. For more attempts or delays use ``RetryConfig`` (delay
+            queues). ``False`` restores the previous behaviour: transient
+            errors requeue immediately with no cap, which hot-loops a
+            poison message (thousands of handler runs per second).
+        manual_settle_on_error: under ``AckPolicy.MANUAL``, a handler that
+            raises WITHOUT settling its message gets the same failure
+            settlement as ``AUTO`` (transient: requeue, bounded as above;
+            permanent: dead-letter), logged with the action taken (default
+            True). Without it the delivery stayed unacked until the channel
+            closed, holding a prefetch slot; ``prefetch`` such failures
+            stalled the consumer. Set False only if the handler settles
+            through something other than ``RabbitMessage`` (a raw channel or
+            a coalescing acker) and then re-raises: the pipeline cannot see
+            that settlement and would settle the delivery a second time.
+        processing_timeout: per-delivery handler deadline in seconds,
+            async broker only (``None`` = off, the default). On expiry the
+            handler task is cancelled and ``HandlerTimeoutError``
+            (``outcome_unknown=True``, transient) goes through the normal
+            failure settlement. The sync broker ignores it (Python cannot
+            interrupt a thread) and logs a warning; use
+            ``TimeoutMiddleware`` there.
+        max_body_bytes: raw-body cap for deliveries, in bytes (``None`` =
+            no cap, the default). A delivery whose body as received (before
+            decompression or any ``on_receive`` hook) is larger is
+            ``INVALID_MESSAGE``: rejected without requeue, so the source
+            queue's dead-letter exchange moves it to the DLQ, without running
+            any middleware or the handler. By default the broker dead-letters
+            it, so the DLQ entry carries ``x-death`` but not rabbitkit's
+            failure headers; with ``SafetyConfig.dead_letter_with_metadata``
+            (async broker; set by the CRITICAL profile) it is a confirmed copy
+            with them (``x-rabbitkit-error-category: invalid_message``).
+            ``CompressionMiddleware`` caps the decompressed size separately.
+    """
 
     prefetch_count: int = 10
     graceful_timeout: float = 30.0
-    # M6: bound the transient hot-loop on retry-less AUTO routes. By default
-    # (False), a transient error nack-requeues with no cap — legitimate
-    # "wait for the downstream to recover" behavior, but a footgun when the
-    # failure is really permanent. When True, a transient error on a message
-    # the broker has ALREADY redelivered (redelivered=True) is rejected to the
-    # DLQ instead of requeued again — a 2-strike cap using the broker's
-    # redelivered flag (the only per-message redelivery signal available
-    # without republishing; classic-queue requeues can't carry a count). For
-    # a higher cap or delays, use retry (delay ladder) or a quorum source
-    # queue with x-delivery-limit. Requires a dead-letter path — the default
-    # reject_without_dlx="auto_provision" (C3) gives AUTO routes one.
-    reject_transient_on_redelivery: bool = False
+    reject_transient_on_redelivery: bool = True
+    manual_settle_on_error: bool = True
+    processing_timeout: float | None = None
+    max_body_bytes: int | None = None
 
     def __post_init__(self) -> None:
         # Architect review M1: prefetch_count=0 means AMQP "unlimited" — a
@@ -387,6 +523,14 @@ class ConsumerConfig:
             raise ConfigValidationError(
                 f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}"
             )
+        if self.processing_timeout is not None and self.processing_timeout <= 0:
+            raise ConfigValidationError(
+                f"ConsumerConfig.processing_timeout must be > 0 or None, got {self.processing_timeout}"
+            )
+        if self.max_body_bytes is not None and self.max_body_bytes < 1:
+            raise ConfigValidationError(
+                f"ConsumerConfig.max_body_bytes must be >= 1 or None, got {self.max_body_bytes}"
+            )
 
 
 # ── Pool ───────────────────────────────────────────────────────────────────
@@ -398,10 +542,22 @@ class PoolConfig:
 
     ``channel_pool_size`` (publisher channel pool) and ``channel_acquire_timeout``
     are active. ``publisher_connections`` / ``consumer_connections`` are
-    **reserved**: the transport currently uses one connection per role, because
-    multiple connections sharing a single event loop showed no throughput benefit
-    in benchmarks (the loop is the bound). Scale throughput by running more
-    processes/pods, not more connections per process.
+    **reserved and ignored** (setting them changes nothing): the transport
+    currently uses one connection per role, because multiple connections
+    sharing a single event loop showed no throughput benefit in benchmarks
+    (the loop is the bound). Scale throughput by running more processes/pods,
+    not more connections per process.
+
+    Attributes:
+        channel_pool_size: Maximum publisher channels per pool (>= 1). On the
+            async broker every confirmed publish holds one channel until its
+            confirm arrives, so this is also the in-flight confirmed-publish
+            cap.
+        channel_acquire_timeout: Admission bound in seconds (> 0). A publish
+            that cannot get a channel (pool exhausted) within it returns
+            ``NOT_SENT`` with reason ``admission_timeout``; exhaustion never
+            rebuilds the connection. Also bounds opening one channel.
+        prewarm_channels: Pre-create all pool channels on ``connect()``.
     """
 
     channel_pool_size: int = 10
@@ -409,6 +565,14 @@ class PoolConfig:
     consumer_connections: int = 1  # reserved — see class docstring
     channel_acquire_timeout: float = 10.0  # seconds to wait for a pooled channel
     prewarm_channels: bool = False  # pre-create all pool channels on connect() to eliminate warmup jitter
+
+    def __post_init__(self) -> None:
+        if self.channel_pool_size < 1:
+            raise ConfigValidationError(f"PoolConfig.channel_pool_size must be >= 1, got {self.channel_pool_size}")
+        if not self.channel_acquire_timeout > 0:
+            raise ConfigValidationError(
+                f"PoolConfig.channel_acquire_timeout must be > 0, got {self.channel_acquire_timeout}"
+            )
 
 
 # ── Retry ──────────────────────────────────────────────────────────────────
@@ -491,16 +655,45 @@ class RetryConfig:
       ``"sanitized"`` (default: redacted + capped), ``"omit"``, or ``"raw"``
       (legacy). See :mod:`rabbitkit.core.sanitizer`.
     * ``handoff``: bounded behavior when the retry publish itself fails.
+
+    Retry policy:
+
+    * ``max_retries`` / ``delays`` — the ladder (delays in whole seconds,
+      one fixed-TTL delay queue per tier). :meth:`exponential` builds
+      ``delays`` from ``initial_delay`` / ``multiplier`` / ``max_delay``.
+    * ``max_retry_age`` (seconds, ``None`` = unbounded) — a transient
+      failure more than this long after the message's FIRST failure
+      (``x-rabbitkit-first-failed-at``) is terminal (category
+      ``retry-age-exceeded``) even with retries left.
+    * ``terminal_action`` — :class:`~rabbitkit.core.types.TerminalAction`:
+      ``"dead_letter"`` (default) publishes a confirmed, metadata-stamped
+      copy to ``<queue>.dlq`` before acking; ``"reject"`` is the legacy
+      broker dead-letter path.
+    * Jitter: ``jitter_factor`` only takes effect with
+      ``jitter_mode="sharded"``. Per-message TTL jitter is deliberately not
+      offered: a classic queue expires messages only at its head, so a
+      message with a long TTL blocks every shorter one behind it.
+
+    Trust model: the retry count, first-failure timestamp and original-*
+    headers travel on the message and are client-controlled. rabbitkit
+    never lowers them on its own republish, takes the larger of the header
+    count and the broker's ``x-death`` history for this queue's delay
+    tiers, and clamps to ``max_retries``; a producer that strips every
+    header restarts the budget — ``max_retry_age`` and a quorum source's
+    ``x-delivery-limit`` bound that case. A producer that sets the header
+    HIGH skips retries; ``trust_retry_header=False`` closes that by counting
+    only the ``x-death`` entries the broker adds when a copy expires out of
+    a ``<queue>.retry.<n>`` delay queue (the header is then informational).
+    Leave it ``True`` for ``TestBroker`` suites that simulate later attempts
+    by setting the header, since the in-memory broker writes no ``x-death``.
     """
 
     max_retries: int = 4
     delays: tuple[int, ...] = (5, 30, 120, 600)
     retry_header: str = "x-rabbitkit-retry-count"
-    # RESERVED / no-op (M2): queue-based retry uses a fixed per-queue
-    # x-message-ttl, so jitter would require per-message TTL — which
-    # reintroduces head-of-line blocking on classic queues. Kept for API
-    # stability; does not affect delay timing. Spread retries across a fleet
-    # via the per-process reconnect jitter, not this.
+    # Only used with jitter_mode="sharded" (TTL spread across shard queues).
+    # With jitter_mode="off" it has no effect: per-message TTL jitter would
+    # reintroduce head-of-line blocking on classic delay queues.
     jitter_factor: float = 0.1
     # F4: "off" (default — single delay queue per tier, exact legacy topology)
     # or "sharded" — each tier becomes jitter_shards sub-queues with uniform
@@ -511,6 +704,8 @@ class RetryConfig:
     # enabling this on an existing topology is additive (no 406s).
     jitter_mode: str = "off"
     jitter_shards: int = 3
+    # DEPRECATED, never used: the DLQ is always "<queue>.dlq" reached via the
+    # default exchange. A non-empty value warns.
     dead_letter_exchange: str = ""
     per_queue: bool = True
     unknown_policy: ErrorSeverity = ErrorSeverity.PERMANENT
@@ -519,10 +714,58 @@ class RetryConfig:
     dlq_queue_type: str = "inherit"
     error_detail: str = "sanitized"
     handoff: RetryHandoffConfig = field(default_factory=RetryHandoffConfig)
+    max_retry_age: float | None = None
+    terminal_action: TerminalAction = TerminalAction.DEAD_LETTER
+    # Quorum options for the retry chain (applied only to the delay queues /
+    # DLQ that resolve to quorum). None = broker defaults = legacy topology.
+    quorum_initial_group_size: int | None = None
+    # x-dead-letter-strategy for QUORUM delay queues: "at-least-once" keeps an
+    # expired message on the delay queue until the source queue confirms it
+    # (also sets x-overflow=reject-publish on them, which RabbitMQ requires).
+    delay_queue_dead_letter_strategy: str | None = None
+    # G-19: True (legacy) = the attempt count is the larger of the
+    # retry_header value and the broker's x-death history. False = only the
+    # x-death history counts: a producer cannot skip (or restart) retries by
+    # setting the header. The header is still written for observability.
+    trust_retry_header: bool = True
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ConfigValidationError(f"RetryConfig.max_retries must be >= 0, got {self.max_retries}")
+        try:
+            object.__setattr__(self, "terminal_action", TerminalAction(self.terminal_action))
+        except ValueError:
+            raise ConfigValidationError(
+                f"RetryConfig.terminal_action must be one of {[a.value for a in TerminalAction]}, "
+                f"got {self.terminal_action!r}"
+            ) from None
+        if self.quorum_initial_group_size is not None and self.quorum_initial_group_size < 1:
+            raise ConfigValidationError(
+                f"RetryConfig.quorum_initial_group_size must be >= 1, got {self.quorum_initial_group_size}"
+            )
+        if self.delay_queue_dead_letter_strategy not in (None, "at-most-once", "at-least-once"):
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy must be None, 'at-most-once' or "
+                f"'at-least-once', got {self.delay_queue_dead_letter_strategy!r}"
+            )
+        if self.delay_queue_dead_letter_strategy is not None and self.delay_queue_type == "classic":
+            raise ConfigValidationError(
+                "RetryConfig.delay_queue_dead_letter_strategy needs quorum delay queues "
+                "(delay_queue_type='quorum' or 'inherit'); classic queues have no dead-letter strategy"
+            )
+        if self.max_retry_age is not None and self.max_retry_age <= 0:
+            raise ConfigValidationError(f"RetryConfig.max_retry_age must be > 0 seconds, got {self.max_retry_age}")
+        if any(d < 0 for d in self.delays):
+            raise ConfigValidationError(f"RetryConfig.delays must be >= 0 seconds, got {self.delays}")
+        if self.dead_letter_exchange:
+            warnings.warn(
+                "RetryConfig.dead_letter_exchange is deprecated and has never been used: retry "
+                "dead-letters to '<queue>.dlq' through the default exchange. Remove the argument; "
+                "for an infrastructure-managed dead-letter exchange use terminal_action='reject' "
+                "with TopologyMode.PASSIVE_ONLY.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
         if self.delay_queue_type not in RETRY_QUEUE_TYPES:
             raise ConfigValidationError(
                 f"RetryConfig.delay_queue_type must be one of {RETRY_QUEUE_TYPES}, got {self.delay_queue_type!r}"
@@ -575,9 +818,38 @@ class RetryConfig:
             )
             if self.strict_delays:
                 raise ConfigValidationError(msg)
-            import warnings
-
             warnings.warn(msg, UserWarning, stacklevel=2)
+
+
+    @classmethod
+    def exponential(
+        cls,
+        *,
+        max_retries: int = 4,
+        initial_delay: float = 5.0,
+        multiplier: float = 2.0,
+        max_delay: float = 600.0,
+        **kwargs: Any,
+    ) -> RetryConfig:
+        """Build a ``RetryConfig`` whose ``delays`` follow a capped exponential.
+
+        ``delays[i] = min(max_delay, initial_delay * multiplier ** i)``,
+        rounded to whole seconds (minimum 1) because each tier is a delay
+        queue with a fixed ``x-message-ttl``. Every other field is passed
+        through ``kwargs``.
+        """
+        if initial_delay <= 0:
+            raise ConfigValidationError(f"initial_delay must be > 0, got {initial_delay}")
+        if multiplier < 1:
+            raise ConfigValidationError(f"multiplier must be >= 1, got {multiplier}")
+        if max_delay < initial_delay:
+            raise ConfigValidationError(f"max_delay ({max_delay}) must be >= initial_delay ({initial_delay})")
+        delays: list[int] = []
+        current = float(initial_delay)
+        for _ in range(max_retries):
+            delays.append(max(1, round(min(max_delay, current))))
+            current = min(max_delay, current * multiplier)
+        return cls(max_retries=max_retries, delays=tuple(delays), **kwargs)
 
 
 # NOTE: ``RetryConfig`` no longer imports ``warnings`` at module top-level; the
@@ -644,6 +916,13 @@ class MetricsConfig:
     @property
     def messages_dead_lettered_total(self) -> str:
         return f"{self.namespace}_messages_dead_lettered_total"
+
+    @property
+    def settlement_outcome_unknown_total(self) -> str:
+        """Incremented (labeled by ``queue``) when a handler succeeded but its
+        ack raised: the ack may or may not have reached the broker, so the
+        message may be redelivered and processed again."""
+        return f"{self.namespace}_settlement_outcome_unknown_total"
 
     @property
     def dedup_fallback_total(self) -> str:
@@ -836,6 +1115,84 @@ class MetricsConfig:
         """Number of consumers attached to the queue (0 = nothing draining)."""
         return f"{self.namespace}_queue_consumers"
 
+    # ── Broker/transport metrics (G-22, §19). Emitted by the broker itself
+    # whenever any MetricsMiddleware with a collector is configured (publish
+    # middlewares or any route), so publish-only brokers get them too. ──
+
+    @property
+    def messages_failed_total(self) -> str:
+        """Handler failures labeled by ``queue`` and ``category`` (one of the
+        six ``ErrorCategory`` values)."""
+        return f"{self.namespace}_messages_failed_total"
+
+    @property
+    def publish_in_flight(self) -> str:
+        """Gauge: async publishes between admission and their outcome (sampled)."""
+        return f"{self.namespace}_publish_in_flight"
+
+    @property
+    def publish_in_flight_bytes(self) -> str:
+        """Gauge: body bytes held by the ``max_in_flight_bytes`` budget (sampled;
+        only emitted when that budget is configured)."""
+        return f"{self.namespace}_publish_in_flight_bytes"
+
+    @property
+    def publish_channels_in_use(self) -> str:
+        """Gauge: publisher channels checked out of the async pools (sampled)."""
+        return f"{self.namespace}_publish_channels_in_use"
+
+    @property
+    def publish_routing_failures_total(self) -> str:
+        """Publishes the broker could not route, labeled by ``exchange`` and
+        ``reason`` (``returned`` / ``exchange_not_found``). Counts every
+        transport publish, including retry and dead-letter copies."""
+        return f"{self.namespace}_publish_routing_failures_total"
+
+    @property
+    def connection_up(self) -> str:
+        """Gauge: 1 while the connection of ``role`` is up, else 0."""
+        return f"{self.namespace}_connection_up"
+
+    @property
+    def connections_active(self) -> str:
+        """Gauge: connections currently up."""
+        return f"{self.namespace}_connections_active"
+
+    @property
+    def channels_active(self) -> str:
+        """Gauge: channels the transport currently holds open (sampled)."""
+        return f"{self.namespace}_channels_active"
+
+    @property
+    def connection_failures_total(self) -> str:
+        """Connection failures labeled by ``role`` and a bounded ``reason``:
+        a live connection lost, a failed reconnect attempt, or a terminal
+        give-up (its ``TerminalConnectionError.reason``)."""
+        return f"{self.namespace}_connection_failures_total"
+
+    @property
+    def reconnect_attempts_total(self) -> str:
+        """FAILED reconnect attempts labeled by ``role``. A successful
+        reconnect increments ``reconnects_total`` instead."""
+        return f"{self.namespace}_reconnect_attempts_total"
+
+    @property
+    def connection_blocked(self) -> str:
+        """Gauge: 1 while RabbitMQ has the connection blocked
+        (``connection.blocked``: a memory or disk alarm), else 0."""
+        return f"{self.namespace}_connection_blocked"
+
+    @property
+    def consumer_cancelled_total(self) -> str:
+        """Consumers the BROKER cancelled (``basic.cancel``), labeled by ``queue``."""
+        return f"{self.namespace}_consumer_cancelled_total"
+
+    @property
+    def route_consuming(self) -> str:
+        """Gauge per ``queue``: 1 while the route's consumer is subscribed, 0
+        while it is not (stopped, or cancelled by the broker)."""
+        return f"{self.namespace}_route_consuming"
+
 
 # ── Health Check ──────────────────────────────────────────────────────────
 
@@ -990,11 +1347,26 @@ class SafetyConfig:
 
     Only applied under ``TopologyMode.AUTO_DECLARE``; per-route override via
     ``@subscriber(reject_without_dlx=...)``.
+
+    ``dead_letter_with_metadata`` (G-17, async broker; default ``False``) —
+    failures that never reach ``RetryMiddleware`` (an ``on_receive`` failure
+    such as a bad gzip body or signature, a body over
+    ``ConsumerConfig.max_body_bytes``, a failure on a route without retry, a
+    transient failure on redelivery) are dead-lettered by a broker reject,
+    so their DLQ entry carries only ``x-death``. With ``True`` the async
+    broker first publishes a confirmed copy carrying the same failure
+    metadata as ``RetryMiddleware``'s terminal copy to the route's DLQ (one
+    reached through the default exchange: the retry DLQ or the
+    ``auto_provision`` safety DLQ) and acks the delivery only once that copy
+    is confirmed; if it is not, the reject (or the requeue for a missing
+    DLQ) runs as before. Such a DLQ entry has no ``x-death``. The CRITICAL
+    profile turns it on. ``SyncBroker`` ignores it (and logs so).
     """
 
     reject_without_dlx: str = "auto_provision"
     dlq_suffix: str = ".dlq"
     warn_on_discard: bool = True
+    dead_letter_with_metadata: bool = False
     # M14: what to do when declaring a queue/exchange 406s because it already
     # exists with incompatible arguments (drift — e.g. ops created it, or a
     # prior rabbitkit version, with a different type/TTL/DLX).
@@ -1118,6 +1490,19 @@ class WorkerConfig:
     """Consumer concurrency configuration.
 
     Accepted by broker.start(), NOT part of RabbitConfig. Added in 0.2.0.
+
+    Concurrency semantics, per queue:
+
+    * ``worker_count >= 2``: a worker pool of that size runs the handlers;
+      prefetch is ``worker_count * prefetch_per_worker`` when
+      ``prefetch_per_worker`` is set.
+    * ``worker_count == 1`` (the default) creates NO pool, and
+      ``prefetch_per_worker`` is ignored. On the **async** broker every
+      delivery then runs as its own task, so up to ``prefetch_count``
+      handlers of one queue run concurrently -- ``worker_count=1`` does
+      **not** serialize async handlers. Use ``prefetch_count=1`` (or a
+      lock in the handler) for one-at-a-time processing. On the **sync**
+      broker handlers run inline on the I/O thread, one at a time.
 
     ``stop_timeout`` (H12): a FALLBACK drain deadline for the worker pool's
     ``stop()`` — consulted only when no explicit timeout is passed. On the

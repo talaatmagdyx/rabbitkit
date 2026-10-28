@@ -53,7 +53,7 @@ await broker.publish(MessageEnvelope(routing_key="orders", body=b'{"id":1}'))
 ```python
 from rabbitkit.core.config import RetryConfig
 
-@broker.subscriber(queue="orders", retry_config=RetryConfig(max_retries=3, delays=(5, 30, 120)))
+@broker.subscriber(queue="orders", retry=RetryConfig(max_retries=3, delays=(5, 30, 120)))
 async def handle(body: dict) -> None:
     ...  # retried 3x on transient errors; dead-lettered after
 ```

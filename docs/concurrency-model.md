@@ -23,7 +23,7 @@ them from.
 | `SyncBatchPublisher.publish()` | dedicated `SelectConnection` I/O thread inside | **any thread** (this is its purpose) |
 | Startup/shutdown hooks (sync, with timeout) | a fresh single-worker executor thread per hook | n/a |
 | `AsyncBroker` — everything | one asyncio event loop | that loop only |
-| Async handlers | tasks on the broker's loop | n/a |
+| Async handlers | tasks on the broker's loop — up to `prefetch_count` per queue run concurrently unless `worker_count >= 2` (then the pool size bounds them); `worker_count=1` does **not** serialize them | n/a |
 | Large-body decode (≥ 256 KiB, async) | `asyncio.to_thread` worker | internal |
 | `HealthWatcher` | its own daemon poller thread | constructed anywhere; `stop()` from anywhere |
 | `AsyncHealthWatcher` | an asyncio task on the broker's loop | that loop |
@@ -122,10 +122,12 @@ Two places work intentionally leaves the loop:
 `AsyncConnectionPool` does hold an `asyncio.Lock`, but it scopes to
 guarding *first-time* connection creation only (so two concurrent
 callers racing to establish the initial connection don't each create
-one). Ongoing reconnection — after that first connect — is owned
-entirely by aio-pika's own `connect_robust()` machinery internally; a
-rabbitkit-level lock wrapped around a process rabbitkit doesn't control
-would serialize nothing real and just add latency for no safety gain.
+one). Ongoing reconnection — after that first connect — runs inside
+aio-pika's own `connect_robust()` task, one per connection; rabbitkit only
+sets its policy from aio-pika's close hook (backoff delay, budget, the
+next endpoint and fresh credentials, giving up on a permanent failure; see
+`async_/reconnect.py`). A rabbitkit-level lock around that would serialize
+nothing real and just add latency for no safety gain.
 
 ## Health checks and probes
 

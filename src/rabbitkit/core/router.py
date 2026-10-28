@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
-from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
@@ -82,7 +82,7 @@ class RabbitRouter:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber on this router.
 
         Applies router-level defaults:
@@ -133,7 +133,7 @@ class RabbitRouter:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a result publisher on this router."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 

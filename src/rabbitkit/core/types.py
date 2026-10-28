@@ -196,6 +196,48 @@ class ErrorSeverity(str, Enum):
     PERMANENT = "permanent"
 
 
+class ErrorCategory(str, Enum):
+    """What kind of failure a handler error is (the failure taxonomy).
+
+    :class:`ErrorSeverity` still decides retry versus dead-letter; the
+    category says *why*, for the ``x-rabbitkit-error-category`` header on
+    retry and DLQ copies and as a bounded metric label.
+
+    * ``RETRYABLE``: transient; a retry may succeed (``TimeoutError``,
+      ``ConnectionError``/``OSError``, ``EOFError``).
+    * ``PERMANENT``: a retry cannot succeed (business rule violation,
+      handler bug). The default for unclassified exceptions.
+    * ``INVALID_MESSAGE``: the message itself cannot be decoded or
+      validated (body decode or validation failure, missing required
+      header, unreadable compressed body, bad signature). Terminal.
+    * ``UNKNOWN_OUTCOME``: the handler's side effects may or may not have
+      happened (a processing deadline expired). Retried; the handler must
+      be idempotent.
+    * ``INFRASTRUCTURE``: a dependency is unavailable (AMQP client
+      connection/channel errors, or an application's
+      :class:`~rabbitkit.core.errors.InfrastructureError`). Retried, counted
+      separately.
+    * ``SHUTDOWN``: cancellation or interpreter shutdown
+      (``asyncio.CancelledError``, ``KeyboardInterrupt``, ``SystemExit``).
+      Never retried by rabbitkit: the delivery is requeued and the
+      cancellation propagates.
+    """
+
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
+    INVALID_MESSAGE = "invalid_message"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+    INFRASTRUCTURE = "infrastructure"
+    SHUTDOWN = "shutdown"
+
+    @property
+    def severity(self) -> ErrorSeverity:
+        """The retry decision this category implies."""
+        if self in (ErrorCategory.PERMANENT, ErrorCategory.INVALID_MESSAGE):
+            return ErrorSeverity.PERMANENT
+        return ErrorSeverity.TRANSIENT
+
+
 class PublishStatus(str, Enum):
     """Result status of a publish operation."""
 
@@ -209,9 +251,84 @@ class PublishStatus(str, Enum):
     #: when nothing was actually confirmed.
     SENT = "sent"
     NACKED = "nacked"
+    #: No publisher confirm arrived within the confirm timeout (or the
+    #: per-call ``timeout``). The frames left the client, so the broker may
+    #: or may not have the message: a flavour of :attr:`UNKNOWN`
+    #: (``PublishOutcome.is_unknown`` is True for both).
     TIMEOUT = "timeout"
     RETURNED = "returned"
+    #: An unexpected, unclassified failure. Every failure the transport can
+    #: classify is reported as NOT_SENT, UNKNOWN, TIMEOUT, NACKED or RETURNED
+    #: instead; ``PublishOutcome.reason`` says which ERROR it was when known
+    #: (e.g. ``exchange_not_found``).
     ERROR = "error"
+    #: The message definitely never left the client: admission timed out,
+    #: the publisher is closed, no connection or channel was available, or a
+    #: flow-control policy dropped it. Safe to publish again.
+    NOT_SENT = "not_sent"
+    #: The frames may have left the client but no confirm, return or nack
+    #: was observed (connection or channel lost mid-publish, shutdown).
+    #: Republish only with the SAME ``message_id`` so consumers can
+    #: deduplicate; the library never republishes on its own.
+    UNKNOWN = "unknown"
+
+
+class PublishReason:
+    """Bounded ``PublishOutcome.reason`` codes (snake_case, safe as a metric label).
+
+    Plain string constants rather than an Enum so ``outcome.reason`` is an
+    ordinary ``str`` (``"admission_timeout"``), whatever produced it.
+    """
+
+    # NOT_SENT
+    ADMISSION_TIMEOUT = "admission_timeout"
+    PUBLISHER_CLOSED = "publisher_closed"
+    NOT_CONNECTED = "not_connected"
+    CHANNEL_UNAVAILABLE = "channel_unavailable"
+    EXCEEDS_BYTE_BUDGET = "exceeds_max_in_flight_bytes"
+    BACKPRESSURE_DROPPED = "backpressure_dropped"
+    #: The caller was cancelled before its message left the client.
+    CANCELLED = "cancelled"
+    # UNKNOWN
+    CONNECTION_LOST = "connection_lost"
+    CHANNEL_CLOSED = "channel_closed"
+    SHUTDOWN = "shutdown"
+    # TIMEOUT
+    CONFIRM_TIMEOUT = "confirm_timeout"
+    PUBLISH_TIMEOUT = "publish_timeout"
+    # RETURNED / NACKED
+    RETURNED = "returned"
+    NACKED = "nacked"
+    # ERROR
+    EXCHANGE_NOT_FOUND = "exchange_not_found"
+    ACCESS_REFUSED = "access_refused"
+    PRECONDITION_FAILED = "precondition_failed"
+    INVALID_ENVELOPE = "invalid_envelope"
+    PUBLISH_ERROR = "publish_error"
+
+    ALL: frozenset[str] = frozenset(
+        {
+            ADMISSION_TIMEOUT,
+            PUBLISHER_CLOSED,
+            NOT_CONNECTED,
+            CHANNEL_UNAVAILABLE,
+            EXCEEDS_BYTE_BUDGET,
+            BACKPRESSURE_DROPPED,
+            CONNECTION_LOST,
+            CHANNEL_CLOSED,
+            SHUTDOWN,
+            CANCELLED,
+            CONFIRM_TIMEOUT,
+            PUBLISH_TIMEOUT,
+            RETURNED,
+            NACKED,
+            EXCHANGE_NOT_FOUND,
+            ACCESS_REFUSED,
+            PRECONDITION_FAILED,
+            INVALID_ENVELOPE,
+            PUBLISH_ERROR,
+        }
+    )
 
 
 class BulkPublishStatus(str, Enum):
@@ -333,6 +450,54 @@ class PreflightStatus(str, Enum):
     FAILED = "failed"
 
 
+class TerminalAction(str, Enum):
+    """What ``RetryMiddleware`` does with a message whose failure is terminal
+    (permanent, retries exhausted, or ``max_retry_age`` exceeded).
+
+    * ``DEAD_LETTER`` (default): publish a copy to ``<queue>.dlq`` carrying
+      the terminal failure metadata (error class, sanitized message,
+      category, attempts, timestamps, original queue/exchange/routing key,
+      message id), wait for the broker confirm, THEN ack the source. If that
+      publish fails, fall back to ``REJECT`` so the message is never lost.
+    * ``REJECT``: legacy behaviour — reject ``requeue=False`` and let the
+      source queue's dead-letter exchange move it. The DLQ copy then carries
+      only the broker's ``x-death`` and the PREVIOUS attempt's headers.
+    """
+
+    DEAD_LETTER = "dead_letter"
+    REJECT = "reject"
+
+
+class FailureCategory(str, Enum):
+    """Failure category stamped on retry/DLQ copies as
+    ``x-rabbitkit-failure-category``.
+
+    ``TRANSIENT`` / ``TIMEOUT_UNKNOWN`` describe a failure that was retried
+    (``TIMEOUT_UNKNOWN``: the handler timed out, so whether its side effects
+    happened is unknown). ``PERMANENT`` / ``EXHAUSTED`` /
+    ``RETRY_AGE_EXCEEDED`` describe why a message went to the DLQ.
+    """
+
+    TRANSIENT = "transient"
+    TIMEOUT_UNKNOWN = "timeout-unknown"
+    PERMANENT = "permanent"
+    EXHAUSTED = "exhausted"
+    RETRY_AGE_EXCEEDED = "retry-age-exceeded"
+
+
+class DeadLetterStrategy(str, Enum):
+    """Quorum-queue ``x-dead-letter-strategy``.
+
+    ``AT_LEAST_ONCE`` keeps a dead-lettered message on the source until the
+    dead-letter target confirms it (requires ``overflow="reject-publish"``;
+    RabbitMQ 3.10+). ``AT_MOST_ONCE`` is the broker default: the message is
+    dropped if the target is missing or full.
+    """
+
+    AT_MOST_ONCE = "at-most-once"
+    AT_LEAST_ONCE = "at-least-once"
+
+
 class HandoffState(str, Enum):
     """Retry-handoff tracker state (see :mod:`rabbitkit.core.retry_handoff`)."""
 
@@ -358,7 +523,14 @@ def safe_exception_repr(exc: BaseException) -> str:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class PublishOutcome:
-    """Result of a publish operation."""
+    """Result of a publish operation.
+
+    ``reason`` is a bounded code from :class:`PublishReason` saying why a
+    non-success status happened (``None`` when the transport did not
+    classify it). ``reply_code`` / ``reply_text`` carry the broker's
+    ``basic.return`` fields for a RETURNED publish (e.g. ``312`` /
+    ``"NO_ROUTE"``) and the channel-close fields for a refused one.
+    """
 
     status: PublishStatus
     delivery_tag: int | None = None
@@ -366,17 +538,35 @@ class PublishOutcome:
     routing_key: str = ""
     error: BaseException | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+    reason: str | None = None
+    reply_code: int | None = None
+    reply_text: str | None = None
 
     def __repr__(self) -> str:
         # Hand-written so a broken error repr (see safe_exception_repr) can't
         # make the outcome itself unprintable: raise_for_status() builds its
         # message from this, and used to raise AttributeError on aiormq 7.
         error = None if self.error is None else safe_exception_repr(self.error)
+        extra = ""
+        if self.reason is not None:
+            extra += f", reason={self.reason!r}"
+        if self.reply_code is not None:
+            extra += f", reply_code={self.reply_code!r}, reply_text={self.reply_text!r}"
         return (
             f"PublishOutcome(status={self.status!r}, delivery_tag={self.delivery_tag!r}, "
             f"exchange={self.exchange!r}, routing_key={self.routing_key!r}, error={error}, "
-            f"timestamp={self.timestamp!r})"
+            f"timestamp={self.timestamp!r}{extra})"
         )
+
+    @property
+    def is_unknown(self) -> bool:
+        """True when the broker may or may not have the message: ``UNKNOWN``
+        or ``TIMEOUT`` (a confirm timeout is one kind of unknown outcome).
+
+        Republish only with the same ``message_id`` so consumers can
+        deduplicate.
+        """
+        return self.status in (PublishStatus.UNKNOWN, PublishStatus.TIMEOUT)
 
     @property
     def ok(self) -> bool:
@@ -396,7 +586,8 @@ class PublishOutcome:
         """Raise ``PublishError`` if the publish failed; else return self (M1).
 
         ``broker.publish()`` never raises — it returns this outcome so a
-        failed publish (NACKED / TIMEOUT / RETURNED / ERROR) can't be lost by
+        failed publish (NACKED / TIMEOUT / RETURNED / ERROR / NOT_SENT /
+        UNKNOWN) can't be lost by
         code that simply ignores the return value. Callers who prefer
         exceptions opt in::
 
@@ -474,11 +665,35 @@ class MessageEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class ClassifiedError:
-    """Result of error classification."""
+    """Result of error classification.
+
+    ``outcome_unknown`` is True when the failure does not say whether the
+    handler's side effects happened -- a processing deadline expired
+    (:class:`~rabbitkit.core.errors.HandlerTimeoutError`) while the work may
+    have been half done or fully done. Such a failure is still ``TRANSIENT``
+    (it is worth retrying), but a redelivery runs the handler again on top of
+    whatever the first attempt did, so the handler must be idempotent.
+
+    ``category`` refines ``severity`` (see :class:`ErrorCategory`). When it
+    is omitted, or contradicts ``severity``, it is derived from ``severity``
+    (``TRANSIENT`` → ``RETRYABLE``, or ``UNKNOWN_OUTCOME`` with
+    ``outcome_unknown``; ``PERMANENT`` → ``PERMANENT``), so code that builds
+    a ``ClassifiedError`` from a severity alone stays consistent.
+    """
 
     severity: ErrorSeverity
     original: BaseException
     reason: str
+    outcome_unknown: bool = False
+    category: ErrorCategory = ErrorCategory.PERMANENT
+
+    def __post_init__(self) -> None:
+        category = self.category
+        if category.severity is not self.severity:
+            category = ErrorCategory.RETRYABLE if self.severity is ErrorSeverity.TRANSIENT else ErrorCategory.PERMANENT
+        if self.outcome_unknown and category is ErrorCategory.RETRYABLE:
+            category = ErrorCategory.UNKNOWN_OUTCOME
+        object.__setattr__(self, "category", category)
 
 
 @runtime_checkable

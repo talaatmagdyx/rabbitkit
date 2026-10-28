@@ -20,6 +20,7 @@ Requirements:
 
 from rabbitkit import (
     ConfigValidationError,
+    ConsumerConfig,
     ManagementConfig,
     PublisherConfig,
     QueueType,
@@ -45,7 +46,8 @@ def main() -> None:
         print(f"contradiction rejected: {exc}\n")
 
     # 2. Fill in the critical requirements on top of your own config.
-    config = critical_config(RabbitConfig())
+    # The critical profile needs a processing deadline (it has no safe default).
+    config = critical_config(RabbitConfig(consumer=ConsumerConfig(processing_timeout=30)))
     print("critical publisher settings:", config.publisher)
     assert config.retry is not None
     print(f"retry chain: delay={config.retry.delay_queue_type} dlq={config.retry.dlq_queue_type}\n")

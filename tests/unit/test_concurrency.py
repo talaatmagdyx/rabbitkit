@@ -434,9 +434,7 @@ class TestWorkerConfigStopTimeout:
         wait_timeouts: list[float | None] = []
         original_wait = concurrent.futures.wait
 
-        def recording_wait(
-            fs: object, timeout: float | None = None, **kw: object
-        ) -> object:
+        def recording_wait(fs: object, timeout: float | None = None, **kw: object) -> object:
             wait_timeouts.append(timeout)
             return original_wait(fs, timeout=timeout, **kw)  # type: ignore[arg-type]
 
@@ -456,9 +454,7 @@ class TestWorkerConfigStopTimeout:
         wait_timeouts: list[float | None] = []
         original_wait = concurrent.futures.wait
 
-        def recording_wait(
-            fs: object, timeout: float | None = None, **kw: object
-        ) -> object:
+        def recording_wait(fs: object, timeout: float | None = None, **kw: object) -> object:
             wait_timeouts.append(timeout)
             return original_wait(fs, timeout=timeout, **kw)  # type: ignore[arg-type]
 
@@ -640,13 +636,9 @@ class TestDaemonPoolParallelism:
             elapsed = time.monotonic() - t0
         finally:
             pool.stop(timeout=2.0)
-        assert max_concurrent == n, (
-            f"pool did not parallelize: max_concurrent={max_concurrent}, expected {n}"
-        )
+        assert max_concurrent == n, f"pool did not parallelize: max_concurrent={max_concurrent}, expected {n}"
         # And it should be clearly faster than serial.
-        assert elapsed < n * per_task, (
-            f"elapsed={elapsed:.2f}s should be < serial={n*per_task:.2f}s"
-        )
+        assert elapsed < n * per_task, f"elapsed={elapsed:.2f}s should be < serial={n * per_task:.2f}s"
 
 
 # ── _DaemonWorkerPool uncovered lines ──────────────────────────────────────
@@ -884,3 +876,178 @@ class TestSyncWorkerPoolPump:
         mock_logger.warning.assert_called_once()
         assert "did not complete" in mock_logger.warning.call_args[0][0]
         future.cancel()
+
+
+class TestAsyncWorkerPoolStopIsBounded:
+    async def test_cancellation_swallowing_task_does_not_hold_stop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        import rabbitkit.concurrency as concurrency_mod
+
+        monkeypatch.setattr(concurrency_mod, "_CANCEL_JOIN_TIMEOUT", 0.05)
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        message = _make_message(delivery_tag=5, message_id="stuck")
+        nacked: list[bool] = []
+
+        async def nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = nack
+        release = asyncio.Event()
+
+        async def misbehaving(msg: RabbitMessage) -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await release.wait()
+
+        await pool.submit(misbehaving, message)
+        await asyncio.sleep(0.01)
+        t0 = time.monotonic()
+        await pool.stop(timeout=0.05)
+        assert time.monotonic() - t0 < 1.0
+        assert nacked == [True]
+        release.set()
+        await asyncio.sleep(0.01)
+
+
+# ── §3.2: prefetched-but-not-started deliveries are released at stop() ────
+
+
+def _nack_recorder(message: RabbitMessage, *, fail: bool = False) -> list[bool]:
+    nacked: list[bool] = []
+
+    async def nack(requeue: bool) -> None:
+        nacked.append(requeue)
+        if fail:
+            raise ConnectionResetError("channel gone")
+
+    message._nack_async_fn = nack
+    return nacked
+
+
+class TestAsyncWorkerPoolReleasesQueued:
+    async def test_queued_messages_are_nacked_promptly_and_never_run(self) -> None:
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        release = asyncio.Event()
+        ran: list[int] = []
+
+        async def handler(msg: RabbitMessage) -> None:
+            ran.append(msg.delivery_tag or 0)
+            await release.wait()
+
+        messages = [_make_message(delivery_tag=tag) for tag in range(1, 6)]
+        nacks = [_nack_recorder(m) for m in messages]
+        async with asyncio.timeout(5):
+            for message in messages:
+                await pool.submit(handler, message)
+            await asyncio.sleep(0.01)
+            assert ran == [1, 2]  # two slots busy, three queued
+
+            stopping = asyncio.create_task(pool.stop(timeout=5.0))
+            await asyncio.sleep(0.01)
+            # The queued three are released while the in-flight two keep their grace.
+            assert nacks[2:] == [[True], [True], [True]]
+            assert not stopping.done()
+            release.set()
+            await stopping
+        assert ran == [1, 2]
+        assert nacks[0] == [] and nacks[1] == []
+        assert pool.pending_count == 0
+
+    async def test_queued_message_settled_elsewhere_is_not_nacked(self) -> None:
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        release = asyncio.Event()
+
+        async def handler(msg: RabbitMessage) -> None:
+            await release.wait()
+
+        busy = [_make_message(delivery_tag=1), _make_message(delivery_tag=2)]
+        queued = _make_message(delivery_tag=3)
+        nacked = _nack_recorder(queued)
+        async with asyncio.timeout(5):
+            for message in [*busy, queued]:
+                await pool.submit(handler, message)
+            await asyncio.sleep(0.01)
+            queued._disposition = "acked"
+            release.set()
+            await pool.stop(timeout=5.0)
+        assert nacked == []
+
+    async def test_failed_release_nack_is_logged_not_raised(self) -> None:
+        from unittest.mock import patch
+
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        release = asyncio.Event()
+
+        async def handler(msg: RabbitMessage) -> None:
+            await release.wait()
+
+        queued = _make_message(delivery_tag=3)
+        nacked = _nack_recorder(queued, fail=True)
+        async with asyncio.timeout(5):
+            for message in [_make_message(delivery_tag=1), _make_message(delivery_tag=2), queued]:
+                await pool.submit(handler, message)
+            await asyncio.sleep(0.01)
+            release.set()
+            with patch("rabbitkit.concurrency.logger") as log:
+                await pool.stop(timeout=5.0)
+        assert nacked == [True]
+        assert queued.settlement_outcome_unknown is True
+        assert any("not-started" in c.args[0] for c in log.warning.call_args_list)
+
+    async def test_only_queued_work_returns_without_waiting(self) -> None:
+        """All slots finished before stop(); only queued tasks remain."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        gate = asyncio.Event()
+
+        async def handler(msg: RabbitMessage) -> None:
+            await gate.wait()
+
+        assert pool._semaphore is not None
+        # Exhaust the semaphore from outside so submitted tasks stay queued.
+        await pool._semaphore.acquire()
+        await pool._semaphore.acquire()
+        queued = _make_message(delivery_tag=9)
+        nacked = _nack_recorder(queued)
+        async with asyncio.timeout(5):
+            await pool.submit(handler, queued)
+            await asyncio.sleep(0.01)
+            await pool.stop(timeout=5.0)
+        assert nacked == [True]
+        assert pool.pending_count == 0
+
+    async def test_handler_cancelled_mid_ack_is_not_nacked_again(self) -> None:
+        """G-15 through the pool: stop()'s straggler nack must not send a
+        second frame for a delivery whose ack was in flight when cancelled."""
+        pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
+        pool.start()
+        frames: list[str] = []
+        never = asyncio.Event()
+
+        message = _make_message(delivery_tag=4)
+
+        async def ack() -> None:
+            frames.append("ack")
+            await never.wait()
+
+        async def nack(requeue: bool) -> None:
+            frames.append("nack")
+
+        message._ack_async_fn = ack
+        message._nack_async_fn = nack
+
+        async def handler(msg: RabbitMessage) -> None:
+            await msg.ack_async()
+
+        async with asyncio.timeout(5):
+            await pool.submit(handler, message)
+            await asyncio.sleep(0.01)
+            await pool.stop(timeout=0.05)
+        assert frames == ["ack"]
+        assert message.settlement_outcome_unknown is True

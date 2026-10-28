@@ -9,7 +9,11 @@ structured log events with per-message context automatically bound via
 Usage
 -----
 Pass ``logging=LoggingConfig(...)`` to ``RabbitConfig`` and the broker will
-call ``configure_structlog()`` on ``start()``:
+call ``configure_structlog()`` on ``start()`` -- unless the application
+already configured structlog itself (e.g. through obskit), in which case the
+broker leaves that global configuration alone and only installs rabbitkit's
+log redaction on its own loggers. Set ``LoggingConfig(override_existing=True)``
+to make the broker replace it anyway (the previous behaviour):
 
     from rabbitkit import RabbitConfig
     from rabbitkit.core.logging import LoggingConfig
@@ -47,7 +51,9 @@ yourself and do not use ``RabbitConfig.logging``:
 
     configure_structlog(LoggingConfig(render_json=True))
 
-Safe to call multiple times — last call wins.
+Safe to call multiple times — last call wins. A direct call configures
+structlog globally, as it always did; pass ``override_existing=False`` to
+leave an existing application configuration in place.
 
 Secrets and message content (L16)
 ----------------------------------
@@ -128,6 +134,12 @@ class LoggingConfig:
             entirely, or your own ``frozenset`` to customize it. See the
             module docstring ("Secrets and message content") for scope and
             limitations.
+        override_existing: Only for the configuration the BROKER applies at
+            ``start()`` (``RabbitConfig.logging``). ``False`` (default): when
+            structlog was already configured by someone other than rabbitkit
+            (the application, obskit), the broker keeps that configuration
+            and only installs :func:`install_log_redaction` on the
+            ``rabbitkit`` loggers. ``True``: replace it (the old behaviour).
         capture_warnings: Route Python's ``warnings`` module (used for every
             rabbitkit safety warning -- topology drift, retry-without-
             confirms, unsafe TLS, dashboard auth, ...) through the standard
@@ -147,6 +159,7 @@ class LoggingConfig:
     include_caller_info: bool = False
     redact_keys: frozenset[str] | None = DEFAULT_REDACT_KEYS
     capture_warnings: bool = True
+    override_existing: bool = False
 
 
 def _normalize_key(key: str) -> str:
@@ -207,7 +220,6 @@ def _redact_processor(keys: frozenset[str]) -> Any:
         return event_dict
 
     return processor
-
 
 
 # ── Value-level redaction for STDLIB logging (0.16) ───────────────────────
@@ -311,22 +323,58 @@ def install_log_redaction(
     # Any handler already attached under this namespace gets it too, which
     # also covers loggers created AFTER this call whose records reach one of
     # those handlers.
-    for logger in (root, *(
-        lg
-        for name, lg in logging.Logger.manager.loggerDict.items()
-        if name.startswith(prefix) and isinstance(lg, logging.Logger)
-    )):
+    for logger in (
+        root,
+        *(
+            lg
+            for name, lg in logging.Logger.manager.loggerDict.items()
+            if name.startswith(prefix) and isinstance(lg, logging.Logger)
+        ),
+    ):
         for handler in logger.handlers:
             if not any(isinstance(f, SecretRedactingFilter) for f in handler.filters):
                 handler.addFilter(filt)
     return filt
 
 
-def configure_structlog(config: LoggingConfig | None = None) -> None:
-    """One-time structlog configuration.
+# The processor list rabbitkit last handed to structlog.configure(), so a
+# later call can tell its own configuration from an application's. Holds at
+# most one entry.
+_APPLIED_PROCESSORS: list[object] = []
+
+
+def structlog_configured_elsewhere() -> bool:
+    """True if structlog's global configuration was set by someone other
+    than :func:`configure_structlog` (an application, obskit, ...)."""
+    import structlog
+
+    if not structlog.is_configured():
+        return False
+    current = structlog.get_config().get("processors")
+    return not (_APPLIED_PROCESSORS and current is _APPLIED_PROCESSORS[0])
+
+
+def configure_structlog(config: LoggingConfig | None = None, *, override_existing: bool = True) -> bool:
+    """Configure structlog globally for rabbitkit's structured logging.
 
     Safe to call multiple times — last call wins.
     If config is None, uses defaults (console renderer, ISO timestamps).
+
+    Args:
+        config: Rendering and redaction settings.
+        override_existing: ``True`` (default for a direct call, unchanged):
+            always (re)configure structlog. ``False``: if structlog was
+            already configured by someone else (see
+            :func:`structlog_configured_elsewhere`), leave that configuration
+            and ``logging.captureWarnings`` untouched and only attach
+            rabbitkit's value redaction to the ``rabbitkit`` loggers. The
+            brokers pass ``LoggingConfig.override_existing`` here (default
+            ``False``), so an embedding application's setup survives
+            ``broker.start()``.
+
+    Returns:
+        ``True`` if structlog was configured, ``False`` if an existing
+        configuration was kept.
     """
     import logging
 
@@ -334,6 +382,15 @@ def configure_structlog(config: LoggingConfig | None = None) -> None:
 
     if config is None:
         config = LoggingConfig()
+
+    if not override_existing and structlog_configured_elsewhere():
+        if config.redact_keys:
+            install_log_redaction()
+        logging.getLogger(__name__).info(
+            "structlog is already configured by the application; rabbitkit keeps that configuration "
+            "(set LoggingConfig(override_existing=True) to replace it)"
+        )
+        return False
 
     # L16 follow-up: bridge warnings.warn() (every rabbitkit safety warning)
     # into the standard logging module -- otherwise it bypasses this whole
@@ -379,3 +436,5 @@ def configure_structlog(config: LoggingConfig | None = None) -> None:
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
+    _APPLIED_PROCESSORS[:] = [processors]
+    return True

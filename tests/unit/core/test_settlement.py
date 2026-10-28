@@ -515,3 +515,155 @@ class TestApplyCommands:
         assert len(results) == 2, "emission stops at the first failure"
         assert results[0][1] is None
         assert isinstance(results[1][1], RuntimeError)
+
+
+# ── S-D2: a cumulative ack must never sweep an unknown delivery tag ───────
+
+
+class _BrokerChannel:
+    """Models the broker side of one channel: which tags are unacked, and
+    what ``ack(tag, multiple=True)`` really settles (every unacked tag <=
+    tag, known to the client or not)."""
+
+    def __init__(self) -> None:
+        self.unacked: set[int] = set()
+        self.settled_by: dict[int, str] = {}
+
+    def deliver(self, tag: int) -> None:
+        self.unacked.add(tag)
+
+    def apply(self, cmd: SettlementCommand) -> None:
+        if cmd.kind is SettlementAction.ACK and cmd.multiple:
+            swept = sorted(t for t in self.unacked if t <= cmd.delivery_tag)
+        else:
+            assert cmd.delivery_tag in self.unacked, f"PRECONDITION_FAILED: unknown tag {cmd.delivery_tag}"
+            swept = [cmd.delivery_tag]
+        for t in swept:
+            self.unacked.discard(t)
+            self.settled_by[t] = cmd.kind.value
+
+
+class TestCumulativeAckNeverSweepsUnknownTags:
+    def test_refused_delivery_is_not_swept_by_a_later_cumulative_ack(self) -> None:
+        """p08 scenario B: max_pending=2, tag 3 refused, then 1/2 settle and
+        4/5 complete. ack(5, multiple=True) would ack 3 unprocessed."""
+        from rabbitkit.core.settlement import LedgerFullError
+
+        c = SettlementCoordinator(max_pending=2)
+        c.register(1)
+        c.register(2)
+        with pytest.raises(LedgerFullError):
+            c.register(3)
+        c.mark_success(1)
+        c.mark_success(2)
+        assert _acks(c.plan()) == [("ack", 2, True)]
+        c.register(4)
+        c.register(5)
+        c.mark_success(4)
+        c.mark_success(5)
+        cmds = c.plan()
+        assert _acks(cmds) == [("ack", 4, False), ("ack", 5, False)]
+        assert c.gap_floor == 3
+
+    def test_skipped_tag_blocks_coalescing_above_it(self) -> None:
+        c = SettlementCoordinator()
+        for t in (1, 2, 4, 5, 6):
+            c.register(t)
+            c.mark_success(t)
+        cmds = c.plan()
+        assert _acks(cmds) == [("ack", 2, True), ("ack", 4, False), ("ack", 5, False), ("ack", 6, False)]
+        assert c.stats["unregistered_gaps"] == 1
+
+    def test_first_registration_above_one_never_coalesces(self) -> None:
+        """Tags below the first registered one were never seen; they may be
+        unacked deliveries the coordinator does not own."""
+        c = SettlementCoordinator()
+        for t in (7, 8, 9):
+            c.register(t)
+            c.mark_success(t)
+        assert c.gap_floor == 1
+        assert c.frontier == 0
+        assert not any(cmd.multiple for cmd in c.plan())
+
+    def test_invalidate_clears_the_gap(self) -> None:
+        c = SettlementCoordinator()
+        c.register(2)
+        assert c.gap_floor == 1
+        c.invalidate()
+        assert c.gap_floor == 0
+        for t in (1, 2, 3):
+            c.register(t)
+            c.mark_success(t)
+        assert _acks(c.plan()) == [("ack", 3, True)]
+
+    def test_frontier_stops_below_the_gap(self) -> None:
+        c = SettlementCoordinator()
+        for t in (1, 2, 4):
+            c.register(t)
+            c.mark_success(t)
+        assert c.frontier == 2
+
+
+try:
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+except ImportError:  # pragma: no cover - hypothesis is a dev dependency
+    given = None
+
+
+if given is not None:
+
+    @settings(max_examples=300, deadline=None)
+    @given(
+        n=st.integers(min_value=1, max_value=40),
+        data=st.data(),
+        max_pending=st.integers(min_value=0, max_value=6),
+        max_hold=st.integers(min_value=0, max_value=3),
+    )
+    def test_property_no_cumulative_ack_covers_an_unknown_tag(
+        n: int, data: st.DataObject, max_pending: int, max_hold: int
+    ) -> None:
+        """Random delivery streams with refused/foreign tags and random
+        completion order: replaying every emitted command against a broker
+        model never settles a tag the coordinator did not own, and every
+        owned tag that succeeded is acked exactly once."""
+        from rabbitkit.core.settlement import LedgerFullError
+
+        broker = _BrokerChannel()
+        c = SettlementCoordinator(max_pending=max_pending, max_hold=max_hold)
+        owned: list[int] = []
+        foreign: set[int] = set()
+        open_tags: list[int] = []
+        for tag in range(1, n + 1):
+            broker.deliver(tag)
+            if data.draw(st.integers(0, 4), label="foreign") == 0:
+                foreign.add(tag)  # consumed by someone else on the channel
+            else:
+                try:
+                    c.register(tag)
+                except LedgerFullError:
+                    foreign.add(tag)  # refused: stays unacked for redelivery
+                else:
+                    owned.append(tag)
+                    open_tags.append(tag)
+            # complete a random subset of the open ones, in random order
+            while open_tags and data.draw(st.booleans(), label="complete"):
+                t = open_tags.pop(data.draw(st.integers(0, len(open_tags) - 1), label="pick"))
+                outcome = data.draw(st.sampled_from(["success", "success", "nack", "reject", "fail"]), label="o")
+                if outcome == "success":
+                    c.mark_success(t)
+                elif outcome == "nack":
+                    c.mark_nack(t, requeue=True)
+                elif outcome == "reject":
+                    c.mark_reject(t)
+                else:
+                    c.mark_failed(t)
+            if data.draw(st.booleans(), label="flush"):
+                for cmd in c.plan():
+                    broker.apply(cmd)
+        for t in open_tags:
+            c.mark_success(t)
+        for cmd in c.drain_plan():
+            broker.apply(cmd)
+        assert foreign <= broker.unacked, f"foreign/refused tags swept: {sorted(foreign - broker.unacked)}"
+        assert set(broker.settled_by) <= set(owned)

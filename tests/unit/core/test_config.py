@@ -201,6 +201,53 @@ class TestReconnectMaxAttempts:
             ConnectionConfig(reconnect_max_attempts=-1)
 
 
+class TestConnectionTimingValidation:
+    """G-08: timing values that silently broke reconnects are rejected."""
+
+    def test_defaults_are_valid(self) -> None:
+        config = ConnectionConfig()
+        assert config.reconnect_budget_attempts is None
+        assert config.reconnect_budget_seconds is None
+
+    @pytest.mark.parametrize("base", [0, 0.0, -1.0])
+    def test_backoff_base_must_be_positive(self, base: float) -> None:
+        with pytest.raises(ValueError, match="reconnect_backoff_base must be > 0"):
+            ConnectionConfig(reconnect_backoff_base=base)
+
+    def test_backoff_max_below_base_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_backoff_max"):
+            ConnectionConfig(reconnect_backoff_base=5.0, reconnect_backoff_max=1.0)
+
+    def test_backoff_max_equal_to_base_accepted(self) -> None:
+        assert ConnectionConfig(reconnect_backoff_base=2.0, reconnect_backoff_max=2.0).reconnect_backoff_max == 2.0
+
+    @pytest.mark.parametrize("timeout", [0, -1.0])
+    def test_socket_timeout_must_be_positive(self, timeout: float) -> None:
+        with pytest.raises(ValueError, match="socket_timeout must be > 0"):
+            ConnectionConfig(socket_timeout=timeout)
+
+    def test_negative_heartbeat_rejected(self) -> None:
+        with pytest.raises(ValueError, match="heartbeat must be >= 0"):
+            ConnectionConfig(heartbeat=-1)
+
+    def test_zero_heartbeat_warns(self) -> None:
+        with pytest.warns(UserWarning, match="heartbeat=0"):
+            ConnectionConfig(heartbeat=0)
+
+    def test_budgets_accepted(self) -> None:
+        config = ConnectionConfig(reconnect_budget_attempts=5, reconnect_budget_seconds=120.0)
+        assert (config.reconnect_budget_attempts, config.reconnect_budget_seconds) == (5, 120.0)
+
+    def test_attempt_budget_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="reconnect_budget_attempts must be >= 1"):
+            ConnectionConfig(reconnect_budget_attempts=0)
+
+    @pytest.mark.parametrize("seconds", [0, -5.0])
+    def test_seconds_budget_must_be_positive(self, seconds: float) -> None:
+        with pytest.raises(ValueError, match="reconnect_budget_seconds must be > 0"):
+            ConnectionConfig(reconnect_budget_seconds=seconds)
+
+
 class TestClientProperties:
     """Production-hardening checklist item 8: an escape hatch for extra AMQP
     client_properties (service_name/environment/pod_name etc.), validated
@@ -244,8 +291,34 @@ class TestClientProperties:
 
 
 class TestConsumerConfigM6:
-    def test_reject_transient_on_redelivery_default_off(self) -> None:
-        assert ConsumerConfig().reject_transient_on_redelivery is False
+    def test_reject_transient_on_redelivery_default_on(self) -> None:
+        """F15: the transient-failure loop is bounded by default."""
+        assert ConsumerConfig().reject_transient_on_redelivery is True
+
+    def test_manual_settle_on_error_default_on(self) -> None:
+        assert ConsumerConfig().manual_settle_on_error is True
+
+    def test_processing_timeout_default_off(self) -> None:
+        assert ConsumerConfig().processing_timeout is None
+
+    @pytest.mark.parametrize("value", [0, -1.0])
+    def test_processing_timeout_must_be_positive(self, value: float) -> None:
+        with pytest.raises(ValueError, match="processing_timeout"):
+            ConsumerConfig(processing_timeout=value)
+
+    def test_max_body_bytes_default_off(self) -> None:
+        assert ConsumerConfig().max_body_bytes is None
+        assert ConsumerConfig(max_body_bytes=1).max_body_bytes == 1
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_max_body_bytes_must_be_positive(self, value: int) -> None:
+        with pytest.raises(ValueError, match="max_body_bytes"):
+            ConsumerConfig(max_body_bytes=value)
+
+    def test_strip_reserved_headers_default_off(self) -> None:
+        from rabbitkit.core.config import PublisherConfig
+
+        assert PublisherConfig().strip_reserved_headers is False
 
 
 class TestCredentialsProvider:
@@ -405,11 +478,55 @@ class TestPoolConfig:
         assert config.publisher_connections == 1
         assert config.consumer_connections == 1
 
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_pool_size_must_be_positive(self, size: int) -> None:
+        """G-25: channel_pool_size=0 made the pool unbounded."""
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="channel_pool_size"):
+            PoolConfig(channel_pool_size=size)
+
+    @pytest.mark.parametrize("timeout", [0, -1.0, float("nan")])
+    def test_acquire_timeout_must_be_positive(self, timeout: float) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="channel_acquire_timeout"):
+            PoolConfig(channel_acquire_timeout=timeout)
+
+
+class TestPublisherConfigInFlightBytes:
+    def test_default_is_unbounded(self) -> None:
+        assert PublisherConfig().max_in_flight_bytes is None
+
+    def test_accepts_a_budget_at_least_the_message_cap(self) -> None:
+        assert PublisherConfig(max_message_bytes=1024, max_in_flight_bytes=1024).max_in_flight_bytes == 1024
+        assert PublisherConfig(max_message_bytes=0, max_in_flight_bytes=1).max_in_flight_bytes == 1
+
+    def test_rejects_a_non_positive_budget(self) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="max_in_flight_bytes"):
+            PublisherConfig(max_in_flight_bytes=0)
+
+    def test_rejects_a_budget_below_the_message_cap(self) -> None:
+        from rabbitkit.core.errors import ConfigValidationError
+
+        with pytest.raises(ConfigValidationError, match="max_message_bytes"):
+            PublisherConfig(max_in_flight_bytes=1024)  # default cap is 16 MiB
+
 
 # ── RetryConfig ───────────────────────────────────────────────────────────
 
 
 class TestRetryConfig:
+    def test_negative_delay_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="delays must be >= 0"):
+            RetryConfig(max_retries=1, delays=(-1,))
+
+    def test_retry_header_is_trusted_by_default(self) -> None:
+        assert RetryConfig().trust_retry_header is True
+        assert RetryConfig(trust_retry_header=False).trust_retry_header is False
+
     def test_delays_shorter_than_max_retries_warns(self) -> None:
         """Mismatched delays/max_retries emits the reuse-last-delay warning."""
         import warnings

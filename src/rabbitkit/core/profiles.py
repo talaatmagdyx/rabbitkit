@@ -1,25 +1,46 @@
 """Reliability profiles, preflight verification, and broker policy templates.
 
-Two explicit profiles (plan §9):
+Two explicit profiles (plan §9; ADR-M1/M4 of the messaging contract):
 
-=====================  ==============================  ==========================================
-Setting                STANDARD                        CRITICAL
-=====================  ==============================  ==========================================
-Confirms               on                              required
-Mandatory routing      on                              required
-Persistence            on                              required
-Queue type             explicit choice                 quorum for every durable route queue
-Retry topology         explicit                        quorum delay chain + quorum DLQ
-Body limit             explicit                        <= 256 KiB
-Error text             sanitized                       sanitized or omitted (never raw)
-Dead-letter path       auto-provisioned                never ``discard``
-=====================  ==============================  ==========================================
+==========================  ========================  ==============================================
+Setting                     STANDARD                  CRITICAL
+==========================  ========================  ==============================================
+Confirms                    on                        required
+Mandatory routing           on                        required
+Persistence                 on                        required
+Body limit                  explicit                  <= 256 KiB
+In-flight publish bytes     explicit                  bounded (default 64 MiB, overridable)
+Reserved headers            pass through              stripped from application publishes
+Queue type                  explicit choice           quorum for every durable route queue
+Source dead-lettering       broker default            at-least-once + reject-publish (declared or
+                                                      by policy; verified by :func:`preflight`)
+Retry                       explicit                  required on every route: quorum delay chain
+                                                      (at-least-once) + quorum DLQ, terminal DLQ
+                                                      copy with metadata, retry count from
+                                                      ``x-death`` only (``trust_retry_header=False``)
+Transient failure w/o retry  bounded (2 strikes)      bounded (``reject_transient_on_redelivery``)
+MANUAL handler raises       AUTO error path           AUTO error path (``manual_settle_on_error``)
+Processing deadline         explicit                  required (``consumer.processing_timeout``)
+``AckPolicy.ACK_FIRST``     allowed                   rejected on every route
+Error text                  sanitized                 sanitized or omitted (never raw)
+Dead-letter path            auto-provisioned          never ``discard``
+DLQ metadata outside retry  ``x-death`` only          confirmed copy with failure metadata
+                                                      (``safety.dead_letter_with_metadata``, async)
+Event metadata validation   opt-in                    opt-in (an application contract choice)
+Heartbeat                   explicit                  required (> 0)
+Async reconnect budget      unlimited                 unlimited by default; when set, seconds
+                                                      >= ``reconnect_backoff_max`` (warning)
+TLS                         deployment choice         deployment choice; not ``CERT_NONE`` when
+                                                      enabled (warning)
+==========================  ========================  ==============================================
 
 Profiles are opt-in. :func:`apply_profile` returns a NEW ``RabbitConfig``
 with the profile's requirements filled in and raises on a *contradiction*
 (a setting the caller pinned explicitly to a value the profile forbids) —
-it never silently flips a value you set on purpose. :func:`validate_profile`
-just reports.
+it never silently flips a value you set on purpose. A requirement that has
+no safe default (CRITICAL's ``consumer.processing_timeout``) raises too.
+:func:`validate_profile` just reports, including per-route requirements
+(queue type, ack policy, per-route retry) that a config alone cannot carry.
 
 A library cannot see effective broker policies over AMQP. :func:`preflight`
 therefore verifies what it can locally, verifies the rest through a
@@ -40,16 +61,38 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from rabbitkit.core.config import (
+    ConsumerConfig,
     PublisherConfig,
     RabbitConfig,
     RetryConfig,
+    RetryDisabled,
     SafetyConfig,
 )
 from rabbitkit.core.errors import ConfigValidationError
-from rabbitkit.core.types import PreflightStatus, QueueType, ReliabilityProfile
+from rabbitkit.core.types import (
+    AckPolicy,
+    DeadLetterStrategy,
+    PreflightStatus,
+    QueueType,
+    ReliabilityProfile,
+    TerminalAction,
+)
 
 #: Team baseline body limit for the critical profile (256 KiB).
 CRITICAL_MAX_MESSAGE_BYTES = 256 * 1024
+
+#: Default in-flight publish byte budget the critical profile sets when the
+#: config has none (``PublisherConfig.max_in_flight_bytes``, async broker):
+#: 64 MiB, i.e. 256 messages at the 256 KiB body limit. Set your own value to
+#: override it.
+CRITICAL_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024
+
+_PROCESSING_TIMEOUT_REQUIRED = (
+    "consumer.processing_timeout is required by the CRITICAL profile and has no safe default: set "
+    "ConsumerConfig(processing_timeout=<seconds>) to the longest a handler may legitimately run. On expiry "
+    "the handler is cancelled and the delivery is retried as UNKNOWN_OUTCOME (handlers must be idempotent). "
+    "Async broker only; on SyncBroker use TimeoutMiddleware"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +119,93 @@ def _route_queues(routes: Sequence[Any]) -> list[Any]:
         if q is not None:
             queues.append(q)
     return queues
+
+
+def _critical_retry_violations(prefix: str, retry: RetryConfig) -> list[ProfileViolation]:
+    """CRITICAL requirements on one ``RetryConfig`` (the broker's or a route's)."""
+    out: list[ProfileViolation] = []
+    if retry.delay_queue_type != "quorum":
+        out.append(ProfileViolation(f"{prefix}.delay_queue_type", "'quorum'", repr(retry.delay_queue_type)))
+    if retry.dlq_queue_type not in ("quorum", "inherit"):
+        out.append(ProfileViolation(f"{prefix}.dlq_queue_type", "'quorum' or 'inherit'", repr(retry.dlq_queue_type)))
+    if retry.delay_queue_dead_letter_strategy != DeadLetterStrategy.AT_LEAST_ONCE.value:
+        out.append(
+            ProfileViolation(
+                f"{prefix}.delay_queue_dead_letter_strategy",
+                "'at-least-once'",
+                repr(retry.delay_queue_dead_letter_strategy),
+            )
+        )
+    if retry.terminal_action is not TerminalAction.DEAD_LETTER:
+        out.append(
+            ProfileViolation(
+                f"{prefix}.terminal_action",
+                "'dead_letter' (confirmed DLQ copy with failure metadata)",
+                repr(retry.terminal_action.value),
+            )
+        )
+    if retry.trust_retry_header:
+        out.append(ProfileViolation(f"{prefix}.trust_retry_header", "False (count retries from x-death only)", "True"))
+    if retry.error_detail == "raw":
+        out.append(ProfileViolation(f"{prefix}.error_detail", "'sanitized' or 'omit'", "'raw'"))
+    return out
+
+
+def _declares_at_least_once(queue: Any) -> bool:
+    if getattr(queue, "dead_letter_strategy", None) is DeadLetterStrategy.AT_LEAST_ONCE:
+        return True
+    args = getattr(queue, "arguments", None) or {}
+    return bool(args.get("x-dead-letter-strategy") == DeadLetterStrategy.AT_LEAST_ONCE.value)
+
+
+def _critical_route_violations(config: RabbitConfig, routes: Sequence[Any]) -> list[ProfileViolation]:
+    out: list[ProfileViolation] = []
+    retry = config.retry
+    for r in routes:
+        rname = str(getattr(r, "name", "?"))
+        if getattr(r, "ack_policy", None) is AckPolicy.ACK_FIRST:
+            out.append(
+                ProfileViolation(f"route[{rname}].ack_policy", "not ACK_FIRST (ack only after success)", "ACK_FIRST")
+            )
+        override = getattr(r, "retry_override", None)
+        if isinstance(override, RetryDisabled):
+            out.append(ProfileViolation(f"route[{rname}].retry", "retry enabled (RetryConfig)", "RETRY_DISABLED"))
+        elif isinstance(override, RetryConfig):
+            out.extend(_critical_retry_violations(f"route[{rname}].retry", override))
+    for q in _route_queues(routes):
+        qname = getattr(q, "name", "?")
+        qtype = getattr(q, "queue_type", None)
+        durable = getattr(q, "durable", True)
+        if durable and qtype is not QueueType.QUORUM:
+            out.append(
+                ProfileViolation(
+                    f"queue[{qname}].queue_type",
+                    "QueueType.QUORUM",
+                    str(getattr(qtype, "value", qtype)),
+                )
+            )
+        if retry is not None and retry.dlq_queue_type == "inherit" and qtype is not QueueType.QUORUM:
+            out.append(
+                ProfileViolation(
+                    f"queue[{qname}].dlq",
+                    "quorum DLQ (source quorum or dlq_queue_type='quorum')",
+                    "classic (inherited)",
+                )
+            )
+        if qtype is QueueType.QUORUM and not _declares_at_least_once(q):
+            # A broker policy may provide it (policy_templates()); only the
+            # management API can tell, so this is a warning locally and a
+            # broker check in preflight().
+            out.append(
+                ProfileViolation(
+                    f"queue[{qname}].dead_letter_strategy",
+                    "'at-least-once' + overflow 'reject-publish' (declared, or by policy: verify with "
+                    "preflight(management_client=...))",
+                    "not declared",
+                    severity="warning",
+                )
+            )
+    return out
 
 
 def validate_profile(
@@ -113,54 +243,149 @@ def validate_profile(
         out.append(ProfileViolation("publisher.max_message_bytes", "> 0 (bounded)", "0 (unbounded)"))
     if safety.reject_without_dlx == "discard":
         out.append(ProfileViolation("safety.reject_without_dlx", "'auto_provision' or 'error'", "'discard'"))
-    if retry is not None and retry.error_detail == "raw":
+    if retry is not None and retry.error_detail == "raw" and prof is ReliabilityProfile.STANDARD:
         out.append(ProfileViolation("retry.error_detail", "'sanitized' or 'omit'", "'raw'"))
 
     if prof is ReliabilityProfile.CRITICAL:
-        if pub.max_message_bytes > CRITICAL_MAX_MESSAGE_BYTES:
-            out.append(
-                ProfileViolation(
-                    "publisher.max_message_bytes",
-                    f"<= {CRITICAL_MAX_MESSAGE_BYTES}",
-                    str(pub.max_message_bytes),
-                )
+        out.extend(_critical_config_violations(config))
+        out.extend(_critical_route_violations(config, routes))
+    return out
+
+
+def _critical_config_violations(config: RabbitConfig) -> list[ProfileViolation]:
+    out: list[ProfileViolation] = []
+    pub = config.publisher
+    consumer: ConsumerConfig = config.consumer
+    if pub.max_message_bytes > CRITICAL_MAX_MESSAGE_BYTES:
+        out.append(
+            ProfileViolation(
+                "publisher.max_message_bytes",
+                f"<= {CRITICAL_MAX_MESSAGE_BYTES}",
+                str(pub.max_message_bytes),
             )
-        if retry is None:
-            out.append(ProfileViolation("retry", "RetryConfig(...) (bounded retry + DLQ)", "None"))
-        else:
-            if retry.delay_queue_type != "quorum":
-                out.append(ProfileViolation("retry.delay_queue_type", "'quorum'", repr(retry.delay_queue_type)))
-            if retry.dlq_queue_type not in ("quorum", "inherit"):
-                out.append(
-                    ProfileViolation("retry.dlq_queue_type", "'quorum' or 'inherit'", repr(retry.dlq_queue_type))
-                )
-        for q in _route_queues(routes):
-            qtype = getattr(q, "queue_type", None)
-            durable = getattr(q, "durable", True)
-            if durable and qtype is not QueueType.QUORUM:
-                out.append(
-                    ProfileViolation(
-                        f"queue[{getattr(q, 'name', '?')}].queue_type",
-                        "QueueType.QUORUM",
-                        str(getattr(qtype, "value", qtype)),
-                    )
-                )
-            if retry is not None and retry.dlq_queue_type == "inherit" and qtype is not QueueType.QUORUM:
-                out.append(
-                    ProfileViolation(
-                        f"queue[{getattr(q, 'name', '?')}].dlq",
-                        "quorum DLQ (source quorum or dlq_queue_type='quorum')",
-                        "classic (inherited)",
-                    )
-                )
+        )
+    if pub.max_in_flight_bytes is None:
+        out.append(ProfileViolation("publisher.max_in_flight_bytes", "a byte bound", "None (unbounded)"))
+    if not pub.strip_reserved_headers:
+        out.append(ProfileViolation("publisher.strip_reserved_headers", "True", "False"))
+    if config.retry is None:
+        out.append(ProfileViolation("retry", "RetryConfig(...) (bounded retry + DLQ)", "None"))
+    else:
+        out.extend(_critical_retry_violations("retry", config.retry))
+    if consumer.processing_timeout is None:
+        out.append(ProfileViolation("consumer.processing_timeout", _PROCESSING_TIMEOUT_REQUIRED, "None"))
+    if not consumer.reject_transient_on_redelivery:
+        out.append(ProfileViolation("consumer.reject_transient_on_redelivery", "True", "False"))
+    if not consumer.manual_settle_on_error:
+        out.append(ProfileViolation("consumer.manual_settle_on_error", "True", "False"))
+    if not config.safety.dead_letter_with_metadata:
+        out.append(
+            ProfileViolation(
+                "safety.dead_letter_with_metadata",
+                "True (DLQ copy with failure metadata for failures outside RetryMiddleware)",
+                "False",
+            )
+        )
+    out.extend(_critical_connection_violations(config))
+    return out
+
+
+def _critical_connection_violations(config: RabbitConfig) -> list[ProfileViolation]:
+    """CRITICAL requirements on the connection (rationale: docs/reliable-messaging.md).
+
+    * Heartbeats on: without them a peer that vanishes without closing TCP
+      (a partitioned or crashed node) is never detected, so publishes wait on
+      a dead socket and deliveries sit unacknowledged.
+    * The async reconnect budget stays unlimited by default: correctness does
+      not depend on it (outcomes are reported honestly, unacked deliveries
+      are redelivered), and a supervisor restart handles a terminal failure.
+      When set, ``reconnect_budget_seconds`` must leave room for the backoff
+      it bounds (>= ``reconnect_backoff_max``); otherwise the configured
+      backoff ceiling is never reached (warning).
+    * TLS is a deployment choice and is not required. When it is enabled,
+      certificate verification must not be off (warning).
+    """
+    out: list[ProfileViolation] = []
+    conn = config.connection
+    if conn.heartbeat <= 0:
+        out.append(ProfileViolation("connection.heartbeat", "> 0 (dead-peer detection)", str(conn.heartbeat)))
+    budget = conn.reconnect_budget_seconds
+    if budget is not None and budget < conn.reconnect_backoff_max:
+        out.append(
+            ProfileViolation(
+                "connection.reconnect_budget_seconds",
+                f"None (unlimited) or >= reconnect_backoff_max ({conn.reconnect_backoff_max})",
+                str(budget),
+                severity="warning",
+            )
+        )
+    ssl = config.security.ssl
+    if ssl.enabled and ssl.cert_reqs == "CERT_NONE":
+        out.append(
+            ProfileViolation(
+                "security.ssl.cert_reqs",
+                "'CERT_REQUIRED' when TLS is enabled",
+                "'CERT_NONE'",
+                severity="warning",
+            )
+        )
+    return out
+
+
+def _critical_contradictions(config: RabbitConfig, defaults: RabbitConfig) -> list[str]:
+    """Explicit settings the CRITICAL profile cannot reconcile."""
+
+    def _pinned(section: Any, section_defaults: Any, name: str) -> bool:
+        return bool(getattr(section, name) != getattr(section_defaults, name))
+
+    pub = config.publisher
+    out: list[str] = []
+    if _pinned(pub, defaults.publisher, "max_message_bytes") and pub.max_message_bytes > CRITICAL_MAX_MESSAGE_BYTES:
+        out.append(f"publisher.max_message_bytes={pub.max_message_bytes} (> 256 KiB)")
+    if pub.max_message_bytes == 0:
+        out.append("publisher.max_message_bytes=0 (unbounded)")
+    retry = config.retry
+    if retry is not None:
+        if retry.delay_queue_type == "classic" and _pinned(retry, RetryConfig(), "delay_queue_type"):
+            out.append("retry.delay_queue_type='classic'")  # pragma: no cover - "classic" is the default
+        if retry.dlq_queue_type == "classic":
+            out.append("retry.dlq_queue_type='classic'")
+        if retry.delay_queue_dead_letter_strategy == DeadLetterStrategy.AT_MOST_ONCE.value:
+            out.append("retry.delay_queue_dead_letter_strategy='at-most-once'")
+        if retry.terminal_action is TerminalAction.REJECT:
+            out.append("retry.terminal_action='reject' (no failure metadata on the DLQ copy)")
+    consumer = config.consumer
+    if not consumer.reject_transient_on_redelivery:
+        out.append("consumer.reject_transient_on_redelivery=False")
+    if not consumer.manual_settle_on_error:
+        out.append("consumer.manual_settle_on_error=False")
+    if config.connection.heartbeat == 0:
+        out.append("connection.heartbeat=0 (no dead-peer detection)")
     return out
 
 
 def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> RabbitConfig:
-    """Return a copy of *config* satisfying *profile*'s publisher/safety/retry
-    requirements. Raises :class:`ConfigValidationError` if the caller pinned
-    a contradictory value (e.g. ``confirm_delivery=False`` under CRITICAL) —
-    a profile never silently overrides an explicit choice.
+    """Return a copy of *config* satisfying *profile*'s config-level requirements.
+
+    Raises :class:`ConfigValidationError` if the caller pinned a
+    contradictory value (e.g. ``confirm_delivery=False`` under CRITICAL) —
+    a profile never silently overrides an explicit choice — and, under
+    CRITICAL, when ``consumer.processing_timeout`` is not set (it has no
+    safe default).
+
+    CRITICAL fills in: confirms, persistence, mandatory, body limit
+    (<= 256 KiB), ``max_in_flight_bytes`` (:data:`CRITICAL_MAX_IN_FLIGHT_BYTES`
+    unless set), ``strip_reserved_headers``, a ``RetryConfig`` when there is
+    none (keeping your ladder when there is) with quorum delay queues
+    dead-lettering at-least-once, a quorum DLQ, ``terminal_action=dead_letter``
+    and ``trust_retry_header=False``, and ``safety.dead_letter_with_metadata``. It requires a heartbeat (``heartbeat=0``
+    raises) and leaves the reconnect budget and TLS to you. Per-route requirements (quorum source
+    queues declared at-least-once, no ``ACK_FIRST``, retry not disabled) are
+    the routes' to meet: check them with :func:`validate_profile` /
+    :func:`preflight` after registering the subscribers. Event-metadata
+    validation stays opt-in (``EventMetadataMiddleware``).
+
+    STANDARD fills in confirms, persistence and mandatory only.
     """
     prof = ReliabilityProfile(profile)
     defaults = RabbitConfig()
@@ -179,46 +404,52 @@ def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> Ra
     if config.retry is not None and config.retry.error_detail == "raw":
         contradictions.append("retry.error_detail='raw'")
     if prof is ReliabilityProfile.CRITICAL:
-        if _pinned(pub, defaults.publisher, "max_message_bytes") and pub.max_message_bytes > CRITICAL_MAX_MESSAGE_BYTES:
-            contradictions.append(f"publisher.max_message_bytes={pub.max_message_bytes} (> 256 KiB)")
-        if pub.max_message_bytes == 0:
-            contradictions.append("publisher.max_message_bytes=0 (unbounded)")
-        if (
-            config.retry is not None
-            and config.retry.delay_queue_type == "classic"
-            and _pinned(config.retry, RetryConfig(), "delay_queue_type")
-        ):
-            contradictions.append("retry.delay_queue_type='classic'")
-        if config.retry is not None and config.retry.dlq_queue_type == "classic":
-            contradictions.append("retry.dlq_queue_type='classic'")
+        contradictions.extend(_critical_contradictions(config, defaults))
     if contradictions:
         raise ConfigValidationError(
             f"Cannot apply reliability profile {prof.value!r}: contradictory explicit settings: "
             + ", ".join(contradictions)
         )
+    if prof is ReliabilityProfile.CRITICAL and config.consumer.processing_timeout is None:
+        raise ConfigValidationError(f"Cannot apply reliability profile 'critical': {_PROCESSING_TIMEOUT_REQUIRED}.")
 
-    new_pub = dataclasses.replace(
-        pub,
-        confirm_delivery=True,
-        persistent=True,
-        mandatory=True,
-        max_message_bytes=(
-            min(pub.max_message_bytes, CRITICAL_MAX_MESSAGE_BYTES)
-            if prof is ReliabilityProfile.CRITICAL
-            else pub.max_message_bytes
-        ),
-    )
-    new_retry = config.retry
     if prof is ReliabilityProfile.CRITICAL:
+        new_pub = dataclasses.replace(
+            pub,
+            confirm_delivery=True,
+            persistent=True,
+            mandatory=True,
+            max_message_bytes=min(pub.max_message_bytes, CRITICAL_MAX_MESSAGE_BYTES),
+            max_in_flight_bytes=(
+                pub.max_in_flight_bytes if pub.max_in_flight_bytes is not None else CRITICAL_MAX_IN_FLIGHT_BYTES
+            ),
+            strip_reserved_headers=True,
+        )
         base_retry = config.retry if config.retry is not None else RetryConfig()
         # A critical DLQ stores failed events indefinitely: always quorum
         # ("inherit" would silently become classic for a classic source).
-        new_retry = dataclasses.replace(base_retry, delay_queue_type="quorum", dlq_queue_type="quorum")
-    return dataclasses.replace(config, publisher=new_pub, retry=new_retry)
+        # Delay queues dead-letter back to the source at-least-once, so an
+        # expiring retry copy is never dropped when the source is full.
+        new_retry: RetryConfig | None = dataclasses.replace(
+            base_retry,
+            delay_queue_type="quorum",
+            dlq_queue_type="quorum",
+            delay_queue_dead_letter_strategy=DeadLetterStrategy.AT_LEAST_ONCE.value,
+            terminal_action=TerminalAction.DEAD_LETTER,
+            trust_retry_header=False,
+        )
+        new_safety = dataclasses.replace(config.safety, dead_letter_with_metadata=True)
+        return dataclasses.replace(config, publisher=new_pub, retry=new_retry, safety=new_safety)
+
+    new_pub = dataclasses.replace(pub, confirm_delivery=True, persistent=True, mandatory=True)
+    return dataclasses.replace(config, publisher=new_pub)
 
 
 def critical_config(base: RabbitConfig | None = None) -> RabbitConfig:
-    """Shorthand for ``apply_profile(base or RabbitConfig(), CRITICAL)``."""
+    """Shorthand for ``apply_profile(base or RabbitConfig(), CRITICAL)``.
+
+    *base* must set ``consumer.processing_timeout`` (see :func:`apply_profile`).
+    """
     return apply_profile(base or RabbitConfig(), ReliabilityProfile.CRITICAL)
 
 
@@ -304,6 +535,14 @@ def preflight(
     checks: list[PreflightCheck] = []
 
     violations = validate_profile(config, prof, routes=routes)
+    if management_client is not None:
+        # The broker-side dead-letter-strategy check below is authoritative
+        # (it sees policies too); drop the local "not declared" warning.
+        violations = [
+            v
+            for v in violations
+            if not (v.setting.startswith("queue[") and v.setting.endswith(".dead_letter_strategy"))
+        ]
     if violations:
         for v in violations:
             checks.append(

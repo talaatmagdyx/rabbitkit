@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import secrets
 import ssl
 from typing import Any
 from unittest.mock import patch
 
+import aiormq.exceptions as aiormq_exc
 import pytest
 
 from rabbitkit.async_.connection import (
@@ -184,8 +186,9 @@ class TestMakeAioPikaConnectKwargs:
         assert "backup:5673" in kwargs["url"]
         assert "primary" not in kwargs["url"]
 
-    def test_reconnect_jitter_survives_misconfigured_max_below_base(self) -> None:
-        """A misconfigured backoff_max <= base must not crash or drop below base."""
+    def test_reconnect_jitter_pinned_at_base_when_max_equals_base(self) -> None:
+        """backoff_max == base leaves no jitter span: the interval is base.
+        (backoff_max < base is rejected by ConnectionConfig itself.)"""
         try:
             import aio_pika  # noqa: F401
         except ImportError:
@@ -193,7 +196,7 @@ class TestMakeAioPikaConnectKwargs:
 
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
-        conn = ConnectionConfig(host="h", reconnect_backoff_base=5.0, reconnect_backoff_max=1.0)
+        conn = ConnectionConfig(host="h", reconnect_backoff_base=5.0, reconnect_backoff_max=5.0)
         interval = make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"]
         assert interval == 5.0  # zero jitter span, pinned at base
 
@@ -747,3 +750,170 @@ class TestForcedReconnectScope:
         assert monitor.is_blocked
         underlay.close.assert_not_awaited()
         assert monitor.forced_reconnects == 0
+
+
+class TestGetInfrastructureErrors:
+    def test_aiormq_channel_and_connection_errors(self) -> None:
+        import aiormq.exceptions
+
+        from rabbitkit.async_.connection import get_infrastructure_errors
+
+        errors = get_infrastructure_errors()
+        assert aiormq.exceptions.AMQPConnectionError in errors
+        assert aiormq.exceptions.ChannelClosed in errors
+        assert aiormq.exceptions.ChannelInvalidStateError in errors
+
+    def test_empty_without_aiormq(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        from rabbitkit.async_.connection import get_infrastructure_errors
+
+        monkeypatch.setitem(sys.modules, "aiormq.exceptions", None)
+        assert get_infrastructure_errors() == ()
+# ── G-08: permanent connect failures ─────────────────────────────────────
+
+
+class _AMQPInternalError(Exception):
+    """aiormq 6's error for an unexpected frame (aiormq 7 dropped the class)."""
+
+
+class _CloseFrame:
+    """Stands in for pamqp's Connection.Close frame (aiormq 6 passes it as an arg)."""
+
+    name = "Connection.Close"
+
+    def __init__(self, reply_code: int, reply_text: str) -> None:
+        self.reply_code = reply_code
+        self.reply_text = reply_text
+
+
+def _cert_error(message: str) -> ssl.SSLCertVerificationError:
+    error = ssl.SSLCertVerificationError(1, f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: {message}")
+    error.verify_message = message
+    return error
+
+
+def _ssl_error(reason: str) -> ssl.SSLError:
+    error = ssl.SSLError(1, f"[SSL: {reason}] {reason.lower()}")
+    error.reason = reason
+    return error
+
+
+class TestPermanentFailureReason:
+    @pytest.mark.parametrize(
+        ("make_error", "expected"),
+        [
+            (lambda: _cert_error("Hostname mismatch"), "tls_verification_failed"),
+            (lambda: _ssl_error("TLSV1_ALERT_UNKNOWN_CA"), "tls_handshake_rejected"),
+            (lambda: _ssl_error("WRONG_VERSION_NUMBER"), "tls_handshake_rejected"),
+            (lambda: _ssl_error("UNEXPECTED_EOF_WHILE_READING"), None),
+            (lambda: aiormq_exc.ProbableAuthenticationError("ACCESS_REFUSED"), "authentication_failed"),
+            (lambda: aiormq_exc.AuthenticationError("PLAIN", ["AMQPLAIN"]), "authentication_failed"),
+            (lambda: aiormq_exc.ConnectionClosed(403, "ACCESS_REFUSED"), "authentication_failed"),
+            (lambda: aiormq_exc.ConnectionClosed(320, "CONNECTION_FORCED"), None),
+            (
+                lambda: aiormq_exc.InvalidFrameError(
+                    "Expected one of ['Connection.OpenOk'], got <Connection.Close object at 0x1>"
+                ),
+                "vhost_access_refused",
+            ),
+            (
+                lambda: _AMQPInternalError(
+                    "one of ['Connection.OpenOk']", _CloseFrame(530, "NOT_ALLOWED - vhost x not found")
+                ),
+                "vhost_access_refused",
+            ),
+            (
+                lambda: _AMQPInternalError(
+                    "one of ['Connection.OpenOk']", _CloseFrame(530, "NOT_ALLOWED - vhost x is down")
+                ),
+                None,
+            ),
+            (
+                lambda: _AMQPInternalError("one of ['Connection.OpenOk']", _CloseFrame(541, "INTERNAL")),
+                None,
+            ),
+            (lambda: _AMQPInternalError("one of ['Connection.TuneOk']", _CloseFrame(530, "x")), None),
+            (lambda: aiormq_exc.InvalidFrameError("Expected one of ['Channel.OpenOk'], got <Basic.Ack>"), None),
+            (lambda: aiormq_exc.AMQPConnectionError(), None),
+            (lambda: ConnectionRefusedError(61, "refused"), None),
+            (lambda: TimeoutError(), None),
+        ],
+    )
+    def test_classifies(self, make_error: Any, expected: str | None) -> None:
+        from rabbitkit.async_.connection import permanent_failure_reason
+
+        assert permanent_failure_reason(make_error()) == expected
+
+    def test_looks_through_aiormqs_wrapping_of_the_ssl_error(self) -> None:
+        """aiormq 7 raises AMQPConnectionError(*e.args) from the ssl error."""
+        from rabbitkit.async_.connection import permanent_failure_reason
+
+        cert = _cert_error("Hostname mismatch")
+        try:
+            raise aiormq_exc.AMQPConnectionError(*cert.args) from cert
+        except aiormq_exc.AMQPConnectionError as wrapped:
+            assert permanent_failure_reason(wrapped) == "tls_verification_failed"
+
+    def test_cause_chain_depth_is_bounded(self) -> None:
+        from rabbitkit.async_.connection import permanent_failure_reason
+
+        error: BaseException = _cert_error("deep")
+        for _ in range(5):
+            outer = ConnectionError("wrapped")
+            outer.__cause__ = error
+            error = outer
+        assert permanent_failure_reason(error) is None
+
+
+class TestPermanentConnectionError:
+    def _build(self, error: BaseException) -> Any:
+        from rabbitkit.async_.connection import permanent_connection_error
+
+        return permanent_connection_error(error, endpoint="rabbit:5672", vhost="orders")
+
+    def test_transient_is_none(self) -> None:
+        assert self._build(ConnectionResetError()) is None
+
+    def test_authentication(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        error = self._build(aiormq_exc.ProbableAuthenticationError("ACCESS_REFUSED - Login was refused"))
+        assert isinstance(error, AuthenticationFailedError)
+        assert isinstance(error, ConnectionError)
+        assert error.reason == "authentication_failed"
+        assert error.endpoint == "rabbit:5672"
+        assert "rabbit:5672" in str(error) and "credentials_provider" in str(error)
+
+    def test_vhost(self) -> None:
+        from rabbitkit.core.errors import VhostAccessRefusedError
+
+        refusal = aiormq_exc.InvalidFrameError("Expected one of ['Connection.OpenOk'], got <Connection.Close>")
+        error = self._build(refusal)
+        assert isinstance(error, VhostAccessRefusedError)
+        assert "'orders'" in str(error)
+
+    def test_tls_verification_names_the_check(self) -> None:
+        from rabbitkit.core.errors import TLSVerificationError
+
+        error = self._build(_cert_error("Hostname mismatch, certificate is not valid for 'x'."))
+        assert isinstance(error, TLSVerificationError)
+        assert error.reason == "tls_verification_failed"
+        assert "Hostname mismatch" in str(error)
+
+    def test_tls_verification_without_a_verify_message(self) -> None:
+        error = self._build(ssl.SSLCertVerificationError(1, "verify failed"))
+        assert "SSLCertVerificationError" in str(error)
+
+    def test_tls_handshake_rejected(self) -> None:
+        from rabbitkit.core.errors import TLSVerificationError
+
+        error = self._build(_ssl_error("SSLV3_ALERT_BAD_CERTIFICATE"))
+        assert isinstance(error, TLSVerificationError)
+        assert error.reason == "tls_handshake_rejected"
+        assert "SSLV3_ALERT_BAD_CERTIFICATE" in str(error)
+
+    def test_never_carries_credentials(self) -> None:
+        cfg = ConnectionConfig(host="rabbit", username="svc-user", password=secrets.token_urlsafe(12))
+        error = self._build(aiormq_exc.ProbableAuthenticationError("ACCESS_REFUSED"))
+        assert cfg.password not in str(error) and cfg.username not in str(error)

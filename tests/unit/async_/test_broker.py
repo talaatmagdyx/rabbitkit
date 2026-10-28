@@ -190,7 +190,9 @@ class TestLifecycle:
             await broker.start()
             await broker.stop()
 
-            mock_transport.cancel_consumer.assert_called_once_with("consumer-tag-1")
+            mock_transport.cancel_consumer.assert_called_once()
+            assert mock_transport.cancel_consumer.call_args.args == ("consumer-tag-1",)
+            assert 0 < mock_transport.cancel_consumer.call_args.kwargs["timeout"] <= 30.0  # bounded by stop()
             mock_transport.disconnect.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1224,6 +1226,11 @@ class TestWorkerPoolWarning:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
+        mock_transport.on_connection_failed = MagicMock()
         return mock_transport
 
     async def test_warning_when_worker_count_exceeds_channel_pool_size(self) -> None:
@@ -1290,6 +1297,10 @@ class TestRPCClient:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     async def test_request_requires_started_broker(self) -> None:
@@ -1459,6 +1470,10 @@ class TestOnMessageCallback:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     async def test_on_message_sets_original_queue_header(self) -> None:
@@ -1611,6 +1626,10 @@ class TestBatchPublisherAutoCap:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
+        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
+        mock_transport.on_consumer_cancelled = MagicMock()
+        mock_transport.on_consumer_resumed = MagicMock()
         return mock_transport
 
     @pytest.mark.asyncio
@@ -1626,13 +1645,13 @@ class TestBatchPublisherAutoCap:
         captured: list[Any] = []
 
         class CapturingPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 captured.append(cfg)
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -1660,13 +1679,13 @@ class TestBatchPublisherAutoCap:
         )
 
         class NoOpPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 pass
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -1700,13 +1719,13 @@ class TestBatchPublisherAutoCap:
         )
 
         class NoOpPublisher:
-            def __init__(self, transport: Any, cfg: Any) -> None:
+            def __init__(self, transport: Any, cfg: Any, **kwargs: Any) -> None:
                 pass
 
             async def start(self) -> None:
                 pass
 
-            async def stop(self) -> None:
+            async def stop(self, timeout: float | None = 0.0) -> None:
                 pass
 
             async def publish(self, envelope: Any) -> Any:  # pragma: no cover
@@ -2117,7 +2136,7 @@ class TestAsyncPublishWithFlowController:
 
     @pytest.mark.asyncio
     async def test_publish_dropped_by_backpressure(self) -> None:
-        """fc.acquire_async() returns False → publish returns ERROR outcome."""
+        """fc.acquire_async() returns False → NOT_SENT (backpressure_dropped): it never left the client."""
         from rabbitkit.core.config import BackpressureConfig
         from rabbitkit.highload.backpressure import FlowController
 
@@ -2128,7 +2147,8 @@ class TestAsyncPublishWithFlowController:
 
         envelope = MessageEnvelope(routing_key="rk", body=b"test")
         outcome = await broker.publish(envelope)
-        assert outcome.status == PublishStatus.ERROR
+        assert outcome.status == PublishStatus.NOT_SENT
+        assert outcome.reason == "backpressure_dropped"
 
     @pytest.mark.asyncio
     async def test_publish_succeeds_with_flow_controller(self) -> None:
@@ -2264,10 +2284,8 @@ class TestPublishSizeGuardAsync:
 
 
 class TestWireReconnectMetricAsync:
-    """Channel-churn counter wiring via the first route MetricsMiddleware's
-    collector. Unlike sync, ``reconnects_total`` is deliberately NOT wired:
-    aio-pika does not report a broker-initiated reconnect, so the series
-    would be permanently 0 while connections really are flapping."""
+    """Connection-churn counter wiring via the first route MetricsMiddleware's
+    collector. ``reconnects_total`` is wired like on sync (G-08)."""
 
     def _wired(self, collector: MagicMock) -> AsyncBroker:
         from rabbitkit.middleware.metrics import MetricsMiddleware
@@ -2282,10 +2300,13 @@ class TestWireReconnectMetricAsync:
         broker._wire_reconnect_metric()
         return broker
 
-    def test_does_not_wire_a_reconnect_counter(self) -> None:
+    def test_wires_the_reconnect_counter(self) -> None:
         collector = MagicMock()
         broker = self._wired(collector)
-        broker._transport.on_reconnect.assert_not_called()
+
+        broker._transport.on_reconnect.assert_called_once()
+        broker._transport.on_reconnect.call_args.args[0]()
+        collector.inc_counter.assert_called_once_with("rabbitkit_reconnects_total", {})
 
     def test_wires_the_channel_churn_counters(self) -> None:
         collector = MagicMock()
@@ -2507,3 +2528,551 @@ class TestUserSuppliedRetryMiddlewareWiring:
             await broker.start()
 
         assert user_mw._publish_async_fn is not None
+
+
+class TestAsyncWaitInFlightIsBounded:
+    """INV-008: a handler that swallows CancelledError must not hold stop()
+    open past the graceful deadline plus the short cancel-join bound."""
+
+    async def test_cancellation_swallowing_handler_is_abandoned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        import rabbitkit.async_.broker as broker_mod
+        from rabbitkit.core.message import RabbitMessage
+
+        monkeypatch.setattr(broker_mod, "_CANCEL_JOIN_TIMEOUT", 0.05)
+        broker = AsyncBroker()
+        message = RabbitMessage(body=b"", delivery_tag=9, message_id="stuck")
+        nacked: list[bool] = []
+
+        async def nack(requeue: bool) -> None:
+            nacked.append(requeue)
+
+        message._nack_async_fn = nack
+        release = asyncio.Event()
+
+        async def misbehaving() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await release.wait()  # swallows cancellation
+
+        task = asyncio.create_task(misbehaving())
+        await asyncio.sleep(0)
+        broker._inflight_tasks[task] = message
+        broker._in_flight = 1
+        t0 = time.monotonic()
+        with patch("rabbitkit.async_.broker.logger") as mock_logger:
+            await broker._wait_in_flight(time.monotonic() - 1.0)
+        assert time.monotonic() - t0 < 1.0
+        assert nacked == [True]
+        assert any("ignored cancellation" in str(c.args[0]) for c in mock_logger.error.call_args_list)
+        release.set()
+        await task
+
+
+# ── G-26: broker-initiated consumer cancel → route state + hooks ─────────
+
+
+class TestConsumerCancelledByBroker:
+    @staticmethod
+    def _transport() -> AsyncMock:
+        transport = AsyncMock()
+        transport.consume = AsyncMock(return_value="tag-1")
+        transport.on_consumer_cancelled = MagicMock()
+        transport.on_consumer_resumed = MagicMock()
+        transport.on_channel_opened = MagicMock()
+        transport.on_channel_rebuilt = MagicMock()
+        return transport
+
+    async def _started(self) -> tuple[AsyncBroker, AsyncMock]:
+        broker = AsyncBroker()
+
+        @broker.subscriber(queue="orders")
+        async def orders(body: bytes) -> None:
+            pass
+
+        @broker.subscriber(queue="audit")
+        async def audit(body: bytes) -> None:
+            pass
+
+        transport = self._transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            await broker.start(install_signal_handlers=False)
+        return broker, transport
+
+    async def test_cancel_and_resume_update_the_route_and_call_the_hooks(self) -> None:
+        from rabbitkit.health import broker_health_check
+
+        broker, transport = await self._started()
+        cancelled: list[str] = []
+        resumed: list[str] = []
+        broker.on_consumer_cancelled = cancelled.append
+        broker.on_consumer_resumed = resumed.append
+        # Wired once per transport, not once per route.
+        transport.on_consumer_cancelled.assert_called_once()
+        on_cancel = transport.on_consumer_cancelled.call_args.args[0]
+        on_resume = transport.on_consumer_resumed.call_args.args[0]
+
+        on_cancel("orders")
+        by_queue = {r.queue.name: r for r in broker.routes}
+        assert by_queue["orders"].runtime_state.consumer_cancelled is True
+        assert by_queue["audit"].runtime_state.consumer_cancelled is False
+        assert cancelled == ["orders"]
+        assert broker_health_check(broker).consumer_count == 1
+
+        on_resume("orders")
+        assert by_queue["orders"].runtime_state.consumer_cancelled is False
+        assert resumed == ["orders"]
+        assert broker_health_check(broker).consumer_count == 2
+        await broker.stop()
+
+    async def test_hooks_are_optional_and_a_raising_hook_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        broker, transport = await self._started()
+        on_cancel = transport.on_consumer_cancelled.call_args.args[0]
+        on_cancel("orders")  # no hook set
+
+        def boom(queue: str) -> None:
+            raise RuntimeError("hook bug")
+
+        broker.on_consumer_resumed = boom
+        on_resume = transport.on_consumer_resumed.call_args.args[0]
+        with caplog.at_level("WARNING", logger="rabbitkit.async_.broker"):
+            on_resume("orders")
+        assert "on_consumer_resumed hook raised" in caplog.text
+        assert all(not r.runtime_state.consumer_cancelled for r in broker.routes)
+        await broker.stop()
+
+
+# ── G-24: signal handlers of an embedding application survive start()/stop() ──
+
+
+class TestEmbeddingAppSignalHandlers:
+    @pytest.fixture(autouse=True)
+    async def _restore_process_handlers(self) -> Any:
+        import contextlib
+        import signal
+
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        yield
+        loop = asyncio.get_running_loop()
+        for sig, handler in saved.items():
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+            signal.signal(sig, handler)
+
+    @staticmethod
+    def _logged(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]) -> str:
+        return caplog.text + capsys.readouterr().out  # stdlib or structlog rendering
+
+    async def test_default_handlers_are_put_back(self) -> None:
+        import signal
+
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        assert broker._installed_loop_handlers is True
+        assert getattr(signal.getsignal(signal.SIGTERM), "__name__", "") == "_sighandler_noop"
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert broker._installed_loop_handlers is False
+
+    async def test_custom_python_handler_is_replaced_with_a_warning_and_restored(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import signal
+
+        def app_handler(signum: int, frame: Any) -> None:
+            pass
+
+        signal.signal(signal.SIGTERM, app_handler)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "replacing the existing SIGTERM handler" in self._logged(caplog, capsys)
+        assert signal.getsignal(signal.SIGTERM) is not app_handler
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGTERM) is app_handler
+
+    async def test_existing_asyncio_handler_is_left_alone(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import os
+        import signal
+
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        loop.add_signal_handler(signal.SIGTERM, fired.set)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "asyncio handler for SIGTERM is already installed" in self._logged(caplog, capsys)
+        assert signal.SIGTERM not in broker._signal_prev
+        broker._restore_signal_handlers()
+
+        os.kill(os.getpid(), signal.SIGTERM)  # still the application's handler
+        async with asyncio.timeout(5):
+            await fired.wait()
+        assert not broker._shutdown_event.is_set()
+
+    async def test_handler_installed_by_the_app_after_start_is_not_removed(self) -> None:
+        import os
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        loop = asyncio.get_running_loop()
+        fired = asyncio.Event()
+        loop.add_signal_handler(signal.SIGTERM, fired.set)  # the app takes over after start()
+        broker._restore_signal_handlers()
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        async with asyncio.timeout(5):
+            await fired.wait()
+
+    async def test_asyncio_run_sigint_handler_is_default_and_restored(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import functools
+        import signal
+
+        class Runner:
+            def _on_sigint(self, signum: int, frame: Any, main_task: Any) -> None:
+                pass
+
+        runner_handler = functools.partial(Runner()._on_sigint, main_task=None)
+        signal.signal(signal.SIGINT, runner_handler)
+        broker = AsyncBroker()
+        with caplog.at_level("WARNING"):
+            broker._install_signal_handlers()
+        assert "SIGINT" not in self._logged(caplog, capsys)
+        broker._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGINT) is runner_handler
+
+    async def test_install_is_idempotent(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        first = dict(broker._signal_prev)
+        broker._install_signal_handlers()  # must not capture its own handler as "previous"
+        assert broker._signal_prev == first
+        broker._restore_signal_handlers()
+        assert not getattr(signal.getsignal(signal.SIGTERM), "__name__", "").endswith("noop")
+
+    async def test_unrestorable_previous_handler_is_skipped(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        broker._install_signal_handlers()
+        broker._signal_prev[signal.SIGTERM] = None  # installed outside Python
+        broker._signal_prev[signal.SIGINT] = "not-a-handler"
+        broker._restore_signal_handlers()  # logs, does not raise
+        assert broker._signal_prev == {}
+
+    def test_loop_without_a_handler_table_is_assumed_ours(self) -> None:
+        import signal
+
+        broker = AsyncBroker()
+        assert broker._owns_loop_signal(MagicMock(spec=[]), signal.SIGTERM) is True
+
+
+class TestDeadLetterGuardProbe:
+    """F17: the broker's queue-existence probe used by the dead-letter guard."""
+
+    async def test_without_a_transport_the_queue_is_reported_missing(self) -> None:
+        assert await AsyncBroker()._queue_exists_for_guard("orders.dlq") is False
+
+    async def test_delegates_to_the_transport(self) -> None:
+        broker = AsyncBroker()
+        transport = AsyncMock()
+        transport.queue_exists = AsyncMock(return_value=1)
+        broker._transport = transport
+        assert await broker._queue_exists_for_guard("orders.dlq") is True
+        transport.queue_exists.assert_awaited_once_with("orders.dlq")
+
+
+class TestBulkSettlementMetricsHook:
+    def test_hook_counts_settlement_items_through_the_metrics_collector(self) -> None:
+        from types import SimpleNamespace
+
+        from rabbitkit.middleware.metrics import MetricsMiddleware
+
+        collector = MagicMock(spec=["inc_counter"])
+        mw = MetricsMiddleware(collector=collector)
+        broker = AsyncBroker(middlewares=[mw])
+        action = SimpleNamespace(value="ack")
+        hook = broker._settlement_item_hook(action)  # type: ignore[arg-type]
+        assert hook is not None
+        hook(SimpleNamespace(status=SimpleNamespace(value="settled")))  # type: ignore[arg-type]
+        collector.inc_counter.assert_called_once_with(
+            mw.config.settlement_items_total, {"action": "ack", "status": "settled"}
+        )
+        broker._set_lifecycle_gauges(connected=True)  # collector without set_gauge: no-op
+# ── G-10: a failed start() undoes itself; G-08: terminal failures ───────
+
+
+def _foundation_transport(*, consume: Any = None) -> MagicMock:
+    transport = MagicMock()
+    for name in (
+        "connect",
+        "declare_exchange",
+        "declare_queue",
+        "bind_queue",
+        "bind_exchange",
+        "cancel_consumer",
+        "close_publishing",
+        "disconnect",
+        "queue_exists",
+    ):
+        setattr(transport, name, AsyncMock())
+    transport.consume = consume or AsyncMock(return_value="tag-1")
+    transport.connection_failure = None
+    return transport
+
+
+class TestFailedStartCleanup:
+    @staticmethod
+    def _broker(**kw: Any) -> AsyncBroker:
+        broker = AsyncBroker(**kw)
+
+        @broker.subscriber(queue="first")
+        async def first(body: bytes) -> None:
+            pass
+
+        @broker.subscriber(queue="second")
+        async def second(body: bytes) -> None:
+            pass
+
+        return broker
+
+    @pytest.mark.asyncio
+    async def test_undoes_everything_and_can_be_retried(self) -> None:
+        from rabbitkit.core.config import BatchPublishConfig
+
+        broker = self._broker(batch_config=BatchPublishConfig(batch_size=10, flush_workers=1))
+        failing = _foundation_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
+        batch = MagicMock()
+        batch.start = AsyncMock()
+        batch.stop = AsyncMock()
+        with (
+            patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=failing),
+            patch("rabbitkit.async_.batch.AsyncBatchPublisher", return_value=batch),
+        ):
+            with pytest.raises(RuntimeError, match="consume refused"):
+                await broker.start(worker_config=WorkerConfig(worker_count=2), install_signal_handlers=False)
+
+        failing.cancel_consumer.assert_awaited_once_with("tag-1")
+        batch.stop.assert_awaited_once()
+        failing.disconnect.assert_awaited_once()
+        assert not broker.started
+        assert broker._transport is None
+        assert broker._worker_pool is None
+        assert broker._batch_publisher is None
+        assert all(route.consumer_tag is None for route in broker.routes)
+        failing.on_connection_failed.assert_called_once_with(broker._on_connection_failed)
+
+        working = _foundation_transport()
+        with (
+            patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=working),
+            patch("rabbitkit.async_.batch.AsyncBatchPublisher", return_value=batch),
+        ):
+            await broker.start(install_signal_handlers=False)
+        assert broker.started
+        assert broker._transport is working
+        await broker.stop()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_errors_never_mask_the_start_failure(self) -> None:
+        broker = self._broker()
+        transport = _foundation_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
+        transport.cancel_consumer = AsyncMock(side_effect=RuntimeError("cancel failed"))
+        transport.disconnect = AsyncMock(side_effect=RuntimeError("disconnect failed"))
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            with pytest.raises(RuntimeError, match="consume refused"):
+                await broker.start(install_signal_handlers=False)
+        assert not broker.started
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_needs_no_consumer_cleanup(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        broker = self._broker()
+        transport = _foundation_transport()
+        transport.connect = AsyncMock(side_effect=AuthenticationFailedError("refused", reason="authentication_failed"))
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            with pytest.raises(AuthenticationFailedError):
+                await broker.start(install_signal_handlers=False)
+        transport.cancel_consumer.assert_not_awaited()
+        transport.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failure_after_the_heartbeat_started_stops_it(self) -> None:
+        broker = self._broker()
+        transport = _foundation_transport()
+        with (
+            patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport),
+            patch.object(broker, "_install_signal_handlers", side_effect=RuntimeError("no signals here")),
+        ):
+            with pytest.raises(RuntimeError, match="no signals here"):
+                await broker.start()
+        assert broker._heartbeat_task is None
+        assert not broker.started
+        assert transport.cancel_consumer.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_cleans_up(self) -> None:
+        broker = self._broker()
+        transport = _foundation_transport()
+        entered = asyncio.Event()
+
+        async def slow_declare(*_a: Any, **_kw: Any) -> None:
+            entered.set()
+            await asyncio.sleep(60)
+
+        transport.declare_queue = AsyncMock(side_effect=slow_declare)
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            task = asyncio.ensure_future(broker.start(install_signal_handlers=False))
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        transport.disconnect.assert_awaited_once()
+        assert broker._transport is None
+
+
+class TestTerminalConnectionFailure:
+    @staticmethod
+    def _error() -> Any:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        return AuthenticationFailedError("refused", reason="authentication_failed", endpoint="h:5672")
+
+    @pytest.mark.asyncio
+    async def test_run_stops_and_raises_the_failure(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        broker = AsyncBroker()
+        transport = _foundation_transport()
+        with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
+            run_task = asyncio.ensure_future(broker.run())
+            for _ in range(200):
+                if broker._run_waiting:
+                    break
+                await asyncio.sleep(0)
+            error = self._error()
+            transport.connection_failure = error
+            broker._on_connection_failed(error)
+            with pytest.raises(AuthenticationFailedError):
+                await asyncio.wait_for(run_task, timeout=2.0)
+        assert not broker.started
+        transport.disconnect.assert_awaited_once()
+
+    def test_without_run_it_only_reports(self) -> None:
+        broker = AsyncBroker()
+        with patch("rabbitkit.async_.broker.logger") as log:
+            broker._on_connection_failed(self._error())
+        assert not broker._shutdown_event.is_set()
+        log.critical.assert_called_once()
+        assert log.critical.call_args.args[1] == "authentication_failed"
+
+    def test_connection_failure_helper(self) -> None:
+        broker = AsyncBroker()
+        assert broker._connection_failure() is None
+        broker._transport = MagicMock(connection_failure="not an error")
+        assert broker._connection_failure() is None
+        error = self._error()
+        broker._transport = MagicMock(connection_failure=error)
+        assert broker._connection_failure() is error
+
+
+class TestQueueExistsForGuard:
+    @pytest.mark.asyncio
+    async def test_without_a_transport_nothing_exists(self) -> None:
+        assert await AsyncBroker()._queue_exists_for_guard("orders.dlq") is False
+
+    @pytest.mark.asyncio
+    async def test_asks_the_transport(self) -> None:
+        broker = AsyncBroker()
+        broker._transport = _foundation_transport()
+        broker._transport.queue_exists = AsyncMock(return_value=True)
+        assert await broker._queue_exists_for_guard("orders.dlq") is True
+        broker._transport.queue_exists.assert_awaited_once_with("orders.dlq")
+
+
+# ── async context manager (contract §4.3) ─────────────────────────────────
+
+
+class TestAsyncContextManager:
+    @pytest.mark.asyncio
+    async def test_enter_starts_without_signal_handlers_and_exit_stops(self) -> None:
+        broker = AsyncBroker()
+        calls: list[tuple[str, Any]] = []
+
+        async def fake_start(worker_config: Any = None, *, install_signal_handlers: bool = True) -> None:
+            calls.append(("start", install_signal_handlers))
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            calls.append(("stop", timeout))
+
+        with patch.object(broker, "start", fake_start), patch.object(broker, "stop", fake_stop):
+            async with broker as entered:
+                assert entered is broker
+                assert calls == [("start", False)]
+
+        assert calls == [("start", False), ("stop", None)]
+
+    @pytest.mark.asyncio
+    async def test_exit_stops_when_the_block_raises(self) -> None:
+        broker = AsyncBroker()
+        stopped: list[bool] = []
+
+        async def fake_stop(timeout: float | None = None) -> None:
+            stopped.append(True)
+
+        with (
+            patch.object(broker, "start", AsyncMock()),
+            patch.object(broker, "stop", fake_stop),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            async with broker:
+                raise RuntimeError("boom")
+
+        assert stopped == [True]
+
+
+# ── G-17: DLQ copies for failures outside RetryMiddleware ─────────────────
+
+
+class TestDeadLetterCopyWiring:
+    def test_off_by_default(self) -> None:
+        broker = AsyncBroker()
+        assert broker._dead_letter_copier is None
+        assert broker._pipeline._dead_letter_copy is None
+
+    def test_on_wires_the_copier_into_the_pipeline(self) -> None:
+        from rabbitkit.core.config import SafetyConfig
+
+        broker = AsyncBroker(RabbitConfig(safety=SafetyConfig(dead_letter_with_metadata=True)))
+        assert broker._dead_letter_copier is not None
+        assert broker._pipeline._dead_letter_copy == broker._dead_letter_copier.copy
+
+    def test_sanitizer_and_retry_header_follow_the_route_retry_config(self) -> None:
+        broker = AsyncBroker(RabbitConfig(retry=RetryConfig(error_detail="omit", retry_header="x-tries")))
+
+        @broker.subscriber(queue="with-retry")
+        async def a(body: bytes) -> None: ...
+
+        plain = AsyncBroker()
+
+        @plain.subscriber(queue="plain")
+        async def b(body: bytes) -> None: ...
+
+        route = broker.routes[0]
+        assert broker._dead_letter_sanitizer(route).policy == "omit"
+        assert broker._dead_letter_sanitizer(route) is broker._dead_letter_sanitizer(route)  # cached
+        assert broker._dead_letter_retry_header(route) == "x-tries"
+        assert plain._dead_letter_sanitizer(plain.routes[0]).policy == "sanitized"
+        assert plain._dead_letter_retry_header(plain.routes[0]) == "x-rabbitkit-retry-count"

@@ -122,7 +122,7 @@ class TestConfirmLatency:
         with pytest.raises(RuntimeError):
             mw.publish_scope(boom, env)
         collector.inc_counter.assert_any_call(
-            "rabbitkit_messages_published_total", {"exchange": "default", "status": "error"}
+            "rabbitkit_messages_published_total", {"exchange": "default", "status": "error", "reason": "exception"}
         )
 
 

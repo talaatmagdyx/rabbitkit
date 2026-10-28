@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -335,8 +336,9 @@ class TestAsyncAlreadySettled:
 
 
 # ── ack-failure propagation (Core-H4) ─────────────────────────────────────
-# A failed settlement must RAISE and leave the message UNSETTLED, so the
-# recovery loop can redeliver instead of silently swallowing the failure.
+# A failed settlement must RAISE. The sync variants leave the message
+# UNSETTLED so the recovery loop can redeliver; the async variants keep the
+# claim and report the outcome as unknown (G-15).
 
 
 class TestAckFailurePropagation:
@@ -405,7 +407,7 @@ class TestAckFailurePropagation:
         assert msg._disposition == "acked"
 
     @pytest.mark.asyncio
-    async def test_async_ack_failure_raises_and_leaves_unsettled(self) -> None:
+    async def test_async_ack_failure_raises_and_keeps_the_claim(self) -> None:
         msg = _make_message()
 
         async def boom() -> None:
@@ -416,11 +418,13 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.ack_async()
 
-        assert msg.is_settled is False
-        assert msg._disposition == "pending"
+        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        assert msg.is_settled is True
+        assert msg._disposition == "acked"
+        assert msg.settlement_outcome_unknown is True
 
     @pytest.mark.asyncio
-    async def test_async_nack_failure_raises_and_leaves_unsettled(self) -> None:
+    async def test_async_nack_failure_raises_and_keeps_the_claim(self) -> None:
         msg = _make_message()
 
         async def boom(_requeue: bool) -> None:
@@ -431,11 +435,13 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.nack_async(requeue=True)
 
-        assert msg.is_settled is False
-        assert msg._disposition == "pending"
+        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        assert msg.is_settled is True
+        assert msg._disposition == "nacked"
+        assert msg.settlement_outcome_unknown is True
 
     @pytest.mark.asyncio
-    async def test_async_reject_failure_raises_and_leaves_unsettled(self) -> None:
+    async def test_async_reject_failure_raises_and_keeps_the_claim(self) -> None:
         msg = _make_message()
 
         async def boom(_requeue: bool) -> None:
@@ -446,8 +452,10 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.reject_async(requeue=False)
 
-        assert msg.is_settled is False
-        assert msg._disposition == "pending"
+        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        assert msg.is_settled is True
+        assert msg._disposition == "rejected"
+        assert msg.settlement_outcome_unknown is True
 
 
 class TestAsyncNoSettlementFn:
@@ -471,3 +479,104 @@ class TestAsyncNoSettlementFn:
         msg = RabbitMessage(body=b"x", routing_key="q")
         with pytest.raises(RuntimeError, match="Cannot async-reject"):
             await msg.reject_async()
+
+
+# ── G-15: async settlement is claimed atomically ──────────────────────────
+
+
+def _wire_async_gated(msg: RabbitMessage) -> tuple[list[tuple[str, bool | None]], asyncio.Event]:
+    """Wire async settlement fns that record each frame and block until released."""
+    frames: list[tuple[str, bool | None]] = []
+    release = asyncio.Event()
+
+    async def ack() -> None:
+        frames.append(("ack", None))
+        await release.wait()
+
+    async def nack(requeue: bool) -> None:
+        frames.append(("nack", requeue))
+        await release.wait()
+
+    async def reject(requeue: bool) -> None:
+        frames.append(("reject", requeue))
+        await release.wait()
+
+    msg._ack_async_fn = ack
+    msg._nack_async_fn = nack
+    msg._reject_async_fn = reject
+    return frames, release
+
+
+class TestAtomicAsyncSettlement:
+    @pytest.mark.asyncio
+    async def test_concurrent_ack_and_nack_send_one_frame(self) -> None:
+        msg = _make_message(delivery_tag=7)
+        frames, release = _wire_async_gated(msg)
+        async with asyncio.timeout(5):
+            first = asyncio.create_task(msg.ack_async())
+            await asyncio.sleep(0)  # the ack is now awaiting the transport
+            second = asyncio.create_task(msg.nack_async(requeue=True))
+            third = asyncio.create_task(msg.reject_async(requeue=False))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second, third)
+        assert frames == [("ack", None)]
+        assert msg.disposition == "acked"
+        assert msg.settlement_outcome_unknown is False
+
+    @pytest.mark.asyncio
+    async def test_many_concurrent_settlements_send_exactly_one_frame(self) -> None:
+        msg = _make_message(delivery_tag=1)
+        frames, release = _wire_async_gated(msg)
+        async with asyncio.timeout(5):
+            tasks = [
+                asyncio.create_task(coro)
+                for _ in range(20)
+                for coro in (msg.ack_async(), msg.nack_async(True), msg.reject_async(False))
+            ]
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(*tasks)
+        assert len(frames) == 1
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_ack_keeps_claim_and_a_later_nack_sends_nothing(self) -> None:
+        """The stop() straggler path: a handler task is cancelled while its ack
+        is in flight, then stop() nacks it. The nack must be a no-op, or the
+        broker would see two frames for one delivery tag and close the channel."""
+        msg = _make_message(delivery_tag=3)
+        frames, _release = _wire_async_gated(msg)
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(msg.ack_async())
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await msg.nack_async(requeue=True)
+        assert frames == [("ack", None)]
+        assert msg.is_settled is True
+        assert msg.disposition == "acked"
+        assert msg.settlement_outcome_unknown is True
+
+    @pytest.mark.asyncio
+    async def test_failed_sync_fallback_keeps_claim(self) -> None:
+        msg = _make_message()
+        nack = MagicMock(side_effect=RuntimeError("closed"))
+        msg._nack_fn = nack
+        with pytest.raises(RuntimeError, match="closed"):
+            await msg.nack_async(requeue=False)
+        await msg.reject_async()
+        nack.assert_called_once_with(False)
+        assert msg.disposition == "nacked"
+        assert msg.settlement_outcome_unknown is True
+
+    @pytest.mark.asyncio
+    async def test_missing_settlement_fn_does_not_claim(self) -> None:
+        msg = _make_message()
+        with pytest.raises(RuntimeError, match="Cannot async-ack"):
+            await msg.ack_async()
+        assert msg.is_settled is False
+        assert msg.settlement_outcome_unknown is False
+
+    def test_outcome_unknown_false_initially(self) -> None:
+        assert _make_message().settlement_outcome_unknown is False

@@ -20,12 +20,18 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rabbitkit.async_.connection import get_connection_errors
-from rabbitkit.async_.pool import AsyncConnectionPool
+from rabbitkit.async_.consumers import ConsumerRecord, ConsumerSupervisor
+from rabbitkit.async_.pool import (
+    AsyncConnectionPool,
+    ChannelPoolClosedError,
+    ChannelPoolExhaustedError,
+    InFlightByteLimiter,
+)
 from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
-from rabbitkit.core.errors import ConfigurationError
+from rabbitkit.core.errors import ConfigurationError, TerminalConnectionError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.topology_dispatch import TopoAction, TopologyDispatcher
@@ -33,16 +39,33 @@ from rabbitkit.core.types import (
     DIRECT_REPLY_TO_QUEUE,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     TopologyMode,
+    safe_exception_repr,
 )
+
+if TYPE_CHECKING:
+    from rabbitkit.async_.reconnect import ReconnectAttempt
 
 logger = logging.getLogger(__name__)
 
-# Item 6: how long publish() waits for aio-pika's own connect_robust() to
-# restore the connection before giving up on the retry-once (rather than
-# retrying immediately against a connection that is still down).
+# How long a publish waits for aio-pika's own connect_robust() to restore a
+# reconnecting publisher connection BEFORE sending (bounded further by the
+# per-call timeout). Expiry reports NOT_SENT(not_connected).
 _PUBLISH_RECOVERY_WAIT_SECONDS = 5.0
+
+# Publisher shutdown: how long close_publishing() waits for force-closed
+# publishes to unwind, and bounds each channel close it does.
+_SHUTDOWN_UNWIND_SECONDS = 1.0
+
+# Outcomes after which an exclusive pooled channel is still safe to reuse:
+# the broker answered this publish and the channel stayed open.
+_REUSABLE_STATUSES = frozenset(
+    {PublishStatus.CONFIRMED, PublishStatus.SENT, PublishStatus.NACKED, PublishStatus.RETURNED}
+)
+# Outcomes that are a broker answer to a confirmed publish (confirm latency).
+_BROKER_ANSWERS = frozenset({PublishStatus.CONFIRMED, PublishStatus.NACKED, PublishStatus.RETURNED})
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -53,6 +76,30 @@ def _is_connection_error(exc: BaseException) -> bool:
     cannot import aio-pika), this file already depends on aio-pika directly.
     """
     return isinstance(exc, get_connection_errors())
+
+
+@functools.cache
+def _basic_return_type() -> type[Any]:
+    from pamqp.commands import Basic
+
+    return Basic.Return
+
+
+def _is_basic_return(frame: Any) -> bool:
+    """True if *frame* is an AMQP ``Basic.Return`` (never true for a mock).
+
+    Called on every confirmed publish: the pamqp import is resolved once."""
+    return isinstance(frame, _basic_return_type())
+
+
+def _return_fields(exc: BaseException) -> tuple[int | None, str | None]:
+    """``(reply_code, reply_text)`` of the ``Basic.Return`` behind an
+    ``aio_pika.exceptions.PublishError`` (its ``frame``, or the returned
+    message's ``delivery``)."""
+    for frame in (getattr(exc, "frame", None), getattr(getattr(exc, "message", None), "delivery", None)):
+        if _is_basic_return(frame):
+            return getattr(frame, "reply_code", None), getattr(frame, "reply_text", None)
+    return None, None
 
 
 def _exact_expiration_message_class() -> Any:
@@ -121,6 +168,7 @@ class AsyncTransportImpl:
         confirm_delivery: bool = True,
         confirm_timeout: float = 5.0,
         on_topology_conflict: str = "raise",
+        max_in_flight_bytes: int | None = None,
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._security_config = security_config or SecurityConfig()
@@ -134,6 +182,16 @@ class AsyncTransportImpl:
         # broker that never confirms would block the publish coroutine forever;
         # on timeout we release/close the channel and return PublishStatus.TIMEOUT.
         self._confirm_timeout = float(confirm_timeout)
+        # G-14: PublisherConfig.max_in_flight_bytes, shared by publish() and
+        # the batch publisher (None = no byte bound).
+        self._byte_limiter: InFlightByteLimiter | None = (
+            InFlightByteLimiter(max_in_flight_bytes) if max_in_flight_bytes is not None else None
+        )
+        # G-12 publisher shutdown state (see close_publishing).
+        self._publish_closed = False
+        self._publish_shutdown = False
+        self._publishes_in_flight = 0
+        self._publishes_idle: asyncio.Event | None = None
 
         self._conn_pool = AsyncConnectionPool(
             self._connection_config,
@@ -143,6 +201,9 @@ class AsyncTransportImpl:
             on_channel_opened=self._fire_channel_opened,
             on_channel_rebuilt=self._fire_channel_rebuilt,
             on_connection_created=self._attach_connection_callbacks,
+            on_reconnect_attempt=self._fire_reconnect_attempt,
+            on_connection_failed=self._fire_connection_failed,
+            on_connection_state=self._fire_connection_state,
         )
         self._connected = False
 
@@ -156,6 +217,10 @@ class AsyncTransportImpl:
         # unhandled and the publish resolve as CONFIRMED (a false success).
         self._inflight_message_ids: dict[tuple[int, str], asyncio.Future[None]] = {}
         self._consumer_tags: dict[str, str] = {}  # queue_name -> consumer_tag
+        # G-26 / CONSUMER-007: the queue object each consumer was started on
+        # (cancel goes through it so robust restore forgets the consumer) and
+        # detection + re-subscription of consumers the SERVER cancelled.
+        self._consumer_supervisor = ConsumerSupervisor(self.queue_exists)
 
         # The channel currently consuming DIRECT_REPLY_TO_QUEUE (set by
         # consume(declare=False), cleared on cancel/disconnect). RabbitMQ's
@@ -193,6 +258,13 @@ class AsyncTransportImpl:
         # Connection-churn metric hook (see on_reconnect) -- adapted from
         # aio-pika's RobustConnection.reconnect_callbacks.
         self._reconnect_callbacks: list[Callable[[], None]] = []
+        # G-08: failed reconnect attempts and the terminal connection failure.
+        self._reconnect_attempt_callbacks: list[Callable[[ReconnectAttempt], None]] = []
+        self._connection_failed_callbacks: list[Callable[[TerminalConnectionError], None]] = []
+        # G-22: connection up/down per role, and publish outcomes with the
+        # send-to-broker-answer latency (metrics hooks).
+        self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
+        self._publish_outcome_callbacks: list[Callable[[PublishOutcome, float | None], None]] = []
 
         # Channel-lifecycle signal (item 3), mirroring SyncTransport:
         # channels_opened_total counts every new channel THIS transport
@@ -220,6 +292,113 @@ class AsyncTransportImpl:
         counted, so a flapping broker/network was invisible to metrics
         alerting."""
         self._reconnect_callbacks.append(callback)
+
+    def on_reconnect_attempt(self, callback: Callable[[ReconnectAttempt], None]) -> None:
+        """Register a callback fired after every FAILED reconnect attempt of a
+        connection that had been up (G-08).
+
+        It receives a :class:`~rabbitkit.async_.reconnect.ReconnectAttempt`:
+        the attempt number within the outage, the backoff delay chosen before
+        the next attempt, the time since the connection was lost, the endpoint
+        and the error. A successful reconnect fires :meth:`on_reconnect`.
+        """
+        self._reconnect_attempt_callbacks.append(callback)
+
+    def on_connection_failed(self, callback: Callable[[TerminalConnectionError], None]) -> None:
+        """Register a callback fired once when a connection stops reconnecting
+        for good after startup (G-08): a permanent failure (refused login or
+        vhost, TLS verification) or a spent reconnect budget. From then on
+        :meth:`is_connected` is False, :attr:`connection_failure` holds the
+        error, and no connect is attempted again.
+        """
+        self._connection_failed_callbacks.append(callback)
+
+    @property
+    def connection_failure(self) -> TerminalConnectionError | None:
+        """The terminal connection failure, if a connection gave up for good."""
+        return self._conn_pool.terminal_error
+
+    def _fire_reconnect_attempt(self, attempt: ReconnectAttempt) -> None:
+        for cb in list(self._reconnect_attempt_callbacks):
+            try:
+                cb(attempt)
+            except Exception:  # never break the reconnect path
+                logger.exception("reconnect_attempt callback raised")
+
+    def _fire_connection_failed(self, error: TerminalConnectionError) -> None:
+        for cb in list(self._connection_failed_callbacks):
+            try:
+                cb(error)
+            except Exception:  # never break the reconnect path
+                logger.exception("connection_failed callback raised")
+
+    def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
+        """Register ``callback(role, up, error)`` for connection state changes (G-22).
+
+        ``role`` is ``"publisher"`` or ``"consumer"``. Fired with ``up=True``
+        when a connection is created or reconnects after a drop, and with
+        ``up=False`` (and the close error, if any) the moment a live
+        connection drops. A connection that gives up for good fires
+        :meth:`on_connection_failed` instead.
+        """
+        self._connection_state_callbacks.append(callback)
+
+    def _fire_connection_state(self, role: str, up: bool, error: BaseException | None) -> None:
+        for cb in list(self._connection_state_callbacks):
+            try:
+                cb(role, up, error)
+            except Exception:  # never break the connect/reconnect path
+                logger.exception("connection_state callback raised")
+
+    def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
+        """Register ``callback(outcome, seconds)`` for every publish whose
+        frame was handed to aio-pika (G-22).
+
+        ``seconds`` is the time from handing the frame to aio-pika until the
+        broker answered (confirm, nack or return), or ``None`` when no broker
+        answer was observed (fire-and-forget ``SENT``, timeout, connection
+        loss, refusal). It excludes admission, channel acquisition and
+        serialization. Outcomes decided before anything was sent
+        (``NOT_SENT``) are not reported here. Covers every transport publish:
+        ``publish()``, the batch publisher, retry and dead-letter copies.
+        """
+        self._publish_outcome_callbacks.append(callback)
+
+    def _report_publish(self, outcome: PublishOutcome, seconds: float | None) -> None:
+        for cb in self._publish_outcome_callbacks:
+            try:
+                cb(outcome, seconds)
+            except Exception:  # never let a metrics hook fail a publish
+                logger.exception("publish_outcome callback raised")
+
+    def connection_states(self) -> dict[str, bool]:
+        """``{"publisher": up, "consumer": up}`` right now (sampled by metrics)."""
+        terminal = self._conn_pool.terminal_error is not None
+        states: dict[str, bool] = {}
+        for role, conn in (
+            ("publisher", self._conn_pool._publisher_connection),
+            ("consumer", self._conn_pool._consumer_connection),
+        ):
+            states[role] = bool(self._connected and not terminal and conn is not None and _connection_live(conn))
+        return states
+
+    @property
+    def channels_active(self) -> int:
+        """Channels this transport holds open right now: the publisher and
+        mandatory pools' channels, the topology and fast-publish channels and
+        one per consumed queue. Bounded by ``2 * channel_pool_size + 2 +
+        consumed queues``."""
+        owned, _in_use = self._conn_pool.channel_counts()
+        count = owned
+        for channel in (self._topology_channel, self._fast_publish_channel, *self._consumer_channels.values()):
+            if channel is not None and not bool(getattr(channel, "is_closed", False)):
+                count += 1
+        return count
+
+    @property
+    def publish_channels_in_use(self) -> int:
+        """Publisher channels currently checked out of the pools."""
+        return self._conn_pool.channel_counts()[1]
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -296,6 +475,14 @@ class AsyncTransportImpl:
                 task = asyncio.get_running_loop().create_task(self._reapply_bindings())
                 self._binding_restore_tasks.add(task)
                 task.add_done_callback(self._binding_restore_tasks.discard)
+
+    def _record_binding(self, binding: tuple[str, str, str, str, dict[str, Any] | None]) -> None:
+        """Remember *binding* for re-apply after a reconnect, once: repeating
+        the same bind (every reconnect, every restart of a route) used to
+        append it again, so the list and each re-apply pass grew without
+        bound. Bindings are few and recorded off the hot path."""
+        if binding not in self._recorded_bindings:
+            self._recorded_bindings.append(binding)
 
     async def _reapply_bindings(self) -> None:
         """Re-apply all recorded bindings after a robust reconnect (m3).
@@ -413,10 +600,33 @@ class AsyncTransportImpl:
                 logger.exception("unblocked callback raised")
 
     async def connect(self) -> None:
-        """Establish publisher and consumer connections."""
+        """Establish publisher and consumer connections.
+
+        All or nothing (G-10): if any step fails (or is cancelled), every
+        connection, channel and monitor it created is closed before the error
+        propagates, so a failed connect leaks nothing and can be retried.
+        """
         if self._connected:
             return
+        try:
+            await self._connect_unguarded()
+        except BaseException:
+            await self._discard_partial_connect()
+            raise
 
+    async def _discard_partial_connect(self) -> None:
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(self._connection_config.socket_timeout):
+                for monitor in self._blocked_monitors:
+                    await monitor.stop()
+                self._blocked_monitors.clear()
+                self._blocked_state = False
+                channel, self._topology_channel = self._topology_channel, None
+                if channel is not None and not channel.is_closed:
+                    await channel.close()
+                await self._conn_pool.close_all()
+
+    async def _connect_unguarded(self) -> None:
         # aio-pika 9's pamqp can't encode field-table ints from -128 to -1
         # (queue/consume/bind arguments, publish headers); fix it before any
         # frame is built. A no-op on pamqp 4.
@@ -465,50 +675,75 @@ class AsyncTransportImpl:
         # method must be __aexit__.
         await self.disconnect()
 
-    async def disconnect(self) -> None:
-        """Close all channels and connections."""
+    async def disconnect(self, timeout: float | None = None) -> None:
+        """Close all channels and connections, within *timeout* seconds.
+
+        Channels are closed first; if the broker stops answering (a
+        partition) the remaining channel closes are skipped and the
+        connections are closed, or abandoned, within what is left.
+        """
         if not self._connected:
             return
 
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+
+        def left() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
         try:
-            for monitor in self._blocked_monitors:
-                await monitor.stop()
-            self._blocked_monitors.clear()
-            self._blocked_state = False
-
-            # Close per-queue consumer channels
-            for ch in list(self._consumer_channels.values()):
-                try:
-                    if not ch.is_closed:
-                        await ch.close()
-                except Exception:
-                    pass
-            self._consumer_channels.clear()
-            self._consumer_tags.clear()
-            self._reply_to_channel = None
-
-            # Close topology channel
-            if self._topology_channel is not None and not self._topology_channel.is_closed:
-                try:
-                    await self._topology_channel.close()
-                except Exception:
-                    pass
-            self._topology_channel = None
-
-            # Close fast publish channel (no-confirm persistent path)
-            if self._fast_publish_channel is not None and not self._fast_publish_channel.is_closed:
-                try:
-                    await self._fast_publish_channel.close()
-                except Exception:  # pragma: no cover — best effort close, network errors only
-                    pass
-            self._fast_publish_channel = None
-
-            await self._conn_pool.close_all()  # includes the mandatory-publish channels
+            try:
+                async with asyncio.timeout(left()):
+                    await self._close_channels()
+            except TimeoutError:
+                logger.warning("Closing RabbitMQ channels timed out; closing the connections")
+            finally:
+                self._consumer_channels.clear()
+                self._consumer_tags.clear()
+                self._reply_to_channel = None
+                self._topology_channel = None
+                self._fast_publish_channel = None
+            await self._conn_pool.close_all(timeout=left())  # includes the mandatory-publish channels
         except Exception as e:
             logger.warning("Error during disconnect: %s", e)
         finally:
             self._connected = False
             logger.info("Disconnected from RabbitMQ (async)")
+
+    async def _close_channels(self) -> None:
+        """Stop the consumer supervisor and blocked monitors, then close every channel."""
+        await self._consumer_supervisor.stop()
+        for monitor in self._blocked_monitors:
+            await monitor.stop()
+        self._blocked_monitors.clear()
+        self._blocked_state = False
+
+        # Close per-queue consumer channels
+        for ch in list(self._consumer_channels.values()):
+            try:
+                if not ch.is_closed:
+                    await ch.close()
+            except Exception:
+                pass
+        self._consumer_channels.clear()
+        self._consumer_tags.clear()
+        self._reply_to_channel = None
+
+        # Close topology channel
+        if self._topology_channel is not None and not self._topology_channel.is_closed:
+            try:
+                await self._topology_channel.close()
+            except Exception:
+                pass
+        self._topology_channel = None
+
+        # Close fast publish channel (no-confirm persistent path)
+        if self._fast_publish_channel is not None and not self._fast_publish_channel.is_closed:
+            try:
+                await self._fast_publish_channel.close()
+            except Exception:  # pragma: no cover — best effort close, network errors only
+                pass
+        self._fast_publish_channel = None
 
     def is_connected(self) -> bool:
         """Check if connected to RabbitMQ, right now.
@@ -521,7 +756,7 @@ class AsyncTransportImpl:
         drops and sets again once the reconnect completes. Both the publisher
         and the consumer connection must be up.
         """
-        if not self._connected:
+        if not self._connected or self._conn_pool.terminal_error is not None:
             return False
         pub = self._conn_pool._publisher_connection
         if pub is None:
@@ -576,8 +811,10 @@ class AsyncTransportImpl:
         Polls rather than awaiting a callback since aio-pika exposes no
         awaitable "reconnected" event.
         """
+        if self._conn_pool.terminal_error is not None:
+            return False  # G-08: closed for good, nothing will recover
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self._publish_shutdown:
             if self._publisher_live():
                 return True
             await asyncio.sleep(0.1)
@@ -586,6 +823,11 @@ class AsyncTransportImpl:
     def _publisher_live(self) -> bool:
         conn = self._conn_pool._publisher_connection
         return self._connected and conn is not None and _connection_live(conn)
+
+    def _publisher_reconnecting(self) -> bool:
+        """True while aio-pika restores an existing publisher connection."""
+        conn = self._conn_pool._publisher_connection
+        return conn is not None and not _connection_live(conn)
 
     async def _ensure_connected(self) -> None:
         """Ensure connection is established."""
@@ -643,31 +885,71 @@ class AsyncTransportImpl:
             timestamp=envelope.timestamp,
         )
 
-    async def _publish_on_channel(self, channel: Any, envelope: MessageEnvelope) -> PublishOutcome:
+    def _outcome(
+        self,
+        envelope: MessageEnvelope,
+        status: PublishStatus,
+        reason: str | None = None,
+        error: BaseException | None = None,
+        *,
+        reply_code: int | None = None,
+        reply_text: str | None = None,
+    ) -> PublishOutcome:
+        return PublishOutcome(
+            status=status,
+            exchange=envelope.exchange,
+            routing_key=envelope.routing_key,
+            error=error,
+            reason=reason,
+            reply_code=reply_code,
+            reply_text=reply_text,
+        )
+
+    def _not_sent(self, envelope: MessageEnvelope, reason: str, error: BaseException | None = None) -> PublishOutcome:
+        return self._outcome(envelope, PublishStatus.NOT_SENT, reason, error)
+
+    async def _publish_on_channel(
+        self,
+        channel: Any,
+        envelope: MessageEnvelope,
+        *,
+        timeout: float | None = None,
+        exclusive: bool = False,
+    ) -> PublishOutcome:
         """Publish *envelope* on an already-acquired channel.
 
         Used by BatchPublisher to publish many messages on one channel and
         gather all confirms concurrently — one pool acquire/release for N
         messages instead of N separate round-trips.
 
-        H1: a ``mandatory=True`` publish that the broker cannot route raises
-        ``aio_pika.exceptions.PublishError`` when the channel has
-        ``on_return_raises=True`` (only true for the connection pool's
-        mandatory channels — regular pool/fast channels default to
-        ``on_return_raises=False`` and would otherwise resolve the confirmation
-        with the returned message instead of raising, indistinguishable from
-        success). Mapped to ``PublishStatus.RETURNED`` so callers keying off
-        ``outcome.ok`` correctly treat it as a failed publish. A broker-side
-        ``Basic.Nack`` (not a return) raises the more generic
-        ``DeliveryError`` and maps to ``PublishStatus.NACKED``.
+        A ``mandatory=True`` publish the broker cannot route is RETURNED on
+        every channel kind (G-01): a channel with ``on_return_raises=True``
+        (the mandatory pool) raises ``aio_pika.exceptions.PublishError``; any
+        other confirmed channel (batch workers, the direct reply-to channel)
+        resolves the confirm with the returned message instead of an ack,
+        which used to be reported as CONFIRMED. Both carry the broker's
+        ``reply_code`` / ``reply_text``. A broker ``Basic.Nack`` raises
+        ``DeliveryError`` and maps to ``NACKED``.
+
+        ``timeout`` caps the confirm wait below ``confirm_timeout`` (the
+        caller's per-call deadline); ``exclusive`` says no other publish uses
+        this channel, so a channel-level refusal (404/403/406) is provably
+        this publish's own. See :meth:`_classify_publish_failure`.
         """
 
-        message = self._build_aio_message(envelope)
-        exchange = (
-            await channel.get_exchange(envelope.exchange, ensure=False)
-            if envelope.exchange
-            else channel.default_exchange
-        )
+        try:
+            message = self._build_aio_message(envelope)
+            exchange = (
+                await channel.get_exchange(envelope.exchange, ensure=False)
+                if envelope.exchange
+                else channel.default_exchange
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # nothing has been sent yet
+            if isinstance(e, (ValueError, TypeError)):
+                return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, e)
+            return self._not_sent(envelope, PublishReason.CHANNEL_UNAVAILABLE, e)
         # Serialize publishes of the SAME message_id on the SAME channel.
         # aiormq keys its Basic.Return correlation by message_id
         # (``message_id_delivery_tag``) and pops that key when a publish of
@@ -684,12 +966,20 @@ class AsyncTransportImpl:
         key = (id(channel), envelope.message_id)
         prior = self._inflight_message_ids.get(key)
         if prior is not None and not prior.done():
+            wait = self._confirm_timeout if timeout is None else min(self._confirm_timeout, timeout)
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(asyncio.shield(prior), timeout=self._confirm_timeout)
+                await asyncio.wait_for(asyncio.shield(prior), timeout=wait)
         mine: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._inflight_message_ids[key] = mine
         try:
-            return await self._publish_on_channel_unguarded(channel, exchange, message, envelope)
+            started = time.monotonic()
+            outcome = await self._publish_on_channel_unguarded(
+                channel, exchange, message, envelope, timeout=timeout, exclusive=exclusive
+            )
+            if self._publish_outcome_callbacks and outcome.status is not PublishStatus.NOT_SENT:
+                answered = outcome.status in _BROKER_ANSWERS
+                self._report_publish(outcome, time.monotonic() - started if answered else None)
+            return outcome
         finally:
             if self._inflight_message_ids.get(key) is mine:
                 del self._inflight_message_ids[key]
@@ -697,13 +987,26 @@ class AsyncTransportImpl:
                 mine.set_result(None)
 
     async def _publish_on_channel_unguarded(
-        self, channel: Any, exchange: Any, message: Any, envelope: MessageEnvelope
+        self,
+        channel: Any,
+        exchange: Any,
+        message: Any,
+        envelope: MessageEnvelope,
+        *,
+        timeout: float | None = None,
+        exclusive: bool = False,
     ) -> PublishOutcome:
         import aio_pika.exceptions
 
+        wait = self._confirm_timeout
+        caller_bound = timeout is not None and timeout < wait
+        if timeout is not None:
+            wait = min(wait, timeout)
+        if wait <= 0:
+            return self._not_sent(envelope, PublishReason.ADMISSION_TIMEOUT)
         try:
-            async with asyncio.timeout(self._confirm_timeout):
-                await exchange.publish(
+            async with asyncio.timeout(wait):
+                result = await exchange.publish(
                     message,
                     routing_key=envelope.routing_key,
                     mandatory=envelope.mandatory,
@@ -719,44 +1022,186 @@ class AsyncTransportImpl:
             # only once they know no other publish is still using it (e.g.
             # after their own single call, or after a whole gathered batch has
             # fully resolved) — see callers of _publish_on_channel.
-            logger.warning("Publish confirm timed out after %.1fs", self._confirm_timeout)
-            return PublishOutcome(
-                status=PublishStatus.TIMEOUT,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
-            )
+            logger.warning("Publish confirm timed out after %.1fs", wait)
+            reason = PublishReason.PUBLISH_TIMEOUT if caller_bound else PublishReason.CONFIRM_TIMEOUT
+            return self._outcome(envelope, PublishStatus.TIMEOUT, reason, e)
         except aio_pika.exceptions.PublishError as e:
-            logger.warning(
-                "Publish returned as unroutable (mandatory=True, no matching binding): exchange=%s routing_key=%s",
-                envelope.exchange,
-                envelope.routing_key,
-            )
-            return PublishOutcome(
-                status=PublishStatus.RETURNED,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
-            )
+            code, text = _return_fields(e)
+            return self._returned(envelope, code, text, e)
         except aio_pika.exceptions.DeliveryError as e:
             logger.warning(
                 "Publish nacked by broker: exchange=%s routing_key=%s",
                 envelope.exchange,
                 envelope.routing_key,
             )
-            return PublishOutcome(
-                status=PublishStatus.NACKED,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
+            return self._outcome(envelope, PublishStatus.NACKED, PublishReason.NACKED, e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return self._classify_publish_failure(e, envelope, exclusive=exclusive)
+        delivery = getattr(result, "delivery", None)
+        if _is_basic_return(delivery):
+            # A confirmed channel WITHOUT on_return_raises resolves an
+            # unroutable mandatory publish with the returned message.
+            return self._returned(
+                envelope, getattr(delivery, "reply_code", None), getattr(delivery, "reply_text", None), None
             )
-        return PublishOutcome(
-            status=PublishStatus.CONFIRMED,
-            exchange=envelope.exchange,
-            routing_key=envelope.routing_key,
+        return self._outcome(envelope, PublishStatus.CONFIRMED)
+
+    def _returned(
+        self, envelope: MessageEnvelope, code: int | None, text: str | None, error: BaseException | None
+    ) -> PublishOutcome:
+        logger.warning(
+            "Publish returned as unroutable (mandatory=True, no matching binding): "
+            "exchange=%s routing_key=%s reply_code=%s reply_text=%s",
+            envelope.exchange,
+            envelope.routing_key,
+            code,
+            text,
+        )
+        return self._outcome(
+            envelope, PublishStatus.RETURNED, PublishReason.RETURNED, error, reply_code=code, reply_text=text
         )
 
-    async def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+    def _classify_publish_failure(
+        self, exc: Exception, envelope: MessageEnvelope, *, exclusive: bool
+    ) -> PublishOutcome:
+        """Map an exception raised by ``exchange.publish`` (frames may have left).
+
+        * A broker channel close that refused THIS publish (404 missing
+          exchange, 403 access refused, 406 precondition failed) is ERROR
+          with a reason and the broker's reply code/text. It is not a
+          connection error, so nothing retries it (G-03/PUB-016). On a shared
+          channel the refusal may belong to a sibling publish, so it counts
+          as ours only if the channel is exclusive or the 404 names our
+          exchange; otherwise this publish is UNKNOWN (``channel_closed``).
+        * Anything connection- or channel-shaped is UNKNOWN: the frames may
+          already have reached the broker. Never retried (INV-003).
+        * Invalid input caught while encoding is ERROR ``invalid_envelope``;
+          anything else is ERROR ``publish_error``.
+        """
+        import aiormq.exceptions as ape
+
+        refusals: tuple[tuple[type[BaseException], str, int], ...] = (
+            (ape.ChannelNotFoundEntity, PublishReason.EXCHANGE_NOT_FOUND, 404),
+            (ape.ChannelAccessRefused, PublishReason.ACCESS_REFUSED, 403),
+            (ape.ChannelPreconditionFailed, PublishReason.PRECONDITION_FAILED, 406),
+        )
+        for cls, reason, code in refusals:
+            if isinstance(exc, cls):
+                text = str(exc.args[0]) if exc.args else None
+                ours = exclusive or (code == 404 and text is not None and f"no exchange '{envelope.exchange}'" in text)
+                if ours:
+                    logger.error(
+                        "Publish refused by broker (%s): exchange=%s routing_key=%s: %s",
+                        reason,
+                        envelope.exchange,
+                        envelope.routing_key,
+                        text,
+                    )
+                    return self._outcome(envelope, PublishStatus.ERROR, reason, exc, reply_code=code, reply_text=text)
+                return self._unknown(envelope, PublishReason.CHANNEL_CLOSED, exc)
+        if isinstance(exc, (ValueError, TypeError)):
+            logger.error("Async publish failed (invalid envelope): %s", exc)
+            return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, exc)
+        if _is_connection_error(exc) or isinstance(exc, ape.ChannelInvalidStateError):
+            reason = PublishReason.SHUTDOWN if self._publish_shutdown else PublishReason.CONNECTION_LOST
+            return self._unknown(envelope, reason, exc)
+        logger.error("Async publish failed: %s", exc)
+        return self._outcome(envelope, PublishStatus.ERROR, PublishReason.PUBLISH_ERROR, exc)
+
+    def _unknown(self, envelope: MessageEnvelope, reason: str, exc: BaseException) -> PublishOutcome:
+        logger.warning(
+            "Publish outcome UNKNOWN (%s): exchange=%s routing_key=%s message_id=%s: %s",
+            reason,
+            envelope.exchange,
+            envelope.routing_key,
+            envelope.message_id,
+            safe_exception_repr(exc),
+        )
+        return self._outcome(envelope, PublishStatus.UNKNOWN, reason, exc)
+
+    # ── Publish admission and shutdown ───────────────────────────────────
+
+    @property
+    def byte_limiter(self) -> InFlightByteLimiter | None:
+        """The ``PublisherConfig.max_in_flight_bytes`` budget (None = unbounded)."""
+        return self._byte_limiter
+
+    @property
+    def publishes_in_flight(self) -> int:
+        """Publishes between admission and their terminal outcome."""
+        return self._publishes_in_flight
+
+    def _publish_entered(self) -> None:
+        self._publishes_in_flight += 1
+        if self._publishes_idle is not None:
+            self._publishes_idle.clear()
+
+    def _publish_exited(self) -> None:
+        self._publishes_in_flight = max(0, self._publishes_in_flight - 1)
+        if self._publishes_in_flight == 0 and self._publishes_idle is not None:
+            self._publishes_idle.set()
+
+    async def _wait_publishes_idle(self, timeout: float | None) -> bool:
+        if self._publishes_in_flight == 0:
+            return True
+        if self._publishes_idle is None:
+            self._publishes_idle = asyncio.Event()
+        try:
+            async with asyncio.timeout(timeout):
+                await self._publishes_idle.wait()
+        except TimeoutError:
+            return False
+        return True
+
+    async def close_publishing(self, timeout: float | None = None) -> None:
+        """Publisher shutdown (G-12), bounded by *timeout*.
+
+        1. Close admission: every later :meth:`publish` returns ``NOT_SENT``
+           (``publisher_closed``) and nothing reconnects.
+        2. Wait for in-flight publishes to reach their outcome.
+        3. On expiry, close the publisher channels: a publish still waiting
+           for a channel or for byte budget returns ``NOT_SENT``
+           (``publisher_closed``); one still waiting for its confirm returns
+           ``UNKNOWN`` (``shutdown``) — its frames may have reached the broker.
+
+        Terminal for this transport instance (the broker builds a new
+        transport on every ``start()``). Connections stay open; call
+        :meth:`disconnect` afterwards.
+        """
+        self._publish_closed = True
+        if await self._wait_publishes_idle(timeout):
+            return
+        logger.warning(
+            "Publisher shutdown: %d publish(es) still in flight after the deadline; "
+            "reporting them UNKNOWN (they may have reached the broker)",
+            self._publishes_in_flight,
+        )
+        self._publish_shutdown = True
+        if self._byte_limiter is not None:
+            self._byte_limiter.close()
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(_SHUTDOWN_UNWIND_SECONDS):
+                await self._conn_pool.close_publisher_channels()
+        fast = self._fast_publish_channel
+        if fast is not None and not fast.is_closed:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(_SHUTDOWN_UNWIND_SECONDS):
+                    await fast.close()
+        if not await self._wait_publishes_idle(_SHUTDOWN_UNWIND_SECONDS):
+            logger.error(
+                "Publisher shutdown: %d publish(es) did not unwind within %.1fs",
+                self._publishes_in_flight,
+                _SHUTDOWN_UNWIND_SECONDS,
+            )
+
+    def _remaining(self, deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return deadline - asyncio.get_running_loop().time()
+
+    async def publish(self, envelope: MessageEnvelope, *, timeout: float | None = None) -> PublishOutcome:
         """Publish a message.
 
         When confirm_delivery=False: uses a single persistent channel (no
@@ -774,128 +1219,187 @@ class AsyncTransportImpl:
         H1: a ``mandatory=True`` envelope (that isn't a direct reply-to
         request) always publishes on a mandatory channel of its own
         (``AsyncConnectionPool.acquire_mandatory_channel``): confirmed and
-        ``on_return_raises=True`` regardless of ``confirm_delivery``, since
-        neither the fast nor the regular pool channel reliably reports an
-        unroutable ``Basic.Return``. One publish per channel: a publish the
-        broker refuses closes its channel and fails everything in flight on
-        it, so a shared channel let one refused publish fail its siblings.
+        ``on_return_raises=True`` regardless of ``confirm_delivery``. One
+        publish per channel: a publish the broker refuses closes its channel
+        and fails everything in flight on it.
 
-        The confirmed (pooled-channel) path is handled by
-        :meth:`_publish_confirmed`, OUTSIDE this method's own try/except
-        (item 6) — see that method's docstring for why.
+        Outcome contract (G-03): ``NOT_SENT`` when the message definitely
+        never left the client (publisher closed, byte budget or channel
+        admission timed out, no connection, no channel), ``UNKNOWN`` /
+        ``TIMEOUT`` when it may have, ``ERROR`` only for a refused or
+        unclassified publish. Never raises for a broker or connection
+        failure and never republishes on its own once frames may have left.
+        ``timeout`` bounds admission, send and confirm together.
         """
+        if self._publish_closed:
+            return self._not_sent(envelope, PublishReason.PUBLISHER_CLOSED)
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        self._publish_entered()
+        reserved = 0
+        try:
+            limiter = self._byte_limiter
+            if limiter is not None:
+                size = len(envelope.body)
+                if size > limiter.limit:
+                    return self._not_sent(envelope, PublishReason.EXCEEDS_BYTE_BUDGET)
+                wait = self._admission_wait(deadline)
+                try:
+                    admitted = await limiter.acquire(size, wait)
+                except ChannelPoolClosedError as e:
+                    return self._not_sent(envelope, PublishReason.PUBLISHER_CLOSED, e)
+                if not admitted:
+                    return self._not_sent(envelope, PublishReason.ADMISSION_TIMEOUT)
+                reserved = size
+            return await self._publish_admitted(envelope, deadline)
+        finally:
+            if reserved:
+                assert self._byte_limiter is not None
+                self._byte_limiter.release(reserved)
+            self._publish_exited()
+
+    def _admission_wait(self, deadline: float | None) -> float:
+        wait = self._pool_config.channel_acquire_timeout
+        remaining = self._remaining(deadline)
+        if remaining is not None:
+            wait = min(wait, max(0.0, remaining))
+        return wait
+
+    async def _publish_admitted(self, envelope: MessageEnvelope, deadline: float | None) -> PublishOutcome:
         try:
             if not self._connected:
                 await self._ensure_connected()
-
-            if envelope.reply_to == DIRECT_REPLY_TO_QUEUE and self._reply_to_channel is not None:
-                channel = self._reply_to_channel
-                if not channel.is_closed:
-                    return await self._publish_on_channel(channel, envelope)
-
-            if not envelope.mandatory and not self._confirm_delivery:
-                # Fast path: persistent channel, no confirm wait, no pool overhead
-                message = self._build_aio_message(envelope)
-                channel = await self._get_fast_channel()
-                exchange = (
-                    await channel.get_exchange(envelope.exchange, ensure=False)
-                    if envelope.exchange
-                    else channel.default_exchange
-                )
-                await exchange.publish(
-                    message,
-                    routing_key=envelope.routing_key,
-                    mandatory=envelope.mandatory,
-                )
-                # M4: SENT, not CONFIRMED -- this channel has publisher_confirms=False,
-                # so nothing was actually acknowledged by the broker.
-                return PublishOutcome(
-                    status=PublishStatus.SENT,
-                    exchange=envelope.exchange,
-                    routing_key=envelope.routing_key,
-                )
-
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error("Async publish failed: %s", e)
-            return PublishOutcome(
-                status=PublishStatus.ERROR,
-                exchange=envelope.exchange,
-                routing_key=envelope.routing_key,
-                error=e,
+            logger.error("Async publish failed: not connected: %s", e)
+            return self._not_sent(envelope, PublishReason.NOT_CONNECTED, e)
+
+        if envelope.reply_to == DIRECT_REPLY_TO_QUEUE and self._reply_to_channel is not None:
+            channel = self._reply_to_channel
+            if not channel.is_closed:
+                return await self._publish_on_channel(channel, envelope, timeout=self._remaining(deadline))
+
+        if not envelope.mandatory and not self._confirm_delivery:
+            return await self._publish_fast(envelope)
+        return await self._publish_confirmed(envelope, deadline)
+
+    async def _publish_fast(self, envelope: MessageEnvelope) -> PublishOutcome:
+        """Fire-and-forget path: persistent channel, no confirm wait, no pool."""
+        try:
+            message = self._build_aio_message(envelope)
+            channel = await self._get_fast_channel()
+            exchange = (
+                await channel.get_exchange(envelope.exchange, ensure=False)
+                if envelope.exchange
+                else channel.default_exchange
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # nothing has been sent yet
+            if isinstance(e, (ValueError, TypeError)):
+                return self._outcome(envelope, PublishStatus.ERROR, PublishReason.INVALID_ENVELOPE, e)
+            logger.error("Async publish failed: no publish channel: %s", e)
+            return self._not_sent(envelope, PublishReason.CHANNEL_UNAVAILABLE, e)
+        try:
+            await exchange.publish(
+                message,
+                routing_key=envelope.routing_key,
+                mandatory=envelope.mandatory,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            outcome = self._classify_publish_failure(e, envelope, exclusive=False)
+        else:
+            # M4: SENT, not CONFIRMED -- this channel has publisher_confirms=False,
+            # so nothing was actually acknowledged by the broker.
+            outcome = self._outcome(envelope, PublishStatus.SENT)
+        if self._publish_outcome_callbacks:
+            self._report_publish(outcome, None)
+        return outcome
 
-        return await self._publish_confirmed(envelope)
+    async def _publish_confirmed(self, envelope: MessageEnvelope, deadline: float | None = None) -> PublishOutcome:
+        """Confirmed (pooled-channel) publish path — one pool channel per
+        publish so each confirm is isolated.
 
-    async def _publish_confirmed(self, envelope: MessageEnvelope) -> PublishOutcome:
-        """Confirmed (pooled-channel) publish path — pool channel per publish
-        so each confirm is isolated. Item 6:
-
-        1. The pool-release cleanup (``finally: release_publisher_channel``)
-           runs OUTSIDE this method's own try/except, so a release-time
-           failure (pool bookkeeping) can never overwrite a real outcome
-           already computed. Previously a single ``try/except Exception``
-           wrapped both the publish AND the release cleanup, so ANY
-           exception from the release step — unrelated to the actual
-           publish — masked a successful confirm as ``PublishStatus.ERROR``.
-        2. A connection-class error (dead socket, not a broker-level
-           NACK/return/timeout) gets one bounded-wait-then-retry: wait up to
-           ``_PUBLISH_RECOVERY_WAIT_SECONDS`` for aio-pika's own
-           ``connect_robust()`` to restore the connection
-           (:meth:`_wait_for_recovery`), then retry exactly once against a
-           fresh channel (the broken one is released back to the pool first,
-           which discards it since it's closed). No wait/recovery, or a
-           second failure, returns ERROR — never raises.
+        * No hidden retry (G-03): once ``basic.publish`` may have left the
+          client the outcome is reported as observed (UNKNOWN on a lost
+          connection) and never republished here. Failures BEFORE the frame
+          (no channel, admission timeout, connection still recovering) are
+          ``NOT_SENT``; only those are retried, inside the pool's
+          connection self-heal.
+        * The channel is returned on every path (G-04), including
+          cancellation. A channel whose confirm state is unknown (cancelled
+          or failed mid-publish, timed out) is discarded — closed and never
+          reused — instead of going back to the pool.
+        * Pool exhaustion waits up to the admission timeout and then returns
+          ``NOT_SENT(admission_timeout)``; it never rebuilds the connection
+          (G-05).
         """
         pool = self._conn_pool
-        acquire, release = (
-            (pool.acquire_mandatory_channel, pool.release_mandatory_channel)
-            if envelope.mandatory
-            else (pool.acquire_publisher_channel, pool.release_publisher_channel)
-        )
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            channel = None
+        if envelope.mandatory:
+            acquire, release, discard = (
+                pool.acquire_mandatory_channel,
+                pool.release_mandatory_channel,
+                pool.discard_mandatory_channel,
+            )
+        else:
+            acquire, release, discard = (
+                pool.acquire_publisher_channel,
+                pool.release_publisher_channel,
+                pool.discard_publisher_channel,
+            )
+
+        if self._publisher_reconnecting():
+            # aio-pika is restoring the publisher connection: wait for it
+            # (bounded) BEFORE sending, rather than publishing into a dead
+            # channel and having to report UNKNOWN.
+            wait = _PUBLISH_RECOVERY_WAIT_SECONDS
+            remaining = self._remaining(deadline)
+            if remaining is not None:
+                wait = min(wait, max(0.0, remaining))
+            if not await self._wait_for_recovery(timeout=wait):
+                return self._not_sent(envelope, PublishReason.NOT_CONNECTED)
+
+        try:
+            channel = await acquire(timeout=self._admission_wait(deadline))
+        except asyncio.CancelledError:
+            raise
+        except ChannelPoolExhaustedError as e:
+            logger.warning(
+                "Publish not sent: no publisher channel free within the admission timeout (exchange=%s routing_key=%s)",
+                envelope.exchange,
+                envelope.routing_key,
+            )
+            return self._not_sent(envelope, PublishReason.ADMISSION_TIMEOUT, e)
+        except ChannelPoolClosedError as e:
+            return self._not_sent(envelope, PublishReason.PUBLISHER_CLOSED, e)
+        except Exception as e:
+            logger.error("Async publish failed: no publisher channel: %s", e)
+            return self._not_sent(envelope, PublishReason.CHANNEL_UNAVAILABLE, e)
+
+        reusable = False
+        try:
             try:
-                channel = await acquire()
-                outcome = await self._publish_on_channel(channel, envelope)
-            except Exception as e:
-                last_exc = e
-                if channel is not None:
-                    with contextlib.suppress(Exception):
-                        await release(channel)
-                if attempt == 0 and _is_connection_error(e) and await self._wait_for_recovery():
-                    logger.warning(
-                        "Publish hit a connection error, retrying once after recovery: exchange=%s routing_key=%s",
-                        envelope.exchange,
-                        envelope.routing_key,
-                    )
-                    continue
-                logger.error("Async publish failed: %s", e)
-                return PublishOutcome(
-                    status=PublishStatus.ERROR,
-                    exchange=envelope.exchange,
-                    routing_key=envelope.routing_key,
-                    error=e,
+                outcome = await self._publish_on_channel(
+                    channel, envelope, timeout=self._remaining(deadline), exclusive=True
                 )
-            else:
-                # M17: close a timed-out channel before returning it to the pool
-                # so the pool doesn't hand out a possibly-wedged channel next.
-                # This channel is exclusively ours for this single publish (not
-                # shared concurrently), so closing here — after our own call has
-                # fully resolved — is safe.
-                if outcome.status == PublishStatus.TIMEOUT and not channel.is_closed:
-                    with contextlib.suppress(Exception):
-                        await channel.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # defensive: _publish_on_channel classifies its own failures
+                outcome = self._classify_publish_failure(e, envelope, exclusive=True)
+            # M17 + G-04: only a channel whose publish reached a broker answer
+            # goes back to the pool; a timed-out or broken one is discarded
+            # (closed) so the pool never hands out a possibly-wedged channel.
+            reusable = outcome.status in _REUSABLE_STATUSES and not channel.is_closed
+            return outcome
+        finally:
+            if reusable:
                 with contextlib.suppress(Exception):
                     await release(channel)
-                return outcome
-
-        return PublishOutcome(  # pragma: no cover — defensive; the loop always returns above
-            status=PublishStatus.ERROR,
-            exchange=envelope.exchange,
-            routing_key=envelope.routing_key,
-            error=last_exc,
-        )
+            else:
+                discard(channel)
 
     async def consume(
         self,
@@ -959,11 +1463,26 @@ class AsyncTransportImpl:
         consumer_tag = f"rabbitkit.{uuid.uuid4()}"
 
         async def on_message(message: Any) -> None:
+            if record.stopped:
+                # CONSUMER-007: rabbitkit cancelled this consumer, yet a
+                # delivery arrived (a reconnect restored it). Hand it back.
+                await self._refuse_stray_delivery(record, message)
+                return
             rabbit_msg = self._build_message(message, no_ack=no_ack)
             await callback(rabbit_msg)
 
+        record = ConsumerRecord(
+            queue=queue,
+            tag=consumer_tag,
+            channel=channel,
+            queue_obj=q,
+            callback=on_message,
+            no_ack=no_ack,
+            supervised=declare,
+        )
         await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
         self._consumer_tags[queue] = consumer_tag
+        await self._consumer_supervisor.register(record)
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)
         return consumer_tag
 
@@ -1054,15 +1573,9 @@ class AsyncTransportImpl:
                 kind,
             )
             return
-        raise ConfigurationError(
-            f"Cannot declare {kind} {name!r}: it already exists with incompatible "
-            f"arguments (broker said: {exc}). This usually means it was created "
-            f"outside rabbitkit (e.g. ops tooling) with different arguments (e.g. "
-            f"quorum vs classic queue type, a different TTL, or a different "
-            f"dead-letter exchange). Either delete/reconcile the existing {kind}, "
-            f"adjust its rabbitkit definition to match, or use "
-            f"TopologyMode.PASSIVE_ONLY to skip declaration and just verify it exists."
-        ) from exc
+        from rabbitkit.core.topology import describe_declare_conflict  # [retry/topology hook]
+
+        raise ConfigurationError(describe_declare_conflict(kind, name, str(exc))) from exc
 
     async def bind_queue(
         self,
@@ -1092,7 +1605,7 @@ class AsyncTransportImpl:
         # queue recreated after a broker restart would come back UNBOUND
         # (consumer silently receives nothing). Record it; the reconnect
         # callback re-applies all recorded bindings (bind is idempotent).
-        self._recorded_bindings.append(("queue", queue, exchange, routing_key, arguments))
+        self._record_binding(("queue", queue, exchange, routing_key, arguments))
 
     async def bind_exchange(
         self,
@@ -1112,28 +1625,97 @@ class AsyncTransportImpl:
         src_ex = await self._topology_channel.get_exchange(source, ensure=False)
         await dest_ex.bind(src_ex, routing_key=routing_key, arguments=arguments)
         # m3: recorded for post-reconnect re-apply — see bind_queue.
-        self._recorded_bindings.append(("exchange", destination, source, routing_key, arguments))
+        self._record_binding(("exchange", destination, source, routing_key, arguments))
 
-    async def cancel_consumer(self, consumer_tag: str) -> None:
-        """Cancel a consumer by tag."""
+    async def cancel_consumer(self, consumer_tag: str, *, timeout: float | None = None) -> None:
+        """Cancel a consumer by tag, waiting at most *timeout* for the broker.
+
+        A cancel the broker does not answer in time (a partition) is handled
+        like a failed one: the consumer is forgotten locally and aio-pika's
+        restore record is dropped, so a later reconnect cannot resurrect it.
+
+        CONSUMER-007: the cancel goes through the queue object the consumer
+        was started on. aio-pika's robust restore re-subscribes every
+        consumer recorded on that object after a reconnect; cancelling via a
+        fresh ``get_queue()`` wrapper left the record in place, so a
+        reconnect during ``stop()``'s drain could bring the consumer back.
+        """
         if not self._connected:
             return
 
         for queue_name, tag in list(self._consumer_tags.items()):
             if tag == consumer_tag:
                 channel = self._consumer_channels.get(queue_name)
-                if channel is not None:
+                record = self._consumer_supervisor.unregister(queue_name)
+                consumer_conn = self._conn_pool._consumer_connection
+                if consumer_conn is not None and (
+                    isinstance(getattr(consumer_conn, "terminal_error", None), BaseException)
+                    or bool(getattr(consumer_conn, "is_closed", False))
+                ):
+                    # G-08: the connection is closed for good (terminal
+                    # failure). The broker dropped the consumer with it, and
+                    # an AMQP cancel would wait forever for a reconnect.
+                    # (aio-pika 9.1 never sets is_closed on a connection that
+                    # is closed without a transport, hence terminal_error.)
+                    del self._consumer_tags[queue_name]
+                    self._consumer_channels.pop(queue_name, None)
+                    if channel is not None and channel is self._reply_to_channel:
+                        self._reply_to_channel = None
+                elif channel is not None:
+                    q: Any = None
                     try:
-                        q = await channel.get_queue(queue_name, ensure=False)
-                        await q.cancel(consumer_tag)
+                        if record is not None:
+                            q = record.queue_obj
+                        else:
+                            q = await channel.get_queue(queue_name, ensure=False)
+                        async with asyncio.timeout(timeout):
+                            await q.cancel(consumer_tag)
                     except Exception as e:
                         logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
+                        # aio-pika 9.x drops its restore record only after
+                        # Basic.CancelOk; a cancel lost to a dropped connection
+                        # must not be restored by the reconnect either.
+                        restore_records = getattr(q, "_consumers", None)
+                        if isinstance(restore_records, dict):
+                            restore_records.pop(consumer_tag, None)
                     finally:
                         del self._consumer_tags[queue_name]
                         del self._consumer_channels[queue_name]
                         if channel is self._reply_to_channel:
                             self._reply_to_channel = None
                 break
+
+    async def _refuse_stray_delivery(self, record: ConsumerRecord, message: Any) -> None:
+        """Requeue a delivery for a consumer rabbitkit already cancelled, and cancel it again."""
+        logger.warning(
+            "Delivery for cancelled consumer queue=%s tag=%s (restored by a reconnect); "
+            "requeueing it and cancelling the consumer",
+            record.queue,
+            record.tag,
+        )
+        if not record.no_ack:
+            with contextlib.suppress(Exception):
+                await message.nack(requeue=True)
+        with contextlib.suppress(Exception):
+            await message.channel.basic_cancel(record.tag)
+
+    def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
+
+        Fires when RabbitMQ sends ``basic.cancel`` (queue deleted, quorum
+        leader change, ...). The transport re-subscribes when the queue exists
+        again and then fires :meth:`on_consumer_resumed`.
+        """
+        self._consumer_supervisor.on_cancelled(callback)
+
+    def on_consumer_resumed(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a broker-cancelled consumer that is consuming again."""
+        self._consumer_supervisor.on_resumed(callback)
+
+    @property
+    def cancelled_consumers(self) -> frozenset[str]:
+        """Queues whose consumer the broker cancelled and that are not consuming again yet."""
+        return self._consumer_supervisor.cancelled_queues
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 

@@ -355,3 +355,50 @@ class TestQuorumInspectKeepsOrder:
         result = self._run_quorum(queue, 10, [])
         assert result.exit_code == 2 and "holding 5001 messages" in result.output
         assert len(queue.ready) == 5001 and not queue.unacked
+
+
+class TestReplayLoopPreventionCli:
+    def test_default_exchange_routes_back_to_the_original_queue(self) -> None:
+        headers = {"x-rabbitkit-original-queue": "orders", "x-rabbitkit-original-routing-key": "orders.created"}
+        result, channel = _run(_Queue([b"a"], headers=headers), ["replay", "orders.dlq", "", "--actor", "bob"])
+        assert result.exit_code == 0, result.output
+        kwargs = channel.basic_publish.call_args.kwargs
+        assert kwargs["exchange"] == "" and kwargs["routing_key"] == "orders"
+        stamped = kwargs["properties"].headers
+        assert stamped["x-rabbitkit-replay-count"] == 1 and stamped["x-rabbitkit-replayed-by"] == "bob"
+
+    def test_over_limit_message_is_refused_and_kept(self) -> None:
+        queue = _Queue([b"a"], headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 3})
+        result, channel = _run(queue, ["replay", "orders.dlq", ""])
+        assert result.exit_code == 1
+        channel.basic_publish.assert_not_called()
+        assert "REFUSED" in result.output
+        assert queue.unacked == {} and len(queue.ready) == 1  # requeued, still on the DLQ
+
+    def test_ignore_replay_limit(self) -> None:
+        queue = _Queue([b"a"], headers={"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 3})
+        result, channel = _run(queue, ["replay", "orders.dlq", "", "--ignore-replay-limit"])
+        assert result.exit_code == 0, result.output
+        assert channel.basic_publish.call_args.kwargs["properties"].headers["x-rabbitkit-replay-count"] == 4
+
+    def test_reset_strips_retry_budget_headers(self) -> None:
+        headers = {
+            "x-rabbitkit-original-queue": "orders",
+            "x-rabbitkit-retry-count": 4,
+            "x-death": [{"queue": "orders.retry.4", "reason": "expired"}],
+        }
+        result, channel = _run(_Queue([b"a"], headers=headers), ["replay", "orders.dlq", "", "--reset-retry-count"])
+        assert result.exit_code == 0, result.output
+        stamped = channel.basic_publish.call_args.kwargs["properties"].headers
+        assert "x-rabbitkit-retry-count" not in stamped and "x-death" not in stamped
+        assert channel.basic_publish.call_args.kwargs["routing_key"] == "orders"
+
+    def test_refused_message_on_a_counted_queue_stops_the_replay(self) -> None:
+        """A message over --max-replays is requeued, so it trips the quorum
+        tripwire like any other requeue: stop before spending more deliveries."""
+        headers = {"x-rabbitkit-original-queue": "orders", "x-rabbitkit-replay-count": 3, "x-delivery-count": 1}
+        queue = _Queue([b"a", b"b"], headers=headers)
+        result, channel = _run(queue, ["replay", "orders.dlq", ""])
+        assert result.exit_code == 2 and "REFUSED" in result.output
+        channel.basic_publish.assert_not_called()
+        assert queue.events.count("get") == 1 and queue.unacked == {}

@@ -1,0 +1,8 @@
+{
+  "include": ["."],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.12",
+  "reportMissingModuleSource": "error",
+  "reportUnnecessaryTypeIgnoreComment": "error",
+  "enableTypeIgnoreComments": false
+}

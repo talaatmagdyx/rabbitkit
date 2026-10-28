@@ -23,14 +23,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, ParamSpec, Protocol, TypeVar, cast
 from unittest.mock import MagicMock
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path
 from rabbitkit.core.pipeline import HandlerPipeline
-from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementReport, settle_many_async, settle_many_sync
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
@@ -48,6 +48,24 @@ if TYPE_CHECKING:
     from rabbitkit.core.router import RabbitRouter
 
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+_R_co = TypeVar("_R_co", covariant=True)
+
+
+class MockedHandler(Protocol, Generic[_P, _R_co]):
+    """A handler registered on :class:`TestBroker`: still callable with its
+    own signature, plus the ``.mock`` the broker records each delivery on.
+
+    This is what ``@test_broker.subscriber(...)`` returns for type checkers,
+    so ``handler.mock.assert_called_once()`` type-checks under strict mode
+    and calling the handler directly keeps its real parameter and return
+    types.
+    """
+
+    mock: MagicMock
+
+    def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R_co: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +155,7 @@ class TestBroker:
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[Callable[_P, _R_co]], MockedHandler[_P, _R_co]]:
         """Register a subscriber — same API as real broker."""
         decorator = self._registry.subscriber(
             queue=queue,
@@ -155,13 +173,13 @@ class TestBroker:
             filter_fn=filter_fn,
         )
 
-        def wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(func: Callable[_P, _R_co]) -> MockedHandler[_P, _R_co]:
             # Apply the subscriber decorator
-            result = decorator(func)
+            result: Any = decorator(func)
             # Attach a mock for assertions
             if not hasattr(result, "mock"):
-                result.mock = MagicMock()  # type: ignore[attr-defined]
-            return result
+                result.mock = MagicMock()
+            return cast("MockedHandler[_P, _R_co]", result)
 
         return wrapper
 
@@ -169,7 +187,7 @@ class TestBroker:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 

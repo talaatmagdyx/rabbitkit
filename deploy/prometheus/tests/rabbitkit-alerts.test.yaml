@@ -1,0 +1,239 @@
+# Behaviour tests for ../rabbitkit-alerts.yaml (G-23):
+#   promtool test rules deploy/prometheus/tests/rabbitkit-alerts.test.yaml
+# Run by tests/integration/test_observability_foundation.py through the
+# prom/prometheus Docker image when Docker is available.
+rule_files:
+  - ../rabbitkit-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ── publisher ────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'rabbitkit_messages_published_total{job="svc",exchange="orders",status="nacked",reason="nacked"}'
+        values: '0+60x20'
+      - series: 'rabbitkit_messages_published_total{job="svc",exchange="orders",status="unknown",reason="connection_lost"}'
+        values: '0+30x20'
+      - series: 'rabbitkit_messages_published_total{job="svc",exchange="healthy",status="confirmed",reason="none"}'
+        values: '0+600x20'
+      - series: 'rabbitkit_publish_routing_failures_total{job="svc",exchange="orders",reason="returned"}'
+        values: '0+120x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PublisherConfirmFailures
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: PublisherConfirmFailures
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, exchange: orders}
+            exp_annotations:
+              description: "svc gets NACKED or ERROR publish outcomes on exchange orders (1/s). The broker did not accept these messages. Break down by the `reason` label of rabbitkit_messages_published_total. Threshold is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/publisher-confirm-timeout/"
+              summary: "Publishes to orders are nacked or refused by RabbitMQ"
+      - eval_time: 10m
+        alertname: PublisherUnknownOutcomes
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, exchange: orders}
+            exp_annotations:
+              description: "svc has publishes whose confirm never arrived (TIMEOUT) or whose connection was lost after sending (UNKNOWN), 500m/s. The broker may or may not hold these messages: republish only with the same message_id. Threshold is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/publisher-confirm-timeout/"
+              summary: "Publishes to orders have an unknown outcome"
+      - eval_time: 10m
+        alertname: PublisherUnroutableMessages
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, exchange: orders, reason: returned}
+            exp_annotations:
+              description: "svc publishes to orders that RabbitMQ returned as unroutable or refused because the exchange does not exist (2/s). Includes retry and dead-letter copies. Threshold is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/unroutable/"
+              summary: "Publishes to orders cannot be routed (returned)"
+
+  # ── connection ───────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'rabbitkit_broker_connected{job="svc",instance="pod-1"}'
+        values: '1 1 0 0 0 0 0 1 1 1 1'
+      - series: 'rabbitkit_reconnect_attempts_total{job="svc",instance="pod-2",role="consumer"}'
+        values: '0+1x30'
+      - series: 'rabbitkit_connection_failures_total{job="svc",instance="pod-2",role="consumer",reason="connection_refused"}'
+        values: '0+1x30'
+      - series: 'rabbitkit_connection_failures_total{job="svc",instance="pod-3",role="publisher",reason="authentication_failed"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'rabbitkit_connection_blocked{job="svc",instance="pod-4"}'
+        values: '0 0 1 1 1 1 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RabbitMQBrokerUnavailable
+        exp_alerts:
+          - exp_labels: {severity: critical, job: svc, instance: pod-1}
+            exp_annotations:
+              description: "At least one of the service's RabbitMQ connections has been down for 2 minutes (see rabbitkit_connection_up by role). Placeholder duration; tune it from measured reconnect times."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/broker-unavailable/"
+              summary: "svc (pod-1) is not connected to RabbitMQ"
+      - eval_time: 9m
+        alertname: RabbitMQBrokerUnavailable
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: RabbitMQConnectionFailures
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, instance: pod-2, role: consumer}
+            exp_annotations:
+              description: "10 failed reconnect attempts in 10 minutes, for 10 minutes. See rabbitkit_connection_failures_total{reason} for why. Threshold is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/connection-storm/"
+              summary: "svc keeps failing to reconnect its consumer connection"
+      - eval_time: 5m
+        alertname: RabbitMQConnectionTerminalFailure
+        exp_alerts:
+          - exp_labels: {severity: critical, job: svc, instance: pod-3, role: publisher, reason: authentication_failed}
+            exp_annotations:
+              description: "A publisher connection gave up: retrying cannot fix authentication_failed. The process needs a restart after the cause is fixed (AsyncBroker.run() exits on its own)."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/connection-storm/"
+              summary: "svc stopped reconnecting to RabbitMQ for good (authentication_failed)"
+      - eval_time: 4m
+        alertname: RabbitMQConnectionBlocked
+        exp_alerts:
+          - exp_labels: {severity: critical, job: svc, instance: pod-4}
+            exp_annotations:
+              description: "RabbitMQ sent connection.blocked: a memory or disk alarm is active on the cluster and every publishing connection is paused. This is the client-side view of RabbitMQDiskAlarm / RabbitMQMemoryAlarm; the rabbitmq-broker group below says which alarm. Placeholder duration."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/"
+              summary: "RabbitMQ is blocking publishes from svc (memory or disk alarm)"
+      - eval_time: 7m
+        alertname: RabbitMQConnectionBlocked
+        exp_alerts: []
+
+  # ── consumer ─────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'rabbitkit_messages_consumed_total{job="svc",queue="orders",status="error"}'
+        values: '0+10x40'
+      - series: 'rabbitkit_messages_consumed_total{job="svc",queue="orders",status="success"}'
+        values: '0+90x40'
+      - series: 'rabbitkit_messages_consumed_total{job="svc",queue="payments",status="success"}'
+        values: '0+100x40'
+      - series: 'rabbitkit_messages_retried_total{job="svc",queue="orders",category="retryable"}'
+        values: '0+60x40'
+      - series: 'rabbitkit_retry_handoff_paused{job="svc",queue="payments"}'
+        values: '1x40'
+      - series: 'rabbitkit_route_consuming{job="svc",instance="pod-1",queue="orders"}'
+        values: '0x40'
+      - series: 'rabbitkit_broker_connected{job="svc",instance="pod-1"}'
+        values: '1x40'
+      - series: 'rabbitkit_queue_messages_ready{queue="orders"}'
+        values: '1000+100x40'
+      - series: 'rabbitkit_queue_messages_ready{queue="steady"}'
+        values: '5000x40'
+      - series: 'rabbitkit_queue_messages_ready{queue="payments.dlq"}'
+        values: '0+1x40'
+      - series: 'rabbitkit_queue_messages_unacked{queue="orders"}'
+        values: '6000x40'
+      - series: 'rabbitkit_messages_dead_lettered_total{job="svc",queue="orders",category="permanent"}'
+        values: '0 0 0 1+1x37'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ConsumerProcessingFailures
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, queue: orders}
+            exp_annotations:
+              description: "10% of handler executions on orders raise. rabbitkit_messages_failed_total{category} says why. 5% is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-failures/"
+              summary: "More than 5% of handler runs on orders fail"
+      - eval_time: 6m
+        alertname: ConsumerNotConsuming
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, instance: pod-1, queue: orders}
+            exp_annotations:
+              description: "The broker is connected but the route's consumer is not subscribed, usually because RabbitMQ cancelled it (queue deleted, quorum leader change). See rabbitkit_consumer_cancelled_total. Placeholder duration."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-failures/"
+              summary: "The consumer of orders is not subscribed"
+      - eval_time: 20m
+        alertname: ConsumerBacklogGrowing
+        exp_alerts:
+          - exp_labels: {severity: warning, queue: orders}
+            exp_annotations:
+              description: "orders has more than 1000 ready messages and the backlog has grown for 15 minutes: consumers are slower than producers or stalled. Needs a QueueMetricsPoller. Thresholds are placeholders; tune them from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-backlog/"
+              summary: "Backlog on orders keeps growing"
+      - eval_time: 20m
+        alertname: ConsumerUnackedHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, queue: orders}
+            exp_annotations:
+              description: "Consumers hold many unacked deliveries for 15 minutes: handlers are stuck or slow, or prefetch is too high for the handler time. Needs a QueueMetricsPoller. Threshold is a placeholder; tune it from measured workloads (prefetch x consumers is the normal ceiling)."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-backlog/"
+              summary: "6000 messages delivered but not acked on orders"
+      - eval_time: 10m
+        alertname: DeadLetterQueueGrowing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, queue: orders}
+            exp_annotations:
+              description: "Terminal failures are being dead-lettered (or a DLQ backlog grows). Every one needs a decision: fix and replay, or discard. Thresholds are placeholders; tune them from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/dlq-growth/"
+              summary: "Messages keep reaching the dead-letter queue of orders"
+          - exp_labels: {severity: warning, queue: payments.dlq}
+            exp_annotations:
+              description: "Terminal failures are being dead-lettered (or a DLQ backlog grows). Every one needs a decision: fix and replay, or discard. Thresholds are placeholders; tune them from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/dlq-growth/"
+              summary: "Messages keep reaching the dead-letter queue of payments.dlq"
+      - eval_time: 15m
+        alertname: RetryStormDetected
+        exp_alerts:
+          - exp_labels: {severity: warning, job: svc, queue: orders}
+            exp_annotations:
+              description: "More than half of the handler runs on orders are retried, or the retry handoff is paused because the delay queue cannot be reached. 50% is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/retry-storm/"
+              summary: "Retry storm on orders"
+          - exp_labels: {severity: warning, job: svc, queue: payments}
+            exp_annotations:
+              description: "More than half of the handler runs on payments are retried, or the retry handoff is paused because the delay queue cannot be reached. 50% is a placeholder; tune it from measured workloads."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/retry-storm/"
+              summary: "Retry storm on payments"
+
+  # ── broker-side (rabbitmq_prometheus plugin metrics) ─────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'rabbitmq_alarms_free_disk_space_watermark{rabbitmq_cluster="c1",rabbitmq_node="rabbit@a"}'
+        values: '0 1 1 1 1 1'
+      - series: 'rabbitmq_alarms_memory_used_watermark{rabbitmq_cluster="c1",rabbitmq_node="rabbit@b"}'
+        values: '0 0 1 1 1 1'
+      - series: 'rabbitmq_identity_info{rabbitmq_cluster="c1",rabbitmq_node="rabbit@a"}'
+        values: '1x30'
+      - series: 'rabbitmq_identity_info{rabbitmq_cluster="c1",rabbitmq_node="rabbit@b"}'
+        values: '1x30'
+      - series: 'rabbitmq_identity_info{rabbitmq_cluster="c2",rabbitmq_node="rabbit@x"}'
+        values: '1x30'
+      - series: 'rabbitmq_identity_info{rabbitmq_cluster="c2",rabbitmq_node="rabbit@y"}'
+        values: '1x30'
+      - series: 'rabbitmq_identity_info{rabbitmq_cluster="c2",rabbitmq_node="rabbit@z"}'
+        values: '1x30'
+      - series: 'rabbitmq_raft_term_total{rabbitmq_cluster="c2",rabbitmq_node="rabbit@x"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: RabbitMQDiskAlarm
+        exp_alerts:
+          - exp_labels: {severity: critical, source: rabbitmq_prometheus, rabbitmq_cluster: c1, rabbitmq_node: rabbit@a}
+            exp_annotations:
+              description: "Free disk space fell below the watermark; RabbitMQ blocks every publisher in the cluster. Needs the rabbitmq_prometheus plugin. Clients see it as rabbitkit_connection_blocked == 1."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/"
+              summary: "RabbitMQ disk alarm on rabbit@a"
+      - eval_time: 4m
+        alertname: RabbitMQMemoryAlarm
+        exp_alerts:
+          - exp_labels: {severity: critical, source: rabbitmq_prometheus, rabbitmq_cluster: c1, rabbitmq_node: rabbit@b}
+            exp_annotations:
+              description: "Memory use crossed the high watermark; RabbitMQ blocks every publisher in the cluster. Needs the rabbitmq_prometheus plugin. Clients see it as rabbitkit_connection_blocked == 1."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/"
+              summary: "RabbitMQ memory alarm on rabbit@b"
+      - eval_time: 20m
+        alertname: RabbitMQQuorumUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: critical, source: rabbitmq_prometheus, rabbitmq_cluster: c1}
+            exp_annotations:
+              description: "Fewer RabbitMQ nodes report than the expected cluster size (3 here: set it to yours; a quorum queue needs a majority of its members), or Raft leader elections churn. Needs the rabbitmq_prometheus plugin (rabbitmq_identity_info, rabbitmq_raft_term_total). Thresholds are placeholders."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/quorum-unavailable/"
+              summary: "Quorum queues in c1 may be unavailable"
+          - exp_labels: {severity: critical, source: rabbitmq_prometheus, rabbitmq_cluster: c2}
+            exp_annotations:
+              description: "Fewer RabbitMQ nodes report than the expected cluster size (3 here: set it to yours; a quorum queue needs a majority of its members), or Raft leader elections churn. Needs the rabbitmq_prometheus plugin (rabbitmq_identity_info, rabbitmq_raft_term_total). Thresholds are placeholders."
+              runbook_url: "https://talaatmagdyx.github.io/rabbitkit/runbooks/quorum-unavailable/"
+              summary: "Quorum queues in c2 may be unavailable"

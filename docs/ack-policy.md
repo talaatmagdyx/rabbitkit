@@ -9,8 +9,32 @@ rabbitkit manages settlement automatically based on handler outcome.
 | Handler result | Action |
 |----------------|--------|
 | Returns normally | `basic.ack` |
-| Raises transient exception | retry or `basic.nack(requeue=False)` |
+| Raises transient exception, with `RetryConfig` | republished to a delay queue (retry) |
+| Raises transient exception, no retry, first delivery | `basic.nack(requeue=True)` |
+| Raises transient exception, no retry, message already redelivered | `basic.reject` → DLQ |
 | Raises permanent exception | `basic.reject` → DLQ |
+
+Transient means `TimeoutError`, `OSError` (connection resets and so on),
+`EOFError` and `HandlerTimeoutError`; everything else, including unknown
+exception types, is permanent.
+
+**The transient loop is bounded by default.** Without retry, a transient
+failure is requeued once; if the redelivery fails again it is dead-lettered
+(`ConsumerConfig.reject_transient_on_redelivery=True`, the default). Earlier
+releases requeued transient failures immediately and forever: a poison
+message that always times out ran thousands of times per second and never
+reached the DLQ. The broker's `redelivered` flag is the only per-message
+signal a classic queue carries, so the cap is two attempts, and it also
+counts a redelivery caused by a crash or a lost connection. Use
+`RetryConfig` for more attempts with delays, or set
+`reject_transient_on_redelivery=False` to restore unbounded requeueing.
+
+Every handler failure is logged as one structured line: queue, message id,
+correlation id, delivery tag, `redelivered`, the exception class, the reason
+for the decision and the action taken. The body, headers and exception text
+are never logged (they may contain payload data or secrets); the traceback
+is logged at DEBUG. Repeats of the same failure on the same queue are
+collapsed to one line per 10 s window, with a count.
 
 ```python
 @broker.subscriber(queue="orders")  # ack_policy=AckPolicy.AUTO is the default
@@ -40,7 +64,20 @@ async def handle(msg: RabbitMessage) -> None:
 
 Use `MANUAL` when the handler needs full settlement control — for example, when settlement depends on an external confirmation or a two-phase commit.
 
-**Warning:** If you forget to ack/nack, the message stays unacked until the connection closes.
+**If the handler raises without settling**, rabbitkit applies the same
+failure settlement as `AUTO` (transient: requeue once, then DLQ; permanent:
+DLQ) and logs it. Earlier releases left the delivery unacked until the
+channel closed; each such failure held a prefetch slot, so `prefetch_count`
+failures stalled the consumer. A handler that settled before raising is not
+settled again.
+
+If your handler settles through something rabbitkit cannot see, a raw
+channel or a `CoalescingAcker`, and then re-raises, set
+`ConsumerConfig(manual_settle_on_error=False)`. Otherwise the pipeline
+settles the same delivery tag a second time and the broker closes the
+channel. Better: do not re-raise after settling.
+
+**Warning:** If the handler *returns* without acking or nacking, the message stays unacked until the connection closes (logged as a warning). rabbitkit never auto-acks under `MANUAL`.
 
 ## NACK_ON_ERROR
 
@@ -67,6 +104,36 @@ async def handle(body: bytes) -> None:
 **Warning:** If the handler fails after the ack, the message is lost permanently. Use only when message loss is acceptable — for example, best-effort audit logging.
 
 Never use `ACK_FIRST` for financial transactions, order processing, or any flow where at-least-once delivery is required.
+
+## Handler deadline (`processing_timeout`)
+
+`ConsumerConfig(processing_timeout=30.0)` gives every handler on an async
+broker a deadline (default `None`, off). When it expires the handler task is
+cancelled and `HandlerTimeoutError` goes through the failure settlement
+above. It is transient, and it carries `outcome_unknown=True`: the handler
+was cut off part-way, so its side effects may or may not have happened. The
+failure log says so (`outcome_unknown=True`), and `classify_error` reports
+it on `ClassifiedError.outcome_unknown`. Retrying it is only safe for
+idempotent handlers.
+
+Only the deadline produces `HandlerTimeoutError`. A `TimeoutError` raised by
+the handler's own code (an HTTP client timeout, say) stays an ordinary
+transient error. The sync broker cannot interrupt a running thread, so it
+ignores `processing_timeout` and logs a warning; use `TimeoutMiddleware`
+there (it abandons the thread rather than stopping it).
+
+## When the ack itself fails
+
+An ack is a frame written to the channel; the broker does not confirm it.
+If writing it raises after the handler succeeded (channel closed, socket
+reset), rabbitkit does not know whether the broker received it. It logs
+"Ack outcome unknown", increments `HandlerPipeline.ack_outcome_unknown_total`
+(and `<namespace>_settlement_outcome_unknown_total` when the route has a
+`MetricsMiddleware`), and sends nothing else for that delivery. If the ack
+was lost, the broker redelivers the message when the channel closes and the
+handler runs again, so handlers must be idempotent. Earlier releases sent
+the failed ack down the handler-failure path, which tried to reject a
+message that had been processed successfully.
 
 ## Message Safety
 

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from rabbitkit.async_.connection import get_infrastructure_errors
 from rabbitkit.async_.transport import AsyncTransportImpl
 from rabbitkit.concurrency import AsyncWorkerPool
 from rabbitkit.core.bulk import BulkPublishItem, BulkPublishOptions, BulkPublishResult, PublishPreparer
@@ -36,21 +37,33 @@ from rabbitkit.core.config import (
     SocketConfig,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
+from rabbitkit.core.dead_letter import DeadLetterCopier, DeadLetterGuard
+from rabbitkit.core.errors import (
+    BackpressureError,
+    BrokerNotStartedError,
+    MessageTooLargeError,
+    TerminalConnectionError,
+    register_infrastructure_errors,
+)
+from rabbitkit.core.failure_copy import DEFAULT_RETRY_HEADER, ERROR_MESSAGE_MAX_LEN
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.quorum import dlq_delivery_limit
-from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.registry import HandlerT, SubscriberRegistry
+from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_async
+from rabbitkit.core.signals import is_default_signal_handler, is_loop_signal_handler, loop_signal_handler_is
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     QueueType,
     ReliabilityProfile,
@@ -58,6 +71,7 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.middleware.metrics import BrokerMetrics
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
 
@@ -65,6 +79,25 @@ if TYPE_CHECKING:
     from rabbitkit.core.router import RabbitRouter
 
 logger = structlog.stdlib.get_logger(__name__)
+
+
+#: How long stop() waits for cancelled in-flight handlers to unwind after the
+#: graceful deadline. A handler that swallows CancelledError is abandoned
+#: after this, so stop() stays bounded (graceful_timeout + this).
+_CANCEL_JOIN_TIMEOUT = 1.0
+
+
+def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = None) -> PublishOutcome:
+    return PublishOutcome(
+        status=PublishStatus.NOT_SENT,
+        exchange=env.exchange,
+        routing_key=env.routing_key,
+        error=error,
+        reason=reason,
+    )
+# Shared with RabbitApp (core/signals.py); kept under the old private names.
+_is_loop_signal_handler = is_loop_signal_handler
+_is_default_signal_handler = is_default_signal_handler
 
 
 class AsyncBroker:
@@ -104,11 +137,34 @@ class AsyncBroker:
         self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
+        # The client library's connection/channel errors classify as
+        # INFRASTRUCTURE (retried) — core/ cannot import them itself.
+        register_infrastructure_errors(*get_infrastructure_errors())
+        # F17: verify a route's DLQ exists before dead-lettering into it.
+        self._dead_letter_guard = DeadLetterGuard(self._queue_exists_for_guard)
+        # G-17: a confirmed, metadata-stamped DLQ copy for failures that
+        # bypass RetryMiddleware (SafetyConfig.dead_letter_with_metadata).
+        self._dead_letter_sanitizers: dict[str, ErrorSanitizer] = {}
+        self._dead_letter_copier: DeadLetterCopier | None = (
+            DeadLetterCopier(
+                self._flow_controlled_internal_publish,
+                self._dead_letter_guard.target_for,
+                sanitizer_for=self._dead_letter_sanitizer,
+                retry_header_for=self._dead_letter_retry_header,
+            )
+            if self._config.safety.dead_letter_with_metadata
+            else None
+        )
         self._pipeline = HandlerPipeline(
             serializer=serializer,
             di_resolver=di_resolver,
             context_repo=context_repo,
             reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
+            manual_settle_on_error=self._config.consumer.manual_settle_on_error,
+            processing_timeout=self._config.consumer.processing_timeout,
+            dead_letter_check=self._dead_letter_guard.check,
+            max_body_bytes=self._config.consumer.max_body_bytes,
+            dead_letter_copy=self._dead_letter_copier.copy if self._dead_letter_copier is not None else None,
         )
 
         # C3: middlewares applied to every broker.publish() call — the primary
@@ -121,12 +177,21 @@ class AsyncBroker:
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
         self._publish_middlewares: list[BaseMiddleware] = middlewares or []
+        # G-19: PublisherConfig.strip_reserved_headers (None = off).
+        self._reserved_header_stripper: ReservedHeaderStripper | None = (
+            ReservedHeaderStripper(extra=(self._config.retry.retry_header,) if self._config.retry is not None else ())
+            if self._config.publisher.strip_reserved_headers
+            else None
+        )
 
         self._batch_config = batch_config
         self._batch_publisher: Any | None = None  # BatchPublisher, started lazily in start()
         self._transport: Any | None = None  # AsyncTransportImpl
         self._worker_pool: AsyncWorkerPool | None = None
         self._started = False
+        # G-12: set by stop() once publisher shutdown begins; publish() then
+        # raises BrokerNotStartedError instead of silently reconnecting.
+        self._publish_closed = False
         self._rpc_client: Any | None = None
 
         # L14: liveness heartbeat (see health.broker_liveness). None until
@@ -139,6 +204,16 @@ class AsyncBroker:
         # where the broker's handler overwrites the app's). Wire
         # ``broker.on_app_shutdown = app.request_shutdown`` before ``app.run_async()``.
         self.on_app_shutdown: Callable[[], None] | None = None
+        # G-26: optional hooks called with the queue name when the BROKER
+        # cancels a route's consumer (queue deleted, quorum leader change, ...)
+        # and when it is consuming again. The transport re-subscribes on its
+        # own; the route reports as not consuming in health checks meanwhile.
+        self.on_consumer_cancelled: Callable[[str], None] | None = None
+        self.on_consumer_resumed: Callable[[str], None] | None = None
+        self._consumer_state_wired: Any = None  # the transport the state callbacks are on
+        # G-22: connection/channel/flow-control metrics, built at start() from
+        # the first MetricsMiddleware with a collector (None = no metrics).
+        self._broker_metrics: BrokerMetrics | None = None
 
         # Bounded graceful drain (C-2): inline in-flight counter guarded by an
         # asyncio.Condition (R-Condition). ``_in_flight`` stays a plain int so
@@ -155,7 +230,10 @@ class AsyncBroker:
         # Optional publish-side flow control (C-6).
         self._flow_controller: Any | None = None
 
-        # Signal-handler bookkeeping (H-SRE5).
+        # Signal-handler bookkeeping (H-SRE5, G-24). _signal_prev: the
+        # Python-level handler each loop-installed signal replaced, restored
+        # by stop(); _original_handlers: the signal.signal() fallback's.
+        self._signal_prev: dict[signal.Signals, Any] = {}
         self._original_handlers: dict[signal.Signals, Any] = {}
         self._installed_loop_handlers = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -215,6 +293,7 @@ class AsyncBroker:
             while True:
                 await asyncio.sleep(self._HEARTBEAT_INTERVAL)
                 self._mark_heartbeat()
+                self._sample_metrics()
         except asyncio.CancelledError:
             pass
 
@@ -287,7 +366,7 @@ class AsyncBroker:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
             queue=queue,
@@ -310,7 +389,7 @@ class AsyncBroker:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 
@@ -319,6 +398,41 @@ class AsyncBroker:
         self._registry.include_router(router, prefix=prefix)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def _dead_letter_sanitizer(self, route: RouteDefinition) -> ErrorSanitizer:
+        """The error-header sanitizer for *route*'s G-17 DLQ copies: its retry
+        config's ``error_detail`` (the same policy RetryMiddleware applies),
+        else the sanitized default."""
+        retry = route.effective_retry_config(self._config.retry)
+        policy = retry.error_detail if retry is not None else "sanitized"
+        sanitizer = self._dead_letter_sanitizers.get(policy)
+        if sanitizer is None:
+            sanitizer = self._dead_letter_sanitizers[policy] = ErrorSanitizer(
+                policy=policy, max_summary_len=ERROR_MESSAGE_MAX_LEN
+            )
+        return sanitizer
+
+    def _dead_letter_retry_header(self, route: RouteDefinition) -> str:
+        retry = route.effective_retry_config(self._config.retry)
+        return retry.retry_header if retry is not None else DEFAULT_RETRY_HEADER
+
+    async def __aenter__(self) -> AsyncBroker:
+        """``async with AsyncBroker(config) as broker:`` starts the broker and
+        stops it when the block exits (also on an exception or cancellation).
+
+        Entering calls ``start(install_signal_handlers=False)``: a ``with``
+        block is a scope owned by the surrounding code (a script, a test, an
+        application that embeds the broker), so the broker leaves SIGINT and
+        SIGTERM to that code. A standalone consumer process should use
+        ``await broker.run()`` instead, which owns the signals and drains on
+        SIGTERM. To pass a ``WorkerConfig``, call ``start()`` yourself and
+        ``stop()`` in a ``finally``; ``start()`` on a started broker is a no-op.
+        """
+        await self.start(install_signal_handlers=False)
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.stop()
 
     async def start(
         self,
@@ -346,17 +460,73 @@ class AsyncBroker:
         staleness check, instead of bypassing it entirely (a ``None``
         heartbeat is treated as "no signal available" there, which
         previously meant "always alive").
+
+        G-10: all or nothing. If any step raises (or the call is cancelled),
+        everything this call created is undone before the error propagates:
+        consumers already started are cancelled, the worker pool, batch
+        publisher and heartbeat are stopped, and both connections are closed.
+        ``start()`` can then simply be called again.
+
+        G-08: a refused login or vhost, or a TLS verification failure, raises a
+        :class:`~rabbitkit.core.errors.PermanentConnectionError` at once
+        instead of retrying.
         """
         if self._started:
             return
+        try:
+            await self._start_unguarded(worker_config, install_signal_handlers=install_signal_handlers)
+        except BaseException:
+            await self._abort_failed_start()
+            raise
 
+    async def _abort_failed_start(self) -> None:
+        """Undo a ``start()`` that raised part-way (G-10). Best effort and bounded."""
+        self._restore_signal_handlers()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        transport, self._transport = self._transport, None
+        bound = self._config.connection.socket_timeout
+        if transport is not None:
+            for route in self._registry.routes:
+                tag = route.consumer_tag
+                if tag:
+                    with contextlib.suppress(Exception):
+                        async with asyncio.timeout(bound):
+                            await transport.cancel_consumer(tag)
+                    route.runtime_state.consumer_tag = None
+        if self._worker_pool is not None:
+            pool, self._worker_pool = self._worker_pool, None
+            with contextlib.suppress(Exception):
+                await pool.stop(timeout=0)
+        # Handlers of consumers that started before the failure: cancel and
+        # nack them now (an immediate drain deadline).
+        with contextlib.suppress(Exception):
+            await self._wait_in_flight(time.monotonic())
+        if self._batch_publisher is not None:
+            batch, self._batch_publisher = self._batch_publisher, None
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(bound):
+                    await batch.stop()
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(bound):
+                    await transport.disconnect()
+            # disconnect() is a no-op unless connect() finished; connect()
+            # cleans up after itself, this covers a connect() that succeeded.
+        self._started = False
+        self._set_lifecycle_gauges(connected=False)
+
+    async def _start_unguarded(self, worker_config: WorkerConfig | None, *, install_signal_handlers: bool) -> None:
         self.last_heartbeat = time.monotonic()
 
         # Configure structured logging if enabled
         if self._config.logging is not None:
             from rabbitkit.core.logging import configure_structlog
 
-            configure_structlog(self._config.logging)
+            configure_structlog(self._config.logging, override_existing=self._config.logging.override_existing)
 
         # SocketConfig is sync-only: pika accepts tcp_options, but
         # aio-pika/aiormq exposes no socket-tuning knobs, and applying
@@ -386,7 +556,13 @@ class AsyncBroker:
             confirm_delivery=self._config.publisher.confirm_delivery,
             confirm_timeout=self._config.publisher.confirm_timeout,
             on_topology_conflict=self._config.safety.on_topology_conflict,
+            max_in_flight_bytes=self._config.publisher.max_in_flight_bytes,
         )
+        self._publish_closed = False
+        self._transport.on_connection_failed(self._on_connection_failed)
+        # Before connect(), so the connection-up events and the first
+        # channels are counted too (G-22).
+        self._wire_reconnect_metric()
 
         await self._transport.connect()
 
@@ -442,18 +618,22 @@ class AsyncBroker:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            self._batch_publisher = AsyncBatchPublisher(self._transport, batch_cfg)
+            self._batch_publisher = AsyncBatchPublisher(
+                self._transport,
+                batch_cfg,
+                admission_timeout=self._config.pool.channel_acquire_timeout,
+                confirm_timeout=self._config.publisher.confirm_timeout,
+                byte_limiter=self._transport.byte_limiter,
+            )
             await self._batch_publisher.start()
 
         # Declare topology
         await self._declare_topology()
+        self._notify_passive_only()
 
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
-
-        # Connection-churn counter: reconnects were logged but never counted.
-        self._wire_reconnect_metric()
 
         # Create worker pool if requested
         if worker_config is not None and worker_config.worker_count > 1:
@@ -533,32 +713,97 @@ class AsyncBroker:
         finally:
             self._run_waiting = False
             await self.stop()
+        failure = self._connection_failure()
+        if failure is not None:
+            raise failure
+
+    def _connection_failure(self) -> TerminalConnectionError | None:
+        transport = self._transport
+        failure = getattr(transport, "connection_failure", None) if transport is not None else None
+        return failure if isinstance(failure, TerminalConnectionError) else None
+
+    def _on_connection_failed(self, error: TerminalConnectionError) -> None:
+        """A connection stopped reconnecting for good after startup (G-08).
+
+        The broker stays started (``stop()`` still drains and closes), but
+        readiness and liveness go false. Under :meth:`run` this also ends the
+        run: it stops the broker and raises *error*, so the process exits and
+        its supervisor restarts it.
+        """
+        logger.critical(
+            "RabbitMQ connection failed for good (%s); readiness and liveness are now false: %s",
+            error.reason,
+            error,
+        )
+        self._set_lifecycle_gauges(connected=False)
+        if self._run_waiting:
+            self._shutdown_event.set()
 
     def _install_signal_handlers(self) -> None:
-        """Install portable SIGINT/SIGTERM handlers that drain via stop() (H-SRE5).
+        """Install SIGINT/SIGTERM handlers that drain via stop() (H-SRE5, G-24).
 
         Prefers ``loop.add_signal_handler``; falls back to ``signal.signal`` on
         platforms/threads where the loop API is unavailable. Idempotent.
+
+        G-24: an embedding application's handlers are not clobbered.
+
+        * The Python-level handler in place (``signal.getsignal``) is captured
+          and put back by ``stop()``. A custom one (anything but the default,
+          ``SIG_DFL`` or ``asyncio.run()``'s own SIGINT handler) is replaced
+          for the broker's lifetime, with a WARNING.
+        * A handler registered with ``loop.add_signal_handler`` cannot be read
+          back through asyncio's public API, so it could not be restored.
+          The broker leaves such a signal alone (WARNING): the application's
+          handler stays in charge and should call ``broker.request_shutdown()``
+          or ``await broker.stop()``.
+
+        Embedding applications should pass ``install_signal_handlers=False``.
         """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover
             return  # no running loop - nothing to install
         self._loop = loop
-        installed = False
-        try:
-            for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            if sig in self._signal_prev or sig in self._original_handlers:
+                continue  # already ours
+            prev = signal.getsignal(sig)
+            if _is_loop_signal_handler(prev):
+                logger.warning(
+                    "AsyncBroker: an asyncio handler for %s is already installed (e.g. by the "
+                    "application or RabbitApp); not replacing it, because asyncio cannot hand it back "
+                    "after stop(). That handler should call broker.request_shutdown() or await "
+                    "broker.stop(). Pass start(install_signal_handlers=False) to silence this.",
+                    sig.name,
+                )
+                continue
+            if not _is_default_signal_handler(sig, prev):
+                logger.warning(
+                    "AsyncBroker: replacing the existing %s handler %r until stop(), which restores it. "
+                    "Pass start(install_signal_handlers=False) if the application owns signal handling.",
+                    sig.name,
+                    prev,
+                )
+            try:
                 loop.add_signal_handler(sig, self._on_signal)
-            installed = True
-        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-            pass  # pragma: no cover
-        self._installed_loop_handlers = installed
-        if not installed:  # pragma: no cover
-            for sig in (signal.SIGINT, signal.SIGTERM):  # pragma: no cover
+            except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - Windows / non-main thread
                 try:  # pragma: no cover
                     self._original_handlers[sig] = signal.signal(sig, self._on_signal_sync)  # pragma: no cover
                 except (ValueError, OSError):  # pragma: no cover - not main thread
                     pass
+                continue  # pragma: no cover
+            self._signal_prev[sig] = prev
+            self._installed_loop_handlers = True
+
+    def _owns_loop_signal(self, loop: asyncio.AbstractEventLoop, sig: signal.Signals) -> bool:
+        """Whether *loop*'s handler for *sig* is still this broker's.
+
+        Reads asyncio's private handler table when it exists (the standard
+        Unix loop), so an application handler installed after ``start()`` is
+        not removed by ``stop()``. Without it (e.g. uvloop) the broker
+        assumes the handler is still its own, as before.
+        """
+        return loop_signal_handler_is(loop, sig, self._on_signal)
 
     def _trigger_shutdown(self) -> None:
         """Set the shutdown event so an in-progress ``run()`` joins the drain
@@ -598,19 +843,36 @@ class AsyncBroker:
         self._trigger_shutdown()
 
     def _restore_signal_handlers(self) -> None:
-        if self._loop is not None and self._installed_loop_handlers:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    self._loop.remove_signal_handler(sig)
-                except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-                    pass
-            self._installed_loop_handlers = False
+        """Remove this broker's handlers and put back what was there before (G-24)."""
+        loop = self._loop
+        for sig, prev in self._signal_prev.items():
+            if loop is None or not self._owns_loop_signal(loop, sig):
+                logger.info("AsyncBroker: %s handler was replaced after start(); leaving it in place", sig.name)
+                continue
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
+                continue
+            if prev is None:
+                continue  # installed outside Python: nothing we can put back
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError, TypeError):
+                logger.warning("AsyncBroker: could not restore the previous %s handler", sig.name, exc_info=True)
+        self._signal_prev.clear()
+        self._installed_loop_handlers = False
         for sig, prev in self._original_handlers.items():  # pragma: no cover
             try:  # pragma: no cover
                 signal.signal(sig, prev)  # pragma: no cover
             except (ValueError, OSError):  # pragma: no cover
                 pass  # pragma: no cover
         self._original_handlers.clear()
+
+    async def _queue_exists_for_guard(self, queue: str) -> bool:
+        transport = self._transport
+        if transport is None:
+            return False
+        return bool(await transport.queue_exists(queue))
 
     async def _wait_in_flight(self, deadline: float | None) -> None:
         cond = self._ensure_inflight_cond()
@@ -649,7 +911,20 @@ class AsyncBroker:
             for task in tasks:
                 task.cancel()
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # INV-008: bounded even when a handler swallows CancelledError
+                # (an unbounded gather here let stop() overrun graceful_timeout
+                # by however long the misbehaving handler kept running).
+                _done, still_running = await asyncio.wait(tasks, timeout=_CANCEL_JOIN_TIMEOUT)
+                for task in still_running:
+                    stuck = tasks[task]
+                    logger.error(
+                        "AsyncBroker.stop: handler for delivery_tag=%s message_id=%s ignored cancellation "
+                        "for %.1fs; abandoning it (it may still run, and its side effects may still "
+                        "happen). The delivery is nacked for redelivery below.",
+                        stuck.delivery_tag,
+                        stuck.message_id,
+                        _CANCEL_JOIN_TIMEOUT,
+                    )
             for message in tasks.values():
                 if message.is_settled:
                     continue  # handler reached its own ack/nack before being cut off
@@ -665,6 +940,10 @@ class AsyncBroker:
                     await message.nack_async(requeue=True)
                 except Exception:
                     logger.warning("nack on abandoned handler's message raised", exc_info=True)
+
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        return None if deadline is None else max(0.0, deadline - time.monotonic())
 
     async def stop(self, timeout: float | None = None) -> None:
         """Stop the broker - cancel consumers, drain pool, drain in-flight, disconnect.
@@ -704,9 +983,12 @@ class AsyncBroker:
         # anything, so nothing new arrives while the pool/in-flight drain runs.
         if self._transport is None:  # pragma: no cover — defensive (assert was stripped under -O)
             return
+        # Every step below is bounded by the overall deadline, including the
+        # ones that talk to the broker: during a partition a cancel or a close
+        # is never answered, and stop() used to wait for the network to heal.
         for route in self._registry.routes:
             if route.consumer_tag:
-                await self._transport.cancel_consumer(route.consumer_tag)
+                await self._transport.cancel_consumer(route.consumer_tag, timeout=self._remaining(deadline))
 
         # Drain the worker pool (let in-flight pooled tasks finish), bounded by
         # the outer deadline.
@@ -718,19 +1000,29 @@ class AsyncBroker:
         # Drain inline in-flight handlers (C-2).
         await self._wait_in_flight(deadline)
 
-        # Stop batch publisher (drain remaining messages before disconnecting)
+        # Publisher shutdown (G-12). After the consumer drain, so a handler
+        # finishing inside the grace period can still publish its result or
+        # retry handoff. Then, within what is left of the deadline:
+        # 1. close admission (publish() now raises BrokerNotStartedError and
+        #    never reconnects); 2. flush the batch queue and wait for
+        #    in-flight confirms; 3. resolve the rest (queued: NOT_SENT,
+        #    on the wire: UNKNOWN) and release every waiter; then disconnect.
+        self._publish_closed = True
         if self._batch_publisher is not None:
-            await self._batch_publisher.stop()
+            await self._batch_publisher.stop(timeout=self._remaining(deadline))
             self._batch_publisher = None
+        await self._transport.close_publishing(timeout=self._remaining(deadline))
 
         # Close RPC client if used
         if self._rpc_client is not None:
-            await self._rpc_client.close()
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(self._remaining(deadline)):
+                    await self._rpc_client.close()
             self._rpc_client = None
 
         # Disconnect
         if self._transport:
-            await self._transport.disconnect()
+            await self._transport.disconnect(timeout=self._remaining(deadline))
 
         self._started = False
         self._set_lifecycle_gauges(connected=False)
@@ -749,6 +1041,8 @@ class AsyncBroker:
         content_type: str = "application/json",
         correlation_id: str | None = None,
         reply_to: str | None = None,
+        message_id: str | None = None,
+        timeout: float | None = None,
     ) -> PublishOutcome:
         """Publish a message.
 
@@ -778,7 +1072,28 @@ class AsyncBroker:
         Middleware wraps OUTSIDE both flow control and batching, so a
         middleware-transformed envelope is what gets rate-limited/batched, and
         what actually reaches the wire.
+
+        ``message_id`` (kwargs form only) sets the AMQP message id instead of
+        a fresh uuid4, so an application can republish the SAME logical
+        message after an ``UNKNOWN`` outcome and let consumers deduplicate.
+        With an envelope, set ``MessageEnvelope.message_id`` instead.
+
+        ``timeout`` bounds this call end to end: admission (flow control,
+        byte budget, a free channel), send and confirm. On expiry the outcome
+        is ``NOT_SENT`` (``admission_timeout``) if nothing was sent, else
+        ``TIMEOUT`` (``publish_timeout``), which is an unknown outcome.
+        ``None`` keeps the configured bounds (``channel_acquire_timeout``,
+        ``confirm_timeout``).
+
+        Outcomes are returned, not raised (see :class:`PublishStatus`).
+        Raises ``BrokerNotStartedError`` before ``start()`` and once
+        ``stop()`` has begun closing the publisher — a publish never
+        reconnects a stopped broker.
         """
+        if timeout is not None and not timeout > 0:
+            raise ValueError(f"publish timeout must be > 0, got {timeout}")
+        if envelope is not None and message_id is not None:
+            raise ValueError("message_id applies to the kwargs form; set MessageEnvelope.message_id instead")
         if envelope is None:
             import json as _json
 
@@ -803,6 +1118,13 @@ class AsyncBroker:
                 mandatory=self._config.publisher.mandatory,
                 delivery_mode=2 if self._config.publisher.persistent else 1,
             )
+            if message_id is not None:
+                envelope = replace(envelope, message_id=message_id)
+
+        # G-19: an application publish cannot carry rabbitkit's retry/DLQ
+        # bookkeeping headers (opt-in; the library's own republishes bypass this).
+        if self._reserved_header_stripper is not None:
+            envelope = self._reserved_header_stripper(envelope)
 
         # M10: reject oversized bodies at publish time (see sync broker).
         max_bytes = self._config.publisher.max_message_bytes
@@ -816,24 +1138,43 @@ class AsyncBroker:
 
         if self._transport is None:
             raise BrokerNotStartedError("Broker not started. Call start() first.")
+        if self._publish_closed:
+            raise BrokerNotStartedError("Broker is stopping or stopped; publishing is closed. Call start() first.")
 
         publish_fn = self._batch_publisher.publish if self._batch_publisher is not None else self._transport.publish
+        if timeout is None and self._flow_controller is None and not self._publish_middlewares:
+            # Hot path: nothing to wrap, so skip the per-call closures and the
+            # extra coroutine layers below (measurable at ~10k msg/s).
+            return await publish_fn(envelope)  # type: ignore[no-any-return]
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+
+        async def send(env: MessageEnvelope) -> PublishOutcome:
+            if deadline is None:
+                return await publish_fn(env)  # type: ignore[no-any-return]
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return _not_sent(env, PublishReason.ADMISSION_TIMEOUT)
+            return await publish_fn(env, timeout=remaining)  # type: ignore[no-any-return]
 
         async def do_publish(env: MessageEnvelope) -> PublishOutcome:
             fc = self._flow_controller
             if fc is not None:
-                if not await fc.acquire_async():
-                    return PublishOutcome(
-                        status=PublishStatus.ERROR,
-                        exchange=env.exchange,
-                        routing_key=env.routing_key,
-                        error=BackpressureError("publish dropped by backpressure policy"),
+                if deadline is None:
+                    acquired = await fc.acquire_async()
+                else:
+                    acquired = await fc.acquire_async(timeout=max(0.0, deadline - loop.time()))
+                if not acquired:
+                    return _not_sent(
+                        env,
+                        PublishReason.BACKPRESSURE_DROPPED,
+                        BackpressureError("publish dropped by backpressure policy"),
                     )
                 try:
-                    return await publish_fn(env)  # type: ignore[no-any-return]
+                    return await send(env)
                 finally:
                     await fc.release_async()
-            return await publish_fn(env)  # type: ignore[no-any-return]
+            return await send(env)
 
         if self._publish_middlewares:
             chain = self._pipeline.compose_broker_publish_async(self._publish_middlewares)
@@ -883,7 +1224,13 @@ class AsyncBroker:
 
     def _set_lifecycle_gauges(self, *, connected: bool) -> None:
         """Emit the declared-but-previously-missing lifecycle gauges:
-        ``broker_connected``, ``consumer_active`` and ``worker_pool_pending``."""
+        ``broker_connected``, ``consumer_active`` and ``worker_pool_pending``.
+
+        ``connected=True`` (start) then samples every broker gauge, so
+        ``broker_connected`` reflects the connections' real state; it follows
+        drops and reconnects from then on (G-22). ``connected=False`` (stop,
+        failed start, terminal failure) zeroes the sampled gauges.
+        """
         found = self._bulk_metrics()
         if found is None:
             return
@@ -895,6 +1242,42 @@ class AsyncBroker:
         set_gauge(cfg.consumer_active, {}, float(len(self._registry.routes)) if connected else 0.0)
         pool = self._worker_pool
         set_gauge(cfg.worker_pool_pending, {}, float(pool.pending_count) if pool is not None else 0.0)
+        metrics = self._broker_metrics
+        if metrics is None:
+            return
+        if connected:
+            self._sample_metrics()
+        else:
+            metrics.stopped(route.queue.name for route in self._registry.routes)
+
+    def _sample_metrics(self) -> None:
+        """Refresh the sampled broker gauges (G-22): connection state, open
+        channels, publishes and bytes in flight, publisher channels in use,
+        blocked state, per-route consuming and the worker-pool backlog. Runs
+        at start and on every heartbeat tick (``_HEARTBEAT_INTERVAL``), never
+        on the publish or consume hot path."""
+        metrics, transport = self._broker_metrics, self._transport
+        if metrics is None or transport is None:
+            return
+        try:
+            metrics.set_states(transport.connection_states())
+            limiter = transport.byte_limiter
+            metrics.sample(
+                channels_active=transport.channels_active,
+                publish_in_flight=transport.publishes_in_flight,
+                publish_in_flight_bytes=limiter.used if limiter is not None else None,
+                publish_channels_in_use=transport.publish_channels_in_use,
+                connection_blocked=transport.is_blocked,
+                consuming={
+                    route.queue.name: bool(route.consumer_tag) and not route.runtime_state.consumer_cancelled
+                    for route in self._registry.routes
+                },
+            )
+            pool = self._worker_pool
+            if pool is not None:
+                metrics.sample_worker_pool(pool.pending_count)
+        except Exception:  # a metrics sample must never stop the heartbeat loop
+            logger.warning("Sampling broker metrics failed", exc_info=True)
 
     def preflight(
         self,
@@ -935,7 +1318,7 @@ class AsyncBroker:
         the whole operation by ``overall_timeout`` (in-flight items past the
         deadline are reported ``UNKNOWN``, never dropped).
         """
-        if self._transport is None:
+        if self._transport is None or self._publish_closed:
             raise BrokerNotStartedError("Broker not started. Call start() first.")
         opts = options or BulkPublishOptions()
         # Without a batch publisher every in-flight publish holds one pooled
@@ -1054,15 +1437,10 @@ class AsyncBroker:
         try:
             acquired = await fc.acquire_async()
         except BackpressureError as exc:
-            return PublishOutcome(
-                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
-            )
+            return _not_sent(env, PublishReason.BACKPRESSURE_DROPPED, exc)
         if not acquired:
-            return PublishOutcome(
-                status=PublishStatus.ERROR,
-                exchange=env.exchange,
-                routing_key=env.routing_key,
-                error=BackpressureError("publish dropped by backpressure policy"),
+            return _not_sent(
+                env, PublishReason.BACKPRESSURE_DROPPED, BackpressureError("publish dropped by backpressure policy")
             )
         try:
             return await transport.publish(env)  # type: ignore[no-any-return]
@@ -1191,51 +1569,43 @@ class AsyncBroker:
             self._pipeline.clear_caches()
 
     def _wire_reconnect_metric(self) -> None:
-        """Wire the channel-churn counters via the first route
-        ``MetricsMiddleware``'s collector, if any. No-op without metrics.
+        """Wire the broker metrics (:class:`BrokerMetrics`) to the transport's
+        hooks via the first ``MetricsMiddleware`` with a collector: publish
+        middlewares first, then any route (G-22: a publish-only broker gets
+        connection and channel metrics too). No-op without metrics.
 
-        Does NOT wire ``reconnects_total``, unlike the sync broker. 0.14
-        removed it on a measurement that said aio-pika never fires
+        Wires ``reconnects_total`` like the sync broker (G-08). 0.14 removed
+        it on a measurement that said aio-pika never fires
         ``reconnect_callbacks`` for a broker-closed connection; re-measured in
         0.19.2 (aio-pika 9.6.2 and 10.1.0), it does, once per connection and
-        after the consumers are restored. Re-adding the counter is a separate
-        change; ``channel_rebuilds_total`` remains the async churn signal —
-        see ``docs/observability.md``.
+        after the consumers are restored, and a real-broker test now covers it.
 
         ``on_reconnect`` fires for a broker-closed connection and whenever
         rabbitkit REPLACES a connection (a rebuilt publisher connection, a
         lazy re-create).
         """
-        if self._transport is None:
+        self._broker_metrics = None
+        transport = self._transport
+        if transport is None:
             return
-        from rabbitkit.middleware.metrics import MetricsMiddleware
-
-        metrics_mw = next(
-            (
-                mw
-                for route in self._registry.routes
-                for mw in route.route_middlewares
-                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
-            ),
-            None,
-        )
-        if metrics_mw is None or metrics_mw.collector is None:
+        found = self._bulk_metrics()
+        if found is None:
             return
-        collector = metrics_mw.collector
-        logger.info(
-            "Async broker: not emitting %s — aio-pika does not report a broker-initiated "
-            "reconnect, so the series would be permanently 0 while connections flap. "
-            "Alert on %s instead (see docs/observability.md).",
-            metrics_mw.config.reconnects_total,
-            metrics_mw.config.channel_rebuilds_total,
+        collector, cfg = found
+        metrics = BrokerMetrics(collector, cfg, roles=("publisher", "consumer"))
+        self._broker_metrics = metrics
+        transport.on_reconnect(metrics.reconnected)
+        transport.on_channel_opened(metrics.channel_opened)
+        transport.on_channel_rebuilt(metrics.channel_rebuilt)
+        transport.on_connection_state(metrics.connection_state)
+        transport.on_reconnect_attempt(lambda attempt: metrics.reconnect_failed(attempt.role, attempt.error))
+        transport.on_connection_failed(metrics.connection_failed)
+        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_unblocked(lambda: metrics.blocked(False))
+        transport.on_publish_outcome(metrics.publish_outcome)
+        metrics.take_over_confirm_latency(
+            [*self._publish_middlewares, *(mw for route in self._registry.routes for mw in route.route_middlewares)]
         )
-
-        # Item 3: channel open/rebuild counters — same collector, same
-        # no-route-metrics no-op behavior.
-        opened_name = metrics_mw.config.channels_opened_total
-        rebuilt_name = metrics_mw.config.channel_rebuilds_total
-        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
-        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
 
     async def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -1312,6 +1682,10 @@ class AsyncBroker:
             else:
                 source_queue = route.queue
 
+            self._dead_letter_guard.set_target(
+                route.queue.name, source_queue.dead_letter_exchange, source_queue.dead_letter_routing_key
+            )
+
             # Declare queue (with DLQ routing arguments if retry/safety DLX applies)
             if source_queue is route.queue and is_anothers_dlq and route.queue.queue_type == QueueType.QUORUM:
                 # Consuming another route's quorum DLQ: declare it exactly as
@@ -1364,6 +1738,12 @@ class AsyncBroker:
                         broker_version=self._broker_server_version(),
                     )
                 )
+
+    def _notify_passive_only(self) -> None:
+        """[retry/topology hook] PASSIVE_ONLY startup notice (see topology_validation)."""
+        from rabbitkit.core.topology_validation import log_passive_only_limits
+
+        log_passive_only_limits(self._config.topology_mode, self._registry.routes)
 
     def _broker_server_version(self) -> str | None:
         version = getattr(self._transport, "server_version", None)
@@ -1442,9 +1822,109 @@ class AsyncBroker:
             callback = on_message
 
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
+        self._wire_consumer_state()
+        route.runtime_state.consumer_cancelled = False
         consumer_tag = await self._transport.consume(
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+    def _wire_consumer_state(self) -> None:
+        """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
+        transport: Any = self._transport  # set: _start_consumer returns early without one
+        if self._consumer_state_wired is transport:
+            return
+        self._consumer_state_wired = transport
+        transport.on_consumer_cancelled(lambda queue: self._consumer_state_changed(queue, cancelled=True))
+        transport.on_consumer_resumed(lambda queue: self._consumer_state_changed(queue, cancelled=False))
+
+    def _consumer_state_changed(self, queue: str, *, cancelled: bool) -> None:
+        for route in self._registry.routes:
+            if route.queue.name == queue:
+                route.runtime_state.consumer_cancelled = cancelled
+        metrics = self._broker_metrics
+        if metrics is not None:
+            if cancelled:
+                metrics.consumer_cancelled(queue)
+            else:
+                metrics.consumer_resumed(queue)
+        hook = self.on_consumer_cancelled if cancelled else self.on_consumer_resumed
+        if hook is None:
+            return
+        try:
+            hook(queue)
+        except Exception:
+            event = "cancelled" if cancelled else "resumed"
+            logger.warning("on_consumer_%s hook raised (queue=%s)", event, queue, exc_info=True)
+
+    # ── Public topology API (16.6) — additive, retry/topology owner ─────
+
+    async def declare_exchange(self, exchange: RabbitExchange) -> None:
+        """Declare *exchange* — for publish-only services that own their exchange.
+
+        Allowed only under ``TopologyMode.AUTO_DECLARE`` (or, under
+        ``PASSIVE_ONLY``, a ``passive=True`` existence check); otherwise
+        raises :class:`~rabbitkit.core.errors.ConfigurationError`. A conflicting
+        existing exchange raises with the conflicting argument named.
+        """
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_exchange", passive=exchange.passive)
+        await self._started_transport().declare_exchange(exchange)
+
+    async def declare_queue(self, queue: RabbitQueue) -> None:
+        """Declare *queue* exactly as given (no retry/safety arguments added).
+
+        Same topology-mode rules as :meth:`declare_exchange`."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_queue", passive=queue.passive)
+        await self._started_transport().declare_queue(queue)
+
+    async def bind_queue(
+        self, queue: str, exchange: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind *queue* to *exchange*. ``AUTO_DECLARE`` only (a binding is always a write)."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_queue")
+        await self._started_transport().bind_queue(
+            queue=queue, exchange=exchange, routing_key=routing_key, arguments=arguments
+        )
+
+    async def bind_exchange(
+        self, destination: str, source: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind exchange *destination* to *source*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_exchange")
+        await self._started_transport().bind_exchange(
+            destination=destination, source=source, routing_key=routing_key, arguments=arguments
+        )
+
+    async def verify_topology(self, management_client: Any | None = None, *, vhost: str | None = None) -> Any:
+        """Check the broker's topology against this application's routes
+        (type, durability, arguments, dead-letter path, bindings). Read-only
+        in every mode; runs the management client off the event loop. Without
+        a client, every check AMQP cannot make is reported ``UNVERIFIED``.
+
+        Returns a :class:`~rabbitkit.core.topology_validation.TopologyReport`;
+        call ``report.raise_for_failures()`` to fail startup on drift.
+        """
+        from rabbitkit.core.topology_validation import verify_topology
+
+        return await asyncio.to_thread(
+            verify_topology,
+            list(self._registry.routes),
+            management_client=management_client,
+            vhost=vhost if vhost is not None else self._config.connection.vhost,
+            broker_retry=self._config.retry,
+        )
+
+    def _started_transport(self) -> Any:
+        if self._transport is None:
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
+        return self._transport

@@ -1,0 +1,288 @@
+# Prometheus alerting rules for services that use rabbitkit (G-23).
+#
+# A plain Prometheus rules file: load it with `rule_files:` or wrap the
+# `groups:` list in a PrometheusRule (`spec: {groups: [...]}`) for the
+# Prometheus Operator. Validate and behaviour-test it with promtool:
+#
+#   promtool check rules deploy/prometheus/rabbitkit-alerts.yaml
+#   promtool test rules deploy/prometheus/tests/rabbitkit-alerts.test.yaml
+#
+# Inputs:
+#   * rabbitkit_* metrics: emitted by a service with a MetricsMiddleware and a
+#     collector (see docs/observability.md). Queue-depth rules also need a
+#     QueueMetricsPoller (rabbitkit_queue_* gauges).
+#   * rabbitmq_* metrics (group "rabbitmq-broker"): emitted by the BROKER's
+#     rabbitmq_prometheus plugin, not by rabbitkit. Check the names against
+#     your RabbitMQ version before relying on them.
+#
+# THRESHOLDS ARE PLACEHOLDERS. They are starting points, not measured values:
+# tune every threshold and `for:` from your own workloads (traffic, normal
+# failure rates, backlog sizes) before paging anyone on them.
+#
+# Runbooks: docs/runbooks/*.md, published under runbooks/ on the docs site.
+
+groups:
+  - name: rabbitkit-publisher
+    rules:
+      - alert: PublisherConfirmFailures
+        expr: |
+          sum by (job, exchange) (
+            rate(rabbitkit_messages_published_total{status=~"nacked|error"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publishes to {{ $labels.exchange }} are nacked or refused by RabbitMQ"
+          description: >-
+            {{ $labels.job }} gets NACKED or ERROR publish outcomes on exchange
+            {{ $labels.exchange }} ({{ $value | humanize }}/s). The broker did not
+            accept these messages. Break down by the `reason` label of
+            rabbitkit_messages_published_total. Threshold is a placeholder; tune it
+            from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/publisher-confirm-timeout/
+
+      - alert: PublisherUnknownOutcomes
+        expr: |
+          sum by (job, exchange) (
+            rate(rabbitkit_messages_published_total{status=~"unknown|timeout"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publishes to {{ $labels.exchange }} have an unknown outcome"
+          description: >-
+            {{ $labels.job }} has publishes whose confirm never arrived (TIMEOUT) or whose
+            connection was lost after sending (UNKNOWN), {{ $value | humanize }}/s. The
+            broker may or may not hold these messages: republish only with the same
+            message_id. Threshold is a placeholder; tune it from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/publisher-confirm-timeout/
+
+      - alert: PublisherUnroutableMessages
+        expr: |
+          sum by (job, exchange, reason) (
+            rate(rabbitkit_publish_routing_failures_total[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publishes to {{ $labels.exchange }} cannot be routed ({{ $labels.reason }})"
+          description: >-
+            {{ $labels.job }} publishes to {{ $labels.exchange }} that RabbitMQ returned as
+            unroutable or refused because the exchange does not exist
+            ({{ $value | humanize }}/s). Includes retry and dead-letter copies.
+            Threshold is a placeholder; tune it from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/unroutable/
+
+  - name: rabbitkit-connection
+    rules:
+      - alert: RabbitMQBrokerUnavailable
+        expr: rabbitkit_broker_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) is not connected to RabbitMQ"
+          description: >-
+            At least one of the service's RabbitMQ connections has been down for 2
+            minutes (see rabbitkit_connection_up by role). Placeholder duration; tune
+            it from measured reconnect times.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/broker-unavailable/
+
+      - alert: RabbitMQConnectionFailures
+        expr: |
+          sum by (job, instance, role) (
+            increase(rabbitkit_reconnect_attempts_total[10m])
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} keeps failing to reconnect its {{ $labels.role }} connection"
+          description: >-
+            {{ $value | humanize }} failed reconnect attempts in 10 minutes, for 10
+            minutes. See rabbitkit_connection_failures_total{reason} for why.
+            Threshold is a placeholder; tune it from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/connection-storm/
+
+      - alert: RabbitMQConnectionTerminalFailure
+        expr: |
+          sum by (job, instance, role, reason) (
+            increase(rabbitkit_connection_failures_total{reason=~"authentication_failed|vhost_access_refused|tls_verification_failed|tls_handshake_rejected|reconnect_budget_exhausted"}[10m])
+          ) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} stopped reconnecting to RabbitMQ for good ({{ $labels.reason }})"
+          description: >-
+            A {{ $labels.role }} connection gave up: retrying cannot fix
+            {{ $labels.reason }}. The process needs a restart after the cause is fixed
+            (AsyncBroker.run() exits on its own).
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/connection-storm/
+
+      - alert: RabbitMQConnectionBlocked
+        expr: max by (job, instance) (rabbitkit_connection_blocked) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ is blocking publishes from {{ $labels.job }} (memory or disk alarm)"
+          description: >-
+            RabbitMQ sent connection.blocked: a memory or disk alarm is active on the
+            cluster and every publishing connection is paused. This is the client-side
+            view of RabbitMQDiskAlarm / RabbitMQMemoryAlarm; the rabbitmq-broker group
+            below says which alarm. Placeholder duration.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/
+
+  - name: rabbitkit-consumer
+    rules:
+      - alert: ConsumerProcessingFailures
+        expr: |
+          (
+            sum by (job, queue) (rate(rabbitkit_messages_consumed_total{status="error"}[5m]))
+            /
+            sum by (job, queue) (rate(rabbitkit_messages_consumed_total[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of handler runs on {{ $labels.queue }} fail"
+          description: >-
+            {{ $value | humanizePercentage }} of handler executions on {{ $labels.queue }}
+            raise. rabbitkit_messages_failed_total{category} says why. 5% is a
+            placeholder; tune it from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-failures/
+
+      - alert: ConsumerNotConsuming
+        expr: rabbitkit_route_consuming == 0 and on (job, instance) rabbitkit_broker_connected == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The consumer of {{ $labels.queue }} is not subscribed"
+          description: >-
+            The broker is connected but the route's consumer is not subscribed,
+            usually because RabbitMQ cancelled it (queue deleted, quorum leader
+            change). See rabbitkit_consumer_cancelled_total. Placeholder duration.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-failures/
+
+      - alert: ConsumerBacklogGrowing
+        expr: |
+          max by (queue) (rabbitkit_queue_messages_ready) > 1000
+          and
+          max by (queue) (deriv(rabbitkit_queue_messages_ready[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backlog on {{ $labels.queue }} keeps growing"
+          description: >-
+            {{ $labels.queue }} has more than 1000 ready messages and the backlog has
+            grown for 15 minutes: consumers are slower than producers or stalled.
+            Needs a QueueMetricsPoller. Thresholds are placeholders; tune them from
+            measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-backlog/
+
+      - alert: ConsumerUnackedHigh
+        expr: max by (queue) (rabbitkit_queue_messages_unacked) > 5000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} messages delivered but not acked on {{ $labels.queue }}"
+          description: >-
+            Consumers hold many unacked deliveries for 15 minutes: handlers are stuck
+            or slow, or prefetch is too high for the handler time. Needs a
+            QueueMetricsPoller. Threshold is a placeholder; tune it from measured
+            workloads (prefetch x consumers is the normal ceiling).
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/consumer-backlog/
+
+      - alert: DeadLetterQueueGrowing
+        expr: |
+          sum by (job, queue) (increase(rabbitkit_messages_dead_lettered_total[15m])) > 0
+          or
+          max by (queue) (delta(rabbitkit_queue_messages_ready{queue=~".+\\.dlq|rabbitkit\\.dlq"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Messages keep reaching the dead-letter queue of {{ $labels.queue }}"
+          description: >-
+            Terminal failures are being dead-lettered (or a DLQ backlog grows). Every
+            one needs a decision: fix and replay, or discard. Thresholds are
+            placeholders; tune them from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/dlq-growth/
+
+      - alert: RetryStormDetected
+        expr: |
+          (
+            sum by (job, queue) (rate(rabbitkit_messages_retried_total[5m]))
+            /
+            sum by (job, queue) (rate(rabbitkit_messages_consumed_total[5m]))
+          ) > 0.5
+          or
+          max by (job, queue) (rabbitkit_retry_handoff_paused) == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retry storm on {{ $labels.queue }}"
+          description: >-
+            More than half of the handler runs on {{ $labels.queue }} are retried, or
+            the retry handoff is paused because the delay queue cannot be reached.
+            50% is a placeholder; tune it from measured workloads.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/retry-storm/
+
+  # ── Broker-side rules: need the RabbitMQ rabbitmq_prometheus plugin ──
+  # These metrics are exported by RabbitMQ itself (port 15692), not by
+  # rabbitkit. Verify the names against your RabbitMQ version.
+  - name: rabbitmq-broker
+    rules:
+      - alert: RabbitMQDiskAlarm
+        expr: max by (rabbitmq_cluster, rabbitmq_node) (rabbitmq_alarms_free_disk_space_watermark) == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: rabbitmq_prometheus
+        annotations:
+          summary: "RabbitMQ disk alarm on {{ $labels.rabbitmq_node }}"
+          description: >-
+            Free disk space fell below the watermark; RabbitMQ blocks every publisher in
+            the cluster. Needs the rabbitmq_prometheus plugin. Clients see it as
+            rabbitkit_connection_blocked == 1.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/
+
+      - alert: RabbitMQMemoryAlarm
+        expr: max by (rabbitmq_cluster, rabbitmq_node) (rabbitmq_alarms_memory_used_watermark) == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: rabbitmq_prometheus
+        annotations:
+          summary: "RabbitMQ memory alarm on {{ $labels.rabbitmq_node }}"
+          description: >-
+            Memory use crossed the high watermark; RabbitMQ blocks every publisher in
+            the cluster. Needs the rabbitmq_prometheus plugin. Clients see it as
+            rabbitkit_connection_blocked == 1.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/flow-control/
+
+      - alert: RabbitMQQuorumUnhealthy
+        expr: |
+          count by (rabbitmq_cluster) (rabbitmq_identity_info) < 3
+          or
+          sum by (rabbitmq_cluster) (increase(rabbitmq_raft_term_total[10m])) > 3
+        for: 5m
+        labels:
+          severity: critical
+          source: rabbitmq_prometheus
+        annotations:
+          summary: "Quorum queues in {{ $labels.rabbitmq_cluster }} may be unavailable"
+          description: >-
+            Fewer RabbitMQ nodes report than the expected cluster size (3 here: set it
+            to yours; a quorum queue needs a majority of its members), or Raft leader
+            elections churn. Needs the rabbitmq_prometheus plugin (rabbitmq_identity_info,
+            rabbitmq_raft_term_total). Thresholds are placeholders.
+          runbook_url: https://talaatmagdyx.github.io/rabbitkit/runbooks/quorum-unavailable/

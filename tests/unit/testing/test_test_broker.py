@@ -30,6 +30,20 @@ class TestRegistration:
 
         assert hasattr(handle, "mock")
 
+    def test_subscriber_returns_the_handler_itself_still_callable(self) -> None:
+        from rabbitkit.testing import MockedHandler
+
+        broker = TestBroker()
+
+        def handle(body: bytes) -> bytes:
+            return body.upper()
+
+        registered: MockedHandler[[bytes], bytes] = broker.subscriber(queue="orders")(handle)
+
+        assert registered is handle
+        assert registered(b"direct") == b"DIRECT"
+        registered.mock.assert_not_called()
+
     def test_multiple_subscribers(self) -> None:
         broker = TestBroker()
 

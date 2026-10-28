@@ -17,11 +17,40 @@ from urllib.parse import quote
 
 from rabbitkit._version import __version__
 from rabbitkit.core.config import ConnectionConfig, SecurityConfig, SSLConfig
+from rabbitkit.core.errors import (
+    AuthenticationFailedError,
+    PermanentConnectionError,
+    TLSVerificationError,
+    VhostAccessRefusedError,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ── Transport-specific connection errors ──────────────────────────────────
+
+
+def get_infrastructure_errors() -> tuple[type[BaseException], ...]:
+    """aio-pika / aiormq errors that mean "the broker (a dependency) is
+    unavailable": connection loss and channel closure.
+
+    Registered with :func:`rabbitkit.core.errors.register_infrastructure_errors`
+    by :class:`~rabbitkit.async_.broker.AsyncBroker`, so a handler that hits
+    one (e.g. while publishing) is classified ``INFRASTRUCTURE`` and retried
+    instead of dead-lettered. ``ChannelClosed`` is aiormq's base for every
+    channel-level close, so a 403/404/406 raised inside a handler is retried
+    too (bounded by the route's ``RetryConfig``). Empty when aio-pika is not
+    installed.
+    """
+    try:
+        import aiormq.exceptions
+    except ImportError:
+        return ()
+    return (
+        aiormq.exceptions.AMQPConnectionError,
+        aiormq.exceptions.ChannelClosed,
+        aiormq.exceptions.ChannelInvalidStateError,
+    )
 
 
 def get_connection_errors() -> tuple[type[BaseException], ...]:
@@ -50,6 +79,147 @@ def get_connection_errors() -> tuple[type[BaseException], ...]:
         return aio_pika_errors + base_errors
     except (ImportError, AttributeError):
         return base_errors
+
+
+# ── Permanent connect failures (G-08) ─────────────────────────────────────
+
+# OpenSSL reasons for a handshake that fails the same way on every retry: the
+# broker rejected the client certificate, no protocol/cipher in common, or the
+# port does not speak TLS at all. Transient handshake failures (a reset or EOF
+# while the broker restarts) carry other reasons and stay retryable.
+_PERMANENT_TLS_REASONS = frozenset(
+    {
+        "TLSV1_ALERT_UNKNOWN_CA",
+        "TLSV1_ALERT_ACCESS_DENIED",
+        "TLSV1_ALERT_PROTOCOL_VERSION",
+        "TLSV13_ALERT_CERTIFICATE_REQUIRED",
+        "SSLV3_ALERT_BAD_CERTIFICATE",
+        "SSLV3_ALERT_CERTIFICATE_EXPIRED",
+        "SSLV3_ALERT_CERTIFICATE_REVOKED",
+        "SSLV3_ALERT_CERTIFICATE_UNKNOWN",
+        "SSLV3_ALERT_UNSUPPORTED_CERTIFICATE",
+        "SSLV3_ALERT_HANDSHAKE_FAILURE",
+        "WRONG_VERSION_NUMBER",
+        "UNSUPPORTED_PROTOCOL",
+        "NO_PROTOCOLS_AVAILABLE",
+    }
+)
+
+
+def _connection_open_refusal(exc: BaseException) -> tuple[int | None, str] | None:
+    """``(reply_code, reply_text)`` if *exc* is the broker refusing ``connection.open``.
+
+    RabbitMQ answers ``connection.open`` for a missing vhost, or one the user
+    has no permissions on, with ``connection.close`` 530 NOT_ALLOWED. aiormq
+    checks the frame type first, so this surfaces as a frame-type error, not
+    as ``ConnectionClosed``: aiormq 6 raises ``AMQPInternalError("one of
+    ['Connection.OpenOk']", <Close frame>)``, aiormq 7 raises
+    ``InvalidFrameError`` whose message names both frames (and loses the reply
+    code, hence ``None``).
+    """
+    first = str(exc.args[0]) if exc.args else ""
+    for arg in exc.args[1:]:
+        if getattr(arg, "name", None) == "Connection.Close" and "Connection.OpenOk" in first:
+            return getattr(arg, "reply_code", None), str(getattr(arg, "reply_text", "") or "")
+    if "Connection.OpenOk" in first and "Connection.Close" in first:
+        return None, ""
+    return None
+
+
+# aiormq 7 wraps a transport OSError (including ssl errors) in
+# AMQPConnectionError(...) from the original: look a few causes deep.
+_MAX_CAUSE_DEPTH = 4
+
+
+def permanent_failure_reason(exc: BaseException) -> str | None:
+    """Reason code if a connect attempt failed in a way retrying cannot fix.
+
+    ``"authentication_failed"``, ``"vhost_access_refused"``,
+    ``"tls_verification_failed"``, ``"tls_handshake_rejected"`` or ``None``
+    (transient: refused, reset, timeout, broker shutting down, ...). A
+    ``NOT_ALLOWED`` that says the vhost "is down" (its process is restarting)
+    stays transient. *exc* and its ``__cause__`` chain are inspected.
+    """
+    found = _find_permanent(exc)
+    return None if found is None else found[0]
+
+
+def _find_permanent(exc: BaseException) -> tuple[str, BaseException] | None:
+    current: BaseException | None = exc
+    for _ in range(_MAX_CAUSE_DEPTH):
+        if current is None:
+            return None
+        reason = _permanent_reason(current)
+        if reason is not None:
+            return reason, current
+        current = current.__cause__
+    return None
+
+
+def _permanent_reason(exc: BaseException) -> str | None:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "tls_verification_failed"
+    if isinstance(exc, ssl.SSLError) and getattr(exc, "reason", None) in _PERMANENT_TLS_REASONS:
+        return "tls_handshake_rejected"
+    try:
+        from aiormq.exceptions import AuthenticationError, ConnectionClosed, ProbableAuthenticationError
+    except ImportError:  # pragma: no cover — aiormq ships with aio-pika
+        return None
+    if isinstance(exc, (ProbableAuthenticationError, AuthenticationError)):
+        return "authentication_failed"
+    if isinstance(exc, ConnectionClosed) and exc.args and exc.args[0] == 403:
+        return "authentication_failed"
+    refusal = _connection_open_refusal(exc)
+    if refusal is not None:
+        code, text = refusal
+        if code in (None, 530) and "is down" not in text.lower():
+            return "vhost_access_refused"
+    return None
+
+
+def permanent_connection_error(exc: BaseException, *, endpoint: str, vhost: str) -> PermanentConnectionError | None:
+    """The typed, actionable error for a permanent connect failure, else ``None``.
+
+    Messages name the endpoint and vhost, never the username or password.
+    The caller chains *exc* as the cause.
+    """
+    found = _find_permanent(exc)
+    if found is None:
+        return None
+    reason, exc = found
+    if reason == "authentication_failed":
+        return AuthenticationFailedError(
+            f"RabbitMQ at {endpoint} refused the login (ACCESS_REFUSED). Check the username and "
+            "password (or what ConnectionConfig.credentials_provider returns); retrying with the "
+            "same credentials cannot succeed.",
+            reason=reason,
+            endpoint=endpoint,
+        )
+    if reason == "vhost_access_refused":
+        return VhostAccessRefusedError(
+            f"RabbitMQ at {endpoint} refused access to vhost {vhost!r} (NOT_ALLOWED): the vhost does "
+            "not exist or the user has no permissions on it. Create the vhost or grant the user "
+            "permissions (rabbitmqctl set_permissions).",
+            reason=reason,
+            endpoint=endpoint,
+        )
+    if reason == "tls_verification_failed":
+        detail = getattr(exc, "verify_message", None) or type(exc).__name__
+        return TLSVerificationError(
+            f"TLS certificate verification failed for {endpoint}: {detail}. Check "
+            "SSLConfig.ca_certs (the CA that signed the broker certificate) and "
+            "SSLConfig.server_hostname (the name in the certificate).",
+            reason=reason,
+            endpoint=endpoint,
+        )
+    # tls_handshake_rejected
+    return TLSVerificationError(
+        f"TLS handshake with {endpoint} failed ({getattr(exc, 'reason', None)}): the broker "
+        "rejected the client certificate, no TLS version is shared, or the port does not "
+        "speak TLS. Check SSLConfig and the broker's listener.",
+        reason=reason,
+        endpoint=endpoint,
+    )
 
 
 class _PinnedHostnameSSLContext(ssl.SSLContext):
@@ -201,16 +371,13 @@ def make_aio_pika_connect_kwargs(
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}heartbeat={connection.heartbeat}"
 
-    # H4: aio-pika's connect_robust uses a FIXED reconnect_interval — no
-    # exponential backoff. A fleet of consumers restarted together (e.g. a
-    # broker bounce under 200 pods) would otherwise retry in lockstep every
-    # `reconnect_backoff_base` seconds, hammering the recovering node in a
-    # thundering herd. We can't inject exponential backoff into connect_robust,
-    # but randomizing the interval PER PROCESS (full jitter over
-    # [base, min(base*2, backoff_max)]) de-synchronizes the herd so retries
-    # spread across the window instead of arriving as a spike. Each process
-    # picks its interval once at connect time; `random` needs no seeding for
-    # inter-process spread since PYTHONHASHSEED/os entropy differ per process.
+    # H4 / G-08: this is only aio-pika's STEADY-STATE interval: its pause
+    # after a successful (re)connect and between consumer-restore retries.
+    # The delay after each FAILED reconnect attempt is set per attempt by
+    # rabbitkit's RobustConnection subclass (async_/reconnect.py): exponential
+    # backoff with full jitter. The steady interval is still randomized per
+    # process over [base, min(base*2, backoff_max)] so a fleet restarted
+    # together does not pause in lockstep.
     base = connection.reconnect_backoff_base
     jitter_span = max(0.0, min(base, connection.reconnect_backoff_max - base))
     jittered_interval = base + random.uniform(0.0, jitter_span)  # noqa: S311 — jitter, not crypto

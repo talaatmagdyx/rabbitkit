@@ -138,3 +138,21 @@ class TestExceptionMiddlewareAsync:
 
         with pytest.raises(RuntimeError, match="terminal"):
             await mw.consume_scope_async(fail, msg)
+
+
+def test_terminal_log_is_sanitized(caplog: pytest.LogCaptureFixture) -> None:
+    """F30: the terminal log must not print raw exception text."""
+    import logging
+
+    from rabbitkit.core.message import RabbitMessage
+    from rabbitkit.middleware.exception import ExceptionMiddleware
+
+    exc = ValueError("db url postgres://app:hunter2@db/x")
+    exc._rabbitkit_terminal = True  # type: ignore[attr-defined]
+
+    def handler(m: RabbitMessage) -> None:
+        raise exc
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ValueError):
+        ExceptionMiddleware().consume_scope(handler, RabbitMessage(body=b"{}"))
+    assert "Terminal exception" in caplog.text and "hunter2" not in caplog.text

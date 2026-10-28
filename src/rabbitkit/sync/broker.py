@@ -32,14 +32,20 @@ from rabbitkit.core.config import (
     RetryDisabled,
     WorkerConfig,
 )
-from rabbitkit.core.errors import BackpressureError, BrokerNotStartedError, MessageTooLargeError
+from rabbitkit.core.errors import (
+    BackpressureError,
+    BrokerNotStartedError,
+    MessageTooLargeError,
+    register_infrastructure_errors,
+)
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.path import extract_path, to_binding_key
 from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.quorum import dlq_delivery_limit
-from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.registry import HandlerT, SubscriberRegistry
+from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
@@ -47,6 +53,7 @@ from rabbitkit.core.types import (
     AckPolicy,
     MessageEnvelope,
     PublishOutcome,
+    PublishReason,
     PublishStatus,
     QueueType,
     ReliabilityProfile,
@@ -54,9 +61,10 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.middleware.base import BaseMiddleware
+from rabbitkit.middleware.metrics import BrokerMetrics
 from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
 from rabbitkit.serialization.base import Serializer
-from rabbitkit.sync.connection import get_connection_errors
+from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
 from rabbitkit.sync.transport import SyncTransport
 
 if TYPE_CHECKING:
@@ -100,20 +108,45 @@ class SyncBroker:
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
         self._publish_middlewares: list[BaseMiddleware] = middlewares or []
+        # G-19: PublisherConfig.strip_reserved_headers (None = off).
+        self._reserved_header_stripper: ReservedHeaderStripper | None = (
+            ReservedHeaderStripper(extra=(self._config.retry.retry_header,) if self._config.retry is not None else ())
+            if self._config.publisher.strip_reserved_headers
+            else None
+        )
         # Private mutable view of consumer config — brokers may apply a
         # prefetch override derived from WorkerConfig.prefetch_per_worker.
         # Stored separately so the caller's frozen RabbitConfig is never mutated.
         self._consumer_config = self._config.consumer
 
         self._registry = SubscriberRegistry(broker_retry=self._config.retry)
+        # The client library's connection/channel errors classify as
+        # INFRASTRUCTURE (retried) — core/ cannot import them itself.
+        register_infrastructure_errors(*get_infrastructure_errors())
         self._pipeline = HandlerPipeline(
             serializer=serializer,
             di_resolver=di_resolver,
             context_repo=context_repo,
             reject_transient_on_redelivery=self._config.consumer.reject_transient_on_redelivery,
+            manual_settle_on_error=self._config.consumer.manual_settle_on_error,
+            max_body_bytes=self._config.consumer.max_body_bytes,
         )
+        if self._config.consumer.processing_timeout is not None:
+            logger.warning(
+                "ConsumerConfig.processing_timeout=%s is not enforced by SyncBroker (a running "
+                "thread cannot be interrupted); use TimeoutMiddleware for sync handlers.",
+                self._config.consumer.processing_timeout,
+            )
+        if self._config.safety.dead_letter_with_metadata:
+            logger.warning(
+                "SafetyConfig.dead_letter_with_metadata is applied by AsyncBroker only: SyncBroker dead-letters "
+                "failures RetryMiddleware did not handle by a reject, so their DLQ entry carries only x-death."
+            )
 
         self._transport: SyncTransport | None = None
+        # G-22: connection/channel/flow-control metrics (see AsyncBroker).
+        self._broker_metrics: BrokerMetrics | None = None
+        self._metrics_sampled_at = 0.0
         self._worker_pool: SyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
@@ -213,7 +246,7 @@ class SyncBroker:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
             queue=queue,
@@ -236,7 +269,7 @@ class SyncBroker:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 
@@ -272,7 +305,7 @@ class SyncBroker:
         if self._config.logging is not None:
             from rabbitkit.core.logging import configure_structlog
 
-            configure_structlog(self._config.logging)
+            configure_structlog(self._config.logging, override_existing=self._config.logging.override_existing)
 
         # Create transport
         self._transport = SyncTransport(
@@ -287,9 +320,12 @@ class SyncBroker:
         # Reconnect-attempts bound: previously hardcoded on the transport
         # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
         self._transport.max_reconnect_attempts = self._config.connection.reconnect_max_attempts
+        # Before connect(), so the first connection and channel count (G-22).
+        self._wire_reconnect_metric()
 
         self._transport.connect()
         self._transport.on_io_tick(self._mark_heartbeat)
+        self._transport.on_io_tick(self._sample_metrics_throttled)
 
         # Wire an opt-in FlowController's blocked/unblocked callbacks to the
         # transport now that it exists (C-6).
@@ -307,13 +343,11 @@ class SyncBroker:
 
         # Declare topology
         self._declare_topology()
+        self._notify_passive_only()
 
         # Install RetryMiddleware on retry-enabled routes (topology alone does
         # not retry — the middleware routes failures into the delay queues).
         self._wire_retry_middleware()
-
-        # Connection-churn counter: reconnects were logged but never counted.
-        self._wire_reconnect_metric()
 
         # H2: single-worker sync consumers run the handler INLINE on the pika
         # I/O thread, so nothing services heartbeat frames while a handler
@@ -536,7 +570,7 @@ class SyncBroker:
                     break
                 except connection_errors as exc:
                     logger.warning("consumer connection lost; recovering", error=str(exc))
-                    self._recover_consumers()
+                    self._recover_consumers(exc)
         finally:
             self._restore_signal_handlers()
             self.stop()
@@ -581,6 +615,7 @@ class SyncBroker:
         content_type: str = "application/json",
         correlation_id: str | None = None,
         reply_to: str | None = None,
+        message_id: str | None = None,
     ) -> PublishOutcome:
         """Publish a message.
 
@@ -616,7 +651,13 @@ class SyncBroker:
         BlockingConnection serializes confirms, it cannot pipeline them. To
         drain a large backlog fast, use AsyncBroker + AsyncBatchPublisher
         (pipelined confirms, ~6.1k msg/s) or more processes.
+
+        ``message_id`` (kwargs form only) sets the AMQP message id instead of
+        a fresh uuid4, so the same logical message can be republished after
+        an unknown outcome and deduplicated downstream.
         """
+        if envelope is not None and message_id is not None:
+            raise ValueError("message_id applies to the kwargs form; set MessageEnvelope.message_id instead")
         if envelope is None:
             import json as _json
 
@@ -641,6 +682,13 @@ class SyncBroker:
                 mandatory=self._config.publisher.mandatory,
                 delivery_mode=2 if self._config.publisher.persistent else 1,
             )
+            if message_id is not None:
+                envelope = replace(envelope, message_id=message_id)
+
+        # G-19: an application publish cannot carry rabbitkit's retry/DLQ
+        # bookkeeping headers (opt-in; the library's own republishes bypass this).
+        if self._reserved_header_stripper is not None:
+            envelope = self._reserved_header_stripper(envelope)
 
         # M10: reject oversized bodies at publish time (input validation at
         # the trust boundary — a too-large message is a programming/policy
@@ -664,10 +712,11 @@ class SyncBroker:
                 if not fc.acquire():
                     # Dropped by backpressure policy (drop/timeout). Do not publish.
                     return PublishOutcome(
-                        status=PublishStatus.ERROR,
+                        status=PublishStatus.NOT_SENT,
                         exchange=env.exchange,
                         routing_key=env.routing_key,
                         error=BackpressureError("publish dropped by backpressure policy"),
+                        reason=PublishReason.BACKPRESSURE_DROPPED,
                     )
                 try:
                     return transport.publish(env)
@@ -735,6 +784,43 @@ class SyncBroker:
         set_gauge(cfg.consumer_active, {}, float(len(self._registry.routes)) if connected else 0.0)
         pool = self._worker_pool
         set_gauge(cfg.worker_pool_pending, {}, float(pool.pending_count) if pool is not None else 0.0)
+        metrics = self._broker_metrics
+        if metrics is None:
+            return
+        if connected:
+            self._sample_metrics()
+        else:
+            metrics.stopped(route.queue.name for route in self._registry.routes)
+
+    _METRICS_SAMPLE_INTERVAL: float = 5.0
+
+    def _sample_metrics_throttled(self) -> None:
+        """I/O-tick hook: sample at most every ``_METRICS_SAMPLE_INTERVAL``."""
+        if self._broker_metrics is None:
+            return
+        now = time.monotonic()
+        if now - self._metrics_sampled_at >= self._METRICS_SAMPLE_INTERVAL:
+            self._metrics_sampled_at = now
+            self._sample_metrics()
+
+    def _sample_metrics(self) -> None:
+        """Refresh the sampled broker gauges (G-22): connection state, open
+        channels, blocked state, per-route consuming, worker-pool backlog."""
+        metrics, transport = self._broker_metrics, self._transport
+        if metrics is None or transport is None:
+            return
+        try:
+            metrics.set_states({"shared": transport.is_connected()})
+            metrics.sample(
+                channels_active=transport.channels_active,
+                connection_blocked=transport.is_blocked,
+                consuming={route.queue.name: bool(route.consumer_tag) for route in self._registry.routes},
+            )
+            pool = self._worker_pool
+            if pool is not None:
+                metrics.sample_worker_pool(pool.pending_count)
+        except Exception:  # a metrics sample must never break the I/O loop
+            logger.warning("Sampling broker metrics failed", exc_info=True)
 
     def preflight(
         self,
@@ -880,8 +966,9 @@ class SyncBroker:
         the existing safe nack+requeue-on-publish-failure behavior both paths
         already implement. So regardless of the configured policy, a
         blocked/dropped slot here always resolves as a failed
-        ``PublishOutcome`` (status=ERROR), never an exception — the same
-        outcome shape a real transport failure already produces.
+        ``PublishOutcome`` (status=NOT_SENT, reason ``backpressure_dropped``),
+        never an exception — the same outcome shape a real transport failure
+        already produces.
         """
         if self._transport is None:  # pragma: no cover — defensive; callers only run while consuming
             raise BrokerNotStartedError("Broker not started. Call start() first.")
@@ -893,14 +980,19 @@ class SyncBroker:
             acquired = fc.acquire()
         except BackpressureError as exc:
             return PublishOutcome(
-                status=PublishStatus.ERROR, exchange=env.exchange, routing_key=env.routing_key, error=exc
+                status=PublishStatus.NOT_SENT,
+                exchange=env.exchange,
+                routing_key=env.routing_key,
+                error=exc,
+                reason=PublishReason.BACKPRESSURE_DROPPED,
             )
         if not acquired:
             return PublishOutcome(
-                status=PublishStatus.ERROR,
+                status=PublishStatus.NOT_SENT,
                 exchange=env.exchange,
                 routing_key=env.routing_key,
                 error=BackpressureError("publish dropped by backpressure policy"),
+                reason=PublishReason.BACKPRESSURE_DROPPED,
             )
         try:
             return transport.publish(env)
@@ -931,11 +1023,11 @@ class SyncBroker:
 
     # ── Internal ──────────────────────────────────────────────────────────
 
-    def _recover_consumers(self) -> None:
+    def _recover_consumers(self, cause: BaseException | None = None) -> None:
         """Reconnect and re-establish topology + subscriptions after a drop."""
         if self._transport is None:
             return
-        self._transport.reconnect()
+        self._transport.reconnect(cause)
         self._declare_topology()
         for route in self._registry.routes:
             self._start_consumer(route)
@@ -1024,35 +1116,33 @@ class SyncBroker:
             self._pipeline.clear_caches()
 
     def _wire_reconnect_metric(self) -> None:
-        """Count transport reconnects (connection churn) via the first route
-        ``MetricsMiddleware``'s collector, if any. Reconnects were logged but
-        never counted, so a flapping broker/network was invisible to
-        metrics-based alerting. No-op when no route carries metrics."""
-        if self._transport is None:
+        """Wire the broker metrics (:class:`BrokerMetrics`) to the transport's
+        hooks via the first ``MetricsMiddleware`` with a collector: publish
+        middlewares first, then any route (G-22: a publish-only broker gets
+        connection and channel metrics too). No-op without metrics. The sync
+        broker has one connection, reported as role ``"shared"``.
+        """
+        self._broker_metrics = None
+        transport = self._transport
+        if transport is None:
             return
-        from rabbitkit.middleware.metrics import MetricsMiddleware
-
-        metrics_mw = next(
-            (
-                mw
-                for route in self._registry.routes
-                for mw in route.route_middlewares
-                if isinstance(mw, MetricsMiddleware) and mw.collector is not None
-            ),
-            None,
+        found = self._bulk_metrics()
+        if found is None:
+            return
+        collector, cfg = found
+        metrics = BrokerMetrics(collector, cfg, roles=("shared",))
+        self._broker_metrics = metrics
+        transport.on_reconnect(metrics.reconnected)
+        transport.on_channel_opened(metrics.channel_opened)
+        transport.on_channel_rebuilt(metrics.channel_rebuilt)
+        transport.on_connection_state(metrics.connection_state)
+        transport.on_reconnect_attempt(lambda _attempt, error: metrics.reconnect_failed("shared", error))
+        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_unblocked(lambda: metrics.blocked(False))
+        transport.on_publish_outcome(metrics.publish_outcome)
+        metrics.take_over_confirm_latency(
+            [*self._publish_middlewares, *(mw for route in self._registry.routes for mw in route.route_middlewares)]
         )
-        if metrics_mw is None or metrics_mw.collector is None:
-            return
-        collector = metrics_mw.collector
-        metric_name = metrics_mw.config.reconnects_total
-        self._transport.on_reconnect(lambda: collector.inc_counter(metric_name, {}))
-
-        # Item 3: channel open/rebuild counters — same collector, same
-        # no-route-metrics no-op behavior as the reconnect hook above.
-        opened_name = metrics_mw.config.channels_opened_total
-        rebuilt_name = metrics_mw.config.channel_rebuilds_total
-        self._transport.on_channel_opened(lambda: collector.inc_counter(opened_name, {}))
-        self._transport.on_channel_rebuilt(lambda: collector.inc_counter(rebuilt_name, {}))
 
     def _declare_topology(self) -> None:
         """Declare exchanges, queues, and bindings for all routes."""
@@ -1182,6 +1272,12 @@ class SyncBroker:
                     )
                 )
 
+    def _notify_passive_only(self) -> None:
+        """[retry/topology hook] PASSIVE_ONLY startup notice (see topology_validation)."""
+        from rabbitkit.core.topology_validation import log_passive_only_limits
+
+        log_passive_only_limits(self._config.topology_mode, self._registry.routes)
+
     def _broker_server_version(self) -> str | None:
         version = getattr(self._transport, "server_version", None)
         return version if isinstance(version, str) else None
@@ -1286,3 +1382,58 @@ class SyncBroker:
             prefetch=effective_prefetch,
         )
         route.runtime_state.consumer_tag = consumer_tag
+
+    # ── Public topology API (16.6) — additive, retry/topology owner ─────
+
+    def declare_exchange(self, exchange: RabbitExchange) -> None:
+        """Declare *exchange* (``AUTO_DECLARE`` only, or a ``passive=True``
+        existence check under ``PASSIVE_ONLY``). See ``AsyncBroker.declare_exchange``."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_exchange", passive=exchange.passive)
+        self._started_transport().declare_exchange(exchange)
+
+    def declare_queue(self, queue: RabbitQueue) -> None:
+        """Declare *queue* exactly as given. Same rules as :meth:`declare_exchange`."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "declare_queue", passive=queue.passive)
+        self._started_transport().declare_queue(queue)
+
+    def bind_queue(
+        self, queue: str, exchange: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind *queue* to *exchange*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_queue")
+        self._started_transport().bind_queue(
+            queue=queue, exchange=exchange, routing_key=routing_key, arguments=arguments
+        )
+
+    def bind_exchange(
+        self, destination: str, source: str, routing_key: str = "", arguments: dict[str, Any] | None = None
+    ) -> None:
+        """Bind exchange *destination* to *source*. ``AUTO_DECLARE`` only."""
+        from rabbitkit.core.topology_dispatch import check_public_topology_write
+
+        check_public_topology_write(self._config.topology_mode, "bind_exchange")
+        self._started_transport().bind_exchange(
+            destination=destination, source=source, routing_key=routing_key, arguments=arguments
+        )
+
+    def verify_topology(self, management_client: Any | None = None, *, vhost: str | None = None) -> Any:
+        """Read-only topology compatibility check — see ``AsyncBroker.verify_topology``."""
+        from rabbitkit.core.topology_validation import verify_topology
+
+        return verify_topology(
+            list(self._registry.routes),
+            management_client=management_client,
+            vhost=vhost if vhost is not None else self._config.connection.vhost,
+            broker_retry=self._config.retry,
+        )
+
+    def _started_transport(self) -> Any:
+        if self._transport is None:
+            raise BrokerNotStartedError("Broker not started. Call start() first.")
+        return self._transport

@@ -266,6 +266,23 @@ def dlq_replay(
         None, "--management-url", "-m", envvar="RABBITMQ_MANAGEMENT_URL", help=_MANAGEMENT_URL_HELP
     ),
     no_limit_check: bool = typer.Option(False, "--no-delivery-limit-check", help=_NO_LIMIT_CHECK_HELP),
+    max_replays: int = typer.Option(
+        3,
+        "--max-replays",
+        help="Refuse (leave on the DLQ) a message already replayed this many times (x-rabbitkit-replay-count).",
+    ),
+    ignore_replay_limit: bool = typer.Option(
+        False, "--ignore-replay-limit", help="Replay messages even past --max-replays (audited)."
+    ),
+    actor: str | None = typer.Option(
+        None, "--actor", envvar="RABBITKIT_REPLAY_ACTOR", help="Who is replaying, for the audit log (default: OS user)."
+    ),
+    require_actor: bool = typer.Option(
+        False,
+        "--require-actor",
+        envvar="RABBITKIT_REPLAY_REQUIRE_ACTOR",
+        help="Refuse (audited, exit 2) unless --actor / RABBITKIT_REPLAY_ACTOR names who is replaying.",
+    ),
 ) -> None:
     """Replay messages from a dead-letter queue to a target exchange/queue.
 
@@ -274,17 +291,30 @@ def dlq_replay(
     (removed) only after the broker confirms the republish; a failed or
     unroutable publish is requeued so the message stays on the DLQ.
 
-    Without ``--routing-key``, a message is published with the routing key
-    it had before it was dead-lettered (``x-rabbitkit-original-routing-key``,
-    then the broker's ``x-death``). A message that would be published
-    straight back into the DLQ is skipped.
+    Without ``--routing-key`` the routing follows the same rule as
+    ``DLQInspector.replay``: to the default exchange (``""``) a message goes
+    back to the queue it was dead-lettered from (``x-rabbitkit-original-queue``,
+    then the broker's ``x-death``); to a named exchange it is published with
+    the routing key it originally had (``x-rabbitkit-original-routing-key``,
+    then ``x-death``). A message that would be published straight back into
+    the DLQ is skipped.
+
+    Loop prevention: every replayed copy carries ``x-rabbitkit-replay-count``
+    / ``-replayed-at`` / ``-replayed-by``; a message already replayed
+    ``--max-replays`` times stays on the DLQ unless ``--ignore-replay-limit``.
+    Start and finish records go to the ``rabbitkit.dlq.audit`` logger.
+    ``--require-actor`` (or ``RABBITKIT_REPLAY_REQUIRE_ACTOR=1`` in a shared
+    ops environment) refuses a replay that does not name its actor.
 
     ``--dry-run`` requeues every message it shows, so it gets the same
     quorum delivery-limit checks as ``inspect``.
 
     Example::
 
-        # Replay up to 10 messages to the original exchange
+        # Replay up to 10 messages back to the queue each one failed on
+        rabbitkit dlq replay orders.created.dlq ""
+
+        # ...or through the original exchange, by original routing key
         rabbitkit dlq replay orders.created.dlq orders
 
         # Dry-run to preview without publishing
@@ -303,7 +333,26 @@ def dlq_replay(
         typer.echo("pika is required: pip install pika", err=True)
         raise typer.Exit(1) from None
     from rabbitkit.core.quorum import DELIVERY_COUNT_HEADER
-    from rabbitkit.dlq import original_routing_key
+    from rabbitkit.dlq import (
+        ReplayRequest,
+        audit_denied,
+        audit_replay_finish,
+        audit_replay_start,
+        default_actor,
+        prepare_replay_headers,
+        replay_count,
+        resolve_replay_routing_key,
+    )
+
+    who = actor or default_actor()
+    limit_label: int | str = "unlimited" if ignore_replay_limit else max_replays
+    target_label = f"exchange={target!r} routing_key={routing_key!r}" if routing_key else f"exchange={target!r}"
+    if require_actor and not actor and not dry_run:
+        audit_denied(
+            ReplayRequest(operation="replay", actor=who, actor_explicit=False, queue=queue, target=target_label),
+            "no --actor given (--require-actor)",
+        )
+        raise _fail("--require-actor: name who is replaying with --actor or RABBITKIT_REPLAY_ACTOR")
 
     # --dry-run requeues everything it shows: vet up front. A real replay
     # acks what it republishes and vets at its first requeue (a failed or
@@ -326,7 +375,18 @@ def dlq_replay(
     replayed = 0
     failed = 0
     skipped = 0
+    refused = 0
     tripped = False
+    if not dry_run:
+        audit_replay_start(
+            actor=who,
+            queue=queue,
+            target=target_label,
+            predicate="all",
+            limit=limit,
+            reset_retry_count=reset_retry_count,
+            max_replays=limit_label,
+        )
     # Requeued only after the loop: a message requeued at once goes back to
     # the head, and the next basic_get would fetch it again.
     held: list[int] = []
@@ -341,9 +401,28 @@ def dlq_replay(
                 tripped = True
                 break
 
-            rk = routing_key or original_routing_key(dict(properties.headers or {})) or method.routing_key
-            if reset_retry_count and properties.headers and retry_count_header in properties.headers:
-                properties.headers.pop(retry_count_header, None)
+            original_headers = dict(properties.headers or {})
+            rk = resolve_replay_routing_key(
+                original_headers, method.routing_key, exchange=target, routing_key=routing_key
+            )
+            properties.headers = prepare_replay_headers(
+                original_headers, reset_retry_count=reset_retry_count, retry_header=retry_count_header, actor=who
+            )
+
+            if not ignore_replay_limit and replay_count(original_headers) >= max_replays:
+                typer.echo(
+                    f"REFUSED (stays on DLQ): message_id={properties.message_id} was already replayed "
+                    f"{replay_count(original_headers)} time(s) (--max-replays {max_replays}); fix the cause or "
+                    "pass --ignore-replay-limit",
+                    err=True,
+                )
+                held.append(method.delivery_tag)
+                refused += 1
+                if not dry_run:
+                    refusal, vetted = _vet_requeue(queue, management_url, amqp_url, no_limit_check, vetted, properties)
+                    if refusal:
+                        break
+                continue
 
             if dry_run:
                 typer.echo(f"[dry-run] Would publish to exchange={target!r} routing_key={rk!r}  body={body[:100]!r}")
@@ -389,6 +468,17 @@ def dlq_replay(
     finally:
         _release(channel, held)
         connection.close()
+        if not dry_run:
+            audit_replay_finish(
+                actor=who,
+                queue=queue,
+                target=target_label,
+                replayed=replayed,
+                failed=failed,
+                requeued=0,
+                skipped=skipped,
+                refused=refused,
+            )
 
     if tripped:
         raise _fail(_tripwire_message(queue))
@@ -398,6 +488,6 @@ def dlq_replay(
 
     if not dry_run:
         typer.echo(f"\nReplayed {replayed} message(s) from {queue!r} → {target!r}.")
-        if failed or skipped:
-            typer.echo(f"{failed + skipped} message(s) were not replayed and remain on {queue!r}.", err=True)
+        if failed or skipped or refused:
+            typer.echo(f"{failed + skipped + refused} message(s) were not replayed and remain on {queue!r}.", err=True)
             raise typer.Exit(1)

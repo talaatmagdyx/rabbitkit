@@ -366,3 +366,24 @@ class TestApplySocketOptionsKeepalive:
             if c[0][0] == socket_mod.IPPROTO_TCP and c[0][1] == 4  # TCP_KEEPIDLE value
         ]
         assert len(keepidle_calls) >= 1
+
+
+class TestGetInfrastructureErrors:
+    def test_pika_channel_and_connection_errors(self) -> None:
+        import pika.exceptions
+
+        from rabbitkit.sync.connection import get_infrastructure_errors
+
+        errors = get_infrastructure_errors()
+        assert pika.exceptions.StreamLostError in errors
+        assert pika.exceptions.AMQPChannelError in errors
+        assert OSError not in errors  # the stdlib part stays in get_connection_errors
+
+    def test_empty_without_pika(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        from rabbitkit.sync.connection import get_infrastructure_errors
+
+        monkeypatch.setitem(sys.modules, "pika.exceptions", None)
+        assert get_infrastructure_errors() == ()
+        assert OSError in get_connection_errors()

@@ -204,8 +204,8 @@ instead of discovering it.
     every I/O tick.
   - *Sync, publish-only:* **nothing** services them between publishes —
     call `broker.pump_idle()` from your idle loop, or accept that the
-    first publish after an idle gap hits a dead socket (it reconnects and
-    retries once automatically, but proactive pumping avoids the hiccup).
+    first publish after an idle gap finds a dead socket (it notices that
+    before sending and reconnects, but proactive pumping avoids the hiccup).
   - *Sync, single worker:* a handler longer than ~2x the heartbeat starves
     the loop → broker kills the connection mid-handler → redelivery +
     duplicate side effects. Warned at startup; fix with `worker_count > 1`.
@@ -235,11 +235,10 @@ in-flight work is redelivered — this is why handlers are idempotent).
   heartbeat, so **a broker outage never trips liveness** and your fleet
   doesn't restart mid-outage.
 - **Reconnect visibility:** wire `MetricsMiddleware` and alert on the
-  reconnect counter — a flapping network looks like nothing else. On
-  **sync** that is `rabbitkit_reconnects_total`; on **async** use
-  `rabbitkit_channel_rebuilds_total`, because aio-pika does not report a
-  broker-initiated reconnect
-  ([why](../observability.md#async-does-not-emit-reconnects_total)).
+  reconnect counter — a flapping network looks like nothing else:
+  `rabbitkit_reconnects_total` on both brokers (async counts two per
+  outage, one per connection; see
+  [async reconnects](../observability.md#async-reconnects)).
 
 ### 4.3 Retry, DLQ, and the poison-message defense in depth
 

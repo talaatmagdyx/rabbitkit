@@ -53,11 +53,25 @@ nav:
       - Full Guide: guide/full-guide.md
       - Retry Architecture: rabbitmq-retry-architecture.md
       - Bulk Operations & Reliability Profiles: bulk-operations.md
+      - Event Metadata: event-metadata.md
   - Production:
+      - Reliable Messaging (contract & CRITICAL profile): reliable-messaging.md
       - Patterns (reference code): production/patterns.md
       - Scale & Reliability Handbook: production/scale.md
       - Checklist: production/checklist.md
       - Observability Reference: observability.md
+      - Runbooks:
+          - Overview: runbooks/index.md
+          - Broker unavailable: runbooks/broker-unavailable.md
+          - Publisher confirm failures: runbooks/publisher-confirm-timeout.md
+          - Unroutable publishes: runbooks/unroutable.md
+          - Connection storm / terminal failure: runbooks/connection-storm.md
+          - Consumer backlog: runbooks/consumer-backlog.md
+          - Consumer failures: runbooks/consumer-failures.md
+          - Retry storm: runbooks/retry-storm.md
+          - DLQ growth: runbooks/dlq-growth.md
+          - Quorum unavailable: runbooks/quorum-unavailable.md
+          - Flow control and alarms: runbooks/flow-control.md
       - Idempotency Contract: production/idempotency.md
       - Kubernetes: kubernetes.md
       - Troubleshooting: troubleshooting.md

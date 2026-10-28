@@ -23,12 +23,15 @@ Usage::
     # Start from timestamp
     config = StreamConsumerConfig(offset=StreamOffset.timestamp(datetime(2026, 1, 1)))
 
-    # Use with broker
-    @broker.subscriber(
-        queue=RabbitQueue("events", queue_type=QueueType.STREAM),
-        stream_config=config,
-    )
-    def handle(body: bytes) -> None: ...
+    # The consume arguments RabbitMQ expects (x-stream-offset, ...)
+    args = config.to_consume_arguments()
+
+Experimental (``rabbitkit.experimental``; see docs/stability-policy.md):
+these helpers only build the consume arguments. ``broker.subscriber()`` does
+not accept them, so a stream queue consumed through a broker route starts
+at RabbitMQ's default offset (``next``) with no offset control. Pass
+``to_consume_arguments()`` to your own client's consume call (e.g. aio-pika's
+``queue.consume(callback, arguments=args)``) when you need an offset.
 """
 
 from __future__ import annotations

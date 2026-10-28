@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.19.2"
+version = "0.20.0"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"
@@ -153,7 +153,10 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["integration: integration tests (may need RabbitMQ)"]
+markers = [
+    "integration: integration tests (may need RabbitMQ)",
+    "cluster_chaos: slow multi-container failure tests (3-node cluster, toxiproxy); nightly only, not part of -m integration",
+]
 filterwarnings = [
     # rabbitkit's own operator-guidance warnings, exercised deliberately by
     # tests (dedicated pytest.warns tests still assert they fire — pytest.warns

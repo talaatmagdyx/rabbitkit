@@ -473,7 +473,16 @@ async def test_replay_preserves_properties(side: str, rabbit: dict[str, Any]) ->
     assert props.content_type is None  # was "application/octet-stream"
     if side == "sync":
         assert props.message_id is None  # aiormq always stamps one on async
-    assert props.headers == {"x-rabbitkit-original-queue": source}
+    # Every original header survives untouched; replay only ADDS its audit
+    # trail (count, when, who) on top.
+    headers = dict(props.headers)
+    replayed_at = headers.pop("x-rabbitkit-replayed-at")
+    replayed_by = headers.pop("x-rabbitkit-replayed-by")
+    assert headers == {"x-rabbitkit-original-queue": source, "x-rabbitkit-replay-count": 1}
+    replayed_at = replayed_at.decode() if isinstance(replayed_at, bytes) else replayed_at
+    assert datetime.fromisoformat(replayed_at).tzinfo is not None
+    replayed_by = replayed_by.decode() if isinstance(replayed_by, bytes) else replayed_by
+    assert isinstance(replayed_by, str) and replayed_by
 
 
 # ── #34 / #35: held messages and per-inspection channels ───────────────────
@@ -534,16 +543,32 @@ async def test_one_inspections_channel_error_spares_another(rabbit: dict[str, An
 
 async def test_is_connected_is_false_while_reconnecting(rabbit: dict[str, Any]) -> None:
     transport = await _async_transport(rabbit, reconnect_backoff_base=2.0, reconnect_backoff_max=2.0)
+    seen_down = asyncio.Event()
+
+    async def watch() -> None:
+        # The first reconnect after a loss is immediate, so the outage lasts
+        # only a few ms on a local broker, often less than the docker exec
+        # that causes it. Watch from before the kill, yielding at every
+        # event-loop step: the reconnect needs network round trips, so a
+        # cleared connected-state is always observable here.
+        while not seen_down.is_set():
+            if not transport.is_connected():
+                seen_down.set()
+            await asyncio.sleep(0)
+
     try:
         assert transport.is_connected()
+        watcher = asyncio.create_task(watch())
         await asyncio.to_thread(
             rabbit["container"].get_wrapped_container().exec_run,
             ["rabbitmqctl", "close_all_connections", "rabbitkit test outage"],
         )
-        deadline = asyncio.get_running_loop().time() + 10
-        while transport.is_connected():
-            assert asyncio.get_running_loop().time() < deadline, "is_connected() stayed True during the outage"
-            await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(seen_down.wait(), timeout=10)
+        except TimeoutError:
+            raise AssertionError("is_connected() stayed True during the outage") from None
+        finally:
+            watcher.cancel()
         deadline = asyncio.get_running_loop().time() + 30
         while not transport.is_connected():
             assert asyncio.get_running_loop().time() < deadline, "never reconnected"

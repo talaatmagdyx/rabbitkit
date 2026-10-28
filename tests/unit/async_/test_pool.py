@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -255,6 +255,7 @@ class TestAsyncConnectionPool:
 
         bad_channel_pool = AsyncMock()
         bad_channel_pool.acquire = AsyncMock(side_effect=RuntimeError("dead connection"))
+        bad_channel_pool.try_acquire_idle = MagicMock(return_value=None)
         bad_conn = AsyncMock()
         bad_conn.is_closed = False
         pool._publisher_connection = bad_conn
@@ -688,51 +689,39 @@ class TestAsyncChannelPoolExhausted:
         assert pool.size <= 1
 
     @pytest.mark.asyncio
-    async def test_release_discards_when_channel_closed_and_close_raises(self) -> None:
-        """release() handles exception when closing a discarded closed channel."""
+    async def test_release_of_a_foreign_closed_channel_changes_nothing(self) -> None:
+        """G-05: a channel this pool does not own (stale, from a replaced
+        pool) must never decrement this pool's counter."""
         mock_conn = AsyncMock()
         mock_channel = AsyncMock()
-        mock_channel.is_closed = True  # channel is already closed
+        mock_channel.is_closed = True
         mock_channel.close = AsyncMock(side_effect=RuntimeError("already closed"))
-        mock_conn.channel = AsyncMock(return_value=mock_channel)
-
         pool = AsyncChannelPool(mock_conn, pool_size=5)
-
-        # Manually set _created so decrement makes sense
         pool._created = 1
 
-        # Should not raise even when channel.close() raises
         await pool.release(mock_channel)
-        assert pool.created_count == 0  # decremented
+
+        assert pool.created_count == 1
+        mock_channel.close.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_release_discards_open_channel_when_close_raises(self) -> None:
-        """release() swallows exception when channel is open but close() raises (lines 93-94)."""
+    async def test_release_of_a_foreign_open_channel_closes_it_without_counting(self) -> None:
         mock_conn = AsyncMock()
-        mock_channel = AsyncMock()
-        # Channel appears open (not closed), but close() raises
-        mock_channel.is_closed = False
-        mock_channel.close = AsyncMock(side_effect=RuntimeError("close failed"))
-        mock_conn.channel = AsyncMock(return_value=mock_channel)
-
+        owned = AsyncMock()
+        owned.is_closed = False
+        mock_conn.channel = AsyncMock(return_value=owned)
         pool = AsyncChannelPool(mock_conn, pool_size=1)
+        await pool.acquire()
 
-        # Acquire the only channel to set _created = 1
-        ch = await pool.acquire()
-        # Fill the pool queue to capacity so put_nowait raises QueueFull
-        pool._pool.put_nowait(ch)
-        # Reset pool._created so the decrement makes sense
-        pool._created = 2
+        foreign = AsyncMock()
+        foreign.is_closed = False
+        foreign.close = AsyncMock(side_effect=RuntimeError("close error"))
+        await pool.release(foreign)
+        await asyncio.sleep(0)  # let the background close run
 
-        # Now release another open channel — queue is full, so it tries to close it,
-        # but close() raises. Should be silently swallowed.
-        another_open_channel = AsyncMock()
-        another_open_channel.is_closed = False
-        another_open_channel.close = AsyncMock(side_effect=RuntimeError("close error"))
-
-        # Should not raise
-        await pool.release(another_open_channel)
-        assert pool.created_count == 1  # decremented from 2
+        assert pool.created_count == 1
+        assert pool.in_use_count == 1
+        foreign.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_close_all_handles_exception_in_channel_close(self) -> None:
@@ -1111,3 +1100,223 @@ class TestExhaustedWarningIsRateLimited:
 
         levels = [r.levelno for r in caplog.records if "pool exhausted" in r.getMessage()]
         assert levels == [logging.WARNING, logging.DEBUG]
+
+
+# ── G-08 / G-10: fail fast, terminal failures, no leaks ─────────────────
+
+
+class TestPoolConnectionFoundation:
+    @staticmethod
+    def _pool(**kw: Any) -> AsyncConnectionPool:
+        config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.002)
+        return AsyncConnectionPool(connection_config=config, security_config=SecurityConfig(), **kw)
+
+    @staticmethod
+    def _auth_error() -> BaseException:
+        from aiormq.exceptions import ProbableAuthenticationError
+
+        return ProbableAuthenticationError("ACCESS_REFUSED - Login was refused")
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_raises_at_once(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        pool = self._pool()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=self._auth_error()) as connect:
+            with pytest.raises(AuthenticationFailedError) as caught:
+                await pool._create_connection()
+        connect.assert_awaited_once()  # no 30-attempt retry loop
+        assert caught.value.endpoint == "localhost:5672"
+        assert pool.terminal_error is None  # startup failure: start() raises, nothing to report
+
+    @pytest.mark.asyncio
+    async def test_unclassified_non_connection_error_raises_at_once(self) -> None:
+        pool = self._pool()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=ValueError("bad")) as connect:
+            with pytest.raises(ValueError, match="bad"):
+                await pool._create_connection()
+        connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_builds_rabbitkit_robust_connections(self) -> None:
+        from rabbitkit.async_.reconnect import RabbitkitRobustConnection
+
+        pool = self._pool()
+        conn = AsyncMock()
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn) as connect:
+            assert await pool._create_connection(role="consumer") is conn
+        factory = connect.call_args.kwargs["connection_class"]
+        assert factory.func is RabbitkitRobustConnection
+        policy = factory.keywords["rk_policy"]
+        assert policy.role == "consumer"
+        assert policy.on_terminal == pool._record_terminal
+
+    @pytest.mark.asyncio
+    async def test_abandoned_connection_objects_are_closed(self) -> None:
+        """A failed or cancelled initial connect must not leave aio-pika's
+        reconnect task running in the background."""
+        pool = self._pool()
+        built: list[Any] = []
+
+        async def fake_connect_robust(**kwargs: Any) -> Any:
+            built.append(kwargs["connection_class"]("amqp://u:p@h:5672/"))
+            raise ConnectionRefusedError(61, "refused")
+
+        with patch("aio_pika.connect_robust", side_effect=fake_connect_robust):
+            pool._connection_config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.001)
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(ConnectionRefusedError):
+                    await pool._create_connection()
+        assert len(built) == 30
+        assert all(conn._close_called for conn in built)  # is_closed stays False on aio-pika 9 without a transport
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_closes_the_abandoned_connection(self) -> None:
+        pool = self._pool()
+        built: list[Any] = []
+
+        async def hangs(**kwargs: Any) -> Any:
+            built.append(kwargs["connection_class"]("amqp://u:p@h:5672/"))
+            await asyncio.sleep(60)
+
+        with patch("aio_pika.connect_robust", side_effect=hangs):
+            task = asyncio.ensure_future(pool._create_connection())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert built and built[0]._close_called
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_after_startup_is_terminal_and_sticky(self) -> None:
+        from rabbitkit.core.errors import AuthenticationFailedError
+
+        failures: list[Any] = []
+        pool = self._pool(on_connection_failed=failures.append)
+        pool._connected_once = True
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, side_effect=self._auth_error()):
+            with pytest.raises(AuthenticationFailedError):
+                await pool._create_connection()
+        assert failures == [pool.terminal_error]
+
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock) as connect:
+            with pytest.raises(AuthenticationFailedError) as again:
+                await pool._create_connection()
+        connect.assert_not_awaited()
+        assert again.value is not pool.terminal_error
+        assert again.value.__cause__ is pool.terminal_error
+        assert again.value.reason == "authentication_failed"
+        assert failures == [pool.terminal_error]  # reported once
+
+    def test_record_terminal_reports_only_the_first_and_survives_a_raising_hook(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        def boom(_error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        pool = self._pool(on_connection_failed=boom)
+        first = ReconnectBudgetExhaustedError("one", reason="reconnect_budget_exhausted")
+        pool._record_terminal(first)
+        pool._record_terminal(ReconnectBudgetExhaustedError("two", reason="reconnect_budget_exhausted"))
+        assert pool.terminal_error is first
+        assert "on_connection_failed callback raised" in caplog.text
+
+    def test_record_terminal_without_a_hook(self) -> None:
+        from rabbitkit.core.errors import ReconnectBudgetExhaustedError
+
+        pool = self._pool()
+        error = ReconnectBudgetExhaustedError("one", reason="reconnect_budget_exhausted")
+        pool._record_terminal(error)
+        assert pool.terminal_error is error
+
+    @pytest.mark.asyncio
+    async def test_connect_closes_the_first_connection_when_the_second_fails(self) -> None:
+        pool = self._pool()
+        publisher = AsyncMock()
+        publisher.is_closed = False
+        with patch(
+            "aio_pika.connect_robust", new_callable=AsyncMock, side_effect=[publisher, ValueError("consumer failed")]
+        ):
+            with pytest.raises(ValueError, match="consumer failed"):
+                await pool.connect()
+        publisher.close.assert_awaited_once()
+        assert pool._publisher_connection is None and pool._consumer_connection is None
+        assert not pool._connected_once
+
+    @pytest.mark.asyncio
+    async def test_successful_connect_marks_the_pool_connected_once(self) -> None:
+        pool = self._pool()
+        conn = AsyncMock()
+        conn.is_closed = False
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=conn):
+            await pool.connect()
+        assert pool._connected_once
+
+
+# ── G-22: connection state and channel counts for the metrics ───────────
+
+
+class TestPoolObservability:
+    @staticmethod
+    def _pool(**kw: Any) -> AsyncConnectionPool:
+        config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.002)
+        return AsyncConnectionPool(connection_config=config, security_config=SecurityConfig(), **kw)
+
+    @pytest.mark.asyncio
+    async def test_a_created_connection_reports_up_and_the_policy_reports_drops(self) -> None:
+        states: list[tuple[str, bool, Any]] = []
+        pool = self._pool(on_connection_state=lambda role, up, error: states.append((role, up, error)))
+        with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=AsyncMock()) as connect:
+            await pool._create_connection(role="consumer")
+        assert states == [("consumer", True, None)]
+        policy = connect.call_args.kwargs["connection_class"].keywords["rk_policy"]
+        error = ConnectionResetError("reset")
+        policy.on_lost("consumer", error)
+        policy.on_restored("consumer")
+        assert states[1:] == [("consumer", False, error), ("consumer", True, None)]
+
+    def test_without_a_hook_state_changes_are_ignored(self) -> None:
+        pool = self._pool()
+        pool._connection_lost("publisher", None)
+        pool._connection_restored("publisher")
+
+    def test_a_raising_state_hook_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        def boom(_role: str, _up: bool, _error: Any) -> None:
+            raise RuntimeError("hook bug")
+
+        pool = self._pool(on_connection_state=boom)
+        pool._connection_lost("publisher", None)
+        assert "on_connection_state callback raised" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_after_startup_names_the_role(self) -> None:
+        from aiormq.exceptions import ProbableAuthenticationError
+
+        failures: list[Any] = []
+        pool = self._pool(on_connection_failed=failures.append)
+        pool._connected_once = True
+        with patch(
+            "aio_pika.connect_robust", new_callable=AsyncMock, side_effect=ProbableAuthenticationError("ACCESS_REFUSED")
+        ):
+            with pytest.raises(ConnectionError):
+                await pool._create_connection(role="consumer")
+        assert failures[0].role == "consumer"
+
+    def test_channel_counts_cover_both_publisher_pools(self) -> None:
+        pool = self._pool()
+        assert pool.channel_counts() == (0, 0)
+        publisher = AsyncChannelPool(MagicMock(), pool_size=4)
+        publisher._created = 3
+        publisher._in_use = {object(), object()}
+        mandatory = AsyncChannelPool(MagicMock(), pool_size=4)
+        mandatory._created = 1
+        closed = AsyncChannelPool(MagicMock(), pool_size=4)
+        closed._created = 4
+        closed._closed = True
+        pool._publisher_channel_pool = publisher
+        pool._mandatory_channel_pool = mandatory
+        assert pool.channel_counts() == (4, 2)
+        pool._mandatory_channel_pool = closed
+        assert pool.channel_counts() == (3, 2)

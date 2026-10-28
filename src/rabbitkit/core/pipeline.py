@@ -12,6 +12,8 @@ Decompression operates on message.body before deserialize.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import logging
 import threading
@@ -21,8 +23,20 @@ from typing import Any, Protocol
 
 import structlog
 
-from rabbitkit.core.errors import classify_error
-from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage, is_rabbit_message_annotation
+from rabbitkit.core.errors import (
+    HandlerTimeoutError,
+    InboundMessageTooLargeError,
+    classify_error,
+    mark_invalid_message,
+)
+from rabbitkit.core.message import (
+    AckMessage,
+    NackMessage,
+    RabbitMessage,
+    RejectMessage,
+    SettlementError,
+    is_rabbit_message_annotation,
+)
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.types import (
     REQUEUED_FOR_RETRY,
@@ -86,6 +100,7 @@ def _is_channel_gone(exc: BaseException) -> bool:
         current = current.__cause__ or current.__context__
     return False
 
+
 class _SettlementLossWarner:
     """Aggregate "channel closed before settlement" warnings.
 
@@ -144,12 +159,85 @@ class _SettlementLossWarner:
                 )
 
 
+class _WindowedLog:
+    """Rate-limit one log line per key per window.
+
+    The first event for a key in a window is logged in full; repeats inside
+    the window are counted (and logged at DEBUG) and summarised by the next
+    full line for that key. A poison message on a hot loop therefore costs
+    one WARNING per window, not one per delivery, while a single failure is
+    never hidden or delayed. The key table is bounded (it is cleared when it
+    reaches ``MAX_KEYS``; at worst that re-logs a line early).
+
+    Thread-safe: the sync pipeline settles from worker-pool threads.
+    """
+
+    WINDOW_SECONDS = 10.0
+    MAX_KEYS = 1024
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, log: Any = None) -> None:
+        self._clock = clock
+        self._log = log if log is not None else logger
+        self._lock = threading.Lock()
+        self._windows: dict[tuple[str, ...], tuple[float, int]] = {}
+
+    def emit(self, key: tuple[str, ...], level: str, msg: str, *args: Any) -> None:
+        now = self._clock()
+        with self._lock:
+            start, suppressed = self._windows.get(key, (-self.WINDOW_SECONDS - 1.0, 0))
+            if now - start <= self.WINDOW_SECONDS:
+                self._windows[key] = (start, suppressed + 1)
+                full = False
+            else:
+                if len(self._windows) >= self.MAX_KEYS:
+                    self._windows.clear()
+                self._windows[key] = (now, 0)
+                full = True
+        if full:
+            if suppressed:
+                msg += " (%d similar event(s) suppressed in the previous %.0fs window)"
+                args = (*args, suppressed, self.WINDOW_SECONDS)
+            getattr(self._log, level)(msg, *args)
+        else:
+            self._log.debug(msg, *args)
+
+
+#: Settlement actions recorded by the failure path (bounded, log/metric safe).
+_ACTION_REQUEUE = "nack_requeue"
+_ACTION_DEAD_LETTER = "dead_letter"
+_ACTION_DEAD_LETTER_COPY = "dead_letter_copy_with_metadata"
+_ACTION_DLQ_MISSING_REQUEUE = "requeue_dead_letter_target_missing"
+_ACTION_LEFT_UNSETTLED = "left_unsettled"
+
+#: Backoff while a route's dead-letter queue is missing: the message is held
+#: this long before it is requeued, so a missing DLQ cannot become a hot
+#: redelivery loop. Doubles per consecutive miss, capped.
+_DLQ_MISSING_BACKOFF_INITIAL = 0.5
+_DLQ_MISSING_BACKOFF_MAX = 5.0
+
+
 # M10: on the async path, bodies at/above this size are decoded in a worker
 # thread (asyncio.to_thread) so a large JSON/msgspec/pydantic parse doesn't
 # block the event loop. Below it, inline decode is faster than the thread hop.
 # ponytail: fixed 256 KiB threshold — make it configurable only if a workload
 # proves the cutoff wrong.
 _DECODE_OFFLOAD_THRESHOLD_BYTES = 256 * 1024
+
+
+def _note_dead_lettered(exc: BaseException) -> None:
+    """Run the hook RetryMiddleware attaches to a terminal exception it handed
+    back unconfirmed (``_rabbitkit_on_dead_lettered``), once the pipeline has
+    actually sent the dead-lettering settlement: the dead-letter is complete
+    only now (a requeue because the DLQ is missing is not one)."""
+    hook = getattr(exc, "_rabbitkit_on_dead_lettered", None)
+    if hook is None:
+        return
+    with contextlib.suppress(AttributeError):
+        delattr(exc, "_rabbitkit_on_dead_lettered")  # run it once
+    try:
+        hook()
+    except Exception:  # an observability hook never changes settlement
+        logger.exception("dead-letter hook raised")
 
 
 def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> None:
@@ -169,15 +257,31 @@ def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> N
 
     A "pending" disposition (e.g. a MANUAL-policy handler that hasn't
     settled its message yet by the time this runs) emits nothing — there is
-    nothing final to report yet.
+    nothing final to report yet. Neither does a claimed settlement whose send
+    failed (``settlement_outcome_unknown``, G-15): the frame may not have
+    reached the broker, and an ack's unknown outcome is counted separately.
     """
-    if message.disposition == "pending":
+    if message.disposition == "pending" or message.settlement_outcome_unknown:
         return
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
     for mw in route.route_middlewares:
         if isinstance(mw, MetricsMiddleware):
             mw.record_settlement(message, message.disposition)
+            return
+
+
+def _emit_outcome_unknown_metric(route: RouteDefinition, message: RabbitMessage) -> None:
+    """Count an ack whose outcome is unknown through the route's
+    ``MetricsMiddleware``, if any (same lazy-import rationale as
+    :func:`_emit_settlement_metric`)."""
+    if not route.route_middlewares:
+        return
+    from rabbitkit.middleware.metrics import MetricsMiddleware
+
+    for mw in route.route_middlewares:
+        if isinstance(mw, MetricsMiddleware):
+            mw.record_settlement_outcome_unknown(message)
             return
 
 
@@ -423,13 +527,36 @@ class HandlerPipeline:
         serializer: Serializer[Any] | None = None,
         di_resolver: DIResolver | None = None,
         context_repo: ContextRepo | None = None,
-        reject_transient_on_redelivery: bool = False,
+        reject_transient_on_redelivery: bool = True,
+        manual_settle_on_error: bool = True,
+        processing_timeout: float | None = None,
+        dead_letter_check: Callable[[RouteDefinition], Awaitable[bool]] | None = None,
+        max_body_bytes: int | None = None,
+        dead_letter_copy: Callable[[RouteDefinition, RabbitMessage, BaseException, str], Awaitable[bool]] | None = None,
     ) -> None:
         self._serializer = serializer
         self._di_resolver = di_resolver
         self._context_repo = context_repo
-        # M6: opt-in 2-strike cap on transient hot-loops (see ConsumerConfig).
+        # M6 / F15: 2-strike cap on transient hot-loops (see ConsumerConfig).
         self._reject_transient_on_redelivery = reject_transient_on_redelivery
+        # MANUAL handler raised without settling: apply the failure policy.
+        self._manual_settle_on_error = manual_settle_on_error
+        # Async-only per-delivery deadline (ConsumerConfig.processing_timeout).
+        self._processing_timeout = processing_timeout
+        # F17: verify the dead-letter target before rejecting into it (async).
+        self._dead_letter_check = dead_letter_check
+        # §15.6: raw-body cap (ConsumerConfig.max_body_bytes); None = no cap.
+        self._max_body_bytes = max_body_bytes
+        # G-17 (async): publish a confirmed, metadata-stamped DLQ copy before
+        # a dead-lettering settlement that RetryMiddleware never saw; True =
+        # the copy is confirmed and the delivery may be acked.
+        self._dead_letter_copy = dead_letter_copy
+        self._dlq_missing_streak: dict[str, int] = {}
+        self._failure_log = _WindowedLog()
+        # Counters a metrics exporter can read (also emitted through a
+        # route's MetricsMiddleware when one is configured).
+        self.ack_outcome_unknown_total = 0
+        self.dead_letter_blocked_total = 0
         # Per-handler caches so the hot path avoids inspect.signature() per message.
         self._body_type_cache: dict[Any, type | None] = {}
         self._sig_cache: dict[Any, Any] = {}  # handler -> inspect.Signature (fallback resolver)
@@ -580,6 +707,13 @@ class HandlerPipeline:
         3. Process result (serialize + publish if applicable)
         4. Settle message (ack/nack/reject per AckPolicy)
         """
+        # §15.6: an oversized delivery is dead-lettered before anything
+        # (filter, middleware, decode, handler) looks at its body.
+        oversized = self._oversized(message)
+        if oversized is not None:
+            self._dead_letter_oversized_sync(route, message, oversized)
+            return
+
         # Filter check — reject before any processing
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
@@ -627,12 +761,13 @@ class HandlerPipeline:
                         message.nack(requeue=True)
                     return
 
-                # Settle on success
-                strategy.on_success(message)
+                # Settle on success. A failing ack is NOT a handler failure:
+                # the work is done, only the ack's fate is unknown (§11.3).
+                self._ack_after_success_sync(route, message, strategy)
 
             except AckMessage:
                 if not message.is_settled:
-                    message.ack()
+                    self._ack_after_success_sync(route, message, None)
 
             except NackMessage as exc:
                 if not message.is_settled:
@@ -660,6 +795,11 @@ class HandlerPipeline:
 
         Same stages as sync, but async.
         """
+        oversized = self._oversized(message)  # §15.6, see process_sync
+        if oversized is not None:
+            await self._dead_letter_oversized_async(route, message, oversized)
+            return
+
         # Filter check — reject before any processing
         if route.filter_fn is not None and not route.filter_fn(message):
             if not message.is_settled:
@@ -687,8 +827,12 @@ class HandlerPipeline:
                 await message.ack_async()
 
             try:
-                # Resolve parameters and call handler (through the middleware chain)
-                result = await self._run_consume_async(route, message)
+                # Resolve parameters and call handler (through the middleware
+                # chain), under the processing deadline when one is set.
+                if self._processing_timeout is None:
+                    result = await self._run_consume_async(route, message)
+                else:
+                    result = await self._run_consume_with_deadline(route, message, self._processing_timeout)
 
                 # Publish result if needed (Contract 5). M7: skip the
                 # REQUEUED_FOR_RETRY sentinel (see the sync path above).
@@ -703,20 +847,27 @@ class HandlerPipeline:
                         await message.nack_async(requeue=True)
                     return
 
-                # Settle on success
-                await strategy.on_success(message)
+                # Settle on success (see the sync path: a failing ack is an
+                # ambiguous outcome, not a handler failure).
+                await self._ack_after_success_async(route, message, strategy)
 
             except AckMessage:
                 if not message.is_settled:
-                    await message.ack_async()
+                    await self._ack_after_success_async(route, message, None)
 
             except NackMessage as exc:
                 if not message.is_settled:
-                    await message.nack_async(requeue=exc.requeue)
+                    if exc.requeue:
+                        await message.nack_async(requeue=True)
+                    else:
+                        await self._settle_failure_async(route, message, "nack", requeue=False, log=False)
 
             except RejectMessage as exc:
                 if not message.is_settled:
-                    await message.reject_async(requeue=exc.requeue)
+                    if exc.requeue:
+                        await message.reject_async(requeue=True)
+                    else:
+                        await self._settle_failure_async(route, message, "reject", requeue=False, log=False)
 
             except Exception as exc:
                 await self._handle_async_exception(route, message, exc)
@@ -725,6 +876,47 @@ class HandlerPipeline:
             _emit_settlement_metric(route, message)
             if debug:
                 structlog.contextvars.clear_contextvars()
+
+    # ── Internal: raw-body cap (§15.6) ───────────────────────────────────
+
+    def _oversized(self, message: RabbitMessage) -> InboundMessageTooLargeError | None:
+        limit = self._max_body_bytes
+        if limit is None:
+            return None
+        size = len(message.wire_body)
+        return InboundMessageTooLargeError(size, limit) if size > limit else None
+
+    def _dead_letter_oversized_sync(
+        self, route: RouteDefinition, message: RabbitMessage, exc: InboundMessageTooLargeError
+    ) -> None:
+        """Reject an oversized delivery without requeue, whatever the AckPolicy:
+        the handler never ran, so a MANUAL handler cannot own it."""
+        try:
+            if not message.is_settled:
+                self._log_failure(route, message, exc, _ACTION_DEAD_LETTER, "body_too_large")
+                message.reject(requeue=False)
+        except Exception as settle_exc:
+            if not _is_channel_gone(settle_exc):
+                raise
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
+        finally:
+            _emit_settlement_metric(route, message)
+
+    async def _dead_letter_oversized_async(
+        self, route: RouteDefinition, message: RabbitMessage, exc: InboundMessageTooLargeError
+    ) -> None:
+        """Async variant of :meth:`_dead_letter_oversized_sync` (verifies the DLQ exists first, F17)."""
+        try:
+            if not message.is_settled:
+                await self._settle_failure_async(
+                    route, message, "reject", requeue=False, exc=exc, reason="body_too_large"
+                )
+        except Exception as settle_exc:
+            if not _is_channel_gone(settle_exc):
+                raise
+            self._settlement_loss_warner.warn(type(settle_exc).__name__)
+        finally:
+            _emit_settlement_metric(route, message)
 
     # ── Internal: middleware composition ─────────────────────────────────
 
@@ -788,8 +980,12 @@ class HandlerPipeline:
         if not middlewares:
             return self._invoke_handler_sync(route, message)
 
-        for mw in reversed(middlewares):
-            mw.on_receive(message)
+        try:
+            for mw in reversed(middlewares):
+                mw.on_receive(message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # unreadable/untrusted delivery: INVALID_MESSAGE
+            raise
 
         # M-P1: cache the composed chain per route — closures are allocated once
         # per route, not per message.
@@ -820,8 +1016,12 @@ class HandlerPipeline:
         if not middlewares:
             return await self._invoke_handler_async(route, message)
 
-        for mw in reversed(middlewares):
-            await mw.on_receive_async(message)
+        try:
+            for mw in reversed(middlewares):
+                await mw.on_receive_async(message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # see _run_consume_sync
+            raise
 
         chain = self._consume_chain_async_cache.get(id(route))
         if chain is None:
@@ -842,6 +1042,22 @@ class HandlerPipeline:
 
         return await chain(message)
 
+    async def _run_consume_with_deadline(self, route: RouteDefinition, message: RabbitMessage, seconds: float) -> Any:
+        """Run the consume chain under ``ConsumerConfig.processing_timeout``.
+
+        Only the deadline itself becomes :class:`HandlerTimeoutError`
+        (outcome unknown); a ``TimeoutError`` the handler raises on its own
+        stays what it is.
+        """
+        deadline = asyncio.timeout(seconds)
+        try:
+            async with deadline:
+                return await self._run_consume_async(route, message)
+        except TimeoutError:
+            if deadline.expired():
+                raise HandlerTimeoutError(seconds) from None
+            raise
+
     # ── Internal: handler invocation ─────────────────────────────────────
 
     def _invoke_handler_sync(self, route: RouteDefinition, message: RabbitMessage) -> Any:
@@ -854,7 +1070,11 @@ class HandlerPipeline:
         failure still tears down any generators opened earlier in the same call.
         """
         # Deserialize body if serializer is available
-        body = self._deserialize_body(route, message)
+        try:
+            body = self._deserialize_body(route, message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # a body that cannot decode is INVALID_MESSAGE
+            raise
 
         # Create scope whenever the effective resolver (explicit or auto) is in
         # play — this is the fix for the auto-DI generator-teardown leak.
@@ -881,7 +1101,11 @@ class HandlerPipeline:
 
     async def _invoke_handler_async(self, route: RouteDefinition, message: RabbitMessage) -> Any:
         """Deserialize, resolve params, call handler (async)."""
-        body = await self._deserialize_body_async(route, message)
+        try:
+            body = await self._deserialize_body_async(route, message)
+        except Exception as exc:
+            mark_invalid_message(exc)  # see _invoke_handler_sync
+            raise
 
         resolver = self._effective_resolver(route.handler)
         scope: DependencyScope | None = None
@@ -895,6 +1119,7 @@ class HandlerPipeline:
             is_async = self._is_async_handler_cache.get(route.handler)
             if is_async is None:
                 import inspect as _inspect
+
                 is_async = _inspect.iscoroutinefunction(route.handler)
                 self._is_async_handler_cache[route.handler] = is_async
             if is_async:
@@ -1020,6 +1245,7 @@ class HandlerPipeline:
         plan = self._binding_plan_cache.get(route.handler)
         if plan is None:
             import inspect
+
             sig = self._sig_cache.get(route.handler)
             if sig is None:
                 sig = inspect.signature(route.handler)
@@ -1293,8 +1519,7 @@ class HandlerPipeline:
             # to it unchecked is a one-hop write into any queue in the vhost.
             if not _reply_to_permitted(message.reply_to, route.reply_to_allow):
                 logger.warning(
-                    "Route %r refused to publish its result to reply_to=%r: not in reply_to_allow. "
-                    "Result dropped.",
+                    "Route %r refused to publish its result to reply_to=%r: not in reply_to_allow. Result dropped.",
                     route.name,
                     message.reply_to,
                 )
@@ -1387,38 +1612,230 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         if message.is_settled:
+            # [retry hook] RetryMiddleware already published a confirmed,
+            # metadata-stamped DLQ copy and acked the source: nothing to do.
+            if getattr(exc, "_rabbitkit_dead_lettered", False):
+                return
             # Already settled (e.g., MANUAL mode handler settled then raised)
             logger.warning("Exception after settlement: %s", exc)
             return
+        decision = self._failure_decision(route, message, exc)
+        if decision is None:
+            raise exc  # MANUAL with manual_settle_on_error=False: handler owns it
+        kind, requeue, reason = decision
+        self._log_failure(route, message, exc, _ACTION_REQUEUE if requeue else _ACTION_DEAD_LETTER, reason)
+        if kind == "reject":
+            message.reject(requeue=requeue)
+        else:
+            message.nack(requeue=requeue)
+        if not requeue:
+            _note_dead_lettered(exc)
 
+    # ── Internal: failure policy (shared by both pipelines) ──────────────
+
+    def _failure_decision(
+        self,
+        route: RouteDefinition,
+        message: RabbitMessage,
+        exc: Exception,
+    ) -> tuple[str, bool, str] | None:
+        """Decide how a handler failure settles: ``(kind, requeue, reason)``.
+
+        ``kind`` is ``"nack"`` or ``"reject"``; ``reason`` is a bounded code
+        for logs. ``None`` means "leave it to the handler" (MANUAL with
+        ``manual_settle_on_error=False``; the exception propagates).
+        """
+        policy = route.ack_policy
+        if policy is AckPolicy.MANUAL and not self._manual_settle_on_error:
+            logger.error(
+                "Handler failed under AckPolicy.MANUAL without settling: queue=%s message_id=%s "
+                "delivery_tag=%s error=%s action=%s (manual_settle_on_error=False; the delivery stays "
+                "unacked and holds a prefetch slot until the channel closes)",
+                route.queue.name,
+                message.message_id,
+                message.delivery_tag,
+                type(exc).__name__,
+                _ACTION_LEFT_UNSETTLED,
+            )
+            return None
         # RetryMiddleware tags exhausted/permanent failures as terminal. Dead-letter
         # them (reject → source-queue DLX → DLQ) rather than re-classifying: an
         # *exhausted transient* error would otherwise be re-classified TRANSIENT and
         # nack(requeue=True)'d straight back into a hot loop, never reaching the DLQ.
-        # MANUAL is excluded — retry is incompatible with MANUAL (handler owns ack).
-        if getattr(exc, "_rabbitkit_terminal", False) and route.ack_policy != AckPolicy.MANUAL:
-            message.reject(requeue=False)
-            return
+        if getattr(exc, "_rabbitkit_terminal", False) and policy is not AckPolicy.MANUAL:
+            return ("reject", False, "retry_terminal")
+        if policy is AckPolicy.NACK_ON_ERROR:
+            return ("nack", False, "nack_on_error")
+        if classify_error(exc).severity is not ErrorSeverity.TRANSIENT:
+            return ("reject", False, "permanent")
+        # F15 / M6: 2-strike cap on the transient hot-loop. A transient error on
+        # a message the broker has already redelivered dead-letters instead of
+        # requeueing again (ConsumerConfig.reject_transient_on_redelivery).
+        if self._reject_transient_on_redelivery and message.redelivered:
+            return ("reject", False, "transient_on_redelivery")
+        return ("nack", True, "transient")
 
-        # M6: 2-strike cap on the transient hot-loop. A transient error on a
-        # message the broker has already redelivered escalates to the DLQ
-        # instead of an unbounded nack-requeue. Only AUTO requeues transients;
-        # opt-in via ConsumerConfig.reject_transient_on_redelivery.
+    def _log_failure(
+        self,
+        route: RouteDefinition,
+        message: RabbitMessage,
+        exc: BaseException | None,
+        action: str,
+        reason: str,
+        *,
+        level: str = "warning",
+    ) -> None:
+        """One structured, rate-limited line per handler failure (INV-009).
+
+        Carries identifiers and the decision only: never the body, headers
+        or the exception text (either may hold payload data or secrets). The
+        traceback is logged at DEBUG.
+        """
+        error_type = type(exc).__name__ if exc is not None else "-"
+        outcome_unknown = bool(getattr(exc, "outcome_unknown", False))
+        category = classify_error(exc).category.value if exc is not None else "-"
+        self._failure_log.emit(
+            (route.queue.name, error_type, action),
+            level,
+            "Handler failed: queue=%s message_id=%s correlation_id=%s delivery_tag=%s redelivered=%s "
+            "error=%s category=%s reason=%s outcome_unknown=%s action=%s%s",
+            route.queue.name,
+            message.message_id,
+            message.correlation_id,
+            message.delivery_tag,
+            message.redelivered,
+            error_type,
+            category,
+            reason,
+            outcome_unknown,
+            action,
+            " (the handler timed out: its side effects may or may not have happened)" if outcome_unknown else "",
+        )
+        if exc is not None and _stdlib_logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Handler failure traceback (queue=%s)", route.queue.name, exc_info=exc)
+
+    def _record_ack_outcome_unknown(self, route: RouteDefinition, message: RabbitMessage, exc: Exception) -> None:
+        """A handler succeeded but its ack raised (§11.3).
+
+        The ack frame may or may not have reached the broker, so this is an
+        ambiguous outcome, not a failure: nothing else is sent for the
+        delivery (a nack/reject now could contradict an ack that landed).
+        If the broker did not get it, it redelivers the message when the
+        channel closes, and the handler runs again.
+        """
+        with self._failure_log._lock:
+            self.ack_outcome_unknown_total += 1
+        _emit_outcome_unknown_metric(route, message)
+        self._failure_log.emit(
+            (route.queue.name, "ack_outcome_unknown"),
+            "warning",
+            "Ack outcome unknown: queue=%s message_id=%s delivery_tag=%s error=%s. The handler finished, "
+            "but the ack may not have reached the broker; if it did not, the broker redelivers the "
+            "message when the channel closes, so the handler must be idempotent. "
+            "ack_outcome_unknown_total=%d",
+            route.queue.name,
+            message.message_id,
+            message.delivery_tag,
+            type(exc).__name__,
+            self.ack_outcome_unknown_total,
+        )
+
+    def _ack_after_success_sync(
+        self, route: RouteDefinition, message: RabbitMessage, strategy: AckStrategy | None
+    ) -> None:
+        try:
+            if strategy is None:
+                message.ack()
+            else:
+                strategy.on_success(message)
+        except SettlementError:
+            raise  # wiring bug (sync ack on an async transport), not an ambiguity
+        except Exception as exc:
+            self._record_ack_outcome_unknown(route, message, exc)
+
+    async def _ack_after_success_async(
+        self, route: RouteDefinition, message: RabbitMessage, strategy: _AsyncAckStrategy | None
+    ) -> None:
+        try:
+            if strategy is None:
+                await message.ack_async()
+            else:
+                await strategy.on_success(message)
+        except SettlementError:
+            raise
+        except Exception as exc:
+            self._record_ack_outcome_unknown(route, message, exc)
+
+    async def _settle_failure_async(
+        self,
+        route: RouteDefinition,
+        message: RabbitMessage,
+        kind: str,
+        *,
+        requeue: bool,
+        exc: BaseException | None = None,
+        reason: str = "handler_requested",
+        log: bool = True,
+    ) -> None:
+        """Nack/reject *message*; a dead-lettering settlement (``requeue=False``)
+        first verifies the dead-letter target (F17).
+
+        If the DLQ is missing, dead-lettering would DROP the message (classic
+        queues dead-letter at most once). It is requeued instead, after a
+        capped backoff that keeps a missing DLQ from becoming a hot loop,
+        and an ERROR is logged every window until the DLQ is restored.
+
+        G-17: a failure RetryMiddleware never handled (an ``on_receive``
+        failure, a body over ``max_body_bytes``, a route without retry, a
+        transient failure on redelivery) first gets a confirmed DLQ copy with
+        rabbitkit's failure metadata, and only then is the delivery acked.
+        If the copy is not confirmed (or the DLQ cannot be addressed), the
+        reject/requeue path below runs as before: the delivery is never acked
+        without a confirmed copy. Handler-requested rejects (no exception)
+        and RetryMiddleware's own terminal hand-backs are not copied.
+        """
         if (
-            self._reject_transient_on_redelivery
-            and message.redelivered
-            and route.ack_policy == AckPolicy.AUTO
-            and classify_error(exc).severity == ErrorSeverity.TRANSIENT
+            not requeue
+            and exc is not None
+            and reason != "retry_terminal"
+            and self._dead_letter_copy is not None
+            and await self._dead_letter_copy(route, message, exc, reason)
         ):
-            logger.warning(
-                "Transient error on an already-redelivered message; rejecting to DLQ "
-                "instead of requeuing again (reject_transient_on_redelivery)",
-                exc_info=True,
-            )
-            message.reject(requeue=False)
+            self._dlq_missing_streak.pop(route.queue.name, None)
+            self._log_failure(route, message, exc, _ACTION_DEAD_LETTER_COPY, reason)
+            await message.ack_async()
             return
-
-        _ACK_STRATEGIES[route.ack_policy].on_error(message, exc)
+        if not requeue and self._dead_letter_check is not None:
+            if await self._dead_letter_check(route):
+                self._dlq_missing_streak.pop(route.queue.name, None)
+            else:
+                streak = self._dlq_missing_streak.get(route.queue.name, 0)
+                self._dlq_missing_streak[route.queue.name] = streak + 1
+                delay = min(_DLQ_MISSING_BACKOFF_INITIAL * (2 ** min(streak, 16)), _DLQ_MISSING_BACKOFF_MAX)
+                with self._failure_log._lock:
+                    self.dead_letter_blocked_total += 1
+                self._log_failure(route, message, exc, _ACTION_DLQ_MISSING_REQUEUE, reason, level="error")
+                self._failure_log.emit(
+                    (route.queue.name, "dead_letter_target_missing"),
+                    "error",
+                    "Dead-letter queue for queue=%s is missing: dead-lettering would DROP the message, so "
+                    "it is requeued after %.1fs instead. Restore the DLQ (e.g. restart with "
+                    "topology_mode=auto_declare). dead_letter_blocked_total=%d",
+                    route.queue.name,
+                    delay,
+                    self.dead_letter_blocked_total,
+                )
+                await asyncio.sleep(delay)
+                await message.nack_async(requeue=True)
+                return
+        if log:
+            self._log_failure(route, message, exc, _ACTION_REQUEUE if requeue else _ACTION_DEAD_LETTER, reason)
+        if kind == "reject":
+            await message.reject_async(requeue=requeue)
+        else:
+            await message.nack_async(requeue=requeue)
+        if not requeue and exc is not None:
+            _note_dead_lettered(exc)
 
     async def _handle_async_exception(
         self,
@@ -1443,28 +1860,13 @@ class HandlerPipeline:
         exc: Exception,
     ) -> None:
         if message.is_settled:
+            # [retry hook] see _handle_sync_exception_inner.
+            if getattr(exc, "_rabbitkit_dead_lettered", False):
+                return
             logger.warning("Exception after settlement: %s", exc)
             return
-
-        # See _handle_sync_exception: terminal (exhausted/permanent) failures
-        # dead-letter directly instead of being re-classified into a hot loop.
-        if getattr(exc, "_rabbitkit_terminal", False) and route.ack_policy != AckPolicy.MANUAL:
-            await message.reject_async(requeue=False)
-            return
-
-        # M6: 2-strike cap on the transient hot-loop (see _handle_sync_exception).
-        if (
-            self._reject_transient_on_redelivery
-            and message.redelivered
-            and route.ack_policy == AckPolicy.AUTO
-            and classify_error(exc).severity == ErrorSeverity.TRANSIENT
-        ):
-            logger.warning(
-                "Transient error on an already-redelivered message; rejecting to DLQ "
-                "instead of requeuing again (reject_transient_on_redelivery)",
-                exc_info=True,
-            )
-            await message.reject_async(requeue=False)
-            return
-
-        await _ACK_STRATEGIES_ASYNC[route.ack_policy].on_error(message, exc)
+        decision = self._failure_decision(route, message, exc)
+        if decision is None:
+            raise exc  # MANUAL with manual_settle_on_error=False: handler owns it
+        kind, requeue, reason = decision
+        await self._settle_failure_async(route, message, kind, requeue=requeue, exc=exc, reason=reason)

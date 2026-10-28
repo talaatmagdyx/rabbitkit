@@ -466,12 +466,16 @@ with per-item outcomes, safe ack coalescing (`CoalescingAcker`), reliability
 profiles + `preflight`, pipelined sync confirms (`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
 topology validation/drift/migration CLI, health watcher, circuit-breaker
 middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
-pybreaker).
+pybreaker), and RabbitMQ streams: `subscriber(stream_offset="first")` on a
+`QueueType.STREAM` queue, per-delivery `message.stream_offset`, retention
+options, a durable `SQLiteOffsetStore` so restarts and reconnects resume
+where they left off (at-least-once; no retry/DLQ on streams). See
+[Streams](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md).
 
 **Experimental** (may change without a deprecation cycle — read the
 [stability policy](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/stability-policy.md)): RPC over direct reply-to,
-distributed locking, message signing, result backends, stream queues, the
-monitoring dashboard. Notable caveats: the default signing nonce cache is
+distributed locking, message signing, result backends, the monitoring
+dashboard. Notable caveats: the default signing nonce cache is
 per-process (use a shared cache for real replay protection), and never
 expose the dashboard publicly without authentication.
 
@@ -678,6 +682,7 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
 - [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
 - [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
+- [Streams — offsets, replay, retention](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)

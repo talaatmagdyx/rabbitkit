@@ -153,11 +153,13 @@ Delivery is **at-least-once**:
   everything published during the outage) and never at `"first"` again.
   Deliveries that were in flight when the channel died are delivered again
   (at most the route's prefetch).
-- **Before the first delivery**, a `"next"` or `"last"` consumer knows no
-  offset. A reconnect in that window re-subscribes from the time it first
-  subscribed, minus 5 seconds for clock skew between client and broker:
-  nothing published after subscribing is skipped, and a few older messages
-  may be delivered.
+- **Before the first message is processed**, a `"next"` or `"last"`
+  consumer knows no offset. A reconnect in that window re-subscribes from
+  the time it first subscribed, minus 5 seconds for clock skew between
+  client and broker: nothing published after subscribing is skipped, and a
+  few older messages may be delivered. For `"last"`, the chunk that was
+  "last" at subscription time is not delivered again if it is older than
+  that (the window is short: a non-empty stream delivers it at once).
 
 ## Settlement, failures and retry
 

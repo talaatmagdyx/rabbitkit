@@ -479,8 +479,10 @@ def test_queue_metrics_poller_reports_quorum_members_on_a_single_node(rabbit_con
         history = History()
         poller = QueueMetricsPoller(client, history, queue_filter=lambda q: q in (quorum, classic))
         deadline = time.monotonic() + 30
-        while history.gauge("rabbitkit_queue_quorum_online", queue=quorum) is None:
-            assert time.monotonic() < deadline, "the management API never listed the quorum queue"
+        # The management API can list a just-declared quorum queue with no
+        # online members until its next stats refresh; wait for the settled state.
+        while history.gauge("rabbitkit_queue_quorum_online", queue=quorum) != 1.0:
+            assert time.monotonic() < deadline, "the management API never reported the quorum member online"
             poller.poll_once()
             time.sleep(0.5)
         assert history.gauge("rabbitkit_queue_quorum_members", queue=quorum) == 1.0

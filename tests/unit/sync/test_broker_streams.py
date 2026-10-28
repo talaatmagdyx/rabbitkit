@@ -26,6 +26,9 @@ class _Transport:
         self.calls: list[dict[str, Any]] = []
         self.cancel_consumer = MagicMock()
         self.disconnect = MagicMock()
+        # Broker-cancel hooks the SyncBroker wires on every start (G-26).
+        self.on_consumer_cancelled = MagicMock()
+        self.on_consumer_resumed = MagicMock()
 
     def consume(self, queue: str, callback: Any, prefetch: int = 10, **kw: Any) -> str:
         args = kw.get("arguments")

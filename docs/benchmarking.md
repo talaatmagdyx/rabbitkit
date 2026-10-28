@@ -153,6 +153,22 @@ average 5–9). Single runs unless noted, so treat the numbers as indicative.
 | `sustained` 2,778 msg/s × 60 s (classic) | Same accounting; end-to-end p50 1.1 ms, p95 5.6 ms, p99 12.5 ms, p99.9 32 ms |
 | `burst` 20,000 msg/s × 10 s (quorum) | Publishers achieved 14,688–19,745 msg/s (3 runs). 200,000/200,000 `CONFIRMED`, 0 lost, 0 duplicated each time. The two consumers fell behind: peak backlog 72k–97k, drained 5.0–7.5 s after the last send, so end-to-end p50 was 4.9–6.1 s |
 
+#### On a 3-node cluster (quorum replication factor 3)
+
+Same host and versions; three RabbitMQ 3.13 nodes clustered on a Docker
+network (`--cluster-nodes 3`), every quorum queue with 3 members online,
+clients connected to one node. All three brokers and the clients share one
+laptop (load average about 6.5), so the replication traffic competes with the
+clients for CPU: this bounds the latency from above rather than predicting a
+production cluster.
+
+| Scenario | Result |
+|---|---|
+| `publish` (quorum, 3 replicas) | 6,752–7,395 msg/s (3 runs), 50,000/50,000 `CONFIRMED`, about 131 µs client CPU per message |
+| `consume` (quorum, 3 replicas) | 9,906–10,780 msg/s (3 runs), about 80 µs client CPU per message |
+| `sustained` 2,778 msg/s × 60 s | Rate held. 166,680/166,680 `CONFIRMED`, 0 lost, 0 duplicated, peak backlog 735. End-to-end p50 5.7 ms, p95 380 ms, p99 800 ms, p99.9 1.06 s; confirm p99 185 ms |
+| `burst` 20,000 msg/s × 10 s | Publishers achieved 12,623–15,423 msg/s (3 runs). 200,000/200,000 `CONFIRMED`, 0 lost, 0 duplicated each time; peak backlog 105k–109k, drained 9.6–11.6 s after the last send |
+
 What this shows, and what it doesn't:
 
 - **The 2,778 msg/s sustained target is met** with headroom on one publisher
@@ -161,9 +177,14 @@ What this shows, and what it doesn't:
   reached 74–99% of the target on this shared host, and the consumers need
   seconds to drain the backlog. Size consumers for the burst you need to
   drain, not just for the sustained rate.
-- Quorum queues roughly double tail latency compared with classic queues
-  here. With real replication (3 nodes, network round trips), expect
-  higher. Measure on your own cluster before relying on these figures.
+- **Replication keeps the guarantees but costs tail latency.** On the
+  single node, quorum queues roughly doubled tail latency compared with
+  classic queues. With three replicas sharing one laptop, the sustained rate
+  still held with exact accounting and no loss, but p99 rose to 800 ms and
+  throughput fell by about 5–15%. On separate machines the CPU contention
+  goes away, but network round trips are added. Measure on your own cluster
+  before relying on these figures; the default `PublisherConfirmLatencyHigh`
+  alert (confirm p99 above 250 ms) was not reached in these runs.
 - One earlier `sustained` run on the same host had a 433 ms p99, which came
   from publisher schedule lag (all 256 in-flight slots waiting on slow
   confirms). It did not reproduce. A tail like that means the broker stalled

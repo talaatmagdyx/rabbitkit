@@ -44,7 +44,7 @@ from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.profiles import PreflightReport
 from rabbitkit.core.profiles import preflight as run_preflight
 from rabbitkit.core.quorum import dlq_delivery_limit
-from rabbitkit.core.registry import SubscriberRegistry
+from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
@@ -246,7 +246,7 @@ class SyncBroker:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
             queue=queue,
@@ -269,7 +269,7 @@ class SyncBroker:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Register a result publisher."""
         return self._registry.publisher(exchange=exchange, routing_key=routing_key)
 

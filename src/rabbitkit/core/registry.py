@@ -15,7 +15,7 @@ and validates retry + ack policy + DLX config compatibility.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.message import RabbitMessage
@@ -27,6 +27,13 @@ from rabbitkit.serialization.base import Serializer
 if TYPE_CHECKING:
     from rabbitkit.core.router import RabbitRouter
     from rabbitkit.middleware.base import BaseMiddleware
+
+
+#: A handler function as seen by the ``@subscriber`` / ``@publisher``
+#: decorators. Both return the function they were given unchanged, so they
+#: are typed ``Callable[[HandlerT], HandlerT]``: the decorated name keeps its
+#: real signature instead of degrading to ``(...) -> Any`` for type checkers.
+HandlerT = TypeVar("HandlerT", bound=Callable[..., Any])
 
 
 class DuplicateRouteError(Exception):
@@ -67,7 +74,7 @@ class SubscriberRegistry:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Decorator to register a message handler for a queue.
 
         Args:
@@ -114,7 +121,7 @@ class SubscriberRegistry:
         elif tags is None:
             tags = frozenset()
 
-        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        def decorator(func: HandlerT) -> HandlerT:
             # Validate handler signature at registration time (fail fast).
             # Covers *args/**kwargs and multiple body-like parameters (Contract 4).
             from rabbitkit.di.resolver import DIResolver
@@ -171,7 +178,7 @@ class SubscriberRegistry:
         self,
         exchange: RabbitExchange | str | None = None,
         routing_key: str = "",
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Decorator to configure result publishing for a handler.
 
         Must be applied BEFORE @subscriber on the same handler.
@@ -188,7 +195,7 @@ class SubscriberRegistry:
 
         result_pub = ResultPublisher(exchange=exchange, routing_key=routing_key)
 
-        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        def decorator(func: HandlerT) -> HandlerT:
             # Store pending publisher for this handler
             self._pending_publishers[id(func)] = result_pub
             return func

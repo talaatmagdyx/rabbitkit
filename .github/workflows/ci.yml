@@ -23,6 +23,27 @@ jobs:
       - name: mypy
         run: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 
+  # G-29: the PUBLIC API must type-check under Pyright strict from a
+  # downstream application's point of view. tests/typing/public_api.py uses
+  # the API the way a strictly typed app would and pins the types it relies
+  # on with assert_type, so a public signature that degrades to Any (e.g. a
+  # decorator erasing the handler's signature) fails here. Scoped by
+  # tests/typing/pyrightconfig.json to that directory only: the package
+  # itself is gated by mypy --strict above, not by pyright. Pyright is
+  # pinned so a new release cannot turn this job red on its own; bump it
+  # deliberately.
+  typing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[all]" "pyright==1.1.414"
+      - name: Pyright strict (public API, downstream view)
+        run: .venv/bin/pyright -p tests/typing --pythonpath .venv/bin/python
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25

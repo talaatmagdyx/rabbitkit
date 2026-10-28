@@ -53,6 +53,36 @@ jobs:
           path: benchmarks/results/
           if-no-files-found: ignore
 
+  # Multi-node failure tests (failure-matrix F19 quorum loss, F20 network
+  # partition): a 3-node RabbitMQ cluster on a private Docker network, and a
+  # broker behind toxiproxy. Several minutes of container churn, so they are
+  # marked `cluster_chaos` (not `integration`) and run here, nightly, instead
+  # of in ci.yml's per-PR integration job.
+  # GATING. RK_REQUIRE_BROKER=1 makes tests/integration/conftest.py fail the
+  # run if Docker is unreachable or nothing passed, so these cannot silently
+  # skip. Known product defects are strict xfails (-rxX lists them); a fix
+  # shows up as an XPASS failure until its marker is removed.
+  cluster-chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install uv && uv venv && uv pip install -e ".[integration]"
+      # Pulled up front so image download time does not eat into the tests'
+      # own boot timeouts.
+      - name: Pull images
+        run: |
+          docker pull rabbitmq:3.13-management-alpine
+          docker pull ghcr.io/shopify/toxiproxy:2.12.0
+      - name: Cluster chaos (quorum loss, network partition)
+        timeout-minutes: 20
+        env:
+          RK_REQUIRE_BROKER: "1"
+        run: .venv/bin/pytest tests/integration/test_cluster_chaos.py -m cluster_chaos -q --tb=short -rxX
+
   # Runs every example/ script against a real broker so the examples can't
   # silently drift when the package API changes (they aren't in the wheel).
   # ci.yml runs the same job on every PR (#41); this nightly copy catches

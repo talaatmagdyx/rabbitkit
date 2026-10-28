@@ -118,6 +118,76 @@ python -m benchmarks.bench_bulk --url amqp://guest:guest@localhost:5672/ --mgmt-
 Results (with an environment fingerprint) land in
 `benchmarks/results/bulk_<timestamp>.json`.
 
+## Tier 2c: the reliability profile (`python -m benchmarks.bench_foundation`)
+
+Measures the workload a reliable deployment actually runs, rather than a
+toy one. Every message is 1 KiB, persistent, published with confirms and
+`mandatory=True` into a durable **quorum** queue (`--queue-type classic`
+to compare), and consumed with manual acks after the handler. Publishers
+and consumers run in separate processes. The end-to-end runs are open-loop:
+latency is measured from each message's *intended* send time, so publisher
+lag and broker queueing count against the system. Every run accounts for
+every message: loss, duplicates and non-`CONFIRMED` publishes are reported,
+never dropped from the numbers.
+
+| Scenario | What it does |
+|---|---|
+| `publish` | `publish_many`, 256 in flight, 50,000 messages; confirm accounting |
+| `consume` | drain a preloaded queue of 50,000 messages, prefetch 256 |
+| `sustained` | open-loop at 2,778 msg/s for 60 s (the 10M events/hour design rate), 1 publisher and 1 consumer process |
+| `burst` | open-loop at 20,000 msg/s for 10 s, 4 publisher and 2 consumer processes; peak backlog and drain time |
+
+### Results for 0.20.0
+
+Environment: Apple Silicon (arm64, 12 cores), Python 3.12.2, aio-pika
+10.2.1, RabbitMQ 3.13 in Docker on the same machine. The broker is a
+**single node**, so the quorum queue has a replication factor of 1 and no
+Raft network round trip. Other workloads were running on the host (load
+average 5–9). Single runs unless noted, so treat the numbers as indicative.
+
+| Scenario | Result |
+|---|---|
+| `publish` (quorum) | 7,535–7,751 msg/s (3 runs), 50,000/50,000 `CONFIRMED`, about 127 µs client CPU per message |
+| `consume` (quorum) | 11,664–12,148 msg/s (3 runs), about 74 µs client CPU per message |
+| `sustained` 2,778 msg/s × 60 s (quorum) | Rate held. 166,680/166,680 `CONFIRMED`, 0 lost, 0 duplicated, peak backlog 0. End-to-end p50 1.9 ms, p95 9.3 ms, p99 27.5 ms, p99.9 94 ms. Peak RSS 65 MiB (publisher), 49 MiB (consumer) |
+| `sustained` 2,778 msg/s × 60 s (classic) | Same accounting; end-to-end p50 1.1 ms, p95 5.6 ms, p99 12.5 ms, p99.9 32 ms |
+| `burst` 20,000 msg/s × 10 s (quorum) | Publishers achieved 14,688–19,745 msg/s (3 runs). 200,000/200,000 `CONFIRMED`, 0 lost, 0 duplicated each time. The two consumers fell behind: peak backlog 72k–97k, drained 5.0–7.5 s after the last send, so end-to-end p50 was 4.9–6.1 s |
+
+What this shows, and what it doesn't:
+
+- **The 2,778 msg/s sustained target is met** with headroom on one publisher
+  and one consumer process, with exact accounting and no loss.
+- **20,000 msg/s bursts are absorbed without loss**, but the publish rate
+  reached 74–99% of the target on this shared host, and the consumers need
+  seconds to drain the backlog. Size consumers for the burst you need to
+  drain, not just for the sustained rate.
+- Quorum queues roughly double tail latency compared with classic queues
+  here. With real replication (3 nodes, network round trips), expect
+  higher. Measure on your own cluster before relying on these figures.
+- One earlier `sustained` run on the same host had a 433 ms p99, which came
+  from publisher schedule lag (all 256 in-flight slots waiting on slow
+  confirms). It did not reproduce. A tail like that means the broker stalled
+  confirms long enough to exhaust the in-flight window.
+
+### Cost of the 0.20.0 reliability work on the publish hot path
+
+Client CPU per message, 0.19.2 against 0.20.0, both run under the **same**
+virtualenv (aio-pika 10.2.1), 20,000 × 1 KiB confirmed publishes per run,
+6 interleaved rounds, median:
+
+| Path | 0.19.2 | 0.20.0 | Change |
+|---|---|---|---|
+| `publish_many`, 64 in flight (direct confirmed path) | 87.7 µs | 93.5 µs | +5.9 µs (+6.7%); throughput −4.0% |
+| `publish_many` + `AsyncBatchPublisher` | 95.3 µs | 102.2 µs | +6.9 µs (+7.2%); throughput −2.3% |
+
+Before the hot-path fixes in this release these were +8 µs and +18 µs. The
+remaining cost comes from features 0.20.0 adds to every publish: bounded
+waits, publisher drain on `stop()`, return detection on every path, outcome
+classification with reasons, connection-liveness checks and the metrics
+hooks. There is no single hotspot left to remove. Moving from aio-pika 9.6
+to 10.x costs about +7 µs/message on its own (0.19.2 code measured under
+both), so compare benchmarks only across runs with the same aio-pika version.
+
 ## Tier 3: the soak harness (`python -m benchmarks.soak`)
 
 Sustained-runtime evidence for the two questions point-in-time tests

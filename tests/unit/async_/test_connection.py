@@ -127,9 +127,7 @@ class TestMakeAioPikaConnectKwargs:
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
         conn = ConnectionConfig(host="h", reconnect_backoff_base=2.0, reconnect_backoff_max=30.0)
-        intervals = [
-            make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)
-        ]
+        intervals = [make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)]
         # Never below base (don't hammer faster than configured)...
         assert all(i >= 2.0 for i in intervals)
         # ...and bounded by base + min(base, max-base) = 4.0.
@@ -148,9 +146,7 @@ class TestMakeAioPikaConnectKwargs:
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
         conn = ConnectionConfig(host="h", reconnect_backoff_base=1.0, reconnect_backoff_max=1.3)
-        intervals = [
-            make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)
-        ]
+        intervals = [make_aio_pika_connect_kwargs(conn, SecurityConfig())["reconnect_interval"] for _ in range(50)]
         assert all(1.0 <= i <= 1.3 for i in intervals)
 
     def test_credentials_provider_used_in_url(self) -> None:
@@ -163,7 +159,9 @@ class TestMakeAioPikaConnectKwargs:
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
         cfg = ConnectionConfig(
-            host="h", username="static", password="static",
+            host="h",
+            username="static",
+            password="static",
             credentials_provider=lambda: ("rot-user", "rot-pass"),
         )
         kwargs = make_aio_pika_connect_kwargs(cfg, SecurityConfig())
@@ -180,9 +178,7 @@ class TestMakeAioPikaConnectKwargs:
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
         conn = ConnectionConfig(host="primary", port=5672, nodes=("backup:5673",))
-        kwargs = make_aio_pika_connect_kwargs(
-            conn, SecurityConfig(), host_override="backup", port_override=5673
-        )
+        kwargs = make_aio_pika_connect_kwargs(conn, SecurityConfig(), host_override="backup", port_override=5673)
         assert "backup:5673" in kwargs["url"]
         assert "primary" not in kwargs["url"]
 
@@ -326,17 +322,21 @@ class TestMakeAioPikaConnectKwargs:
         """Contract with the real aiormq: the URL rabbitkit builds selects the
         TLS transport exactly when TLS is enabled, and our context is used."""
         import aiormq
-        from aiormq.connection import TCPTransportFactory, TLSTransportFactory
+        import aiormq.connection
 
         from rabbitkit.async_.connection import make_aio_pika_connect_kwargs
 
         sec = SecurityConfig(ssl=SSLConfig(enabled=enabled, cert_reqs="CERT_REQUIRED"))
         kwargs = make_aio_pika_connect_kwargs(ConnectionConfig(), sec)
         conn = aiormq.Connection(kwargs["url"], context=kwargs.get("ssl_context"))
-        factory = TLSTransportFactory if enabled else TCPTransportFactory
-        assert isinstance(conn._transport_factory, factory)
-        if enabled:
-            assert conn.ssl_context is kwargs["ssl_context"]
+        assert conn.url.scheme == ("amqps" if enabled else "amqp")
+        assert conn.ssl_context is kwargs.get("ssl_context")
+        # aiormq >= 6.8 picks a transport factory by scheme; 6.7 (aio-pika 9.1)
+        # has none and passes ssl_context straight to open_connection.
+        tcp = getattr(aiormq.connection, "TCPTransportFactory", None)
+        tls = getattr(aiormq.connection, "TLSTransportFactory", None)
+        if tcp is not None and tls is not None:
+            assert isinstance(conn._transport_factory, tls if enabled else tcp)
 
     def test_server_hostname_is_pinned_in_the_context(self) -> None:
         """aio-pika drops a server_hostname kwarg and aiormq verifies against
@@ -617,9 +617,7 @@ class TestBlockedConnectionMonitor:
         first.close = AsyncMock()
         robust = _robust(first)
         events: list[str] = []
-        monitor = BlockedConnectionMonitor(
-            robust, blocked_timeout=5.0, on_unblocked=lambda: events.append("unblocked")
-        )
+        monitor = BlockedConnectionMonitor(robust, blocked_timeout=5.0, on_unblocked=lambda: events.append("unblocked"))
         _unblocked(first).clear()
         await monitor.poll(0.0)
 
@@ -683,8 +681,16 @@ class TestBlockedConnectionMonitor:
 class TestPamqpNegativeInts:
     @pytest.mark.parametrize(
         ("arguments", "expected"),
-        [({"x-delivery-limit": -1}, True), ({"x": -128}, True), ({"x": -129}, False), ({"x": 0}, False),
-         ({"x": True}, False), ({"x": "-1"}, False), (None, False), ({}, False)],
+        [
+            ({"x-delivery-limit": -1}, True),
+            ({"x": -128}, True),
+            ({"x": -129}, False),
+            ({"x": 0}, False),
+            ({"x": True}, False),
+            ({"x": "-1"}, False),
+            (None, False),
+            ({}, False),
+        ],
     )
     def test_has_small_negative_int(self, arguments: Any, expected: bool) -> None:
         from rabbitkit.async_.connection import has_small_negative_int
@@ -770,6 +776,8 @@ class TestGetInfrastructureErrors:
 
         monkeypatch.setitem(sys.modules, "aiormq.exceptions", None)
         assert get_infrastructure_errors() == ()
+
+
 # ── G-08: permanent connect failures ─────────────────────────────────────
 
 

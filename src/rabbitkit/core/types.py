@@ -506,6 +506,18 @@ class HandoffState(str, Enum):
     EXHAUSTED = "exhausted"
 
 
+class OutboxEntryState(str, Enum):
+    """State of a producer-outbox entry (see :mod:`rabbitkit.core.outbox`).
+
+    ``PENDING`` entries are published by the relay and deleted once the
+    broker confirms them. ``FAILED`` entries were refused too often (or can
+    never be confirmed); they stay in the store until replayed or purged.
+    """
+
+    PENDING = "pending"
+    FAILED = "failed"
+
+
 def safe_exception_repr(exc: BaseException) -> str:
     """``repr(exc)`` that cannot raise.
 

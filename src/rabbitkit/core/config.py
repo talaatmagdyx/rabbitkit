@@ -1193,6 +1193,127 @@ class MetricsConfig:
         while it is not (stopped, or cancelled by the broker)."""
         return f"{self.namespace}_route_consuming"
 
+    # ── producer outbox (rabbitkit.core.outbox) ───────────────────────
+
+    @property
+    def outbox_pending(self) -> str:
+        """Gauge: outbox entries waiting to be published and confirmed."""
+        return f"{self.namespace}_outbox_pending"
+
+    @property
+    def outbox_failed_entries(self) -> str:
+        """Gauge: outbox entries in the failed state (kept until replayed or purged)."""
+        return f"{self.namespace}_outbox_failed_entries"
+
+    @property
+    def outbox_bytes(self) -> str:
+        """Gauge: bytes held by the outbox (pending and failed), as counted
+        against ``OutboxConfig.max_bytes``."""
+        return f"{self.namespace}_outbox_bytes"
+
+    @property
+    def outbox_enqueued_total(self) -> str:
+        """Entries durably written to the outbox."""
+        return f"{self.namespace}_outbox_enqueued_total"
+
+    @property
+    def outbox_relayed_total(self) -> str:
+        """Entries the broker confirmed and the relay deleted."""
+        return f"{self.namespace}_outbox_relayed_total"
+
+    @property
+    def outbox_publish_retries_total(self) -> str:
+        """Relay publishes that were not confirmed and left the entry pending
+        for a later attempt, labeled by ``status`` and ``reason``."""
+        return f"{self.namespace}_outbox_publish_retries_total"
+
+    @property
+    def outbox_failed_total(self) -> str:
+        """Entries moved to the failed state, labeled by the ``status`` and
+        ``reason`` of their last attempt."""
+        return f"{self.namespace}_outbox_failed_total"
+
+    @property
+    def outbox_full_total(self) -> str:
+        """Enqueues refused because the outbox was full, labeled by ``reason``
+        (``max_entries`` / ``max_bytes``)."""
+        return f"{self.namespace}_outbox_full_total"
+
+
+# ── Producer outbox ───────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxConfig:
+    """Bounds, relay pacing and durability of the producer outbox.
+
+    See ``docs/outbox.md``. Every field has a safe default.
+
+    Attributes:
+        max_entries: Most entries the store holds, pending and failed
+            together. An enqueue beyond it raises ``OutboxFullError``.
+        max_bytes: Most bytes (body plus encoded properties) the store
+            holds, pending and failed together. Same error beyond it.
+        max_in_flight: Entries the relay takes per pass. The async relay
+            publishes them concurrently; the sync relay one after another.
+            Their outcomes are committed together, so this is also the most
+            entries a relay crash can publish twice.
+        max_refusals: ``RETURNED`` / ``NACKED`` / ``ERROR`` outcomes (or
+            publish exceptions) an entry may get before it moves to the
+            failed state. Transient outcomes (``NOT_SENT``, ``UNKNOWN``,
+            ``TIMEOUT``) do not count: they are retried without limit.
+        backoff_initial: First delay, in seconds, after a failed attempt.
+        backoff_max: Cap on the exponential delay.
+        jitter: Random spread applied to every delay, as a fraction
+            (``0.2`` = plus or minus 20 %).
+        poll_interval: How often an idle relay looks for new entries (an
+            enqueue through the outbox wakes it at once; a transactional
+            enqueue on another connection is seen at the next poll, or call
+            ``notify()``).
+        publish_timeout: Per-publish ``timeout=`` passed to
+            ``AsyncBroker.publish`` (``None`` keeps the broker's own bounds).
+            Ignored by the sync relay.
+        drain_timeout: Default bound, in seconds, for ``AsyncOutbox.stop()``
+            and for the drain at the end of ``SyncOutbox.run()``.
+        busy_timeout: Seconds a SQLite statement waits for another
+            connection's write lock before failing.
+        full_fsync: Ask SQLite to use ``F_FULLFSYNC`` (macOS), which flushes
+            the drive cache: needed for power-loss durability on macOS,
+            slower, and a no-op elsewhere.
+    """
+
+    max_entries: int = 100_000
+    max_bytes: int = 256 * 1024 * 1024
+    max_in_flight: int = 100
+    max_refusals: int = 5
+    backoff_initial: float = 0.5
+    backoff_max: float = 30.0
+    jitter: float = 0.2
+    poll_interval: float = 1.0
+    publish_timeout: float | None = None
+    drain_timeout: float = 10.0
+    busy_timeout: float = 5.0
+    full_fsync: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("max_entries", "max_bytes", "max_in_flight", "max_refusals"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigValidationError(f"OutboxConfig.{name} must be an int >= 1, got {value!r}")
+        for name in ("backoff_initial", "poll_interval", "drain_timeout", "busy_timeout"):
+            if not getattr(self, name) > 0:
+                raise ConfigValidationError(f"OutboxConfig.{name} must be > 0, got {getattr(self, name)!r}")
+        if self.backoff_max < self.backoff_initial:
+            raise ConfigValidationError(
+                f"OutboxConfig.backoff_max ({self.backoff_max}) must be >= backoff_initial ({self.backoff_initial})"
+            )
+        if not (0 <= self.jitter < 1):
+            raise ConfigValidationError(f"OutboxConfig.jitter must be in [0, 1), got {self.jitter!r}")
+        if self.publish_timeout is not None and not self.publish_timeout > 0:
+            raise ConfigValidationError(
+                f"OutboxConfig.publish_timeout must be > 0 or None, got {self.publish_timeout!r}"
+            )
+
 
 # ── Health Check ──────────────────────────────────────────────────────────
 

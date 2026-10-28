@@ -26,7 +26,6 @@ from typing import Any, assert_type
 
 from rabbitkit import (
     AsyncBroker,
-    AsyncOutbox,
     BrokerHealthResult,
     BulkPublishItem,
     BulkPublishResult,
@@ -43,12 +42,6 @@ from rabbitkit import (
     InMemoryOffsetStore,
     MessageEnvelope,
     OffsetStore,
-    OutboxConfig,
-    OutboxEntry,
-    OutboxEntryState,
-    OutboxFullError,
-    OutboxPassReport,
-    OutboxStats,
     PublisherConfig,
     PublishOutcome,
     PublishReason,
@@ -64,7 +57,6 @@ from rabbitkit import (
     StreamOffset,
     StreamOffsetType,
     SyncBroker,
-    SyncOutbox,
     apply_profile,
     broker_health_check,
     broker_health_check_async,
@@ -262,44 +254,6 @@ def exercise_test_broker() -> int:
     finally:
         broker.stop()
     return len(seen)
-
-
-# ── producer outbox ───────────────────────────────────────────────────────────
-
-
-async def relay_with_async_outbox(broker: AsyncBroker, path: str) -> int:
-    outbox = AsyncOutbox(broker, path, OutboxConfig(max_entries=1_000, publish_timeout=5.0))
-    await outbox.start()
-    try:
-        try:
-            entry_id = await outbox.enqueue(MessageEnvelope(routing_key="orders", body=b"x", mandatory=True))
-        except OutboxFullError as exc:
-            assert_type(exc.limit, str)
-            return -1
-        assert_type(entry_id, int)
-        assert_type(await outbox.enqueue_many([MessageEnvelope(routing_key="orders", body=b"y")]), list[int])
-        assert_type(await outbox.relay_once(), OutboxPassReport)
-        stats = await outbox.stats()
-        assert_type(stats, OutboxStats)
-        failed = await outbox.list_entries(OutboxEntryState.FAILED, limit=10)
-        assert_type(failed, list[OutboxEntry])
-        assert_type(await outbox.replay_failed([entry.id for entry in failed]), int)
-        return stats.pending
-    finally:
-        assert_type(await outbox.stop(timeout=10.0), bool)
-
-
-def relay_with_sync_outbox(broker: SyncBroker, path: str) -> bool:
-    with SyncOutbox(broker, path) as outbox:
-        assert_type(outbox.enqueue(MessageEnvelope(routing_key="orders", body=b"x")), int)
-        conn = outbox.store.connect()
-        try:
-            with conn:
-                assert_type(outbox.store.enqueue_in(conn, MessageEnvelope(routing_key="orders", body=b"z")), int)
-        finally:
-            conn.close()
-        assert_type(outbox.relay_once(), OutboxPassReport)
-        return outbox.drain(timeout=5.0)
 
 
 # ── stream queues ─────────────────────────────────────────────────────────────

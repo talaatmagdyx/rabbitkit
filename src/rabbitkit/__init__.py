@@ -25,7 +25,6 @@ from rabbitkit.core.config import (
     DeduplicationConfig,
     HealthCheckConfig,
     MetricsConfig,
-    OutboxConfig,
     PoolConfig,
     PublisherConfig,
     RabbitConfig,
@@ -52,9 +51,6 @@ from rabbitkit.core.errors import (
     InvalidMessageError,
     MessageTooLargeError,
     MissingDependencyError,
-    OutboxClosedError,
-    OutboxError,
-    OutboxFullError,
     PermanentConnectionError,
     ReconnectBudgetExhaustedError,
     SettlementError,
@@ -68,7 +64,6 @@ from rabbitkit.core.errors import (
 from rabbitkit.core.event_metadata import EventMetadata
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
-from rabbitkit.core.outbox import OutboxEntry, OutboxPassReport, OutboxStats, OutboxStore
 from rabbitkit.core.profiles import (
     PolicyTemplate,
     PreflightCheck,
@@ -112,7 +107,6 @@ from rabbitkit.core.types import (
     FlushReason,
     HandoffState,
     MessageEnvelope,
-    OutboxEntryState,
     PreflightStatus,
     PublishOutcome,
     PublishReason,
@@ -169,7 +163,6 @@ from rabbitkit.middleware.metrics import (
 )
 from rabbitkit.middleware.otel import OTelTracingMiddleware
 from rabbitkit.middleware.rate_limit import RateLimitConfig, RateLimitMiddleware
-from rabbitkit.outbox import AsyncOutbox, SyncOutbox
 from rabbitkit.queue_metrics import QueueMetricsPoller
 from rabbitkit.serialization.pipeline import (
     DataclassDecoder,
@@ -202,7 +195,6 @@ __all__ = [
     "AsyncBroker",
     "AsyncCoalescingAcker",
     "AsyncHealthWatcher",
-    "AsyncOutbox",
     "AsyncWorkerPool",
     "AuthenticationFailedError",
     "BackpressureConfig",
@@ -285,15 +277,6 @@ __all__ = [
     "NackMessage",
     "OTelTracingMiddleware",
     "OffsetStore",
-    "OutboxClosedError",
-    "OutboxConfig",
-    "OutboxEntry",
-    "OutboxEntryState",
-    "OutboxError",
-    "OutboxFullError",
-    "OutboxPassReport",
-    "OutboxStats",
-    "OutboxStore",
     "Path",
     "PermanentConnectionError",
     "PolicyTemplate",
@@ -352,7 +335,6 @@ __all__ = [
     "StreamOffsetType",
     "SyncBatchPublisher",
     "SyncBroker",
-    "SyncOutbox",
     "SyncWorkerPool",
     "TLSVerificationError",
     "TerminalAction",

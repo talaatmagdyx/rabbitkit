@@ -381,33 +381,6 @@ upgrade notes: [docs/migration.md](docs/migration.md#0120--upgrade-notes).
 
 ---
 
-## Producer outbox (opt-in)
-
-A message is safe only once the broker confirms it; until then it lives in
-the producer's memory and a crash loses it. `AsyncOutbox` / `SyncOutbox`
-write it to a local SQLite file first (WAL, `synchronous=FULL`, standard
-library only), relay it through the broker's normal confirmed publish, and
-delete it only after `CONFIRMED`. A restarted process republishes whatever
-was not confirmed (at-least-once, same `message_id`); unroutable or refused
-messages end in an inspectable, replayable failed state; the file is bounded
-(`OutboxFullError` is the backpressure signal).
-
-```python
-from rabbitkit import AsyncBroker, AsyncOutbox, MessageEnvelope
-
-
-async def checkout(broker: AsyncBroker) -> None:
-    async with AsyncOutbox(broker, "/var/lib/shop/outbox.db") as outbox:
-        await outbox.enqueue(
-            MessageEnvelope(routing_key="orders", body=b'{"id": 42}', message_id="order-42", mandatory=True)
-        )  # returns once the write is durable; the relay publishes it
-```
-
-Guarantees, transactional enqueue, the sync relay and operations:
-[docs/outbox.md](docs/outbox.md).
-
----
-
 ## Message safety model
 
 rabbitkit is an **at-least-once** toolkit: a handler may run more than once
@@ -437,7 +410,6 @@ duplicates). The rule is simple:
 | Infrastructure-managed topology | `TopologyMode.PASSIVE_ONLY` performs no writes; `broker.verify_topology(management_client)` detects type/argument/binding drift |
 | DLQ replay publish fails | DLQ message is **not** removed as if replay succeeded |
 | Message unroutable | Mandatory publishing returns a distinct `RETURNED` outcome |
-| Producer crashes before the broker confirms | With the opt-in `AsyncOutbox` / `SyncOutbox`: the message is already on local disk and is republished on restart (same `message_id`) |
 | Oversized delivery (`ConsumerConfig.max_body_bytes`) | Dead-lettered as `invalid_message` before any middleware or the handler runs |
 | Broker blips | Readiness changes; liveness does **not** kill the pod |
 | Pod gets SIGTERM | Consumers stop first, in-flight work drains |
@@ -712,7 +684,6 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
 - [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
-- [Producer Outbox — durable, crash-safe publishing](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/outbox.md)
 - [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
 - [Streams — offsets, replay, retention](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)

@@ -56,6 +56,7 @@ nav:
       - Event Metadata: event-metadata.md
   - Production:
       - Reliable Messaging (contract & CRITICAL profile): reliable-messaging.md
+      - Producer Outbox: outbox.md
       - Patterns (reference code): production/patterns.md
       - Scale & Reliability Handbook: production/scale.md
       - Checklist: production/checklist.md
@@ -89,6 +90,7 @@ nav:
       - Serialization: api/serialization.md
       - High-Load: api/highload.md
       - Bulk Operations & Reliability: api/bulk.md
+      - Producer Outbox: api/outbox.md
       - RPC: api/rpc.md
       - Health Checks: api/health.md
       - Locking: api/locking.md

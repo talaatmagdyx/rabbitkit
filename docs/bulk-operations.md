@@ -578,6 +578,9 @@ calls `publish_many` with `message_id` = outbox id, and marks **only the
 CONFIRMED rows** as published. `UNKNOWN` rows stay claimed for
 reconciliation; `NOT_SENT` / `INVALID` rows are released for the next page.
 A crash between publish and mark yields a duplicate on the wire, by design.
+When the business data is in SQLite, or a separate local file is enough,
+the built-in [producer outbox](outbox.md) (`AsyncOutbox` / `SyncOutbox`)
+implements this side for you.
 
 **Inbox (consumer side).** Insert `(consumer, event_id)` into an inbox table
 and apply the business effect in the same transaction. A duplicate key means

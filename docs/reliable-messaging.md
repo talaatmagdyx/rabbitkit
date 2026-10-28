@@ -194,7 +194,7 @@ Rules:
 
 | Where | When a message can be lost | Closed by |
 |---|---|---|
-| Producer, before `CONFIRMED` | Process crash, or an unhandled non-`ok` outcome | Application (an outbox if needed). **Not implemented** in rabbitkit |
+| Producer, before `CONFIRMED` | Process crash, or an unhandled non-`ok` outcome | The opt-in [producer outbox](outbox.md) (`AsyncOutbox` / `SyncOutbox`): the message is committed to a local SQLite file before publishing and deleted only after `CONFIRMED`. Without it, the application |
 | `confirm_delivery=False` | A `SENT` message lost in flight | Confirms on (default; required by both profiles) |
 | Classic queues | Loss of the node's storage | Quorum queues |
 | Broker dead-letter hops (reject → DLX, delay-queue TTL expiry) from a classic queue or an `at-most-once` quorum queue | Dead-letter target missing or full: dropped by the broker | Quorum source and delay queues with `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` (CRITICAL). The async broker also refuses to reject into a missing DLQ; **SyncBroker does not check** |
@@ -254,6 +254,7 @@ bounded `category` label of `rabbitkit_messages_retried_total` and
 | Layer | Guarantee | Owner |
 |---|---|---|
 | Producer memory, before `CONFIRMED` | None | Application |
+| Producer outbox (opt-in), after `enqueue()` returns | Survives a producer crash, restart or `kill -9`, and (storage honouring `fsync`) an OS crash or power loss: SQLite WAL with `synchronous=FULL`, deleted only after `CONFIRMED`, at-least-once (a crash republishes at most `max_in_flight` entries, same `message_id`). Not covered: loss of the disk holding the file. See [Producer outbox](outbox.md) | rabbitkit (`AsyncOutbox` / `SyncOutbox`) plus a persistent local volume |
 | Broker, `CONFIRMED` on a quorum queue, persistent message | Survives the loss of a minority of nodes | Topology |
 | Broker, `CONFIRMED` on a classic durable queue | Single node | Topology |
 | Retry and dead-letter hops | At-least-once only with quorum queues using the at-least-once dead-letter strategy; otherwise at-most-once | Topology (CRITICAL declares it for the retry chain; the source queue is yours to declare or cover by policy) |

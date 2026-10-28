@@ -762,6 +762,28 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 - `rabbitkit.core.failure_copy` (the retry/DLQ copy builder, shared by
   `RetryMiddleware` and the new `rabbitkit.core.dead_letter.DeadLetterCopier`).
 
+#### Hardening
+
+- `rabbitkit.testing.MockedHandler`: what `TestBroker.subscriber(...)` now
+  returns for type checkers. It is the handler with its own signature plus
+  the `.mock` the broker records deliveries on, so
+  `handler.mock.assert_called_once()` passes strict type checking.
+- A Pyright strict check of the public API from a downstream application's
+  view (G-29). `tests/typing/public_api.py` uses the API the way a strictly
+  typed app would and pins the types it relies on with `assert_type`. CI job
+  `typing` runs `pyright -p tests/typing` (pyright 1.1.414, Python 3.12),
+  scoped to that directory only. The package itself stays gated by mypy.
+- Real-broker NACK tests (F04, `tests/integration/test_hardening_foundation.py`).
+  A broker `basic.nack` from a full `x-overflow=reject-publish` queue surfaces
+  as `NACKED` with reason `nacked` (async and sync), per item from
+  `publish_many`, and nothing is republished.
+- Multi-node failure tests (`tests/integration/test_cluster_chaos.py`, marker
+  `cluster_chaos`, nightly job `cluster-chaos` in `integration.yml` under
+  `RK_REQUIRE_BROKER=1`). F19 covers quorum loss on a 3-node cluster (async
+  and sync). F20 covers a network partition through toxiproxy, both
+  directions and one-way, with traffic and idle. Three defects they found
+  are pinned as strict xfails (see Documentation).
+
 ### Fixed
 
 #### Earlier consumer and retry hardening
@@ -975,6 +997,15 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   registered before the kill; `test_is_connected_is_false_while_reconnecting`
   watches from before the kill. 10/10 consecutive passes.
 
+#### Hardening
+
+- The `@subscriber` / `@publisher` decorators (`AsyncBroker`, `SyncBroker`,
+  `RabbitRouter`, `SubscriberRegistry`, `TestBroker.publisher`) were typed
+  `Callable[[Callable[..., Any]], Callable[..., Any]]`. Under a strict type
+  checker that erased the decorated handler to `(...) -> Any`. They return
+  the function unchanged and are now typed that way (`HandlerT -> HandlerT`).
+  Annotations only, with no runtime change.
+
 ### Deprecated
 
 #### Earlier consumer and retry hardening
@@ -1097,6 +1128,18 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `RabbitConfig.logging`, not on by default), `docs/bulk-operations.md`,
   `docs/rabbitmq-retry-architecture.md`, and the `rabbitkit.streams`
   docstring (no `subscriber(stream_config=)`; streams stay experimental).
+
+#### Hardening
+
+- `docs/reliable-messaging.md` gains "Verified failure scenarios": what the
+  real-broker tests prove for broker NACKs, quorum loss, network partitions
+  and heartbeat detection, with measured timings. The heartbeat budget is
+  about 5 × `heartbeat` with aio-pika (`(heartbeat + 1) × 3` s), not 2 ×.
+  `TIMEOUT` publishes were observed to be committed later. The section also
+  lists three known async defects found by the partition tests: queued
+  publishes resolve serially, one `channel_acquire_timeout` each; readiness
+  stays down after a partition until the next publish; `stop(timeout)` is not
+  bounded during a partition.
 
 ## [0.19.2] — 2026-10-02
 

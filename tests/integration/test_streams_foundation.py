@@ -524,14 +524,17 @@ async def test_async_crash_replays_at_most_the_commit_window(rabbit: dict[str, A
         await _async_run(url, queue, _CrashingStore(inner), lambda s: len(s.offsets) >= K, first)
         stored = inner.load(queue.name)
     assert first.offsets == list(range(K))
-    assert stored == 9, "commits landed at offsets 4 and 9 (commit_every=5); 10 and 11 were not committed"
+    # AsyncBroker commits off the event loop, taking the processed position
+    # when the commit runs, so it can land past a commit_every boundary; the
+    # contract is the window, not the exact boundary.
+    assert stored is not None and 9 <= stored <= K - 1, "committed at least the commit_every boundary, never ahead"
 
     second = _Seen()
     with _FileOffsetStore(db) as store:
         await _async_run(url, queue, store, lambda s: bool(s.offsets) and s.offsets[-1] == N - 1, second)
     assert second.offsets == list(range(stored + 1, N))
     duplicates = set(first.offsets) & set(second.offsets)
-    assert duplicates == {10, 11} and len(duplicates) <= 5, "a crash replays at most commit_every messages"
+    assert duplicates == set(range(stored + 1, K)) and len(duplicates) <= 5, "a crash replays at most commit_every"
     assert set(first.offsets) | set(second.offsets) == set(range(N))
 
 

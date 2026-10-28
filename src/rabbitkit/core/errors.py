@@ -106,21 +106,6 @@ class InvalidMessageError(ValueError):
     rabbitkit_error_category = ErrorCategory.INVALID_MESSAGE
 
 
-class EventMetadataError(InvalidMessageError):
-    """Event metadata is missing or invalid (:mod:`rabbitkit.core.event_metadata`).
-
-    Raised when building :class:`~rabbitkit.core.event_metadata.EventMetadata`
-    (a producer bug, raised before anything is published) and when reading
-    it from a delivery (``INVALID_MESSAGE``: dead-lettered, never retried).
-    ``fields`` names the offending fields; the message never contains their
-    values, which may carry payload data.
-    """
-
-    def __init__(self, message: str, *, fields: tuple[str, ...] = ()) -> None:
-        super().__init__(message)
-        self.fields = fields
-
-
 class InboundMessageTooLargeError(InvalidMessageError):
     """A delivery's raw body exceeds ``ConsumerConfig.max_body_bytes``.
 

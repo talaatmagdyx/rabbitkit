@@ -8,7 +8,7 @@ tables describe `AsyncBroker`; `SyncBroker` differences are listed where they
 exist.
 
 Related pages: [Message Safety](message-safety.md) (details and real-broker
-evidence), [Retry and DLQ](retry-and-dlq.md), [Event Metadata](event-metadata.md),
+evidence), [Retry and DLQ](retry-and-dlq.md),
 [Idempotency Contract](production/idempotency.md),
 [Ordering Guarantees](ordering-guarantees.md), [Kubernetes](kubernetes.md).
 
@@ -42,8 +42,7 @@ confirms off). `outcome.reason` is a bounded code (`PublishReason`).
 | `ERROR` | Broker refused the publish, invalid input, or unclassified | `exchange_not_found`, `access_refused`, `precondition_failed`, `invalid_envelope`, `publish_error` | After fixing the cause |
 
 Raised instead of returned: `MessageTooLargeError` (body above
-`PublisherConfig.max_message_bytes`), `EventMetadataError` (invalid
-[event metadata](event-metadata.md), when you use it), `ValueError` for an
+`PublisherConfig.max_message_bytes`), `ValueError` for an
 invalid `timeout` or `message_id` with an envelope, `BrokerNotStartedError`
 before `start()` / after `stop()` began, and `CancelledError` (treat a
 cancelled publish as unknown; its channel and bytes are released).
@@ -126,7 +125,7 @@ middlewares).
 | Raises an AMQP client error or `InfrastructureError` | `INFRASTRUCTURE` | as `RETRYABLE` | as `RETRYABLE` |
 | Exceeds `ConsumerConfig.processing_timeout` | `UNKNOWN_OUTCOME` | async: task cancelled; sync: settled at the deadline, handler thread left running (see [Processing deadline](#processing-deadline-processing_timeout)). Then first delivery: nack(requeue); redelivery: reject → DLQ. The deadline wraps the retry middleware, so no retry copy is made | same |
 | Raises anything else (unclassified) or a permanent error | `PERMANENT` | confirmed DLQ copy with failure metadata, then ack | reject → source queue's DLX → `<queue>.dlq` |
-| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
+| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
 | Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler (copy with metadata first when `dead_letter_with_metadata`, e.g. under CRITICAL) | same |
 | Retries exhausted, or `max_retry_age` passed | terminal | confirmed DLQ copy with metadata, then ack | — |
 | Cancelled by `stop()` | `SHUTDOWN` | nack(requeue); `CancelledError` propagates | same |
@@ -226,7 +225,7 @@ calls both hooks there.
 - Copies keep the wire body and encoding, `message_id` (a message without one
   gets a stable id on its first handoff), `correlation_id`, `type`, `app_id`,
   `user_id`, `reply_to`, `priority`, `timestamp`, `delivery_mode` and every
-  header, including [event metadata](event-metadata.md). `expiration` is moved
+  header. `expiration` is moved
   to `x-rabbitkit-original-expiration`.
 - Failure metadata on retry and DLQ copies: `x-rabbitkit-retry-count`,
   `-attempts`, `-first-failed-at`, `-last-failed-at`, `-error-category`
@@ -294,7 +293,7 @@ tuple; then `RetryConfig.unknown_policy` (default `PERMANENT`).
 | `INFRASTRUCTURE` | yes, labelled separately | AMQP client errors in the handler, `InfrastructureError` |
 | `UNKNOWN_OUTCOME` | yes (handler must be idempotent) | `processing_timeout` expired |
 | `PERMANENT` | no → DLQ | Business rule violation, unclassified exceptions |
-| `INVALID_MESSAGE` | no → DLQ | Decode failure, `on_receive` failure, `InvalidMessageError`, `EventMetadataError`, body over `max_body_bytes` |
+| `INVALID_MESSAGE` | no → DLQ | Decode failure, `on_receive` failure, `InvalidMessageError`, body over `max_body_bytes` |
 | `SHUTDOWN` | no; requeued | Cancellation |
 
 The category is written to `x-rabbitkit-error-category` and used as the
@@ -342,19 +341,19 @@ bounded by its deadline.
 ## Idempotency
 
 1. rabbitkit propagates `message_id`, `correlation_id` and every header
-   (including `idempotency-key` from [event metadata](event-metadata.md))
    unchanged through publish, retry, DLQ and replay. RabbitMQ does not
    deduplicate, and neither does rabbitkit by default.
 2. Handlers with side effects need a **durable deduplication record keyed by
-   the idempotency key, committed in the same transaction as the business
+   your idempotency key (for example `message_id`, or a key your application
+   puts in a header), committed in the same transaction as the business
    change, before the ack** (an "inbox"). This is application code; rabbitkit
    does not ship a database-backed deduplication engine (**Not implemented**,
    by design). Sketch:
 
    ```python
-   @broker.subscriber("orders", middlewares=[EventMetadataMiddleware(validate_publish=False)])
+   @broker.subscriber("orders")
    async def handle(body: dict, message: RabbitMessage) -> None:
-       key = EventMetadata.from_message(message).idempotency_key
+       key = message.message_id  # or your application's own idempotency header
        async with db.transaction() as tx:
            inserted = await tx.execute(
                "INSERT INTO inbox (idempotency_key) VALUES ($1) ON CONFLICT DO NOTHING", key
@@ -476,7 +475,6 @@ profile forbids, and when `consumer.processing_timeout` is unset.
 | Source `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` | — | per route: warning if not declared; verified on the broker by `preflight(management_client=...)` (which then replaces the warning) | — |
 | Dead-letter path never `discard` | — | yes | `reject_without_dlx="discard"` |
 | DLQ copy with metadata for failures outside retry (`on_receive`, body cap, no-retry routes) | `safety.dead_letter_with_metadata=True` (async) | yes | — |
-| Event metadata validation | — (opt-in) | not checked | — |
 | Heartbeat on (`connection.heartbeat > 0`) | — (default 30 s) | yes | `heartbeat=0` |
 | Async reconnect budget | — (unlimited by default) | warning when `reconnect_budget_seconds < reconnect_backoff_max` | — |
 | TLS | — (deployment choice) | warning when enabled with `cert_reqs="CERT_NONE"` | — |

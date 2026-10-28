@@ -53,7 +53,6 @@ nav:
       - Full Guide: guide/full-guide.md
       - Retry Architecture: rabbitmq-retry-architecture.md
       - Bulk Operations & Reliability Profiles: bulk-operations.md
-      - Event Metadata: event-metadata.md
       - Streams: streams.md
   - Production:
       - Reliable Messaging (contract & CRITICAL profile): reliable-messaging.md

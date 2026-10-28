@@ -8,14 +8,6 @@
 
 ::: rabbitkit.core.types.MessageEnvelope
 
-## Event metadata (optional)
-
-See [Event Metadata](../event-metadata.md).
-
-::: rabbitkit.core.event_metadata.EventMetadata
-::: rabbitkit.core.event_metadata.check_supported_version
-::: rabbitkit.core.event_metadata.format_occurred_at
-::: rabbitkit.core.errors.EventMetadataError
 ::: rabbitkit.core.errors.InboundMessageTooLargeError
 
 ## Reserved headers

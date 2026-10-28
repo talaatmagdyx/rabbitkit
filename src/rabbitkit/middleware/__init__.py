@@ -2,7 +2,6 @@
 
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
-from rabbitkit.middleware.event_metadata import EventMetadataMiddleware
 from rabbitkit.middleware.metrics import (
     BrokerMetrics,
     MetricsCollector,
@@ -21,7 +20,6 @@ __all__ = [
     "CircuitBreakerMiddleware",
     "CircuitBreakerOpenError",
     "DeduplicationMiddleware",
-    "EventMetadataMiddleware",
     "HandlerTimeoutError",
     "InvalidSignatureError",
     "MetricSpec",

@@ -1,17 +1,14 @@
-"""Real-broker coverage for the CRITICAL reliability profile and the event
-metadata / body cap / reserved-header features it builds on.
+"""Real-broker coverage for the CRITICAL reliability profile and the body cap
+and reserved-header features it builds on.
 
-* ADR-M1/M4  ``critical_config()`` declares a quorum, at-least-once retry
-             chain and a quorum DLQ; a transient failure is retried and then
-             succeeds; the routes pass ``validate_profile(CRITICAL)``
-* G-20       a permanent failure's DLQ copy carries the failure metadata and
-             the event metadata unchanged
-* G-19       a producer-set ``x-rabbitkit-retry-count`` / ``x-death`` is
-             stripped from an application publish, so retries still happen
-* §15.6      an oversized delivery is dead-lettered without running the
-             handler
-* ADR-M5     an unknown ``event_version`` is dead-lettered as
-             ``invalid_message`` without running the handler
+* ``critical_config()`` declares a quorum, at-least-once retry chain and a
+  quorum DLQ; a transient failure is retried and then succeeds; the routes
+  pass ``validate_profile(CRITICAL)``
+* a permanent failure's DLQ copy carries the failure metadata and keeps the
+  message's AMQP properties and application headers unchanged
+* a producer-set ``x-rabbitkit-retry-count`` / ``x-death`` is stripped from
+  an application publish, so retries still happen
+* an oversized delivery is dead-lettered without running the handler
 """
 
 from __future__ import annotations
@@ -64,21 +61,6 @@ def _source(name: str) -> Any:
     )
 
 
-def _meta(**kw: Any) -> Any:
-    from rabbitkit import EventMetadata
-
-    fields: dict[str, Any] = {
-        "event_type": "order.created",
-        "event_version": 1,
-        "source": "checkout",
-        "idempotency_key": f"order:{uuid.uuid4().hex[:6]}",
-        "occurred_at": OCCURRED,
-        "tenant_id": "tenant-a",
-    }
-    fields.update(kw)
-    return EventMetadata.create(**fields)
-
-
 @contextlib.contextmanager
 def _pika(rabbit: dict[str, Any]) -> Iterator[Any]:
     import pika
@@ -110,19 +92,6 @@ def _delete(rabbit: dict[str, Any], *queues: str) -> None:
 
 def _queues(q: str) -> list[str]:
     return [q, f"{q}.dlq", f"{q}.retry.1"]
-
-
-def _as_message(props: Any, body: bytes) -> Any:
-    from rabbitkit import RabbitMessage
-
-    return RabbitMessage(
-        body=body,
-        headers=dict(props.headers or {}),
-        message_id=props.message_id,
-        correlation_id=props.correlation_id,
-        type=props.type,
-        app_id=props.app_id,
-    )
 
 
 async def _wait(pred: Any, timeout: float) -> bool:
@@ -158,7 +127,7 @@ def _mgmt_get(rabbit: dict[str, Any], path: str) -> Any:
 
 @pytest.mark.asyncio
 async def test_critical_profile_declares_an_at_least_once_quorum_chain_and_retries(rabbit: dict[str, Any]) -> None:
-    from rabbitkit import AsyncBroker, ReliabilityProfile, validate_profile
+    from rabbitkit import AsyncBroker, MessageEnvelope, ReliabilityProfile, validate_profile
 
     q = _name("rk-crit-retry")
     config = _critical(rabbit)
@@ -176,7 +145,7 @@ async def test_critical_profile_declares_an_at_least_once_quorum_chain_and_retri
         async with asyncio.timeout(45):
             await broker.start(install_signal_handlers=False)
             await await_consumers(rabbit["url"], q)
-            outcome = await broker.publish(_meta().to_envelope(routing_key=q, body=b"{}"))
+            outcome = await broker.publish(MessageEnvelope(routing_key=q, body=b"{}", mandatory=True))
             assert outcome.ok, outcome
             assert await _wait(lambda: len(runs) >= 2, 20), runs
             await asyncio.sleep(0.5)
@@ -199,7 +168,7 @@ async def test_critical_profile_declares_an_at_least_once_quorum_chain_and_retri
         _delete(rabbit, *_queues(q))
 
 
-# ── G-20: permanent failure → DLQ copy with failure + event metadata ───────
+# ── permanent failure → DLQ copy with failure metadata, properties kept ────
 
 
 class _OrderRejected(Exception):
@@ -207,11 +176,11 @@ class _OrderRejected(Exception):
 
 
 @pytest.mark.asyncio
-async def test_permanent_failure_dlq_copy_keeps_failure_and_event_metadata(rabbit: dict[str, Any]) -> None:
-    from rabbitkit import AsyncBroker, EventMetadata, EventMetadataMiddleware
+async def test_permanent_failure_dlq_copy_keeps_failure_metadata_and_properties(rabbit: dict[str, Any]) -> None:
+    from rabbitkit import AsyncBroker, MessageEnvelope
 
     q = _name("rk-crit-perm")
-    broker = AsyncBroker(_critical(rabbit), middlewares=[EventMetadataMiddleware()])
+    broker = AsyncBroker(_critical(rabbit))
     runs = {"n": 0}
 
     @broker.subscriber(_source(q))
@@ -219,12 +188,22 @@ async def test_permanent_failure_dlq_copy_keeps_failure_and_event_metadata(rabbi
         runs["n"] += 1
         raise _OrderRejected("business rule")
 
-    meta = _meta()
+    envelope = MessageEnvelope(
+        routing_key=q,
+        body=b'{"id": 1}',
+        message_id=f"order-{uuid.uuid4().hex[:6]}",
+        correlation_id="corr-1",
+        type="order.created",
+        app_id="checkout",
+        timestamp=OCCURRED,
+        headers={"x-app-key": "order:1"},
+        mandatory=True,
+    )
     try:
         async with asyncio.timeout(45):
             await broker.start(install_signal_handlers=False)
             await await_consumers(rabbit["url"], q)
-            outcome = await broker.publish(meta.to_envelope(routing_key=q, body=b'{"id": 1}'))
+            outcome = await broker.publish(envelope)
             assert outcome.ok, outcome
             await _wait_ready(rabbit, f"{q}.dlq", 1)
             await broker.stop()
@@ -237,8 +216,10 @@ async def test_permanent_failure_dlq_copy_keeps_failure_and_event_metadata(rabbi
         assert headers["x-rabbitkit-original-queue"] == q
         assert "x-rabbitkit-dead-lettered-at" in headers
         assert props.delivery_mode == 2
-        assert props.timestamp is not None  # set on publish because metadata was used
-        assert EventMetadata.from_message(_as_message(props, body), require_tenant=True) == meta
+        assert (props.message_id, props.correlation_id) == (envelope.message_id, "corr-1")
+        assert (props.type, props.app_id) == ("order.created", "checkout")
+        assert props.timestamp is not None
+        assert headers["x-app-key"] == "order:1"
     finally:
         with contextlib.suppress(Exception):
             await broker.stop()
@@ -329,46 +310,6 @@ async def test_oversized_delivery_is_dead_lettered_without_running_the_handler(r
         assert headers["x-rabbitkit-original-queue"] == q
         assert headers["x-rabbitkit-original-message-id"] == "big-1"
         assert "x-death" not in headers
-    finally:
-        with contextlib.suppress(Exception):
-            await broker.stop()
-        _delete(rabbit, *_queues(q))
-
-
-# ── ADR-M5: unknown event_version → invalid_message ────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_unknown_event_version_is_dead_lettered_as_invalid_message(rabbit: dict[str, Any]) -> None:
-    from rabbitkit import AsyncBroker, EventMetadata, EventMetadataMiddleware
-
-    q = _name("rk-crit-ver")
-    broker = AsyncBroker(_critical(rabbit))
-    runs = {"n": 0}
-
-    @broker.subscriber(
-        _source(q),
-        middlewares=[EventMetadataMiddleware(supported_versions={"order.created": {1}}, validate_publish=False)],
-    )
-    async def handle(body: bytes) -> None:
-        runs["n"] += 1
-
-    good, unknown = _meta(event_version=1), _meta(event_version=2)
-    try:
-        async with asyncio.timeout(45):
-            await broker.start(install_signal_handlers=False)
-            await await_consumers(rabbit["url"], q)
-            assert (await broker.publish(unknown.to_envelope(routing_key=q, body=b"{}"))).ok
-            assert (await broker.publish(good.to_envelope(routing_key=q, body=b"{}"))).ok
-            await _wait_ready(rabbit, f"{q}.dlq", 1)
-            assert await _wait(lambda: runs["n"] >= 1, 10)
-            await asyncio.sleep(0.5)
-            await broker.stop()
-        assert runs["n"] == 1  # only the supported version reached the handler
-        ((props, body),) = _drain(rabbit, f"{q}.dlq")
-        assert props.headers["x-rabbitkit-error-category"] == "invalid_message"
-        assert props.headers["x-rabbitkit-error-type"] == "EventMetadataError"
-        assert EventMetadata.from_message(_as_message(props, body)) == unknown
     finally:
         with contextlib.suppress(Exception):
             await broker.stop()

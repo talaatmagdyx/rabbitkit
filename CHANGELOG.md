@@ -318,7 +318,7 @@ fixes (see below).
   `swallow_permanent=True` or a matching fallback handler. Its log lines are
   sanitized (they printed raw exception text).
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
 - **The CRITICAL reliability profile enforces the reliable-messaging
   contract (ADR-M1/M4).** `apply_profile(..., "critical")` /
@@ -340,8 +340,7 @@ fixes (see below).
   source queue not declared `x-dead-letter-strategy=at-least-once`; with a
   management client, `preflight()` verifies that on the broker instead and
   drops the warning. A previously compliant CRITICAL config therefore now
-  reports violations until it adopts the new settings. Event-metadata
-  validation is not forced. STANDARD is unchanged. Connection
+  reports violations until it adopts the new settings. STANDARD is unchanged. Connection
   reconnect/backoff settings are not covered yet (TODO for the connection
   stream).
 
@@ -718,30 +717,8 @@ fixes (see below).
   --require-actor` (env `RABBITKIT_REPLAY_REQUIRE_ACTOR`) refuses (exit 2,
   audited) a replay without `--actor`.
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
-- **Event metadata (G-20, ADR-M5), optional and generic.**
-  `rabbitkit.EventMetadata` (frozen, `core/event_metadata.py`) maps
-  `message_id` (AMQP `message_id`), `idempotency_key` (header
-  `idempotency-key`), `event_type` (`type`), `event_version` (header
-  `event-version`, int >= 1), `source` (`app_id`), `occurred_at` (header
-  `occurred-at`, RFC 3339 UTC), `correlation_id` and optional `tenant_id`
-  (header `tenant-id`). Trace context stays with `OTelTracingMiddleware`.
-  Construction validates and raises the new `rabbitkit.EventMetadataError`
-  (an `InvalidMessageError`, so `INVALID_MESSAGE`; names the bad fields,
-  never their values). `EventMetadata.create()` fills in `message_id`,
-  `correlation_id` (= `message_id`) and `occurred_at`; `to_envelope()` /
-  `apply_to()` build a `MessageEnvelope` (no change to `MessageEnvelope`),
-  refuse to overwrite different values and set the AMQP `timestamp` when
-  missing; `from_message()` / `from_envelope()` read and validate;
-  `check_supported_version()` applies a supported-versions policy.
-- `rabbitkit.EventMetadataMiddleware` (opt-in): validates deliveries before
-  the handler (missing/invalid metadata or an unsupported `event_version` /
-  event type → `EventMetadataError`: dead-lettered, never retried; with
-  retry the DLQ copy carries `x-rabbitkit-error-category: invalid_message`),
-  and validates envelopes before publish (`validate_publish=False` to skip
-  on a route whose results are not events), setting `timestamp` when
-  missing. Retry, DLQ and replay copies keep the metadata (tested).
 - `ConsumerConfig.max_body_bytes` (§15.6, default `None` = no cap): a
   delivery whose wire body is larger is `INVALID_MESSAGE` and rejected
   without requeue (the source's DLX moves it to the DLQ; the async broker
@@ -1195,7 +1172,7 @@ fixes (see below).
   loss for both strategies, the declared strategy, bounded redelivery, and
   that the at-most-once message reaches the restored DLQ with metadata).
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
 - **`RabbitApp.run_async()` reset the application's signal handlers
   (G-24).** `loop.remove_signal_handler()` restores `SIG_DFL`, not the
@@ -1391,7 +1368,7 @@ fixes (see below).
   composed DLQ-missing behaviour per source type, `trust_retry_header`,
   replay authorization.
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
 - New `docs/reliable-messaging.md` (in the mkdocs nav under Production):
   the contract as implemented — publish outcome table with reasons,
@@ -1402,8 +1379,6 @@ fixes (see below).
   (producer outbox, exhausted handoff → DLQ, connection settings in the
   profile) and the SyncBroker's retry-once-after-dead-connection publish is
   called out.
-- New `docs/event-metadata.md` (nav: User Guide); API entries in
-  `docs/api/messages.md` and `docs/api/middleware.md`.
 - `docs/bulk-operations.md`: CRITICAL table and example
   (`processing_timeout`); `docs/retry-and-dlq.md`: stripping reserved
   headers; `docs/message-safety.md`: two guarantee rows.

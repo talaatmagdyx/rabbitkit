@@ -518,7 +518,6 @@ validates it.
 | Middleware | Job |
 |---|---|
 | `RetryMiddleware` | Broker-side retry ladder (auto-wired with `retry=`) |
-| `EventMetadataMiddleware` | Opt-in [event metadata](docs/event-metadata.md) validation (type, version, source, idempotency key, …); bad or unknown-version events are dead-lettered |
 | `DeduplicationMiddleware` | Redis-backed duplicate suppression; `claim` policy is crash-safe; `store_results` replays the original answer to duplicates |
 | `MetricsMiddleware` | Counters + latency histograms, cardinality-guarded labels |
 | `OTelTracingMiddleware` | Standard OpenTelemetry spans + W3C propagation |
@@ -684,7 +683,6 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
 - [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
-- [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
 - [Streams — offsets, replay, retention](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)

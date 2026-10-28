@@ -20,12 +20,6 @@
 ::: rabbitkit.middleware.signing.SigningConfig
 ::: rabbitkit.middleware.signing.InvalidSignatureError
 
-## EventMetadataMiddleware
-
-Opt-in validation of [event metadata](../event-metadata.md).
-
-::: rabbitkit.middleware.event_metadata.EventMetadataMiddleware
-
 ## RateLimitMiddleware
 
 ::: rabbitkit.middleware.rate_limit.RateLimitMiddleware

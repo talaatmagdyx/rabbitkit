@@ -26,7 +26,6 @@ Error text                  sanitized                 sanitized or omitted (neve
 Dead-letter path            auto-provisioned          never ``discard``
 DLQ metadata outside retry  ``x-death`` only          confirmed copy with failure metadata
                                                       (``safety.dead_letter_with_metadata``, async)
-Event metadata validation   opt-in                    opt-in (an application contract choice)
 Heartbeat                   explicit                  required (> 0)
 Async reconnect budget      unlimited                 unlimited by default; when set, seconds
                                                       >= ``reconnect_backoff_max`` (warning)
@@ -382,8 +381,7 @@ def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> Ra
     raises) and leaves the reconnect budget and TLS to you. Per-route requirements (quorum source
     queues declared at-least-once, no ``ACK_FIRST``, retry not disabled) are
     the routes' to meet: check them with :func:`validate_profile` /
-    :func:`preflight` after registering the subscribers. Event-metadata
-    validation stays opt-in (``EventMetadataMiddleware``).
+    :func:`preflight` after registering the subscribers.
 
     STANDARD fills in confirms, persistence and mandatory only.
     """

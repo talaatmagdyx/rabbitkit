@@ -100,8 +100,10 @@ class TestStreamOffset:
     def test_to_consume_arguments_timestamp(self) -> None:
         dt = datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC)
         args = StreamOffset.timestamp(dt).to_consume_arguments()
-        # RabbitMQ expects a Unix timestamp in seconds (int), not a datetime.
-        assert args == {"x-stream-offset": int(dt.timestamp())}
+        # A datetime, which pika and aio-pika encode as an AMQP timestamp. An
+        # int would be read by RabbitMQ as a numeric offset, not a time
+        # (verified on 3.13/4.1: an int "timestamp" delivered nothing).
+        assert args == {"x-stream-offset": dt}
 
     def test_repr_no_value(self) -> None:
         assert repr(StreamOffset.first()) == "StreamOffset(first)"
@@ -187,7 +189,6 @@ class TestStreamConsumerConfig:
 
 class TestStreamOffsetTimestampValidation:
     def test_timestamp_offset_requires_datetime(self) -> None:
-        """TIMESTAMP offset raises TypeError when value is not a datetime."""
-        offset = StreamOffset(type=StreamOffsetType.TIMESTAMP, value="not-a-datetime")
-        with pytest.raises(TypeError, match="TIMESTAMP stream offset requires a datetime"):
-            offset.to_consume_arguments()
+        """A TIMESTAMP offset without a datetime is refused at construction."""
+        with pytest.raises(TypeError, match="TIMESTAMP stream offset needs a datetime"):
+            StreamOffset(type=StreamOffsetType.TIMESTAMP, value="not-a-datetime")  # type: ignore[arg-type]

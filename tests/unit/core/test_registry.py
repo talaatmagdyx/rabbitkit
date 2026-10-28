@@ -551,3 +551,147 @@ class TestPrefetchOverride:
                 pass
 
         assert reg.routes == []
+
+
+# ── stream routes ────────────────────────────────────────────────────────
+
+
+def _stream_queue(name: str = "events") -> RabbitQueue:
+    from rabbitkit.core.types import QueueType
+
+    return RabbitQueue(name=name, queue_type=QueueType.STREAM)
+
+
+class TestStreamRoutes:
+    def test_a_stream_queue_gets_a_default_stream_config(self) -> None:
+        from rabbitkit.core.streams import StreamConsumerConfig
+
+        reg = _make_registry()
+
+        @reg.subscriber(queue=_stream_queue())
+        def handle(body: bytes) -> None: ...
+
+        assert reg.routes[0].stream_config == StreamConsumerConfig()
+        assert reg.routes[0].is_stream
+
+    def test_a_classic_queue_has_no_stream_config(self) -> None:
+        reg = _make_registry()
+
+        @reg.subscriber(queue="orders")
+        def handle(body: bytes) -> None: ...
+
+        assert reg.routes[0].stream_config is None
+        assert not reg.routes[0].is_stream
+
+    def test_stream_offset_shorthand(self) -> None:
+        from rabbitkit.core.streams import StreamOffset
+
+        reg = _make_registry()
+
+        @reg.subscriber(queue=_stream_queue(), stream_offset=42)
+        def handle(body: bytes) -> None: ...
+
+        config = reg.routes[0].stream_config
+        assert config is not None and config.offset == StreamOffset.offset(42)
+
+    def test_stream_config_is_kept(self) -> None:
+        from rabbitkit.core.streams import StreamConsumerConfig
+
+        reg = _make_registry()
+        config = StreamConsumerConfig(offset="first", commit_every=10)
+
+        @reg.subscriber(queue=_stream_queue(), stream=config)
+        def handle(body: bytes) -> None: ...
+
+        assert reg.routes[0].stream_config is config
+
+    def test_both_stream_and_stream_offset_is_refused(self) -> None:
+        from rabbitkit.core.streams import StreamConsumerConfig
+
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="not both"):
+
+            @reg.subscriber(queue=_stream_queue(), stream=StreamConsumerConfig(), stream_offset="first")
+            def handle(body: bytes) -> None: ...
+
+    def test_stream_must_be_a_stream_consumer_config(self) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="must be a StreamConsumerConfig"):
+
+            @reg.subscriber(queue=_stream_queue(), stream="first")  # type: ignore[arg-type]
+            def handle(body: bytes) -> None: ...
+
+    @pytest.mark.parametrize("bad", ["begin", -1, 1.5])
+    def test_invalid_stream_offset_is_a_configuration_error(self, bad: object) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="invalid stream_offset"):
+
+            @reg.subscriber(queue=_stream_queue(), stream_offset=bad)  # type: ignore[arg-type]
+            def handle(body: bytes) -> None: ...
+
+    def test_stream_options_on_a_classic_queue_are_refused(self) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="need a stream queue; queue 'orders' is classic"):
+
+            @reg.subscriber(queue="orders", stream_offset="first")
+            def handle(body: bytes) -> None: ...
+
+    def test_retry_on_a_stream_route_is_refused(self) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match=r"retry/DLQ is not supported .*this route.s retry="):
+
+            @reg.subscriber(queue=_stream_queue(), retry=RetryConfig(max_retries=3))
+            def handle(body: bytes) -> None: ...
+
+    def test_inherited_broker_retry_on_a_stream_route_is_refused(self) -> None:
+        reg = _make_registry(broker_retry=RetryConfig(max_retries=3))
+        with pytest.raises(ConfigurationError, match=r"the broker.s default RetryConfig.*RETRY_DISABLED"):
+
+            @reg.subscriber(queue=_stream_queue())
+            def handle(body: bytes) -> None: ...
+
+    def test_retry_disabled_on_a_stream_route_is_accepted_under_a_broker_retry(self) -> None:
+        reg = _make_registry(broker_retry=RetryConfig(max_retries=3))
+
+        @reg.subscriber(queue=_stream_queue(), retry=RETRY_DISABLED)
+        def handle(body: bytes) -> None: ...
+
+        assert reg.routes[0].is_stream
+
+    def test_setting_a_broker_retry_later_revalidates_stream_routes(self) -> None:
+        reg = _make_registry()
+
+        @reg.subscriber(queue=_stream_queue())
+        def handle(body: bytes) -> None: ...
+
+        with pytest.raises(ConfigurationError, match="retry/DLQ is not supported"):
+            reg.set_broker_retry(RetryConfig(max_retries=3))
+
+    def test_ack_first_on_a_stream_route_is_refused(self) -> None:
+        reg = _make_registry()
+        with pytest.raises(ConfigurationError, match="ACK_FIRST is not supported on a stream queue"):
+
+            @reg.subscriber(queue=_stream_queue(), ack_policy=AckPolicy.ACK_FIRST)
+            def handle(body: bytes) -> None: ...
+
+    @pytest.mark.parametrize("policy", [AckPolicy.AUTO, AckPolicy.NACK_ON_ERROR, AckPolicy.MANUAL])
+    def test_other_ack_policies_are_accepted(self, policy: AckPolicy) -> None:
+        reg = _make_registry()
+
+        @reg.subscriber(queue=_stream_queue(), ack_policy=policy)
+        def handle(body: bytes) -> None: ...
+
+        assert reg.routes[0].ack_policy is policy
+
+    def test_router_routes_keep_their_stream_config(self) -> None:
+        from rabbitkit.core.router import RabbitRouter
+
+        router = RabbitRouter()
+
+        @router.subscriber(_stream_queue(), stream_offset="first")
+        def handle(body: bytes) -> None: ...
+
+        reg = _make_registry()
+        reg.include_router(router)
+        config = reg.routes[0].stream_config
+        assert config is not None and config.offset.type.value == "first"

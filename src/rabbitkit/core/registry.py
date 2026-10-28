@@ -18,10 +18,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled
+from rabbitkit.core.errors import ConfigurationError
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.route import ResultPublisher, RouteDefinition
+from rabbitkit.core.streams import StreamConsumerConfig, StreamOffset, StreamOffsetLike
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy
+from rabbitkit.core.types import AckPolicy, QueueType
 from rabbitkit.serialization.base import Serializer
 
 if TYPE_CHECKING:
@@ -74,6 +76,8 @@ class SubscriberRegistry:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
+        stream: StreamConsumerConfig | None = None,
+        stream_offset: StreamOffsetLike | None = None,
     ) -> Callable[[HandlerT], HandlerT]:
         """Decorator to register a message handler for a queue.
 
@@ -98,6 +102,13 @@ class SubscriberRegistry:
             reject_without_dlx: Per-route override of
                 ``SafetyConfig.reject_without_dlx`` — 'auto_provision',
                 'error', or 'discard' (None=inherit broker default).
+            stream: How to consume a stream queue (start offset, offset
+                store, commit cadence); see ``StreamConsumerConfig``. Only
+                valid when *queue* is a stream; a stream route without it
+                starts at ``"next"`` with an in-memory offset store.
+            stream_offset: Shorthand for ``stream=StreamConsumerConfig(offset=...)``:
+                ``"first"``, ``"last"``, ``"next"``, an int offset or a
+                datetime. Pass ``stream`` or ``stream_offset``, not both.
         """
         # Normalize queue
         if isinstance(queue, str):
@@ -139,6 +150,8 @@ class SubscriberRegistry:
             # Auto-generate name
             route_name = name or f"{queue.name}:{func.__qualname__}"
 
+            stream_config = _resolve_stream_config(route_name, queue, stream, stream_offset)
+
             # Check for pending @publisher
             result_publisher = self._pending_publishers.pop(id(func), None)
 
@@ -159,6 +172,7 @@ class SubscriberRegistry:
                 filter_fn=filter_fn,
                 reject_without_dlx=reject_without_dlx,
                 reply_to_allow=reply_to_allow,
+                stream_config=stream_config,
             )
 
             # Validate at registration time (fail fast)
@@ -297,3 +311,30 @@ class SubscriberRegistry:
         for q in adj:
             if color.get(q, white) == white:
                 dfs(q, [])
+
+
+def _resolve_stream_config(
+    route_name: str,
+    queue: RabbitQueue,
+    stream: StreamConsumerConfig | None,
+    stream_offset: StreamOffsetLike | None,
+) -> StreamConsumerConfig | None:
+    """The route's ``StreamConsumerConfig``: given, built from the shorthand,
+    or the default for a stream queue; None for any other queue."""
+    if stream is not None and stream_offset is not None:
+        raise ConfigurationError(
+            f"Route '{route_name}': pass stream=StreamConsumerConfig(offset=...) or stream_offset=..., not both."
+        )
+    if stream is not None and not isinstance(stream, StreamConsumerConfig):
+        raise ConfigurationError(
+            f"Route '{route_name}': stream= must be a StreamConsumerConfig, got {type(stream).__name__}."
+        )
+    if stream_offset is not None:
+        try:
+            stream = StreamConsumerConfig(offset=StreamOffset.parse(stream_offset))
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"Route '{route_name}': invalid stream_offset: {exc}") from exc
+    if stream is None and queue.queue_type is QueueType.STREAM:
+        stream = StreamConsumerConfig()
+    # A non-stream queue with stream options is refused by RouteDefinition.validate_stream.
+    return stream

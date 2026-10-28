@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from rabbitkit.core.config import RetryConfig, RetryDisabled
 from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
+from rabbitkit.core.streams import StreamConsumerConfig, StreamOffsetLike
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import AckPolicy
 from rabbitkit.serialization.base import Serializer
@@ -82,6 +83,8 @@ class RabbitRouter:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
+        stream: StreamConsumerConfig | None = None,
+        stream_offset: StreamOffsetLike | None = None,
     ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber on this router.
 
@@ -127,6 +130,8 @@ class RabbitRouter:
             filter_fn=filter_fn,
             reject_without_dlx=reject_without_dlx,
             reply_to_allow=reply_to_allow,
+            stream=stream,
+            stream_offset=stream_offset,
         )
 
     def publisher(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 from datetime import UTC
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -626,6 +627,20 @@ class TestConsume:
 
         call_kwargs = channel.basic_consume.call_args.kwargs
         assert call_kwargs["auto_ack"] is False
+        assert "arguments" not in call_kwargs
+
+    def test_consume_passes_arguments_as_read_at_subscribe_time(self) -> None:
+        """Stream routes: basic_consume gets the arguments as they are when
+        consume() subscribes (a snapshot; the broker passes the current
+        resume point again on each re-subscription)."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        arguments: dict[str, Any] = {"x-stream-offset": 7}
+
+        transport.consume("events", lambda msg: None, arguments=arguments)
+        arguments["x-stream-offset"] = 9
+
+        assert channel.basic_consume.call_args.kwargs["arguments"] == {"x-stream-offset": 7}
 
     def test_consume_fires_channel_opened_not_rebuilt_first_time(self) -> None:
         """Item 3: the first consume() call for a queue opens a fresh

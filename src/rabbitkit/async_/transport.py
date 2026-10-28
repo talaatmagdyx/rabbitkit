@@ -1409,6 +1409,7 @@ class AsyncTransportImpl:
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue.
 
@@ -1436,6 +1437,14 @@ class AsyncTransportImpl:
         consumer's channel is also remembered as ``self._reply_to_channel`` so
         :meth:`publish` can route matching requests onto the SAME channel —
         required by RabbitMQ's direct reply-to (see :meth:`publish`).
+
+        ``arguments`` are the ``basic.consume`` arguments (e.g.
+        ``x-stream-offset`` for a stream queue). The dict is passed BY
+        REFERENCE: aio-pika keeps it in the queue's restore record and sends
+        its current contents when ``connect_robust`` re-subscribes after a
+        reconnect (and the consumer supervisor re-subscribes with it after a
+        broker cancel), so the caller can keep the resume point up to date
+        in place.
         """
         await self._ensure_connected()
 
@@ -1479,8 +1488,12 @@ class AsyncTransportImpl:
             callback=on_message,
             no_ack=no_ack,
             supervised=declare,
+            arguments=arguments,
         )
-        await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
+        consume_kwargs: dict[str, Any] = {}
+        if arguments is not None:
+            consume_kwargs["arguments"] = arguments  # by reference: see docstring
+        await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack, **consume_kwargs)
         self._consumer_tags[queue] = consumer_tag
         await self._consumer_supervisor.register(record)
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)

@@ -277,7 +277,7 @@ class TestRabbitConfigLogging:
 
 
 class TestDoesNotClobberAnApplicationsConfiguration:
-    """§19 / ADR-M6: an embedding application (obskit) configures structlog
+    """an embedding application (obskit) configures structlog
     itself; the broker's call must not replace it unless asked."""
 
     @pytest.fixture(autouse=True)

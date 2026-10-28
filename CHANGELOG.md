@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.0] — 2026-10-28
+## [0.20.0] — 2026-10-29
 
-Reliability foundation for the async (aio-pika) path. Every gap from the
-RabbitMQ Async Messaging Foundation audit is closed or documented; see
-`docs/reliable-messaging.md` for the resulting contract. Several defaults
-change behaviour: read **Changed (behaviour)** before upgrading.
+Publish and consume reliability for both brokers: publish outcomes that say
+whether a message definitely did not leave, may have left, or was confirmed;
+bounded failure loops and shutdown; fail-fast connection recovery with
+backoff; dead-letter copies that carry their failure; and RabbitMQ metrics
+with alert rules. `docs/reliable-messaging.md` describes the resulting
+contract. Also new: supported RabbitMQ Streams consumption with resumable
+offsets (`docs/streams.md`). Several defaults change behaviour: read
+**Changed (behaviour)** before upgrading.
+
+0.19.2 was never published to PyPI; upgrading from 0.19.1 also brings its
+fixes (see below).
 
 ### Changed (behaviour)
 
@@ -29,7 +36,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   queues (3.13 and 4.1), 1,936 on a 3.13 quorum queue, and the message never
   reached the DLQ. Now: 2 runs, message in the DLQ. Rationale: an infinite
   immediate requeue loop burns CPU, floods logs and starves other messages
-  (INV-007); the DLQ keeps the message for inspection and replay. The
+; the DLQ keeps the message for inspection and replay. The
   `redelivered` flag is the only per-message signal a classic queue
   carries, so the cap is two attempts, and a redelivery caused by a crash
   or reconnect counts as the first. Use `RetryConfig` for more attempts
@@ -51,7 +58,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   with a `MetricsMiddleware` on the route, in
   `<namespace>_settlement_outcome_unknown_total`
   (`MetricsConfig.settlement_outcome_unknown_total`), and nothing else is
-  sent for that delivery (§11.3).
+  sent for that delivery.
 
 
 - **Terminal failures are dead-lettered by `RetryMiddleware` itself, with
@@ -232,7 +239,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 #### Consumer
 
-- **Async settlement is claimed before the network write (G-15).**
+- **Async settlement is claimed before the network write.**
   `RabbitMessage.ack_async()` / `nack_async()` / `reject_async()` set the
   disposition before awaiting the transport. Before, the guard set it only
   after the await, so two coroutines (a concurrent ack and nack, or `stop()`
@@ -250,7 +257,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   (`messages_acked_total` etc.) is not emitted for such a message. The sync
   methods (`ack()`, `nack()`, `reject()`) are unchanged.
 - **`AsyncBroker.start(install_signal_handlers=True)` no longer clobbers the
-  application's signal handlers (G-24).** The default stays `True`. The
+  application's signal handlers.** The default stays `True`. The
   Python-level SIGINT/SIGTERM handler in place is captured with
   `signal.getsignal` and restored by `stop()` (before, `stop()` reset it to
   the default, so e.g. `asyncio.run()`'s SIGINT handler or an application's
@@ -263,7 +270,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `start()`. Embedding applications should pass
   `install_signal_handlers=False` (see `docs/kubernetes.md`).
 - **`rabbitkit_lifespan` starts an `AsyncBroker` with
-  `install_signal_handlers=False`** (G-24). The ASGI server owns
+  `install_signal_handlers=False`**. The ASGI server owns
   SIGINT/SIGTERM and runs the lifespan teardown on them; with the broker's
   handlers installed over the server's, SIGTERM stopped only the broker and
   the server kept running.
@@ -275,7 +282,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   (and cut them off at the deadline). In-flight handlers keep the
   `graceful_timeout` grace. Verified on a real broker: 2 in flight, 4 queued
   → the 4 are back on the queue while the 2 still run.
-- **Per-route `prefetch_count` is validated at registration (CONSUMER-005).**
+- **Per-route `prefetch_count` is validated at registration.**
   `@broker.subscriber(..., prefetch_count=0)` silently fell back to the
   global value, and a negative value was sent to the broker. It now raises
   `ConfigurationError` unless it is `None` (inherit) or an `int >= 1`.
@@ -313,10 +320,10 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `swallow_permanent=True` or a matching fallback handler. Its log lines are
   sanitized (they printed raw exception text).
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
 - **The CRITICAL reliability profile enforces the reliable-messaging
-  contract (ADR-M1/M4).** `apply_profile(..., "critical")` /
+  contract (M4).** `apply_profile(..., "critical")` /
   `critical_config()` now also set `publisher.max_in_flight_bytes`
   (64 MiB unless set), `publisher.strip_reserved_headers=True`, and on the
   retry config `delay_queue_dead_letter_strategy="at-least-once"`,
@@ -335,10 +342,9 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   source queue not declared `x-dead-letter-strategy=at-least-once`; with a
   management client, `preflight()` verifies that on the broker instead and
   drops the warning. A previously compliant CRITICAL config therefore now
-  reports violations until it adopts the new settings. Event-metadata
-  validation is not forced. STANDARD is unchanged. Connection
-  reconnect/backoff settings are not covered yet (TODO for the connection
-  stream).
+  reports violations until it adopts the new settings. STANDARD is unchanged.
+  The profile also requires a connection heartbeat and validates (without
+  forcing) the reconnect budget.
 
 #### Observability
 
@@ -427,6 +433,89 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   actually sent. It used to be recorded when `RetryMiddleware` handed a
   terminal failure back, so a delivery requeued because its DLQ was missing
   was counted on every redelivery.
+
+#### Sync broker parity
+
+- **`SyncBroker` enforces `ConsumerConfig.processing_timeout`.** It used to
+  ignore it and log a warning. Python cannot interrupt a thread, so the
+  semantics are: when a handler run passes its deadline, the I/O thread
+  settles the delivery through the pipeline's normal failure path with
+  `HandlerTimeoutError` (`UNKNOWN_OUTCOME`, transient: first delivery
+  nack-requeued, a redelivery rejected into the DLQ, logged with
+  `outcome_unknown=True`), exactly as `AsyncBroker` settles its cancelled
+  handler task. The handler thread is not stopped: it keeps its worker until
+  it returns, so no more than `worker_count` handlers ever run; when it
+  returns, its result is logged and discarded. Settlement is claimed once per
+  delivery, so the late handler's ack/nack/reject never reaches the channel
+  (a second settlement of a settled tag would close it), and its
+  handler-result, retry and DLQ publishes are refused (`NOT_SENT`, reason
+  `cancelled`). The deadline starts when the handler starts and is checked
+  on every consume-loop tick (at most `min(1 s, processing_timeout / 4)`
+  apart) and during the `stop()` drain.
+  **Observable change:** with `processing_timeout` set, sync handlers no
+  longer run inline on the I/O thread. `worker_count > 1` uses the worker
+  pool as before; `worker_count = 1` now runs handlers on one dedicated
+  handler thread (same order, one at a time), chosen over refusing to start
+  because the CRITICAL profile requires `processing_timeout` and inline
+  sync consumers under it were valid configurations. Handlers that depend on
+  running on the thread that called `start()` (thread-local state,
+  `broker.request()`) need the deadline off. Unchanged when
+  `processing_timeout` is `None` (the default). A handler that never returns
+  holds its worker for good; with one worker the route then stops taking
+  deliveries (they stay prefetched, unacked).
+- **`SyncBroker` reports a consumer the broker cancelled as not consuming.**
+  Before, a server `basic.cancel` (queue deleted, quorum leader moved,
+  operator action) left the route reported as consuming while nothing was
+  delivered, and it never subscribed again. `broker_health_check()` now
+  reports such a route as not consuming (DEGRADED) and `broker_readiness()`
+  fails until the consumer is back.
+
+#### Streams
+
+- **Stream routes refuse retry and `ACK_FIRST` at registration**
+  (`ConfigurationError`), including a `RetryConfig` inherited from the
+  broker (pass `retry=RETRY_DISABLED` on the stream route). RabbitMQ neither
+  redelivers nor dead-letters a nacked or rejected stream message, so retry
+  could not work; before this change such a route failed at startup instead,
+  when the retry topology declared `x-dead-letter-exchange` on the stream
+  (406).
+- **Stream routes get no safety DLQ.** `SafetyConfig.reject_without_dlx`
+  (default `auto_provision`) no longer adds `x-dead-letter-exchange` to a
+  stream or declares `<stream>.dlq`; RabbitMQ refused the argument (406), so
+  every stream route under the default safety config failed at startup. A
+  rejected stream message is not discarded, it stays in the stream.
+- **A handler failure on a stream route is skipped**, logged as a WARNING
+  with its offset (`Stream route ...: the message at offset N failed and is
+  not retried`), and counted; the consumer moves on. This is what RabbitMQ
+  already did with the nack/reject; it is now explicit.
+- **A stream route resumes after a reconnect** from the last processed
+  offset instead of the broker default `"next"`, which skipped what was
+  published during the outage.
+- `RabbitQueue(queue_type=STREAM)` now raises `TopologyValidationError` for
+  `dead_letter_exchange`, `dead_letter_routing_key`, `max_length`,
+  `overflow`, `expires`, `delivery_limit` and `single_active_consumer`, and
+  for a non-positive `max_length_bytes`. RabbitMQ 3.13 and 4.1 refuse each
+  on a stream with 406 `invalid arg`, so these declarations already failed,
+  at startup.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **Alert thresholds are reasoned defaults, no longer placeholders.** Every
+  alert has a `rationale` annotation and a `source` label. Changed
+  expressions (alert names unchanged): `PublisherUnknownOutcomes` is a ratio
+  (> 1% for 10m, was any for 5m); `RabbitMQConnectionFailures` is > 10 failed
+  attempts in 5m for 5m (was > 5 in 10m for 10m, which a single broker
+  restart could trip); `RabbitMQConnectionBlocked` averages over 2m so the
+  blocked-connection watchdog's reconnects do not hide an alarm, and no
+  longer fires for disk/memory alarms (their own alerts do);
+  `ConsumerBacklogGrowing` uses the drain time (backlog / delivery rate >
+  10 min and growing, was > 1000 ready); `ConsumerUnackedHigh` fires on
+  unacked deliveries with no handler completion for 10m (was > 5000 unacked);
+  `ConsumerProcessingFailures` and `RetryStormDetected` need at least one
+  handler run a minute; the plugin `RabbitMQQuorumUnhealthy` compares the
+  node count with its own 1-day maximum (no hardcoded `3`) and no longer
+  uses `rabbitmq_raft_term_total`, whose rate scales with the number of
+  queues.
 
 ### Added
 
@@ -566,8 +655,8 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 #### Consumer
 
-- **Broker-cancelled consumers are detected, reported and re-subscribed
-  (G-26).** RabbitMQ cancels a consumer itself (`basic.cancel`) when its
+- **Broker-cancelled consumers are detected, reported and re-subscribed.**
+  RabbitMQ cancels a consumer itself (`basic.cancel`) when its
   queue is deleted, a quorum leader moves or an operator closes it; aiormq
   < 7 only drops the tag, so rabbitkit kept reporting the route as consuming
   and never subscribed again. The async transport now detects it (aiormq's
@@ -630,31 +719,9 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   --require-actor` (env `RABBITKIT_REPLAY_REQUIRE_ACTOR`) refuses (exit 2,
   audited) a replay without `--actor`.
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
-- **Event metadata (G-20, ADR-M5), optional and generic.**
-  `rabbitkit.EventMetadata` (frozen, `core/event_metadata.py`) maps
-  `message_id` (AMQP `message_id`), `idempotency_key` (header
-  `idempotency-key`), `event_type` (`type`), `event_version` (header
-  `event-version`, int >= 1), `source` (`app_id`), `occurred_at` (header
-  `occurred-at`, RFC 3339 UTC), `correlation_id` and optional `tenant_id`
-  (header `tenant-id`). Trace context stays with `OTelTracingMiddleware`.
-  Construction validates and raises the new `rabbitkit.EventMetadataError`
-  (an `InvalidMessageError`, so `INVALID_MESSAGE`; names the bad fields,
-  never their values). `EventMetadata.create()` fills in `message_id`,
-  `correlation_id` (= `message_id`) and `occurred_at`; `to_envelope()` /
-  `apply_to()` build a `MessageEnvelope` (no change to `MessageEnvelope`),
-  refuse to overwrite different values and set the AMQP `timestamp` when
-  missing; `from_message()` / `from_envelope()` read and validate;
-  `check_supported_version()` applies a supported-versions policy.
-- `rabbitkit.EventMetadataMiddleware` (opt-in): validates deliveries before
-  the handler (missing/invalid metadata or an unsupported `event_version` /
-  event type → `EventMetadataError`: dead-lettered, never retried; with
-  retry the DLQ copy carries `x-rabbitkit-error-category: invalid_message`),
-  and validates envelopes before publish (`validate_publish=False` to skip
-  on a route whose results are not events), setting `timestamp` when
-  missing. Retry, DLQ and replay copies keep the metadata (tested).
-- `ConsumerConfig.max_body_bytes` (§15.6, default `None` = no cap): a
+- `ConsumerConfig.max_body_bytes` (default `None` = no cap): a
   delivery whose wire body is larger is `INVALID_MESSAGE` and rejected
   without requeue (the source's DLX moves it to the DLQ; the async broker
   checks the DLQ exists first) before the filter, any middleware, decode or
@@ -663,7 +730,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `SafetyConfig.dead_letter_with_metadata` the broker dead-letters it, so the
   DLQ entry carries `x-death` only; with it (on under CRITICAL) the DLQ entry
   is a metadata-stamped copy.
-- `PublisherConfig.strip_reserved_headers` (G-19, default `False`):
+- `PublisherConfig.strip_reserved_headers` (default `False`):
   `broker.publish()` (sync and async, and `publish_many` / `iter_publish`)
   drops rabbitkit's retry/DLQ/replay bookkeeping headers
   (`x-rabbitkit-retry-count`, `-first-failed-at`, `-original-*`,
@@ -681,7 +748,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 #### Observability
 
-- **Broker metrics (`rabbitkit.middleware.BrokerMetrics`, G-22).** Both
+- **Broker metrics (`rabbitkit.middleware.BrokerMetrics`).** Both
   brokers now emit, through the first `MetricsMiddleware` with a collector
   (publish middlewares first, then any route):
   `connection_up{role}`, `connections_active`, `channels_active`,
@@ -723,7 +790,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 - `LoggingConfig.override_existing` (default `False`), `configure_structlog(...,
   override_existing=True)` (returns whether it configured) and
   `structlog_configured_elsewhere()`.
-- **Alert rules and runbooks (G-23).** `deploy/prometheus/rabbitkit-alerts.yaml`
+- **Alert rules and runbooks.** `deploy/prometheus/rabbitkit-alerts.yaml`
   (plain Prometheus rules; wrap in a `PrometheusRule` for the Operator):
   PublisherConfirmFailures, PublisherUnknownOutcomes,
   PublisherUnroutableMessages, RabbitMQBrokerUnavailable,
@@ -743,7 +810,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   as with `rabbitkit_lifespan`) and stops it when the block exits, also on
   an exception or cancellation. Standalone processes keep using
   `await broker.run()`.
-- `SafetyConfig.dead_letter_with_metadata` (G-17; default `False`, async
+- `SafetyConfig.dead_letter_with_metadata` (default `False`, async
   broker only; `SyncBroker` logs that it ignores it): failures that never
   reach `RetryMiddleware` (an `on_receive` failure such as a bad gzip body
   or signature, a body over `ConsumerConfig.max_body_bytes`, a failure on a
@@ -771,20 +838,166 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   the `.mock` the broker records deliveries on, so
   `handler.mock.assert_called_once()` passes strict type checking.
 - A Pyright strict check of the public API from a downstream application's
-  view (G-29). `tests/typing/public_api.py` uses the API the way a strictly
+  view. `tests/typing/public_api.py` uses the API the way a strictly
   typed app would and pins the types it relies on with `assert_type`. CI job
   `typing` runs `pyright -p tests/typing` (pyright 1.1.414, Python 3.12),
   scoped to that directory only. The package itself stays gated by mypy.
-- Real-broker NACK tests (F04, `tests/integration/test_hardening_foundation.py`).
+- Real-broker NACK tests (`tests/integration/test_broker_nack.py`).
   A broker `basic.nack` from a full `x-overflow=reject-publish` queue surfaces
   as `NACKED` with reason `nacked` (async and sync), per item from
   `publish_many`, and nothing is republished.
 - Multi-node failure tests (`tests/integration/test_cluster_chaos.py`, marker
   `cluster_chaos`, nightly job `cluster-chaos` in `integration.yml` under
-  `RK_REQUIRE_BROKER=1`). F19 covers quorum loss on a 3-node cluster (async
-  and sync). F20 covers a network partition through toxiproxy, both
+  `RK_REQUIRE_BROKER=1`). They cover quorum loss on a 3-node cluster (async
+  and sync) and a network partition through toxiproxy, both
   directions and one-way, with traffic and idle. The three defects they
   found are fixed (see Fixed).
+
+#### Sync broker parity
+
+- **Broker-cancelled consumers on `SyncBroker`.** The sync
+  transport registers pika's `BlockingChannel.add_on_cancel_callback` on every
+  consumer channel. On a server `basic.cancel` (dispatched by pika on the I/O
+  thread) it logs a WARNING, sets `RouteRuntimeState.consumer_cancelled`,
+  counts `consumer_cancelled_total{queue}`, sets `route_consuming{queue}` to 0
+  and calls `SyncBroker.on_consumer_cancelled(queue)`. The consume loop then
+  probes the queue with a passive declare (backoff 1 s, doubling, capped at
+  30 s) and re-subscribes with the same consumer tag once it exists, on the
+  I/O thread (never from a worker thread, never re-creating the queue,
+  reusing the consumer channel or opening a fresh one if the broker closed
+  it), then calls `SyncBroker.on_consumer_resumed(queue)`. A reconnect that
+  re-subscribes a cancelled route also reports it resumed. New:
+  `SyncBroker.on_consumer_cancelled` / `on_consumer_resumed`
+  (`Callable[[str], None] | None`, as on `AsyncBroker`), and on
+  `SyncTransport` `on_consumer_cancelled(cb)`, `on_consumer_resumed(cb)`,
+  `cancelled_consumers`; module `rabbitkit.sync.consumers`
+  (`SyncConsumerSupervisor`).
+- **`rabbitkit_publish_in_flight` on `SyncBroker`.**
+  `SyncTransport.publishes_in_flight` counts `publish()` calls between entry
+  and outcome, including worker-thread publishes waiting for the I/O thread;
+  the broker samples it with the other gauges (I/O-loop tick, throttled to
+  5 s) and now also from `pump_idle()`, so a publish-only sync broker samples
+  its gauges too. `publish_in_flight_bytes` stays async-only (the byte budget
+  is enforced by `AsyncBroker` only) and so does `publish_channels_in_use`
+  (the sync broker has one publisher channel, not a pool); the metric
+  inventory says so.
+- `SyncTransport.poll_interval` (default 1.0 s): the consume loop's longest
+  `process_data_events` wait. `SyncWorkerPool(config, threaded=True)` runs a
+  single worker on its own thread. `HandlerPipeline.settle_expired_sync()`.
+  Module `rabbitkit.sync.deadlines` (`SyncDeadlines`, `DeliveryClaim`,
+  `LateSettlementError`).
+
+#### Streams
+
+- **RabbitMQ streams are a supported feature on both brokers** (closes the
+  0.20.0 known limit "Streams remain experimental"). Consumed over AMQP
+  0.9.1; the `rabbitmq_stream` plugin is not needed. See `docs/streams.md`.
+  - `subscriber(..., stream_offset=...)` on a `QueueType.STREAM` queue:
+    `"first"`, `"last"`, `"next"` (default), an int offset or a `datetime`;
+    or `stream=StreamConsumerConfig(offset=..., offset_store=...,
+    commit_every=100, commit_interval=5.0, consumer_name=...)` for the full
+    configuration. On `AsyncBroker`, `SyncBroker`, `RabbitRouter`,
+    `TestBroker`.
+  - `RabbitMessage.stream_offset`: each delivery's offset (from the
+    broker-set `x-stream-offset` header).
+  - Client-side offset tracking (AMQP 0.9.1 has no server-side offset
+    storage): the processed offset advances over the contiguous prefix of
+    settled deliveries (out-of-order handlers never move it past an
+    unfinished message) and is committed to an `OffsetStore` every
+    `commit_every` messages / `commit_interval` seconds and at `stop()`. A
+    restart resumes at the committed offset + 1 (a crash replays at most the
+    messages processed since the last commit: at-least-once).
+  - Offset stores: the `OffsetStore` protocol (`load` / `save`) and
+    `InMemoryOffsetStore` (default; process lifetime). rabbitkit ships no
+    storage: to resume across restarts, implement the protocol over your
+    service's own storage. `AsyncBroker` commits to a non-memory store in a
+    worker thread.
+  - Reconnect: the consume arguments are updated in place as messages are
+    processed, so aio-pika's robust restore, the consumer supervisor's
+    re-subscribe after a broker cancel, and `SyncBroker.run()`'s recovery all
+    resume at the processed offset + 1, never at `"next"` (which skipped
+    everything published during the outage) or at `"first"` again. Before the
+    first delivery a `"next"`/`"last"` consumer re-subscribes from its
+    subscription time minus 5 s.
+  - `RabbitQueue` stream retention options: `max_age` (`x-max-age`, format
+    validated) and `stream_max_segment_size_bytes`
+    (`x-stream-max-segment-size-bytes`), with `max_length_bytes`.
+  - Exported from `rabbitkit` and `rabbitkit.streams`: `StreamOffset`,
+    `StreamOffsetType`, `StreamConsumerConfig`, `OffsetStore`,
+    `InMemoryOffsetStore` (Advanced Stable tier).
+  - `consume(..., arguments=...)` on both transports (and the transport
+    protocols): `basic.consume` arguments; the brokers pass it only for
+    stream routes.
+- Real-broker tests `tests/integration/test_streams.py` (async and
+  sync, RabbitMQ 3.13 and 4.1): "first" sees every message in order with its
+  offset (a publisher-set `x-stream-offset` header is overwritten by the
+  broker); "next" sees only new messages; a timestamp start; stop after K and
+  restart with a durable (application-supplied) store resumes at K with no gap or duplicate; a
+  crash replays exactly the uncommitted messages (at most `commit_every`); a
+  connection kill mid-stream resumes without skipping and not from "first";
+  a reconnect before the first delivery does not skip; a failed message is
+  skipped, not redelivered; retry / ACK_FIRST are refused at registration.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **Resource alarms by cause, from the client.** RabbitMQ's
+  `connection.blocked` carries a reason (`"low on disk"` / `"low on
+  memory"`). New gauge `rabbitkit_connection_blocked_reason{reason}` with the
+  bounded labels `disk`, `memory`, `other` is 1 for each alarm the active
+  reason names (all 0 while unblocked), and `transport.blocked_reason` (sync
+  and async) has the broker's text. On async, aiormq only logged the reason:
+  `ensure_aiormq_records_blocked_reason()` (called at connect) wraps aiormq's
+  private blocked handler at class level to keep it; on an aiormq without
+  that handler the reason is reported as `other`.
+  `BrokerMetrics.blocked(is_blocked, reason=None)` and
+  `BrokerMetrics.sample(..., connection_blocked_reason=None)` take it
+  (both new parameters optional).
+- **Quorum-queue health from the management API.** `QueueMetricsPoller` now
+  exports `rabbitkit_queue_quorum_members{queue}` and
+  `rabbitkit_queue_quorum_online{queue}` for every quorum queue, counted from
+  the `members` / `online` lists the management API reports (verified on
+  RabbitMQ 3.13 and 4.1, and on a 3-node cluster where `online` drops when a
+  member's node stops). `QueueInfo` gains `members`, `online`, `leader`.
+- **Alert rules that need no broker plugin.** `deploy/prometheus/rabbitkit-alerts.yaml`:
+  `RabbitMQDiskAlarm` / `RabbitMQMemoryAlarm` now come from
+  `connection_blocked_reason` (default groups, `source: rabbitkit`); new
+  `RabbitMQQuorumMajorityLost` (critical, `online <= members / 2`) and a
+  per-queue `RabbitMQQuorumUnhealthy` (warning, `online < members`) from the
+  poller; new `PublisherConfirmLatencyHigh` (p99 confirm latency); a
+  `rabbitkit-recording` group with the ratios the alerts compare. The
+  plugin-based rules moved to an alternative group,
+  `rabbitmq-broker-plugin` (`source: rabbitmq_prometheus`).
+- Nightly real-broker run on the aio-pika 9.1.0 floor:
+  `.github/workflows/dependency-matrix.yml`'s `integration-aio-pika-9` job is
+  now a matrix over 9.1.0 and 9.6.2.
+
+#### Sync byte budget
+
+- **`PublisherConfig.max_in_flight_bytes` on `SyncBroker`.** The sync broker
+  now enforces the in-flight publish byte budget with the async rules: a body
+  larger than the whole budget is `NOT_SENT`
+  (`exceeds_max_in_flight_bytes`) at once; any other publish waits, first
+  come first served so a large message is not starved by smaller ones, up to
+  `PoolConfig.channel_acquire_timeout` and then returns `NOT_SENT`
+  (`admission_timeout`); its bytes are released on every terminal path
+  (outcome, failure, exception). It covers every `SyncTransport.publish()`
+  (`broker.publish()`, the bulk APIs, result / retry / DLQ copies), including
+  worker-thread publishes waiting for the I/O thread. New
+  `rabbitkit.sync.pool.InFlightByteLimiter` (thread-safe, FIFO) and
+  `SyncTransport(max_in_flight_bytes=, admission_timeout=)` /
+  `SyncTransport.byte_limiter`. Default `None`: no budget, unchanged
+  behaviour. The CRITICAL profile's budget (`CRITICAL_MAX_IN_FLIGHT_BYTES`,
+  64 MiB unless set) now bounds `SyncBroker` too.
+- **No owner-thread deadlock.** Worker-thread publishes run on the owner
+  (I/O) thread, so an owner-thread publish that slept waiting for bytes held
+  by a waiting worker would stall both until the timeout. The owner thread of
+  a connection that has run a consume loop drives `process_data_events`
+  (<= 10 ms slices) between admission checks instead, which runs those
+  worker publishes. Proven on a real broker by
+  `test_an_owner_thread_publish_waiting_for_budget_runs_the_workers_publishes`
+  (fails, about 5 s per round, without it).
+- The sync broker samples `rabbitkit_publish_in_flight_bytes` (when the budget
+  is set), like the async broker.
 
 ### Fixed
 
@@ -922,7 +1135,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 #### Consumer
 
 - **A reconnect during `AsyncBroker.stop()`'s drain could re-subscribe a
-  cancelled consumer (CONSUMER-007).** `cancel_consumer()` cancelled through
+  cancelled consumer.** `cancel_consumer()` cancelled through
   a fresh `get_queue()` wrapper, so aio-pika's robust-restore record stayed
   on the original queue object and a reconnect restored the consumer; it then
   took new deliveries during shutdown. Reproduced on a real broker (connection
@@ -934,8 +1147,8 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 #### Retry, dead-lettering and failure taxonomy
 
-- **Compression + retry dead-lettered every retried message** (G-07, repro
-  S3). `CompressionMiddleware` decompresses `message.body` in place and
+- **Compression + retry dead-lettered every retried message.**
+  `CompressionMiddleware` decompresses `message.body` in place and
   keeps `content_encoding`; `RetryMiddleware` republished that decoded body
   under `content_encoding=gzip`, so attempt 2 failed to decompress and went
   to the DLQ. The terminal DLQ copy had the same defect (undecodable). Retry
@@ -961,10 +1174,10 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   loss for both strategies, the declared strategy, bounded redelivery, and
   that the at-most-once message reaches the restored DLQ with metadata).
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
-- **`RabbitApp.run_async()` reset the application's signal handlers
-  (G-24).** `loop.remove_signal_handler()` restores `SIG_DFL`, not the
+- **`RabbitApp.run_async()` reset the application's signal handlers.**
+  `loop.remove_signal_handler()` restores `SIG_DFL`, not the
   previous handler, so on exit an application's SIGTERM handler and
   `asyncio.run()`'s SIGINT handler were lost. It now captures and restores
   the previous Python-level handler, leaves a signal alone (WARNING) when an
@@ -976,7 +1189,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 - `docs/observability.md` told users to alert on
   `messages_published_total{status="failure"}`, a value that was never
-  emitted (G-28); and it claimed the first connection predates the metrics
+  emitted; and it claimed the first connection predates the metrics
   wiring.
 
 #### Sync parity, documentation drift and dead-letter metadata
@@ -1036,6 +1249,40 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   the function unchanged and are now typed that way (`HandlerT -> HandlerT`).
   Annotations only, with no runtime change.
 
+#### Sync broker parity
+
+- The settlement metric (`messages_acked/nacked/rejected_total`) is counted
+  once per delivery when the sync processing deadline and the late handler
+  both report it.
+
+#### Streams
+
+- `StreamOffset.timestamp(dt).to_consume_arguments()` returns the
+  `datetime` (sent as an AMQP timestamp) instead of `int(dt.timestamp())`.
+  RabbitMQ reads an integer `x-stream-offset` as a numeric offset, so the
+  old value started from the wrong place (verified: it delivered nothing). A
+  naive `datetime` is taken as UTC. `StreamOffset(...)` now validates its
+  value at construction (an `OFFSET` needs a non-negative int, a `TIMESTAMP`
+  a datetime, the relative types no value).
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **aio-pika 9.x: `connection_name` and `client_properties` never reached
+  the broker.** aio-pika 9.x `connect_robust()` folds `client_properties`
+  into `make_url()`, which returns a caller-supplied URL untouched, and never
+  passes them to the connection class (only aio-pika 10 does). On the whole
+  9.x line (the 9.1.0 floor through 9.6.2) connections were nameless in the
+  management UI. `RabbitkitRobustConnection` now sets them where aiormq reads
+  them, on every connect and reconnect.
+- **aio-pika 9.1: `RabbitMessage.timestamp` was a naive datetime.** pamqp
+  3.2 (resolved by aio-pika 9.1) decodes the AMQP timestamp with
+  `utcfromtimestamp()`; `.timestamp()` on it read it as local time, shifting
+  it by the host's UTC offset. The async transport now returns an aware UTC
+  datetime, like the sync transport.
+- Tests: the aiormq transport-factory unit test and the integration helper
+  that holds confirms open now work on aiormq 6.7 (aio-pika 9.1), so the
+  nightly dependency-matrix unit run on 9.1.0 passes.
+
 ### Deprecated
 
 #### Earlier consumer and retry hardening
@@ -1045,6 +1292,14 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `DeprecationWarning`. `jitter_factor` is documented as effective only with
   `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
   classic queue only expires its head message (head-of-line blocking).
+
+#### Streams
+
+- `from rabbitkit.experimental import StreamOffset, StreamOffsetType,
+  StreamConsumerConfig` still works but emits a `DeprecationWarning`; import
+  them from `rabbitkit` (or `rabbitkit.streams`). The aliases are removed no
+  earlier than the next minor release. They are no longer in
+  `rabbitkit.experimental.__all__`.
 
 ### Documentation
 
@@ -1115,7 +1370,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   composed DLQ-missing behaviour per source type, `trust_retry_header`,
   replay authorization.
 
-#### Event metadata and the CRITICAL profile
+#### CRITICAL profile, body cap and reserved headers
 
 - New `docs/reliable-messaging.md` (in the mkdocs nav under Production):
   the contract as implemented — publish outcome table with reasons,
@@ -1126,8 +1381,6 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   (producer outbox, exhausted handoff → DLQ, connection settings in the
   profile) and the SyncBroker's retry-once-after-dead-connection publish is
   called out.
-- New `docs/event-metadata.md` (nav: User Guide); API entries in
-  `docs/api/messages.md` and `docs/api/middleware.md`.
 - `docs/bulk-operations.md`: CRITICAL table and example
   (`processing_timeout`); `docs/retry-and-dlq.md`: stripping reserved
   headers; `docs/message-safety.md`: two guarantee rows.
@@ -1147,10 +1400,10 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   rationale; `dead_letter_with_metadata` in the settlement table and the
   CRITICAL table; what `messages_dead_lettered_total` counts; `async with`.
 - `docs/retry-and-dlq.md` ("Failures that never reach RetryMiddleware"),
-  `docs/message-safety.md` (sync no-republish, idle-connection row, G-17
-  rows), `docs/production/scale.md`, `docs/production/patterns.md` (idle
+  `docs/message-safety.md` (sync no-republish, idle-connection row,
+  metadata DLQ copy rows), `docs/production/scale.md`, `docs/production/patterns.md` (idle
   sync publish wording).
-- Documentation drift (G-28) fixed in `docs/guide/full-guide.md`,
+- Documentation drift fixed in `docs/guide/full-guide.md`,
   `docs/guide/getting-started.md`, `docs/guide/overview.md`, `docs/index.md`,
   `docs/ordering-guarantees.md`, `docs/retry-and-dlq.md`,
   `docs/message-safety.md`, `docs/security.md`, `docs/production/patterns.md`,
@@ -1166,6 +1419,57 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   and heartbeat detection, with measured timings. The heartbeat budget is
   about 5 × `heartbeat` with aio-pika (`(heartbeat + 1) × 3` s), not 2 ×.
   `TIMEOUT` publishes were observed to be committed later.
+
+#### Sync broker parity
+
+- `docs/reliable-messaging.md`: new "Processing deadline" and
+  "Broker-cancelled consumers" sections; the settlement table row for
+  `processing_timeout` no longer says "async only" and now states what both
+  brokers do (no retry copy: the deadline wraps the retry middleware); two
+  verified failure scenarios added (sync and async); the "enforced by
+  `AsyncBroker` only" note now covers only `max_in_flight_bytes`.
+- `docs/concurrency-model.md`: which thread runs sync handlers under a
+  deadline, settles expired deliveries and re-subscribes cancelled
+  consumers; the claim protocol; the M5 note applies only without a deadline.
+- `docs/observability.md`: `publish_in_flight` is no longer async-only;
+  `consumer_cancelled_total` / `route_consuming` cover the sync broker;
+  sync sampling caveat (gauges hold their last value while the I/O thread is
+  blocked inside a publish).
+- `docs/message-safety.md`, `docs/ack-policy.md`,
+  `docs/runbooks/consumer-failures.md`, `ConsumerConfig` / `WorkerConfig` /
+  `TimeoutMiddleware` docstrings: the sync caveats these changes make untrue
+  are removed or rewritten.
+
+#### Streams
+
+- New `docs/streams.md` (in the nav): when to choose a stream over a quorum
+  queue, declaring and retention, start offsets, offset tracking and stores,
+  the at-least-once replay window, reconnect behaviour, settlement and
+  failure semantics, limits (no single active consumer or server-side
+  offsets over AMQP 0.9.1, no filtering, CRITICAL requires quorum).
+- `docs/reliable-messaging.md`: a "Streams" section with the stream delivery
+  semantics.
+- `docs/stability-policy.md`: streams moved from Experimental to Advanced
+  Stable. `docs/api/streams.md`, the Full Guide's stream section and the
+  README updated.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- `docs/observability.md`: the new metrics, the alert table, the plugin
+  alternative, and a "Tuning the alerts" section (which knob, how to derive
+  it from an SLO, examples). Runbooks updated (flow control, quorum,
+  consumer backlog, connection storm, publisher). `docs/troubleshooting.md`:
+  the two aio-pika 9.x notes.
+
+#### Sync byte budget
+
+- `docs/reliable-messaging.md`, `docs/observability.md`,
+  `docs/message-safety.md`, the `PublisherConfig` / `PoolConfig` docs and the
+  CRITICAL profile constant no longer say the byte budget is async-only.
+  `docs/concurrency-model.md` explains how the sync owner thread waits for
+  budget (it keeps the I/O loop running) and the one case where it cannot
+  (an inline handler, which has no worker publishes to wait on).
+  `publish_channels_in_use` stays async-only (one sync publisher channel).
 
 ## [0.19.2] — 2026-10-02
 

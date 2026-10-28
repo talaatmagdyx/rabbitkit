@@ -1,13 +1,13 @@
-"""Real-broker coverage for the retry/DLQ foundation fixes.
+"""Real-broker coverage for the retry and dead-letter fixes.
 
-* G-07  a compressed message that fails transiently is retried and
-        succeeds on attempt 2 (repro S3 flips); a terminal failure's DLQ
+* a compressed message that fails transiently is retried and
+        succeeds on attempt 2; a terminal failure's DLQ
         copy is still decodable
-* G-16  an AMQP client error raised by the handler is retried as
+* an AMQP client error raised by the handler is retried as
         ``infrastructure``; a decode failure is ``invalid_message``
-* G-19  with ``trust_retry_header=False`` a producer-set retry count does
+* with ``trust_retry_header=False`` a producer-set retry count does
         not skip retries; the broker's x-death history still ends them
-* G-18  an at-least-once retry chain (quorum source, delay queues, DLQ) is
+* an at-least-once retry chain (quorum source, delay queues, DLQ) is
         declared as configured and round-trips a retry
 """
 
@@ -94,12 +94,12 @@ def _retry_queues(q: str, n: int) -> list[str]:
     return [q, f"{q}.dlq", *[f"{q}.retry.{i}" for i in range(1, n + 1)]]
 
 
-# ── G-07 ──────────────────────────────────────────────────────────────────
+# ── compressed messages on the retry path ────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_compressed_message_is_retried_and_succeeds_on_attempt_two(rabbit: dict[str, Any]) -> None:
-    """Repro S3: the retry copy used to carry the DECOMPRESSED body under
+    """The retry copy used to carry the DECOMPRESSED body under
     content_encoding=gzip, so attempt 2 failed to decode and the message was
     dead-lettered after one handler run."""
     from rabbitkit import AsyncBroker, RetryConfig
@@ -176,7 +176,7 @@ async def test_terminal_dlq_copy_of_a_compressed_message_is_decodable(rabbit: di
         _delete(rabbit, *_retry_queues(q, 1))
 
 
-# ── G-16 ──────────────────────────────────────────────────────────────────
+# ── failure taxonomy ─────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -252,7 +252,7 @@ async def test_undecodable_body_is_dead_lettered_as_invalid_message(rabbit: dict
         _delete(rabbit, *_retry_queues(q, 2))
 
 
-# ── G-19 ──────────────────────────────────────────────────────────────────
+# ── untrusted retry counts ───────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_producer_set_retry_count_does_not_skip_retries(rabbit: dict[str, 
         _delete(rabbit, *_retry_queues(q, 2))
 
 
-# ── G-18 ──────────────────────────────────────────────────────────────────
+# ── at-least-once dead-lettering ─────────────────────────────────────────────
 
 
 def _mgmt_get(rabbit: dict[str, Any], path: str) -> Any:

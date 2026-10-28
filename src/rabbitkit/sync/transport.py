@@ -36,6 +36,8 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.sync.connection import get_connection_errors, make_pika_connection_params
+from rabbitkit.sync.consumers import SyncConsumerRecord, SyncConsumerSupervisor
+from rabbitkit.sync.pool import InFlightByteLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,8 @@ class SyncTransport:
         confirm_delivery: bool = True,
         confirm_timeout: float = 5.0,
         on_topology_conflict: str = "raise",
+        max_in_flight_bytes: int | None = None,
+        admission_timeout: float = 10.0,
     ) -> None:
         self._connection_config = connection_config or ConnectionConfig()
         self._socket_config = socket_config or SocketConfig()
@@ -103,6 +107,14 @@ class SyncTransport:
         # a worker forever. Brokers should pass ``config.publisher.confirm_timeout``
         # here; the default is a sane fallback.
         self._confirm_timeout = float(confirm_timeout)
+        # PublisherConfig.max_in_flight_bytes (None = no byte bound): body
+        # bytes of publish() calls between admission and their outcome. A
+        # publish waits up to *admission_timeout* (the broker passes
+        # PoolConfig.channel_acquire_timeout) for room; see _admit_bytes.
+        self._byte_limiter: InFlightByteLimiter | None = (
+            InFlightByteLimiter(max_in_flight_bytes) if max_in_flight_bytes is not None else None
+        )
+        self._admission_timeout = float(admission_timeout)
 
         self._connection: Any = None  # pika.BlockingConnection
         self._channel: Any = None  # pika.channel.Channel (publisher/topology)
@@ -175,6 +187,7 @@ class SyncTransport:
         # reads this (via the is_blocked property) so a broker/disk/memory
         # alarm is visible even when the caller never opted into FlowController.
         self._blocked_state: bool = False
+        self._blocked_reason: str | None = None
 
         # L14: fired once per start_consuming() loop iteration (after each
         # process_data_events() call returns), i.e. once per I/O loop tick --
@@ -196,7 +209,7 @@ class SyncTransport:
         # Fired on every successful connect() AFTER the first (see connect()).
         self._reconnect_callbacks: list[Callable[[], None]] = []
         self._ever_connected = False
-        # G-22 metrics hooks: connection up/down (role "shared": one pika
+        # Metrics hooks: connection up/down (role "shared": one pika
         # connection serves publishing and consuming), failed reconnect
         # attempts, and publish outcomes with the send-to-confirm latency.
         self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
@@ -212,6 +225,24 @@ class SyncTransport:
         self._channel_opened_callbacks: list[Callable[[], None]] = []
         self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
 
+        # consumers the BROKER cancelled (basic.cancel:
+        # queue deleted, quorum leader change, operator action). pika calls
+        # the consumer channel's cancel callback on the owner thread; the
+        # consume loop re-subscribes once a passive declare finds the queue.
+        self._consumer_supervisor = SyncConsumerSupervisor(self._queue_exists_now, self._resubscribe)
+
+        # publish() calls between entry and their outcome (worker
+        # threads waiting for the I/O thread count too). Sampled by the
+        # broker's metrics, never read on the hot path.
+        self._publishes_in_flight = 0
+        self._publishes_lock = threading.Lock()
+
+        #: Longest single ``process_data_events`` wait of the consume loop, in
+        #: seconds. The loop runs its per-tick work (liveness heartbeat,
+        #: metrics sampling, consumer re-subscription, the broker's
+        #: ``processing_timeout`` deadlines) at least this often.
+        self.poll_interval: float = 1.0
+
     def on_reconnect(self, callback: Callable[[], None]) -> None:
         """Register a callback fired on every re-connection after the first
         successful connect (connection-churn metric hook)."""
@@ -225,7 +256,7 @@ class SyncTransport:
                 logger.exception("reconnect callback raised")
 
     def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
-        """Register ``callback(role, up, error)`` (G-22). ``role`` is always
+        """Register ``callback(role, up, error)``. ``role`` is always
         ``"shared"``: fired with ``up=True`` after every successful connect and
         with ``up=False`` once when a connection that was up is found down
         (before the reconnect starts). ``disconnect()`` does not fire it."""
@@ -240,12 +271,12 @@ class SyncTransport:
 
     def on_reconnect_attempt(self, callback: Callable[[int, BaseException], None]) -> None:
         """Register ``callback(attempt, error)`` fired after every FAILED
-        reconnect attempt of a connection that had been up (G-22)."""
+        reconnect attempt of a connection that had been up."""
         self._reconnect_attempt_callbacks.append(callback)
 
     def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
         """Register ``callback(outcome, seconds)`` for every publish handed to
-        pika (G-22). ``seconds`` is the ``basic_publish`` call alone (frame
+        pika. ``seconds`` is the ``basic_publish`` call alone (frame
         write plus, in confirm mode, the wait for the broker's confirm, nack
         or return) when the broker answered, else ``None``."""
         self._publish_outcome_callbacks.append(callback)
@@ -256,6 +287,39 @@ class SyncTransport:
         queue (and cancelled ones still draining)."""
         channels = (self._channel, *self._consumer_channels.values(), *self._cancelled_channels)
         return sum(1 for channel in channels if channel is not None and bool(getattr(channel, "is_open", False)))
+
+    @property
+    def publishes_in_flight(self) -> int:
+        """``publish()`` calls between entry and their outcome.
+
+        Includes worker-thread publishes waiting for the I/O thread to pick
+        them up. One publisher channel serves them one at a time, so more
+        than one means publishes are queued behind the I/O thread.
+        """
+        return self._publishes_in_flight
+
+    @property
+    def byte_limiter(self) -> InFlightByteLimiter | None:
+        """The ``PublisherConfig.max_in_flight_bytes`` budget (None = unbounded)."""
+        return self._byte_limiter
+
+    def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled.
+
+        Fires on the owner thread when RabbitMQ sends ``basic.cancel`` (queue
+        deleted, quorum leader change, ...). The consume loop re-subscribes
+        when the queue exists again and then fires :meth:`on_consumer_resumed`.
+        """
+        self._consumer_supervisor.on_cancelled(callback)
+
+    def on_consumer_resumed(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a broker-cancelled consumer that is consuming again."""
+        self._consumer_supervisor.on_resumed(callback)
+
+    @property
+    def cancelled_consumers(self) -> frozenset[str]:
+        """Queues whose consumer the broker cancelled and that are not consuming again yet."""
+        return self._consumer_supervisor.cancelled_queues
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -299,6 +363,12 @@ class SyncTransport:
         ``FlowController``."""
         return self._blocked_state
 
+    @property
+    def blocked_reason(self) -> str | None:
+        """The broker's ``connection.blocked`` reason (``"low on disk"``,
+        ``"low on memory"``) while :attr:`is_blocked`, else ``None``."""
+        return self._blocked_reason if self._blocked_state else None
+
     def on_io_tick(self, callback: Callable[[], None]) -> None:
         """Register a callback fired once per ``start_consuming()`` loop
         iteration (L14) -- e.g. the broker's liveness heartbeat refresh."""
@@ -311,7 +381,10 @@ class SyncTransport:
             except Exception:  # pragma: no cover — never let a cb break the I/O loop
                 logger.exception("io_tick callback raised")
 
-    def _pika_blocked(self, _connection: Any, *_args: Any) -> None:
+    def _pika_blocked(self, _connection: Any, method_frame: Any = None, *_args: Any) -> None:
+        # pika passes the Connection.Blocked frame: method_frame.method.reason.
+        reason = getattr(getattr(method_frame, "method", None), "reason", None)
+        self._blocked_reason = reason if isinstance(reason, str) else None
         self._blocked_state = True
         for cb in list(self._blocked_callbacks):
             try:
@@ -321,6 +394,7 @@ class SyncTransport:
 
     def _pika_unblocked(self, _connection: Any, *_args: Any) -> None:
         self._blocked_state = False
+        self._blocked_reason = None
         for cb in list(self._unblocked_callbacks):
             try:
                 cb()
@@ -406,6 +480,7 @@ class SyncTransport:
             self._consumer_channels.clear()
             self._cancelled_channels.clear()
             self._consumer_tags = {}
+            self._consumer_supervisor.clear()
 
             if self._channel and self._channel.is_open:
                 self._channel.close()
@@ -757,6 +832,7 @@ class SyncTransport:
         self._consumer_channels = {}
         self._cancelled_channels = []
         self._consumer_tags = {}
+        self._consumer_supervisor.clear()
         self._confirmed_channel_ids = set()
         self._connected = False
         self._owner_ident = None
@@ -764,6 +840,80 @@ class SyncTransport:
         # _ever_consumed_any stays True (sticky) — see __init__.
 
     def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        """Publish a message to RabbitMQ (see :meth:`_publish`); counted in
+        :attr:`publishes_in_flight` until its outcome is known.
+
+        With a byte budget (``max_in_flight_bytes``) the body's bytes are
+        reserved first and held until the outcome is known, on every path:
+        a body larger than the whole budget is ``NOT_SENT``
+        (``exceeds_max_in_flight_bytes``); no room within the admission
+        timeout is ``NOT_SENT`` (``admission_timeout``).
+        """
+        with self._publishes_lock:
+            self._publishes_in_flight += 1
+        limiter = self._byte_limiter
+        reserved = 0
+        try:
+            if limiter is not None:
+                size = len(envelope.body)
+                refused = self._admit_bytes(limiter, envelope, size)
+                if refused is not None:
+                    return refused
+                reserved = size
+            return self._publish(envelope)
+        finally:
+            if reserved:
+                assert limiter is not None
+                limiter.release(reserved)
+            with self._publishes_lock:
+                self._publishes_in_flight -= 1
+
+    def _admit_bytes(self, limiter: InFlightByteLimiter, envelope: MessageEnvelope, size: int) -> PublishOutcome | None:
+        """Reserve *size* bytes of the budget; the NOT_SENT outcome when refused.
+
+        The owner thread of a connection that worker threads marshal their
+        publishes onto must not sleep while it waits: the bytes it needs may
+        be held by a worker whose publish only the owner can run. It drives
+        the I/O loop instead (which runs those marshalled publishes), between
+        admission checks, until it is admitted or the timeout expires. Every
+        other thread sleeps on the limiter's condition.
+        """
+        if size > limiter.limit:
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.EXCEEDS_BYTE_BUDGET)
+        owner_must_pump = threading.get_ident() == self._owner_ident and (
+            self._ever_consumed or self._ever_consumed_any
+        )
+        lost: tuple[type[BaseException], ...] = (*get_connection_errors(), ValueError)
+        try:
+            admitted = limiter.acquire(
+                size, self._admission_timeout, pump=self._pump_for_budget if owner_must_pump else None
+            )
+        except lost as e:
+            # Pumping found the connection dead: nothing of this message was sent.
+            if isinstance(e, ValueError) and not self._connection_died(e):
+                raise
+            logger.warning("Publish not sent: the connection failed while waiting for byte budget (%s)", e)
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.NOT_CONNECTED, e)
+        if not admitted:
+            logger.warning(
+                "Publish not sent: no room in max_in_flight_bytes within the admission timeout "
+                "(exchange=%s routing_key=%s bytes=%d)",
+                envelope.exchange,
+                envelope.routing_key,
+                size,
+            )
+            return self._outcome(envelope, PublishStatus.NOT_SENT, PublishReason.ADMISSION_TIMEOUT)
+        return None
+
+    def _pump_for_budget(self, seconds: float) -> bool:
+        """Drive the I/O loop for up to *seconds* (owner thread); False if closed."""
+        conn = self._connection
+        if conn is None or not conn.is_open:
+            return False
+        conn.process_data_events(time_limit=seconds)
+        return True
+
+    def _publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.
 
         Returns PublishOutcome with status indicating success/failure.
@@ -1133,6 +1283,7 @@ class SyncTransport:
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue.
 
@@ -1149,6 +1300,11 @@ class SyncTransport:
         remembered as ``self._reply_to_channel`` so :meth:`publish` can route
         matching requests onto the SAME channel — required by RabbitMQ's direct
         reply-to (see :meth:`publish`).
+
+        ``arguments`` are the ``basic.consume`` arguments (e.g.
+        ``x-stream-offset`` for a stream queue), read when this call
+        subscribes; the broker passes its current resume point on each
+        re-subscription after a reconnect.
         """
         self._ensure_connected()
 
@@ -1176,16 +1332,101 @@ class SyncTransport:
             message = self._build_message(ch, method, properties, body, no_ack=no_ack)
             callback(message)
 
+        consumer_channel.add_on_cancel_callback(self._on_broker_cancel)
+        consume_kwargs: dict[str, Any] = {}
+        if arguments is not None:
+            consume_kwargs["arguments"] = dict(arguments)
         consumer_channel.basic_consume(
             queue=queue,
             on_message_callback=on_message,
             auto_ack=no_ack,
             consumer_tag=consumer_tag,
+            **consume_kwargs,
         )
 
         self._consumer_tags[queue] = consumer_tag
+        self._consumer_supervisor.register(
+            SyncConsumerRecord(
+                queue=queue,
+                tag=consumer_tag,
+                on_message=on_message,
+                prefetch=prefetch,
+                no_ack=no_ack,
+                supervised=declare,
+                arguments=arguments,
+            )
+        )
         logger.info("Started consuming from queue '%s' with tag '%s'", queue, consumer_tag)
         return consumer_tag
+
+    # ── Broker-initiated consumer cancel (sync) ─────────────────────
+
+    def _on_broker_cancel(self, method_frame: Any) -> None:
+        """pika's ``add_on_cancel_callback`` entry: the server sent ``basic.cancel``.
+
+        pika dispatches it on the owner thread, inside ``process_data_events``.
+        """
+        tag = getattr(getattr(method_frame, "method", None), "consumer_tag", None)
+        if isinstance(tag, str):
+            self._consumer_supervisor.broker_cancelled(tag)
+
+    def _queue_exists_now(self, queue: str) -> bool:
+        """Passive-declare probe for the re-subscribe path (owner thread).
+
+        Unlike :meth:`queue_exists` it never reconnects: it runs inside the
+        consume loop, and a fresh connection there would carry none of the
+        loop's consumers. A dead connection reports False; the loop's next
+        ``process_data_events`` raises and the broker's recovery takes over.
+        """
+        import pika.exceptions
+
+        if not self.is_connected():
+            return False
+        channel = self._connection.channel()
+        try:
+            channel.queue_declare(queue=queue, passive=True)
+            return True
+        except pika.exceptions.ChannelClosedByBroker as exc:
+            if exc.reply_code != 404:
+                logger.warning("Probing queue '%s' for re-subscription failed: %s", queue, exc)
+            return False
+        finally:
+            if channel.is_open:
+                channel.close()
+
+    def _resubscribe(self, record: SyncConsumerRecord) -> bool:
+        """Re-issue ``basic.consume`` for a broker-cancelled consumer, same tag.
+
+        Reuses the queue's consumer channel while it is open (the deliveries
+        still unacked on it stay settleable); opens a fresh one if the broker
+        closed it. Never declares the queue. A channel-level refusal (the
+        queue vanished again, an exclusive consumer holds it) is logged and
+        retried on the next backoff step.
+        """
+        import pika.exceptions
+
+        channel = self._consumer_channels.get(record.queue)
+        try:
+            if channel is None or not channel.is_open:
+                channel = self._connection.channel()
+                self._fire_channel_opened()
+                self._fire_channel_rebuilt()
+                channel.basic_qos(prefetch_count=record.prefetch)
+                channel.add_on_cancel_callback(self._on_broker_cancel)
+                self._consumer_channels[record.queue] = channel
+            channel.basic_consume(
+                queue=record.queue,
+                on_message_callback=record.on_message,
+                auto_ack=record.no_ack,
+                consumer_tag=record.tag,
+                **({"arguments": dict(record.arguments)} if record.arguments else {}),
+            )
+        except pika.exceptions.DuplicateConsumerTag:
+            return True  # already consuming under this tag
+        except pika.exceptions.AMQPChannelError as exc:
+            logger.warning("Re-subscribing to queue '%s' failed (%s); retrying later", record.queue, exc)
+            return False
+        return True
 
     def declare_exchange(self, exchange: RabbitExchange) -> None:
         """Declare an exchange on RabbitMQ."""
@@ -1369,8 +1610,11 @@ class SyncTransport:
             return
 
         channel = self._consumer_channels.get(queue_name)
+        record = self._consumer_supervisor.unregister(queue_name)
+        # A consumer the broker already cancelled is unknown to pika: nothing to cancel.
+        broker_cancelled = record is not None and record.broker_cancelled
         try:
-            if channel is not None and channel.is_open:
+            if channel is not None and channel.is_open and not broker_cancelled:
                 channel.basic_cancel(consumer_tag=consumer_tag)
         except Exception as e:
             logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
@@ -1416,7 +1660,7 @@ class SyncTransport:
                 # process_data_events drains ALL channels' consumers + queued
                 # add_callback_threadsafe callbacks (acks from worker threads).
                 try:
-                    self._connection.process_data_events(time_limit=1.0)
+                    self._connection.process_data_events(time_limit=self.poll_interval)
                 except ValueError as exc:
                     # pika's SelectConnection ioloop raises a bare
                     # ValueError("Timeout closed before call") when the
@@ -1434,6 +1678,9 @@ class SyncTransport:
                 # and pumping -- fire once per tick regardless of whether any
                 # message was actually delivered this iteration.
                 self._fire_io_tick()
+                # re-subscribe broker-cancelled consumers whose queue is
+                # back -- here, on the owner thread, never from a worker.
+                self._consumer_supervisor.check_once()
                 # Safety: if no consumers are registered, exit (avoids looping
                 # forever in tests/embeds that call start_consuming without a
                 # consumer). Real consumers are cancelled by stop_consuming which

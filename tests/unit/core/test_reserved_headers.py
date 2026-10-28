@@ -1,5 +1,5 @@
-"""Tests for core/reserved_headers.py and ``PublisherConfig.strip_reserved_headers``
-(G-19): an application publish cannot carry rabbitkit's retry bookkeeping;
+"""Tests for core/reserved_headers.py and ``PublisherConfig.strip_reserved_headers``:
+an application publish cannot carry rabbitkit's retry bookkeeping;
 the library's own republishes keep it."""
 
 from __future__ import annotations

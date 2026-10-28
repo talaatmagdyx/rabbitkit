@@ -1,9 +1,8 @@
-"""Real-broker tests for the async publish path (transport stream).
+"""Real-broker tests for the async publish path.
 
-Each test reproduces a defect from the messaging-foundation audit (repros S1,
-S2, S6 and gaps G-01, G-03, G-04, G-05, G-12, G-14) against a live RabbitMQ
-and asserts what the BROKER holds, not only what the client reports. Every
-one of them fails on the pre-fix code.
+Each test reproduces a publish-path defect fixed in 0.20.0 against a live
+RabbitMQ and asserts what the BROKER holds, not only what the client
+reports. Every one of them fails on the pre-fix code.
 
 Holding a confirm open: a few tests need a publish whose frames reached the
 broker but whose confirm has not arrived yet. They drop incoming
@@ -86,19 +85,24 @@ async def _await_ready(url: str, queue: str, expected: int, timeout: float = 10.
 
 @contextlib.contextmanager
 def _dropping_confirms() -> Iterator[None]:
-    """Ignore incoming publisher confirms while active (see module docstring)."""
+    """Ignore incoming publisher confirms while active (see module docstring).
+
+    Patches ``Channel._confirm_delivery``, which ``_on_confirm_frame`` looks
+    up on every Ack/Nack. Patching ``_on_confirm_frame`` itself only works on
+    aiormq 7: aiormq 6 (aio-pika 9.x) binds it into a dispatch table when the
+    channel's reader starts, so channels already open ignored the patch."""
     from aiormq.channel import Channel
 
-    original = Channel._on_confirm_frame
+    original = Channel._confirm_delivery
 
-    async def _drop(self: Any, frame: Any) -> None:
+    def _drop(self: Any, delivery_tag: Any, frame: Any) -> None:
         return None
 
-    Channel._on_confirm_frame = _drop  # type: ignore[method-assign]
+    Channel._confirm_delivery = _drop  # type: ignore[method-assign]
     try:
         yield
     finally:
-        Channel._on_confirm_frame = original  # type: ignore[method-assign]
+        Channel._confirm_delivery = original  # type: ignore[method-assign]
 
 
 def _kill_connections_named(rabbit: dict[str, Any], connection_name: str) -> int:
@@ -114,19 +118,19 @@ def _kill_connections_named(rabbit: dict[str, Any], connection_name: str) -> int
             if props.get("connection_name") != connection_name:
                 continue
             with contextlib.suppress(Exception):
-                client.close_connection(str(connection["name"]), reason="transport foundation test")
+                client.close_connection(str(connection["name"]), reason="rabbitkit test")
                 killed += 1
         if killed == 0:
             time.sleep(0.2)  # the management API lists new connections after a moment
     return killed
 
 
-# ── S1 / G-01 ────────────────────────────────────────────────────────────────
+# ── unroutable mandatory publish, batch mode ─────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_batch_mode_reports_an_unroutable_mandatory_publish_as_returned(rabbit: dict[str, Any]) -> None:
-    """S1: with a batch publisher, an unroutable mandatory publish was
+    """With a batch publisher, an unroutable mandatory publish was
     reported CONFIRMED (batch channels resolve the return as a result)."""
     from rabbitkit.core.config import BatchPublishConfig
     from rabbitkit.core.types import MessageEnvelope, PublishStatus
@@ -144,12 +148,12 @@ async def test_batch_mode_reports_an_unroutable_mandatory_publish_as_returned(ra
     assert routed.status is PublishStatus.CONFIRMED
 
 
-# ── S2 / G-04 ────────────────────────────────────────────────────────────────
+# ── cancelled publishes release their channel ────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_cancelled_publishes_do_not_leak_pool_slots(rabbit: dict[str, Any]) -> None:
-    """S2: each cancelled confirmed publish kept its channel; after pool_size
+    """Each cancelled confirmed publish kept its channel; after pool_size
     cancels the next publish waited channel_acquire_timeout, then rebuilt
     the connection."""
     from rabbitkit.core.config import PoolConfig
@@ -184,12 +188,12 @@ async def test_cancelled_publishes_do_not_leak_pool_slots(rabbit: dict[str, Any]
         assert pool.created_count <= pool_size
 
 
-# ── G-05 ─────────────────────────────────────────────────────────────────────
+# ── pool exhaustion ──────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_pool_exhaustion_is_not_sent_and_never_rebuilds_the_connection(rabbit: dict[str, Any]) -> None:
-    """G-05: exhaustion used to rebuild the publisher connection, closing
+    """exhaustion used to rebuild the publisher connection, closing
     every in-use channel and failing healthy in-flight publishes."""
     from rabbitkit.core.config import PoolConfig
     from rabbitkit.core.types import MessageEnvelope, PublishStatus
@@ -220,12 +224,12 @@ def _aio_message(body: bytes) -> Any:
     return aio_pika.Message(body=body)
 
 
-# ── G-03 ─────────────────────────────────────────────────────────────────────
+# ── unknown outcomes ─────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_connection_lost_after_send_is_unknown_and_never_republished(rabbit: dict[str, Any]) -> None:
-    """G-03: a connection error after the frame left was retried once after
+    """a connection error after the frame left was retried once after
     recovery; the message reached the queue twice and the call said
     CONFIRMED."""
     from rabbitkit.core.config import PublisherConfig
@@ -256,7 +260,7 @@ async def test_connection_lost_after_send_is_unknown_and_never_republished(rabbi
 
 @pytest.mark.asyncio
 async def test_missing_exchange_is_an_error_published_once(rabbit: dict[str, Any]) -> None:
-    """PUB-016: a 404 was treated as a connection error: retried once (two
+    """a 404 was treated as a connection error: retried once (two
     publishes, two channels closed), then reported as a generic ERROR."""
     from rabbitkit.core.types import MessageEnvelope, PublishStatus
 
@@ -282,7 +286,7 @@ async def test_missing_exchange_is_an_error_published_once(rabbit: dict[str, Any
         assert (await broker.publish(MessageEnvelope(routing_key=queue, body=b"ok"))).status is PublishStatus.CONFIRMED
 
 
-# ── G-14 ─────────────────────────────────────────────────────────────────────
+# ── byte budget ──────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -331,12 +335,12 @@ async def test_byte_budget_bounds_in_flight_bytes_against_a_real_broker(rabbit: 
         assert limiter.used == 0  # released on the timeout path too
 
 
-# ── S6 / G-12 ────────────────────────────────────────────────────────────────
+# ── publisher shutdown ───────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_publish_after_stop_raises_and_does_not_reconnect(rabbit: dict[str, Any]) -> None:
-    """S6: a publish after stop() reconnected silently and was CONFIRMED."""
+    """A publish after stop() reconnected silently and was CONFIRMED."""
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.errors import BrokerNotStartedError
     from rabbitkit.core.types import MessageEnvelope
@@ -406,7 +410,7 @@ async def test_stop_reports_unconfirmed_publishes_unknown_within_the_deadline(ra
 
 @pytest.mark.asyncio
 async def test_batch_stop_resolves_every_caller(rabbit: dict[str, Any]) -> None:
-    """G-12: batch callers still queued at stop() got a bare RuntimeError."""
+    """batch callers still queued at stop() got a bare RuntimeError."""
     from rabbitkit.async_.broker import AsyncBroker
     from rabbitkit.core.config import BatchPublishConfig
     from rabbitkit.core.types import MessageEnvelope, PublishStatus

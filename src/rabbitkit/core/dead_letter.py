@@ -29,7 +29,7 @@ Limits, stated plainly:
   requeueing is always safe, dead-lettering into the unknown is not.
 
 Before any of that, the async pipeline tries a :class:`DeadLetterCopier`
-copy (G-17): a confirmed copy with rabbitkit's failure metadata, after
+copy: a confirmed copy with rabbitkit's failure metadata, after
 which the delivery is acked. The guard decides only when that copy could
 not be confirmed.
 
@@ -150,7 +150,7 @@ def _broker_retains_dead_letters(route: RouteDefinition) -> bool:
 
 class DeadLetterCopier:
     """Confirmed, metadata-stamped DLQ copies for failures that bypass
-    ``RetryMiddleware`` (G-17).
+    ``RetryMiddleware``.
 
     An ``on_receive`` failure (bad gzip, bad signature), a body over
     ``ConsumerConfig.max_body_bytes``, a failure on a route without retry, or

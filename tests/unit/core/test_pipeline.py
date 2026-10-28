@@ -2383,7 +2383,7 @@ class TestChannelGoneSettlement:
 
         route = _make_route(handler=handler)
         await HandlerPipeline().process_async(route, msg)
-        # G-15: the reject was claimed before the send; the send failed, so
+        # the reject was claimed before the send; the send failed, so
         # its outcome is unknown and nothing else is sent for this delivery.
         assert msg._disposition == "rejected"
         assert msg.settlement_outcome_unknown is True

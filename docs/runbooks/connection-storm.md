@@ -2,7 +2,11 @@
 
 **Alerts:**
 
-- `RabbitMQConnectionFailures` — `rabbitkit_reconnect_attempts_total` keeps rising.
+- `RabbitMQConnectionFailures` — more than 10 failed reconnect attempts
+  (`rabbitkit_reconnect_attempts_total`) in 5 minutes, for 5 minutes. With
+  the default backoff (1 s doubling to 30 s, full jitter) a 60 s broker
+  restart costs about 8 failed attempts and a longer outage about 4 a
+  minute, so this is an outage of several minutes, not a restart.
 - `RabbitMQConnectionTerminalFailure` — a `connection_failures_total` with a terminal reason.
 
 ## What it means

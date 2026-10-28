@@ -218,7 +218,7 @@ class TestPublishSpans:
 
 
 class TestPublishOutcomeOnSpan:
-    """G-22: broker.publish() returns a failed outcome instead of raising; the
+    """broker.publish() returns a failed outcome instead of raising; the
     PRODUCER span must still say it failed."""
 
     @pytest.mark.parametrize(

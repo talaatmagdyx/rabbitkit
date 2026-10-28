@@ -1,5 +1,5 @@
 """async_/pool.py: publish admission — byte budget, bounded channel waits,
-generation-safe release, exhaustion without rebuild (G-04, G-05, G-14)."""
+generation-safe release, exhaustion without rebuild."""
 
 from __future__ import annotations
 
@@ -391,7 +391,7 @@ def _patch_connect(conn: Any) -> Any:
 class TestExhaustionNeverRebuilds:
     @pytest.mark.asyncio
     async def test_exhausted_pool_waits_then_raises_without_touching_the_connection(self) -> None:
-        """G-05: pool exhaustion is capacity, not connection death. The old
+        """pool exhaustion is capacity, not connection death. The old
         code rebuilt the publisher connection here, closing every in-use
         channel and failing healthy in-flight publishes."""
         conn = _conn()
@@ -652,7 +652,7 @@ async def _never(*_: Any, **__: Any) -> None:
 
 
 class TestPartitionRecovery:
-    """F20: a partitioned broker never answers; every wait is the caller's own."""
+    """a partitioned broker never answers; every wait is the caller's own."""
 
     @pytest.mark.asyncio
     async def test_a_step_running_out_of_the_callers_time_is_admission_timeout(self) -> None:

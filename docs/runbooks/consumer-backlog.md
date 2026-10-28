@@ -2,19 +2,27 @@
 
 **Alerts:**
 
-- `ConsumerBacklogGrowing` — `rabbitkit_queue_messages_ready` high and growing.
-- `ConsumerUnackedHigh` — `rabbitkit_queue_messages_unacked` high.
+- `ConsumerBacklogGrowing` — the ready backlog would take more than 10
+  minutes to drain at the current delivery rate
+  (`rabbitkit_queue_messages_ready / rate(rabbitkit_messages_consumed_total)`),
+  and it has grown for 15 minutes. A drain time, not a depth, so the same
+  threshold fits a 10 msg/s queue and a 10,000 msg/s one; a queue that
+  delivers nothing has an infinite drain time.
+- `ConsumerUnackedHigh` — `rabbitkit_queue_messages_unacked > 0` while no
+  handler run on the queue has finished for 10 minutes: handlers are stuck.
 
 Both need a `QueueMetricsPoller` (they are broker-side numbers read through the
-management API).
+management API) and, for the delivery rate, a `MetricsMiddleware` on the
+consuming routes.
 
 ## What it means
 
-- Ready growing: producers are faster than consumers, or consumers are not
+- Backlog growing: producers are faster than consumers, or consumers are not
   consuming (`rabbitkit_queue_consumers == 0`, `rabbitkit_route_consuming == 0`).
-- Unacked high: deliveries sit at consumers without an ack: handlers are slow
-  or stuck, or prefetch × consumers is larger than the handler throughput
-  needs. Unacked messages are redelivered when a consumer's channel closes.
+- Unacked with no completions: deliveries sit at consumers and nothing
+  finishes: a deadlock, or a downstream call with no timeout. Unacked
+  messages are redelivered when a consumer's channel closes. (A high but
+  turning-over unacked count is normal: it tops out at prefetch × consumers.)
 
 ## Triage
 

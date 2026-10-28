@@ -137,7 +137,7 @@ class TestTimeoutMiddlewareAsync:
 
     @pytest.mark.asyncio
     async def test_handlers_own_timeout_error_is_not_relabelled(self) -> None:
-        """F14: only the middleware's deadline is a HandlerTimeoutError."""
+        """only the middleware's deadline is a HandlerTimeoutError."""
         mw = TimeoutMiddleware(TimeoutConfig(timeout_seconds=5.0))
         msg = _make_message()
 

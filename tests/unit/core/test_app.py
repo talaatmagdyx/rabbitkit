@@ -610,7 +610,7 @@ class TestRunHooksAsyncFutureResult:
             await app._run_hooks_async([hook_returning_pending_future], timeout=0.05)
 
 
-# ── G-24: run_async keeps the application's signal handlers ─────────────────
+# ── run_async keeps the application's signal handlers ─────────────────
 
 
 class TestRunAsyncSignalOwnership:
@@ -642,7 +642,7 @@ class TestRunAsyncSignalOwnership:
 
     async def test_python_handlers_are_put_back(self) -> None:
         """remove_signal_handler() alone reset SIGTERM to SIG_DFL, dropping
-        the application's handler (the bug the broker fixed in G-24)."""
+        the application's handler (the bug the broker fixed in 0.20.0)."""
         import signal
 
         def app_handler(signum: int, frame: Any) -> None:

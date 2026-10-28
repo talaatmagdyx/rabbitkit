@@ -1,4 +1,4 @@
-"""Pyright-strict probe of rabbitkit's PUBLIC API (gap G-29).
+"""Pyright-strict probe of rabbitkit's PUBLIC API.
 
 This module is never executed: CI runs ``pyright -p tests/typing`` over it in
 strict mode and requires 0 errors. It uses the public API the way a strictly
@@ -35,11 +35,11 @@ from rabbitkit import (
     ConsumerConfig,
     ErrorCategory,
     ErrorSeverity,
-    EventMetadata,
-    EventMetadataError,
     HealthCheckConfig,
     HealthStatus,
+    InMemoryOffsetStore,
     MessageEnvelope,
+    OffsetStore,
     PublisherConfig,
     PublishOutcome,
     PublishReason,
@@ -50,6 +50,9 @@ from rabbitkit import (
     RabbitQueue,
     ReliabilityProfile,
     RetryConfig,
+    StreamConsumerConfig,
+    StreamOffset,
+    StreamOffsetType,
     SyncBroker,
     apply_profile,
     broker_health_check,
@@ -94,34 +97,11 @@ def retry_policy() -> RetryConfig:
     return RetryConfig(max_retries=3, delays=(1, 5, 30))
 
 
-# ── event metadata ────────────────────────────────────────────────────────────
+# ── envelopes ─────────────────────────────────────────────────────────────────
 
 
-def build_event(order_id: str) -> MessageEnvelope:
-    metadata = EventMetadata.create(
-        event_type="order.created",
-        event_version=1,
-        source="orders-service",
-        idempotency_key=order_id,
-        occurred_at=datetime.now(UTC),
-        tenant_id="tenant-1",
-    )
-    assert_type(metadata.message_id, str)
-    assert_type(metadata.occurred_at, datetime)
-    assert_type(metadata.tenant_id, str | None)
-    envelope = metadata.apply_to(MessageEnvelope(routing_key="orders", body=b"{}", mandatory=True))
-    assert_type(envelope, MessageEnvelope)
-    return envelope
-
-
-def read_event(message: RabbitMessage) -> EventMetadata | None:
-    try:
-        metadata = EventMetadata.from_message(message, require_tenant=True)
-    except EventMetadataError:
-        return None
-    assert_type(metadata.event_type, str)
-    assert_type(metadata.event_version, int)
-    return metadata
+def order_envelope(order_id: str) -> MessageEnvelope:
+    return MessageEnvelope(routing_key="orders", body=b"{}", message_id=order_id, mandatory=True)
 
 
 # ── publish outcomes ──────────────────────────────────────────────────────────
@@ -170,7 +150,7 @@ def build_async_app(url: str, received: list[bytes], probe: RabbitMessage) -> As
     @broker.subscriber(queue=orders_queue(), retry=retry_policy())
     async def on_order(message: RabbitMessage) -> None:
         assert_type(message.body, bytes)
-        if read_event(message) is not None:
+        if message.redelivered is False:
             received.append(message.body)
 
     # The decorator returns the handler unchanged, signature included: an
@@ -184,9 +164,9 @@ async def run_async_app(url: str, probe: RabbitMessage) -> list[str]:
     received: list[bytes] = []
     async with build_async_app(url, received, probe) as broker:
         assert_type(broker, AsyncBroker)
-        outcome = await broker.publish(build_event("o-1"))
+        outcome = await broker.publish(order_envelope("o-1"))
         assert_type(outcome, PublishOutcome)
-        bulk = await broker.publish_many([build_event("o-2"), build_event("o-3")])
+        bulk = await broker.publish_many([order_envelope("o-2"), order_envelope("o-3")])
         assert_type(bulk, BulkPublishResult)
         health = await broker_health_check_async(broker, HealthCheckConfig())
         assert_type(health, BrokerHealthResult)
@@ -209,9 +189,9 @@ def run_sync_app(url: str, probe: RabbitMessage) -> str:
     assert_type(on_order(probe), None)
     broker.start()
     try:
-        outcome = broker.publish(build_event("o-4"))
+        outcome = broker.publish(order_envelope("o-4"))
         assert_type(outcome, PublishOutcome)
-        bulk = broker.publish_many([build_event("o-5")])
+        bulk = broker.publish_many([order_envelope("o-5")])
         assert_type(bulk, BulkPublishResult)
         health = broker_health_check(broker)
         assert_type(health, BrokerHealthResult)
@@ -248,3 +228,32 @@ def exercise_test_broker() -> int:
     finally:
         broker.stop()
     return len(seen)
+
+
+# ── stream queues ─────────────────────────────────────────────────────────────
+
+
+def exercise_streams(path: str) -> None:
+    broker = AsyncBroker(RabbitConfig())
+    events = RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D", max_length_bytes=10_000_000)
+    store: OffsetStore = InMemoryOffsetStore()
+    config = StreamConsumerConfig(offset=StreamOffset.first(), offset_store=store, commit_every=50)
+    assert_type(config.offset, StreamOffset)
+    assert_type(config.offset.type, StreamOffsetType)
+    assert_type(store.load("events"), int | None)
+    memory: OffsetStore = InMemoryOffsetStore()
+    memory.save("events", 3)
+
+    @broker.subscriber(events, stream=config)
+    async def project(body: bytes, message: RabbitMessage) -> None:
+        assert_type(message.stream_offset, int | None)
+
+    @broker.subscriber(RabbitQueue("audit", queue_type=QueueType.STREAM), stream_offset=datetime.now(UTC))
+    async def audit(body: bytes) -> None: ...
+
+    sync = SyncBroker(RabbitConfig())
+
+    @sync.subscriber(RabbitQueue("replay", queue_type=QueueType.STREAM), stream_offset=42)
+    def replay(body: bytes) -> None: ...
+
+    assert_type(StreamOffset.parse("first"), StreamOffset)

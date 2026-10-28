@@ -193,7 +193,7 @@ class RabbitApp:
         ``signal.signal`` on platforms/threads where ``loop.add_signal_handler``
         is unavailable (e.g. Windows, non-main-thread).
 
-        G-24: the handlers in place before are kept. The Python-level handler
+        the handlers in place before are kept. The Python-level handler
         (``signal.getsignal``) is captured and put back on exit:
         ``loop.remove_signal_handler`` alone resets the signal to its
         default, which dropped e.g. an application's SIGTERM handler or
@@ -238,7 +238,7 @@ class RabbitApp:
             self._restore_signal_handlers(loop, installed)
 
     def _restore_signal_handlers(self, loop: asyncio.AbstractEventLoop, installed: dict[signal.Signals, Any]) -> None:
-        """Remove the handlers ``run_async`` installed and put back what was there before (G-24)."""
+        """Remove the handlers ``run_async`` installed and put back what was there before."""
         for sig, prev in installed.items():
             if not loop_signal_handler_is(loop, sig, self._signal_handler):
                 logger.info("RabbitApp: %s handler was replaced while running; leaving it in place", sig.name)

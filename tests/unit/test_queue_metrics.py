@@ -73,6 +73,63 @@ def _by_queue(collector: _RecordingCollector, queue: str) -> dict[str, float]:
     }
 
 
+def _quorum(collector: _RecordingCollector, queue: str) -> dict[str, float]:
+    cfg = MetricsConfig()
+    keymap = {cfg.queue_quorum_members: "members", cfg.queue_quorum_online: "online"}
+    return {
+        keymap[name]: value
+        for (name, labels, value) in collector.gauges
+        if labels.get("queue") == queue and name in keymap
+    }
+
+
+class TestQuorumHealth:
+    """Quorum queues: members/online counts from the management API (the
+    shape verified against RabbitMQ 3.13 and 4.1), so a lost majority can be
+    alerted on without the broker's Prometheus plugin."""
+
+    _NODES: tuple[str, ...] = ("rabbit@a", "rabbit@b", "rabbit@c")
+
+    def _qq(self, name: str, online: list[str] | None) -> dict[str, Any]:
+        queue: dict[str, Any] = {"name": name, "type": "quorum", "members": list(self._NODES)}
+        if online is not None:
+            queue["online"] = online
+        return queue
+
+    def test_all_members_online(self) -> None:
+        collector = _RecordingCollector()
+        QueueMetricsPoller(_FakeMgmt([self._qq("qq", list(self._NODES))]), collector).poll_once()
+        assert _quorum(collector, "qq") == {"members": 3, "online": 3}
+
+    def test_lost_member_lowers_online(self) -> None:
+        collector = _RecordingCollector()
+        QueueMetricsPoller(_FakeMgmt([self._qq("qq", ["rabbit@a"])]), collector).poll_once()
+        assert _quorum(collector, "qq") == {"members": 3, "online": 1}
+
+    def test_missing_online_list_counts_as_none_online(self) -> None:
+        collector = _RecordingCollector()
+        QueueMetricsPoller(_FakeMgmt([self._qq("qq", None)]), collector).poll_once()
+        assert _quorum(collector, "qq") == {"members": 3, "online": 0}
+
+    def test_only_the_queue_label_is_used(self) -> None:
+        collector = _RecordingCollector()
+        QueueMetricsPoller(_FakeMgmt([self._qq("qq", list(self._NODES))]), collector).poll_once()
+        assert {tuple(labels) for _, labels, _ in collector.gauges} == {("queue",)}
+
+    def test_classic_queues_get_no_quorum_gauges(self) -> None:
+        collector = _RecordingCollector()
+        classic = {"name": "cq", "type": "classic", "members": ["rabbit@a"]}  # never a list on classic; be safe
+        QueueMetricsPoller(_FakeMgmt([*_SAMPLE, classic]), collector).poll_once()
+        assert _quorum(collector, "orders") == {}
+        assert _quorum(collector, "cq") == {}
+
+    def test_quorum_without_member_list_is_skipped(self) -> None:
+        collector = _RecordingCollector()
+        QueueMetricsPoller(_FakeMgmt([{"name": "qq", "type": "quorum"}]), collector).poll_once()
+        assert _quorum(collector, "qq") == {}
+
+
+# ── poll_once ───────────────────────────────────────────────────────────
 # ── poll_once ───────────────────────────────────────────────────────────
 
 

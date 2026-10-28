@@ -1,4 +1,4 @@
-"""middleware/metrics.py — G-22 metrics foundation: BrokerMetrics, bounded
+"""middleware/metrics.py — broker metrics: BrokerMetrics, bounded
 reason codes, the metric inventory and its bounded label allow-list."""
 
 from __future__ import annotations
@@ -15,9 +15,11 @@ from rabbitkit.core.errors import AuthenticationFailedError, ReconnectBudgetExha
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import ErrorCategory, MessageEnvelope, PublishOutcome, PublishReason, PublishStatus
 from rabbitkit.middleware.metrics import (
+    BLOCKED_REASONS,
     CONNECTION_FAILURE_REASONS,
     BrokerMetrics,
     MetricsMiddleware,
+    blocked_reason_labels,
     bounded_label_values,
     connection_failure_reason,
     metric_inventory,
@@ -254,6 +256,55 @@ class TestBrokerMetricsConnections:
         assert metrics.config is _CFG
 
 
+class TestBlockedReason:
+    """connection.blocked carries the broker's reason; the reason gauge tells
+    a disk alarm from a memory alarm without the rabbitmq_prometheus plugin."""
+
+    @pytest.mark.parametrize(
+        ("reason", "labels"),
+        [
+            ("low on disk", {"disk"}),
+            ("low on memory", {"memory"}),
+            ("LOW ON MEMORY & DISK", {"disk", "memory"}),
+            ("some future alarm", {"other"}),
+            ("", {"other"}),
+            (None, {"other"}),
+        ],
+    )
+    def test_reason_maps_to_bounded_labels(self, reason: str | None, labels: set[str]) -> None:
+        assert blocked_reason_labels(reason) == frozenset(labels)
+        assert blocked_reason_labels(reason) <= set(BLOCKED_REASONS)
+
+    def _reasons(self, c: RecordingCollector) -> dict[str, float | None]:
+        return {r: c.gauge(_CFG.connection_blocked_reason, reason=r) for r in BLOCKED_REASONS}
+
+    def test_disk_alarm_sets_only_disk(self) -> None:
+        metrics, c = _metrics()
+        metrics.blocked(True, "low on disk")
+        assert c.gauge(_CFG.connection_blocked) == 1.0
+        assert self._reasons(c) == {"disk": 1.0, "memory": 0.0, "other": 0.0}
+
+    def test_unblocked_clears_every_reason(self) -> None:
+        metrics, c = _metrics()
+        metrics.blocked(True, "low on memory")
+        assert self._reasons(c) == {"disk": 0.0, "memory": 1.0, "other": 0.0}
+        metrics.blocked(False, "low on memory")  # a stale reason while unblocked means nothing
+        assert c.gauge(_CFG.connection_blocked) == 0.0
+        assert self._reasons(c) == {"disk": 0.0, "memory": 0.0, "other": 0.0}
+
+    def test_blocked_without_a_reason_is_other(self) -> None:
+        metrics, c = _metrics()
+        metrics.blocked(True)
+        assert self._reasons(c) == {"disk": 0.0, "memory": 0.0, "other": 1.0}
+
+    def test_sample_passes_the_reason(self) -> None:
+        metrics, c = _metrics()
+        metrics.sample(connection_blocked=True, connection_blocked_reason="low on disk")
+        assert self._reasons(c)["disk"] == 1.0
+        metrics.stopped()
+        assert self._reasons(c) == {"disk": 0.0, "memory": 0.0, "other": 0.0}
+
+
 class TestBrokerMetricsConsumersAndPublishing:
     def test_broker_cancelled_consumer(self) -> None:
         metrics, c = _metrics()
@@ -334,6 +385,8 @@ def _emit_everything(collector: RecordingCollector) -> None:
     metrics.channel_opened()
     metrics.channel_rebuilt()
     metrics.blocked(True)
+    for blocked_reason in ("low on disk", "low on memory", "low on memory & disk", "unknown"):
+        metrics.blocked(True, blocked_reason)
     metrics.consumer_cancelled("orders")
     metrics.consumer_resumed("orders")
     for status in PublishStatus:

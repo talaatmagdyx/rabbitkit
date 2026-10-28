@@ -450,11 +450,14 @@ redact secrets once logging is configured
 retried/dead-lettered counts, publish outcomes, handler latency,
 redeliveries, reconnects, confirm latency, in-flight handlers, broker/consumer
 lifecycle gauges, bulk-publish and settlement outcomes, retry-handoff
-failures, and — via the management API poller — queue depth and consumer lag. Tracing is standard OpenTelemetry
+failures, resource alarms by cause (disk or memory, from `connection.blocked`), and — via the management API
+poller — queue depth, consumer lag and quorum-queue member health. Tracing is standard OpenTelemetry
 (`pip install rabbitkit[otel]`): W3C context propagation over AMQP headers,
 one continuous trace from publish to consume. Prometheus alert rules with
 `promtool` tests ship in `deploy/prometheus/rabbitkit-alerts.yaml`, each linked
-to a runbook in `docs/runbooks/`. For the full reliability contract (publish
+to a runbook in `docs/runbooks/` and each threshold explained; they need only
+rabbitkit's own metrics (the broker's `rabbitmq_prometheus` plugin is an
+optional alternative group). For the full reliability contract (publish
 outcomes, settlement, failure taxonomy, durability scope) see
 `docs/reliable-messaging.md`.
 
@@ -466,12 +469,16 @@ with per-item outcomes, safe ack coalescing (`CoalescingAcker`), reliability
 profiles + `preflight`, pipelined sync confirms (`SyncBatchPublisher`), DLQ inspector + replay CLI, management API client,
 topology validation/drift/migration CLI, health watcher, circuit-breaker
 middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
-pybreaker).
+pybreaker), and RabbitMQ streams: `subscriber(stream_offset="first")` on a
+`QueueType.STREAM` queue, per-delivery `message.stream_offset`, retention
+options, and an `OffsetStore` protocol (in-memory by default; plug in your
+own storage) so restarts and reconnects resume where they left off (at-least-once; no retry/DLQ on streams). See
+[Streams](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md).
 
 **Experimental** (may change without a deprecation cycle — read the
 [stability policy](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/stability-policy.md)): RPC over direct reply-to,
-distributed locking, message signing, result backends, stream queues, the
-monitoring dashboard. Notable caveats: the default signing nonce cache is
+distributed locking, message signing, result backends, the monitoring
+dashboard. Notable caveats: the default signing nonce cache is
 per-process (use a shared cache for real replay protection), and never
 expose the dashboard publicly without authentication.
 
@@ -511,7 +518,6 @@ validates it.
 | Middleware | Job |
 |---|---|
 | `RetryMiddleware` | Broker-side retry ladder (auto-wired with `retry=`) |
-| `EventMetadataMiddleware` | Opt-in [event metadata](docs/event-metadata.md) validation (type, version, source, idempotency key, …); bad or unknown-version events are dead-lettered |
 | `DeduplicationMiddleware` | Redis-backed duplicate suppression; `claim` policy is crash-safe; `store_results` replays the original answer to duplicates |
 | `MetricsMiddleware` | Counters + latency histograms, cardinality-guarded labels |
 | `OTelTracingMiddleware` | Standard OpenTelemetry spans + W3C propagation |
@@ -677,7 +683,7 @@ Python ≥ 3.11 (tested: 3.11 / 3.12 / 3.13 / 3.14; 3.15 pre-release experimenta
 - [Message Safety](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/message-safety.md)
 - [Retry & DLQ](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/retry-and-dlq.md)
 - [Reliable Messaging — contract & CRITICAL profile](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/reliable-messaging.md)
-- [Event Metadata](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/event-metadata.md)
+- [Streams — offsets, replay, retention](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md)
 - [Production Patterns — reference code](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/patterns.md)
 - [Scale & Reliability Handbook — millions of messages](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/scale.md)
 - [Production Checklist](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/production/checklist.md)

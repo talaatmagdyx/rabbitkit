@@ -1,4 +1,4 @@
-"""Tests for async_/consumers.py — ConsumerSupervisor (G-26) with in-memory fakes."""
+"""Tests for async_/consumers.py — ConsumerSupervisor with in-memory fakes."""
 
 from __future__ import annotations
 
@@ -61,8 +61,8 @@ class _Queue:
         self.error: BaseException | None = None
         self.on_consume: Any = None
 
-    async def consume(self, callback: Any, *, consumer_tag: str, no_ack: bool, robust: bool) -> str:
-        self.calls.append({"tag": consumer_tag, "no_ack": no_ack, "robust": robust})
+    async def consume(self, callback: Any, *, consumer_tag: str, no_ack: bool, robust: bool, **kw: Any) -> str:
+        self.calls.append({"tag": consumer_tag, "no_ack": no_ack, "robust": robust, **kw})
         if self.on_consume is not None:
             self.on_consume()
         if self.error is not None:
@@ -339,6 +339,22 @@ class TestResubscribe:
         await harness.supervisor._try_resubscribe(harness.record, harness.underlay)
         harness.underlay.basic_cancel.assert_awaited_once_with("t1")
         assert harness.resumed == []
+
+
+class TestResubscribeStream:
+    async def test_resubscribe_sends_the_live_stream_arguments(self, harness: _Harness) -> None:
+        """A stream consumer cancelled by the broker re-subscribes from the
+        CURRENT resume point (the record holds the live arguments dict), not
+        from RabbitMQ's default "next"."""
+        arguments: dict[str, Any] = {"x-stream-offset": "first"}
+        harness.record.arguments = arguments
+        await harness.supervisor.check_once()
+        harness.underlay.broker_cancel("t1")
+        arguments["x-stream-offset"] = 42  # processed up to 41 meanwhile
+        harness.due()
+        await harness.supervisor.check_once()
+        assert harness.queue.calls == [{"tag": "t1", "no_ack": False, "robust": False, "arguments": arguments}]
+        assert harness.queue.calls[0]["arguments"]["x-stream-offset"] == 42
 
 
 class TestHooksAndLifecycle:

@@ -1,4 +1,4 @@
-"""SyncBroker metrics wiring (G-22): BrokerMetrics on the transport hooks
+"""SyncBroker metrics wiring: BrokerMetrics on the transport hooks
 (one "shared" connection), publish-only brokers included, sampled gauges."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.types import PublishOutcome, PublishStatus
 from rabbitkit.middleware.metrics import MetricsMiddleware
 from rabbitkit.sync.broker import SyncBroker
-from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
 _CFG = MetricsConfig()
 
@@ -20,6 +20,7 @@ def _transport() -> MagicMock:
     transport.is_connected.return_value = True
     transport.channels_active = 3
     transport.is_blocked = False
+    transport.blocked_reason = None
     return transport
 
 
@@ -56,8 +57,11 @@ class TestWiring:
         _hook(transport, "on_channel_opened")()
         _hook(transport, "on_channel_rebuilt")()
         _hook(transport, "on_reconnect_attempt")(2, ConnectionRefusedError())
+        transport.blocked_reason = "low on disk"
         _hook(transport, "on_blocked")()
         assert collector.gauge(_CFG.connection_blocked) == 1.0
+        assert collector.gauge(_CFG.connection_blocked_reason, reason="disk") == 1.0
+        assert collector.gauge(_CFG.connection_blocked_reason, reason="memory") == 0.0
         _hook(transport, "on_unblocked")()
         _hook(transport, "on_publish_outcome")(PublishOutcome(status=PublishStatus.CONFIRMED, exchange="x"), 0.002)
         assert collector.count(_CFG.reconnects_total) == 1

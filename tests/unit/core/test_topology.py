@@ -206,6 +206,68 @@ class TestRabbitQueueStream:
         with pytest.raises(ValueError, match="consumer_timeout"):
             RabbitQueue(name="q", queue_type=QueueType.STREAM, consumer_timeout=3_600_000)
 
+    def test_retention_arguments(self) -> None:
+        q = RabbitQueue(
+            name="events",
+            queue_type=QueueType.STREAM,
+            max_age="7D",
+            max_length_bytes=20_000_000_000,
+            stream_max_segment_size_bytes=100_000_000,
+        )
+        args = q.to_declare_kwargs()["arguments"]
+        assert args["x-max-age"] == "7D"
+        assert args["x-max-length-bytes"] == 20_000_000_000
+        assert args["x-stream-max-segment-size-bytes"] == 100_000_000
+
+    @pytest.mark.parametrize("age", ["1Y", "6M", "7D", "12h", "30m", "45s", "100D"])
+    def test_max_age_formats_rabbitmq_accepts(self, age: str) -> None:
+        assert RabbitQueue(name="q", queue_type=QueueType.STREAM, max_age=age).max_age == age
+
+    @pytest.mark.parametrize("age", ["7", "D", "0D", "7d", "1.5h", "7 D", "-1D", 7])
+    def test_invalid_max_age_raises(self, age: object) -> None:
+        with pytest.raises(TopologyValidationError, match="max_age must be a positive integer followed by"):
+            RabbitQueue(name="q", queue_type=QueueType.STREAM, max_age=age)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("option", ["max_length_bytes", "stream_max_segment_size_bytes"])
+    @pytest.mark.parametrize("value", [0, -1, True])
+    def test_sizes_must_be_positive(self, option: str, value: object) -> None:
+        with pytest.raises(TopologyValidationError, match=f"{option} must be a positive number of bytes"):
+            RabbitQueue(name="q", queue_type=QueueType.STREAM, **{option: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("dead_letter_exchange", ""),
+            ("dead_letter_routing_key", "q.dlq"),
+            ("max_length", 10),
+            ("overflow", "reject-publish"),
+            ("expires", 60_000),
+            ("delivery_limit", 5),
+            ("single_active_consumer", True),
+        ],
+    )
+    def test_options_rabbitmq_refuses_on_a_stream_raise(self, option: str, value: object) -> None:
+        """RabbitMQ 3.13 and 4.1 answer each with 406 'invalid arg ... of queue
+        type rabbit_stream_queue'; refuse at construction instead."""
+        with pytest.raises(TopologyValidationError, match=f"does not support {option}"):
+            RabbitQueue(name="q", queue_type=QueueType.STREAM, **{option: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("queue_type", [QueueType.CLASSIC, QueueType.QUORUM])
+    @pytest.mark.parametrize(("option", "value"), [("max_age", "7D"), ("stream_max_segment_size_bytes", 1000)])
+    def test_stream_retention_options_on_other_queue_types_raise(
+        self, queue_type: QueueType, option: str, value: object
+    ) -> None:
+        with pytest.raises(TopologyValidationError, match="only valid for stream queues"):
+            RabbitQueue(name="q", queue_type=queue_type, **{option: value})  # type: ignore[arg-type]
+
+    def test_max_length_bytes_on_classic_is_unchanged(self) -> None:
+        """Only streams validate the size: classic/quorum behaviour is as before."""
+        assert RabbitQueue(name="q", max_length_bytes=0).to_declare_kwargs()["arguments"]["x-max-length-bytes"] == 0
+
+    def test_passive_stream_with_retention_options_warns(self) -> None:
+        with pytest.warns(UserWarning, match="passive=True with creation-only options"):
+            RabbitQueue(name="q", queue_type=QueueType.STREAM, passive=True, max_age="1D")
+
 
 # ── RabbitQueue — consumer_timeout (x-consumer-timeout) ─────────────────
 
@@ -319,6 +381,7 @@ class TestRabbitExchangeInternalAutoDelete:
         """RabbitExchange with internal=True and auto_delete=True is invalid."""
         from rabbitkit.core.topology import RabbitExchange
         from rabbitkit.core.types import ExchangeType
+
         with pytest.raises(ValueError, match="auto_delete"):
             RabbitExchange(name="x", type=ExchangeType.DIRECT, internal=True, auto_delete=True)
 
@@ -363,7 +426,10 @@ class TestQuorumOptions:
             RabbitQueue("q", queue_type=QueueType.QUORUM, dead_letter_strategy="at-least-once")  # type: ignore[arg-type]
         with pytest.raises(TopologyValidationError, match="reject-publish"):
             RabbitQueue(
-                "q", queue_type=QueueType.QUORUM, dead_letter_strategy="at-least-once", overflow="drop-head"  # type: ignore[arg-type]
+                "q",
+                queue_type=QueueType.QUORUM,
+                dead_letter_strategy="at-least-once",
+                overflow="drop-head",  # type: ignore[arg-type]
             )
         # via the escape hatch counts too
         RabbitQueue(

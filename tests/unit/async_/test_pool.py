@@ -690,7 +690,7 @@ class TestAsyncChannelPoolExhausted:
 
     @pytest.mark.asyncio
     async def test_release_of_a_foreign_closed_channel_changes_nothing(self) -> None:
-        """G-05: a channel this pool does not own (stale, from a replaced
+        """a channel this pool does not own (stale, from a replaced
         pool) must never decrement this pool's counter."""
         mock_conn = AsyncMock()
         mock_channel = AsyncMock()
@@ -1102,10 +1102,10 @@ class TestExhaustedWarningIsRateLimited:
         assert levels == [logging.WARNING, logging.DEBUG]
 
 
-# ── G-08 / G-10: fail fast, terminal failures, no leaks ─────────────────
+# ── fail fast, terminal failures, no leaks ─────────────────
 
 
-class TestPoolConnectionFoundation:
+class TestPoolConnectionRecovery:
     @staticmethod
     def _pool(**kw: Any) -> AsyncConnectionPool:
         config = ConnectionConfig(reconnect_backoff_base=0.001, reconnect_backoff_max=0.002)
@@ -1150,6 +1150,9 @@ class TestPoolConnectionFoundation:
         policy = factory.keywords["rk_policy"]
         assert policy.role == "consumer"
         assert policy.on_terminal == pool._record_terminal
+        # aio-pika 9.x drops connect_robust(client_properties=); the class gets them too.
+        assert factory.keywords["rk_client_properties"] == connect.call_args.kwargs["client_properties"]
+        assert factory.keywords["rk_client_properties"]["library"] == "rabbitkit"
 
     @pytest.mark.asyncio
     async def test_abandoned_connection_objects_are_closed(self) -> None:
@@ -1255,7 +1258,7 @@ class TestPoolConnectionFoundation:
         assert pool._connected_once
 
 
-# ── G-22: connection state and channel counts for the metrics ───────────
+# ── connection state and channel counts for the metrics ───────────
 
 
 class TestPoolObservability:

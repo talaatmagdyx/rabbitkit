@@ -44,7 +44,6 @@ from rabbitkit.core.errors import (
     ConfigurationError,
     ConfigValidationError,
     DLQOperationDeniedError,
-    EventMetadataError,
     HandlerTimeoutError,
     InboundMessageTooLargeError,
     InfrastructureError,
@@ -61,7 +60,6 @@ from rabbitkit.core.errors import (
     UnsafeTopologyError,
     VhostAccessRefusedError,
 )
-from rabbitkit.core.event_metadata import EventMetadata
 from rabbitkit.core.logging import DEFAULT_REDACT_KEYS, LoggingConfig, configure_structlog
 from rabbitkit.core.message import AckMessage, NackMessage, RabbitMessage, RejectMessage
 from rabbitkit.core.profiles import (
@@ -153,7 +151,6 @@ from rabbitkit.highload.batch import (
 from rabbitkit.management import ManagementConfig, RabbitManagementClient
 from rabbitkit.middleware.circuit_breaker import CircuitBreakerMiddleware, CircuitBreakerOpenError
 from rabbitkit.middleware.deduplication import DeduplicationMiddleware
-from rabbitkit.middleware.event_metadata import EventMetadataMiddleware
 from rabbitkit.middleware.metrics import (
     MetricsCollector,
     MetricsMiddleware,
@@ -172,6 +169,13 @@ from rabbitkit.serialization.pipeline import (
     PydanticDecoder,
     RawDecoder,
     SerializationPipeline,
+)
+from rabbitkit.streams import (
+    InMemoryOffsetStore,
+    OffsetStore,
+    StreamConsumerConfig,
+    StreamOffset,
+    StreamOffsetType,
 )
 from rabbitkit.sync.batch import SyncBatchPublisher
 from rabbitkit.sync.broker import SyncBroker
@@ -234,9 +238,6 @@ __all__ = [
     "ErrorCategory",
     "ErrorSanitizer",
     "ErrorSeverity",
-    "EventMetadata",
-    "EventMetadataError",
-    "EventMetadataMiddleware",
     "ExchangeType",
     "FailureCategory",
     "FlowController",
@@ -250,6 +251,7 @@ __all__ = [
     "HealthCheckConfig",
     "HealthStatus",
     "HealthWatcher",
+    "InMemoryOffsetStore",
     "InboundMessageTooLargeError",
     "InfrastructureError",
     "InvalidMessageError",
@@ -267,6 +269,7 @@ __all__ = [
     "MissingDependencyError",
     "NackMessage",
     "OTelTracingMiddleware",
+    "OffsetStore",
     "Path",
     "PermanentConnectionError",
     "PolicyTemplate",
@@ -319,6 +322,9 @@ __all__ = [
     "SettlementReportError",
     "SocketConfig",
     "StaleGenerationError",
+    "StreamConsumerConfig",
+    "StreamOffset",
+    "StreamOffsetType",
     "SyncBatchPublisher",
     "SyncBroker",
     "SyncWorkerPool",

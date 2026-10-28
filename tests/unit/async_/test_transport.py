@@ -587,7 +587,7 @@ class TestWaitForRecovery:
 
 
 class TestPublishConfirmedNoHiddenRetry:
-    """G-03: once basic.publish may have left the client, a connection-class
+    """once basic.publish may have left the client, a connection-class
     failure is reported UNKNOWN and never republished (the old retry-once
     could deliver a duplicate reported as CONFIRMED) -- and the pool-release
     cleanup can never overwrite an already-computed outcome."""
@@ -767,7 +767,7 @@ class TestConsume:
 
     @pytest.mark.asyncio
     async def test_cancel_consumer(self) -> None:
-        """CONSUMER-007: cancel through the queue object the consumer was
+        """cancel through the queue object the consumer was
         started on, so aio-pika's robust restore forgets it; a fresh
         get_queue() wrapper left the restore record in place."""
         transport = _make_transport()
@@ -819,7 +819,7 @@ class TestConsume:
 
     @pytest.mark.asyncio
     async def test_delivery_after_cancel_is_requeued_and_consumer_cancelled_again(self) -> None:
-        """CONSUMER-007: a consumer resurrected by a reconnect after rabbitkit
+        """a consumer resurrected by a reconnect after rabbitkit
         cancelled it must not run the handler: the delivery is requeued and the
         stray consumer cancelled."""
         transport = _make_transport()
@@ -919,6 +919,23 @@ class TestConsume:
         channel.declare_queue.assert_awaited_once_with("orders", passive=True)
         channel.get_queue.assert_not_called()
         assert mock_queue.consume.call_args.kwargs["no_ack"] is False
+        assert "arguments" not in mock_queue.consume.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_consume_passes_arguments_by_reference(self) -> None:
+        """Stream routes: the consume arguments reach aio-pika as the SAME dict,
+        so the robust restore record carries in-place updates of the resume
+        point; the supervisor record keeps it too."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        mock_queue = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=mock_queue)
+        arguments: dict[str, Any] = {"x-stream-offset": "first"}
+
+        await transport.consume("events", AsyncMock(), arguments=arguments)
+
+        assert mock_queue.consume.call_args.kwargs["arguments"] is arguments
+        assert transport._consumer_supervisor._records["events"].arguments is arguments
 
 
 # ── Message Building ────────────────────────────────────────────────────
@@ -997,6 +1014,33 @@ class TestBuildMessage:
         message = transport._build_message(mock_aio_msg)
 
         assert message.timestamp == ts
+
+    def test_build_message_tags_a_naive_timestamp_as_utc(self) -> None:
+        """pamqp 3.2 (aio-pika 9.1) decodes the AMQP timestamp to a NAIVE UTC
+        datetime; ``.timestamp()`` on it read it as local time, shifting the
+        producer's epoch by the host's UTC offset."""
+        from datetime import UTC, datetime
+
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = datetime(2026, 1, 1)
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.timestamp == datetime(2026, 1, 1, tzinfo=UTC)
+        assert message.timestamp is not None
+        assert int(message.timestamp.timestamp()) == 1767225600
+
+    def test_build_message_without_timestamp(self) -> None:
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = None
+
+        assert transport._build_message(mock_aio_msg).timestamp is None
 
     def test_build_message_from_aio_pika(self) -> None:
         transport = _make_transport()
@@ -1283,7 +1327,7 @@ class TestDisconnectEdgeCases:
         assert not transport.is_connected()
 
     async def test_disconnect_is_bounded_when_channel_closes_hang(self) -> None:
-        """F20: a partitioned broker never answers Close. disconnect(timeout)
+        """a partitioned broker never answers Close. disconnect(timeout)
         skips the remaining channel closes and still closes the connections."""
         transport = await self._connected_transport()
         stuck = MagicMock()
@@ -1516,7 +1560,7 @@ class TestCancelConsumerEdgeCases:
         await transport.cancel_consumer("rabbitkit.some-tag")
 
     async def test_cancel_consumer_that_is_never_answered_is_bounded_and_forgotten(self) -> None:
-        """F20: during a partition Basic.CancelOk never arrives; the cancel
+        """during a partition Basic.CancelOk never arrives; the cancel
         gives up at its timeout, forgets the consumer and drops aio-pika's
         restore record so a reconnect cannot bring it back."""
         transport = _make_transport()
@@ -1626,6 +1670,18 @@ class TestBlockedUnblockedCallbacks:
         con.is_blocked = False
         transport._aio_unblocked()
         assert events == ["blocked", "unblocked"] and not transport.is_blocked
+
+    def test_blocked_reason_comes_from_a_blocked_monitor(self) -> None:
+        transport = _make_transport()
+        assert transport.blocked_reason is None
+        pub = MagicMock(is_blocked=True, blocked_reason=None)
+        con = MagicMock(is_blocked=True, blocked_reason="low on disk")
+        transport._blocked_monitors = [pub, con]
+        assert transport.blocked_reason is None  # not blocked yet at the transport level
+        transport._aio_blocked()
+        assert transport.blocked_reason == "low on disk"
+        con.blocked_reason = None
+        assert transport.blocked_reason is None
 
     def test_aio_blocked_with_no_callbacks_is_noop(self) -> None:
         """_aio_blocked() with empty list does nothing."""
@@ -2924,7 +2980,10 @@ class TestReviewFindingsAsyncTransport:
 
     async def test_connect_fixes_pamqp_before_any_frame(self) -> None:
         transport = _make_transport()
-        with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
+        with (
+            patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix,
+            patch("rabbitkit.async_.connection.ensure_aiormq_records_blocked_reason") as reason,
+        ):
             with patch(
                 "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
                 return_value={"url": "amqp://guest:guest@localhost/"},
@@ -2932,12 +2991,13 @@ class TestReviewFindingsAsyncTransport:
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()
         fix.assert_called_once()
+        reason.assert_called_once()
 
 
-# ── G-08 / G-10: connection hooks, terminal failure, atomic connect ─────
+# ── connection hooks, terminal failure, atomic connect ─────
 
 
-class TestConnectionFoundation:
+class TestConnectionRecovery:
     async def _connected(self) -> tuple[AsyncTransportImpl, AsyncMock]:
         transport = _make_transport()
         connection = _make_mock_connection()
@@ -3088,7 +3148,7 @@ class TestRecoveryWaitAfterTerminalFailure:
         assert loop.time() - started < 1.0
 
 
-# ── G-22: sampled state for the broker metrics ──────────────────────────
+# ── sampled state for the broker metrics ──────────────────────────
 
 
 class TestObservabilityState:

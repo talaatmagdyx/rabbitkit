@@ -548,11 +548,11 @@ class AsyncConnectionPool:
         # previously were registered once in connect() and so were silently
         # lost the moment a connection object was replaced.
         self._on_connection_created = on_connection_created
-        # G-08: a failed reconnect attempt (a ReconnectAttempt) and the one
+        # a failed reconnect attempt (a ReconnectAttempt) and the one
         # terminal failure (TerminalConnectionError) of any connection.
         self._on_reconnect_attempt = on_reconnect_attempt
         self._on_connection_failed = on_connection_failed
-        # G-22: ``(role, up, error)`` whenever a connection comes up (created
+        # ``(role, up, error)`` whenever a connection comes up (created
         # or reconnected) or a live one drops; the metrics follow it.
         self._on_connection_state = on_connection_state
         # Set once a connection gives up for good (permanent failure or spent
@@ -569,7 +569,7 @@ class AsyncConnectionPool:
         self._mandatory_channel_pool: AsyncChannelPool | None = None
         self._lock = asyncio.Lock()
         self._prewarmed = False
-        # Bug 2 (F20): a rebuild that cannot connect leaves the publisher
+        # Bug 2: a rebuild that cannot connect leaves the publisher
         # connection None; this task restores it in the background (backoff +
         # jitter) so readiness recovers without publish traffic.
         self._restore_task: asyncio.Task[None] | None = None
@@ -581,7 +581,7 @@ class AsyncConnectionPool:
         return self._terminal_error
 
     def _record_terminal(self, error: TerminalConnectionError) -> None:
-        """A connection gave up for good after startup (G-08): remember it and
+        """A connection gave up for good after startup: remember it and
         tell the transport. Only the first failure is reported."""
         if self._terminal_error is not None:
             return
@@ -622,7 +622,7 @@ class AsyncConnectionPool:
     async def connect(self) -> None:
         """Establish publisher and consumer connections eagerly.
 
-        All or nothing (G-10): if the second connection fails, the first is
+        All or nothing: if the second connection fails, the first is
         closed before the error propagates.
         """
         self._closing = False
@@ -709,7 +709,7 @@ class AsyncConnectionPool:
         wait for a free channel. Pool exhaustion raises
         :class:`ChannelPoolExhaustedError` and does NOT touch the connection:
         a busy pool is not a broken connection, and rebuilding it closed every
-        in-flight publish's channel (G-05).
+        in-flight publish's channel.
 
         Self-heals a wedged connection: after a broker outage aio-pika's
         RobustConnection can be left in a state where ``channel()`` hangs (no
@@ -1010,7 +1010,7 @@ class AsyncConnectionPool:
     async def _create_connection(self, *, role: str = "publisher") -> Any:
         """Create a new aio-pika connection.
 
-        G-08: a permanent failure (refused login or vhost, TLS verification)
+        a permanent failure (refused login or vhost, TLS verification)
         raises a :class:`~rabbitkit.core.errors.PermanentConnectionError` at
         once instead of being retried, and the connection object is a
         :class:`~rabbitkit.async_.reconnect.RabbitkitRobustConnection`, so its
@@ -1065,7 +1065,11 @@ class AsyncConnectionPool:
                 on_lost=self._connection_lost,
                 on_restored=self._connection_restored,
             )
-            kwargs["connection_class"] = functools.partial(RabbitkitRobustConnection, rk_policy=policy)
+            kwargs["connection_class"] = functools.partial(
+                RabbitkitRobustConnection,
+                rk_policy=policy,
+                rk_client_properties=kwargs.get("client_properties"),
+            )
             try:
                 connection = await aio_pika.connect_robust(**kwargs)
             except BaseException as e:

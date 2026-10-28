@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING, Any
 
 from rabbitkit.core.config import RetryConfig, RetryDisabled, SafetyConfig
 from rabbitkit.core.errors import ConfigurationError, UnsafeTopologyError
+from rabbitkit.core.streams import StreamConsumerConfig
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
-from rabbitkit.core.types import AckPolicy, ExchangeType, RejectWithoutDLXPolicy
+from rabbitkit.core.types import AckPolicy, ExchangeType, QueueType, RejectWithoutDLXPolicy
 from rabbitkit.serialization.base import Serializer
 
 if TYPE_CHECKING:
@@ -67,7 +68,7 @@ class RouteRuntimeState:
     """
 
     consumer_tag: str | None = None
-    #: G-26: the BROKER cancelled this route's consumer (queue deleted, quorum
+    #: the BROKER cancelled this route's consumer (queue deleted, quorum
     #: leader change, ...) and it is not consuming again yet. ``consumer_tag``
     #: is kept (the same tag is reused when the consumer is re-subscribed);
     #: health checks count the route as not consuming while this is True.
@@ -164,6 +165,11 @@ class RouteDefinition:
     # direct-reply-to pseudo-queue. Set a tuple to enforce; entries ending in
     # "*" are treated as prefixes.
     reply_to_allow: tuple[str, ...] | None = None
+
+    # Stream consumption (start offset, offset store, commit cadence). Set by
+    # the registry for every route whose queue is a stream (a default config
+    # when the subscriber passed none); None for classic/quorum routes.
+    stream_config: StreamConsumerConfig | None = None
 
     # ── Runtime state (mutable sub-object; populated by broker) ──
     runtime_state: RouteRuntimeState = field(default_factory=RouteRuntimeState)
@@ -295,7 +301,7 @@ class RouteDefinition:
             )
 
     def validate_prefetch_count(self) -> None:
-        """Validate the per-route prefetch override (CONSUMER-005).
+        """Validate the per-route prefetch override.
 
         ``None`` inherits ``ConsumerConfig.prefetch_count``. ``0`` used to
         fall through to the global value silently (``route.prefetch_count or
@@ -313,12 +319,56 @@ class RouteDefinition:
                 "(0 would mean UNLIMITED prefetch in AMQP)."
             )
 
+    @property
+    def is_stream(self) -> bool:
+        """True when this route consumes a stream queue."""
+        return self.queue.queue_type is QueueType.STREAM
+
+    def validate_stream(self, broker_retry: RetryConfig | None = None) -> None:
+        """Validate a stream route (registration time).
+
+        A stream keeps every message until retention removes it, never
+        redelivers a nacked or rejected message and cannot dead-letter. So:
+
+        * ``ACK_FIRST`` is refused: the offset would advance before the
+          handler ran, losing the message on a crash for no benefit (a stream
+          consumer must ack anyway; the broker refuses no-ack consumers).
+        * retry (per route or inherited from the broker) is refused: it is
+          built on nack/reject plus a dead-letter exchange, and a stream has
+          neither. Handle failures in the handler, or republish them to a
+          queue that can retry.
+        """
+        if not self.is_stream:
+            if self.stream_config is not None:
+                raise ConfigurationError(
+                    f"Route '{self.name}': stream options (stream= / stream_offset=) need a stream queue; "
+                    f"queue '{self.queue.name}' is {self.queue.queue_type.value}. Declare it with "
+                    "RabbitQueue(..., queue_type=QueueType.STREAM)."
+                )
+            return
+        if self.ack_policy == AckPolicy.ACK_FIRST:
+            raise ConfigurationError(
+                f"Route '{self.name}': ACK_FIRST is not supported on a stream queue. It would record the "
+                "message as processed before the handler runs, so a crash skips it, and gains nothing (a "
+                "stream keeps the message either way). Use AckPolicy.AUTO, NACK_ON_ERROR or MANUAL."
+            )
+        if self.has_retry_enabled(broker_retry):
+            source = "this route's retry=" if self.retry_override is not None else "the broker's default RetryConfig"
+            raise ConfigurationError(
+                f"Route '{self.name}': retry/DLQ is not supported on stream queue '{self.queue.name}' "
+                f"(set by {source}). Retry relies on nack/reject and dead-lettering; a stream neither "
+                "redelivers a nacked message nor dead-letters it, it just moves on. Pass "
+                "retry=RETRY_DISABLED on this route, and handle failures in the handler (retry in "
+                "process, or publish the message to a quorum queue that has retry)."
+            )
+
     def validate(self, broker_retry: RetryConfig | None = None) -> None:
         """Run all route validations.
 
         Called at registration time — fail fast on conflicts.
         """
         self.validate_prefetch_count()
+        self.validate_stream(broker_retry)
         self.validate_retry_ack_compatibility(broker_retry)
         self.validate_retry_dlx_conflict(broker_retry)
         self.validate_headers_binding()
@@ -334,6 +384,8 @@ class RouteDefinition:
         they never reject. Everything else (AUTO/NACK_ON_ERROR/MANUAL,
         filter_fn, permanent-error classification) can reject.
         """
+        if self.is_stream:
+            return False  # a rejected stream message stays in the stream: nothing is discarded
         if self.effective_retry_config(broker_retry) is not None:
             return False
         if self.queue.dead_letter_exchange is not None:

@@ -1,6 +1,6 @@
 """Reliability profiles, preflight verification, and broker policy templates.
 
-Two explicit profiles (plan §9; ADR-M1/M4 of the messaging contract):
+Two explicit profiles:
 
 ==========================  ========================  ==============================================
 Setting                     STANDARD                  CRITICAL
@@ -26,7 +26,6 @@ Error text                  sanitized                 sanitized or omitted (neve
 Dead-letter path            auto-provisioned          never ``discard``
 DLQ metadata outside retry  ``x-death`` only          confirmed copy with failure metadata
                                                       (``safety.dead_letter_with_metadata``, async)
-Event metadata validation   opt-in                    opt-in (an application contract choice)
 Heartbeat                   explicit                  required (> 0)
 Async reconnect budget      unlimited                 unlimited by default; when set, seconds
                                                       >= ``reconnect_backoff_max`` (warning)
@@ -82,7 +81,7 @@ from rabbitkit.core.types import (
 CRITICAL_MAX_MESSAGE_BYTES = 256 * 1024
 
 #: Default in-flight publish byte budget the critical profile sets when the
-#: config has none (``PublisherConfig.max_in_flight_bytes``, async broker):
+#: config has none (``PublisherConfig.max_in_flight_bytes``, both brokers):
 #: 64 MiB, i.e. 256 messages at the 256 KiB body limit. Set your own value to
 #: override it.
 CRITICAL_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024
@@ -382,8 +381,7 @@ def apply_profile(config: RabbitConfig, profile: ReliabilityProfile | str) -> Ra
     raises) and leaves the reconnect budget and TLS to you. Per-route requirements (quorum source
     queues declared at-least-once, no ``ACK_FIRST``, retry not disabled) are
     the routes' to meet: check them with :func:`validate_profile` /
-    :func:`preflight` after registering the subscribers. Event-metadata
-    validation stays opt-in (``EventMetadataMiddleware``).
+    :func:`preflight` after registering the subscribers.
 
     STANDARD fills in confirms, persistence and mandatory only.
     """

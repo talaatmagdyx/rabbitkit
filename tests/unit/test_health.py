@@ -1099,7 +1099,7 @@ class TestBrokerReadinessConnectedFalse:
         assert result is False
 
 
-# ── G-26: a broker-cancelled consumer is not counted as consuming ─────────
+# ── a broker-cancelled consumer is not counted as consuming ─────────
 
 
 class TestBrokerCancelledConsumer:
@@ -1122,7 +1122,7 @@ class TestBrokerCancelledConsumer:
         cancelled.runtime_state.consumer_cancelled = False
         assert broker_health_check(broker).status == HealthStatus.HEALTHY
 class TestTerminalConnectionFailure:
-    """G-08: a connection that stopped reconnecting for good fails liveness,
+    """a connection that stopped reconnecting for good fails liveness,
     readiness and health, with the reason in the details."""
 
     @staticmethod

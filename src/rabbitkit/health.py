@@ -118,7 +118,7 @@ def _get_transport(broker: Any) -> Any:
 
 
 def _get_connection_failure(transport: Any) -> BaseException | None:
-    """The transport's terminal connection failure (G-08), if it gave up for good."""
+    """The transport's terminal connection failure, if it gave up for good."""
     failure = getattr(transport, "connection_failure", None) if transport is not None else None
     return failure if isinstance(failure, BaseException) else None
 
@@ -142,7 +142,7 @@ def _get_consumer_count(broker: Any, transport: Any) -> int:
 
 def _route_consuming(route: Any) -> bool:
     """A route consumes when it has a consumer tag and the broker has not
-    cancelled that consumer (G-26: ``runtime_state.consumer_cancelled``)."""
+    cancelled that consumer (``runtime_state.consumer_cancelled``)."""
     if not getattr(route, "consumer_tag", None):
         return False
     state = getattr(route, "runtime_state", None)
@@ -430,7 +430,7 @@ def broker_liveness(broker: HealthProvider | Any, wedged_timeout: float = 60.0) 
       but has gone stale, meaning the I/O loop is wedged), OR
     - the transport's ``connection_failure`` is set: a connection stopped
       reconnecting for good (refused credentials or vhost, TLS verification,
-      spent reconnect budget; G-08). Only a restart can recover from that.
+      spent reconnect budget). Only a restart can recover from that.
 
     A transient broker/transport disconnect is *not* a liveness failure: the
     process is still running and can recover. Use :func:`broker_readiness` to

@@ -1,4 +1,4 @@
-"""HandlerPipeline raw-body cap (§15.6, ``ConsumerConfig.max_body_bytes``):
+"""HandlerPipeline raw-body cap (``ConsumerConfig.max_body_bytes``):
 an oversized delivery is INVALID_MESSAGE and dead-lettered without running
 the filter, any middleware or the handler."""
 

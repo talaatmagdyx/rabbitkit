@@ -1,7 +1,6 @@
 """async_/transport.py publish outcome contract: NOT_SENT / UNKNOWN / RETURNED
 on every path, no hidden republish, channel release on every path, byte
-budget, per-call timeout and publisher shutdown (G-01, G-03, G-04, G-12,
-G-14, PUB-004)."""
+budget, per-call timeout and publisher shutdown."""
 
 from __future__ import annotations
 
@@ -75,7 +74,7 @@ def _env(**kwargs: Any) -> MessageEnvelope:
     return MessageEnvelope(**kwargs)
 
 
-# ── G-01: mandatory → RETURNED on every channel kind ─────────────────────────
+# ── mandatory → RETURNED on every channel kind ─────────────────────────
 
 
 class TestReturnedOnEveryPath:
@@ -116,7 +115,7 @@ class TestReturnedOnEveryPath:
         assert outcome.status is PublishStatus.RETURNED
 
 
-# ── G-03: classification ─────────────────────────────────────────────────────
+# ── classification ─────────────────────────────────────────────────────
 
 
 class TestFailureClassification:
@@ -183,7 +182,7 @@ class TestFailureClassification:
             await transport._publish_on_channel(_channel(AsyncMock(side_effect=asyncio.CancelledError())), _env())
 
 
-# ── PUB-004: per-call timeout ────────────────────────────────────────────────
+# ── per-call timeout ────────────────────────────────────────────────
 
 
 class TestPerCallTimeout:
@@ -234,7 +233,7 @@ class TestPerCallTimeout:
         assert (await first).status is PublishStatus.CONFIRMED
 
 
-# ── G-03/G-05: admission failures are NOT_SENT ───────────────────────────────
+# ── admission failures are NOT_SENT ───────────────────────────────
 
 
 class TestNotSent:
@@ -315,7 +314,7 @@ class TestFastPath:
         assert transport.publishes_in_flight == 0
 
 
-# ── G-04: channel returned on every path ─────────────────────────────────────
+# ── channel returned on every path ─────────────────────────────────────
 
 
 class TestChannelReleasedOnEveryPath:
@@ -366,7 +365,7 @@ class TestChannelReleasedOnEveryPath:
         assert outcome.status is PublishStatus.UNKNOWN
 
 
-# ── G-14: byte budget ────────────────────────────────────────────────────────
+# ── byte budget ────────────────────────────────────────────────────────
 
 
 class TestByteBudget:
@@ -418,7 +417,7 @@ class TestByteBudget:
         assert transport.byte_limiter.used == 0
 
 
-# ── G-12: publisher shutdown ─────────────────────────────────────────────────
+# ── publisher shutdown ─────────────────────────────────────────────────
 
 
 class TestClosePublishing:
@@ -557,7 +556,7 @@ class TestPreSendFailures:
         assert (outcome.status, outcome.reason) == (PublishStatus.ERROR, "invalid_envelope")
 
 
-# ── G-22: publish outcome hook (confirm latency, routing failures) ───────────
+# ── publish outcome hook (confirm latency, routing failures) ───────────
 
 
 class TestPublishOutcomeHook:

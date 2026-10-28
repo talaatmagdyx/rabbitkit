@@ -1,4 +1,4 @@
-"""AsyncBroker metrics wiring (G-22): BrokerMetrics on every transport hook,
+"""AsyncBroker metrics wiring: BrokerMetrics on every transport hook,
 publish-only brokers included, sampled gauges, consumer cancels, stop."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.errors import AuthenticationFailedError
 from rabbitkit.core.types import PublishOutcome, PublishStatus
 from rabbitkit.middleware.metrics import BrokerMetrics, MetricsMiddleware
-from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
 _CFG = MetricsConfig()
 
@@ -24,6 +24,7 @@ def _transport() -> MagicMock:
     transport.publishes_in_flight = 2
     transport.publish_channels_in_use = 1
     transport.is_blocked = False
+    transport.blocked_reason = None
     transport.byte_limiter = None
     return transport
 
@@ -65,8 +66,11 @@ class TestWiring:
         _hook(transport, "on_reconnect_attempt")(attempt)
         failed = transport.on_connection_failed.call_args_list[-1].args[0]
         failed(AuthenticationFailedError("no", reason="authentication_failed", role="publisher"))
+        transport.blocked_reason = "low on disk"
         _hook(transport, "on_blocked")()
         assert collector.gauge(_CFG.connection_blocked) == 1.0
+        assert collector.gauge(_CFG.connection_blocked_reason, reason="disk") == 1.0
+        assert collector.gauge(_CFG.connection_blocked_reason, reason="memory") == 0.0
         _hook(transport, "on_unblocked")()
         assert collector.gauge(_CFG.connection_blocked) == 0.0
         _hook(transport, "on_publish_outcome")(PublishOutcome(status=PublishStatus.RETURNED, exchange="x"), 0.01)

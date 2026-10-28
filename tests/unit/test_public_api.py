@@ -70,9 +70,6 @@ class TestExperimentalSymbolsNotAtTopLevel:
         "ResultMiddleware",
         "ResultBackend",
         "RedisResultBackend",
-        "StreamConsumerConfig",
-        "StreamOffset",
-        "StreamOffsetType",
     ]
 
     @pytest.mark.parametrize("name", EXPERIMENTAL_SYMBOLS)
@@ -95,6 +92,45 @@ class TestExperimentalSymbolsNotAtTopLevel:
 
         assert hasattr(rabbitkit.experimental, name)
         assert name in rabbitkit.experimental.__all__
+
+
+class TestStreamsGraduated:
+    """Stream support left rabbitkit.experimental: top-level exports, and the
+    old experimental import path still works for one minor version with a
+    DeprecationWarning (docs/stability-policy.md)."""
+
+    MOVED: ClassVar[list[str]] = ["StreamConsumerConfig", "StreamOffset", "StreamOffsetType"]
+    TOP_LEVEL: ClassVar[list[str]] = [*MOVED, "OffsetStore", "InMemoryOffsetStore"]
+
+    @pytest.mark.parametrize("name", TOP_LEVEL)
+    def test_exported_at_top_level_and_from_streams(self, name: str) -> None:
+        import rabbitkit
+        import rabbitkit.streams
+
+        assert name in rabbitkit.__all__
+        assert getattr(rabbitkit, name) is getattr(rabbitkit.streams, name)
+
+    @pytest.mark.parametrize("name", MOVED)
+    def test_experimental_import_warns_and_returns_the_same_object(self, name: str) -> None:
+        import rabbitkit
+        import rabbitkit.experimental
+
+        with pytest.warns(DeprecationWarning, match=f"rabbitkit.experimental.{name} is deprecated"):
+            moved = getattr(rabbitkit.experimental, name)
+        assert moved is getattr(rabbitkit, name)
+
+    @pytest.mark.parametrize("name", MOVED)
+    def test_not_in_experimental_dunder_all(self, name: str) -> None:
+        """A star import of rabbitkit.experimental must not trip the warning."""
+        import rabbitkit.experimental
+
+        assert name not in rabbitkit.experimental.__all__
+
+    def test_unknown_experimental_attribute_still_raises(self) -> None:
+        import rabbitkit.experimental
+
+        with pytest.raises(AttributeError, match="no attribute 'Nope'"):
+            rabbitkit.experimental.Nope  # noqa: B018
 
 
 class TestAioDeprecated:

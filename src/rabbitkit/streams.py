@@ -1,142 +1,46 @@
-"""Stream queue consumer offset tracking.
+"""RabbitMQ stream queues: start offsets, offset stores, consumer config.
 
-RabbitMQ stream queues support offset-based consuming, allowing consumers
-to start reading from a specific position in the log.
+Consume a stream through a normal route; rabbitkit sets ``x-stream-offset``,
+tracks each delivery's offset, resumes after a reconnect from the last
+processed message, and commits the position to an :class:`OffsetStore` so a
+restart resumes too::
 
-Offset types:
-- "first": Start from the beginning of the stream
-- "last": Start from the end (new messages only)
-- "next": Start from the next unconsumed message (default)
-- timestamp: Start from messages published after a given timestamp
-- numeric offset: Start from a specific offset value
+    from rabbitkit import QueueType, RabbitQueue, StreamConsumerConfig
 
-Usage::
+    @broker.subscriber(
+        RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D"),
+        # offset_store: your own OffsetStore (load/save over your storage) to
+        # resume across restarts; the default in-memory store covers reconnects.
+        stream=StreamConsumerConfig(offset="first", offset_store=my_offset_store),
+    )
+    async def handle(body: dict, message: RabbitMessage) -> None:
+        print(message.stream_offset, body)
 
-    from rabbitkit.streams import StreamOffset, StreamConsumerConfig
+    # shorthand when the default in-memory store is enough
+    @broker.subscriber(RabbitQueue("audit", queue_type=QueueType.STREAM), stream_offset="first")
+    async def audit(body: bytes) -> None: ...
 
-    # Start from beginning
-    config = StreamConsumerConfig(offset=StreamOffset.first())
-
-    # Start from specific offset
-    config = StreamConsumerConfig(offset=StreamOffset.offset(42))
-
-    # Start from timestamp
-    config = StreamConsumerConfig(offset=StreamOffset.timestamp(datetime(2026, 1, 1)))
-
-    # The consume arguments RabbitMQ expects (x-stream-offset, ...)
-    args = config.to_consume_arguments()
-
-Experimental (``rabbitkit.experimental``; see docs/stability-policy.md):
-these helpers only build the consume arguments. ``broker.subscriber()`` does
-not accept them, so a stream queue consumed through a broker route starts
-at RabbitMQ's default offset (``next``) with no offset control. Pass
-``to_consume_arguments()`` to your own client's consume call (e.g. aio-pika's
-``queue.consume(callback, arguments=args)``) when you need an offset.
+See ``docs/streams.md`` for the delivery semantics (at-least-once, no
+retry/DLQ on stream routes, the commit window) and when to choose a stream
+over a quorum queue. The implementation lives in ``rabbitkit.core.streams``.
 """
 
 from __future__ import annotations
 
-import enum
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from rabbitkit.core.streams import (
+    InMemoryOffsetStore,
+    OffsetStore,
+    StreamConsumerConfig,
+    StreamOffset,
+    StreamOffsetLike,
+)
+from rabbitkit.core.types import StreamOffsetType
 
-logger = logging.getLogger(__name__)
-
-
-class StreamOffsetType(str, enum.Enum):
-    """Stream offset specification types."""
-
-    FIRST = "first"
-    LAST = "last"
-    NEXT = "next"
-    OFFSET = "offset"
-    TIMESTAMP = "timestamp"
-
-
-@dataclass(frozen=True, slots=True)
-class StreamOffset:
-    """Stream queue offset specification.
-
-    Use class methods to create:
-        StreamOffset.first()
-        StreamOffset.last()
-        StreamOffset.next()
-        StreamOffset.offset(42)
-        StreamOffset.timestamp(datetime(...))
-    """
-
-    type: StreamOffsetType = StreamOffsetType.NEXT
-    value: int | datetime | None = None
-
-    @classmethod
-    def first(cls) -> StreamOffset:
-        """Start from the beginning of the stream."""
-        return cls(type=StreamOffsetType.FIRST)
-
-    @classmethod
-    def last(cls) -> StreamOffset:
-        """Start from the end (new messages only)."""
-        return cls(type=StreamOffsetType.LAST)
-
-    @classmethod
-    def next(cls) -> StreamOffset:
-        """Start from the next unconsumed message (default)."""
-        return cls(type=StreamOffsetType.NEXT)
-
-    @classmethod
-    def offset(cls, value: int) -> StreamOffset:
-        """Start from a specific numeric offset."""
-        if value < 0:
-            msg = "Stream offset must be non-negative"
-            raise ValueError(msg)
-        return cls(type=StreamOffsetType.OFFSET, value=value)
-
-    @classmethod
-    def timestamp(cls, value: datetime) -> StreamOffset:
-        """Start from messages published after the given timestamp."""
-        return cls(type=StreamOffsetType.TIMESTAMP, value=value)
-
-    def to_consume_arguments(self) -> dict[str, Any]:
-        """Convert to RabbitMQ consume arguments (x-stream-offset).
-
-        Returns dict suitable for merging into basic_consume arguments.
-        """
-        if self.type == StreamOffsetType.FIRST:
-            return {"x-stream-offset": "first"}
-        if self.type == StreamOffsetType.LAST:
-            return {"x-stream-offset": "last"}
-        if self.type == StreamOffsetType.NEXT:
-            return {"x-stream-offset": "next"}
-        if self.type == StreamOffsetType.OFFSET:
-            return {"x-stream-offset": self.value}
-        if self.type == StreamOffsetType.TIMESTAMP:
-            if not isinstance(self.value, datetime):
-                raise TypeError("TIMESTAMP stream offset requires a datetime value")
-            # RabbitMQ x-stream-offset by time expects a Unix timestamp in seconds.
-            return {"x-stream-offset": int(self.value.timestamp())}
-        return {}  # pragma: no cover
-
-    def __repr__(self) -> str:
-        if self.value is not None:
-            return f"StreamOffset({self.type.value}={self.value})"
-        return f"StreamOffset({self.type.value})"
-
-
-@dataclass(frozen=True, slots=True)
-class StreamConsumerConfig:
-    """Configuration for stream queue consumers.
-
-    Extends basic consumer behavior with stream-specific options.
-    """
-
-    offset: StreamOffset = field(default_factory=StreamOffset.next)
-    consumer_name: str | None = None  # x-stream-consumer-name for single-active-consumer
-
-    def to_consume_arguments(self) -> dict[str, Any]:
-        """Build consume arguments for stream queue subscription."""
-        args = self.offset.to_consume_arguments()
-        if self.consumer_name is not None:
-            args["x-stream-consumer-name"] = self.consumer_name
-        return args
+__all__ = [
+    "InMemoryOffsetStore",
+    "OffsetStore",
+    "StreamConsumerConfig",
+    "StreamOffset",
+    "StreamOffsetLike",
+    "StreamOffsetType",
+]

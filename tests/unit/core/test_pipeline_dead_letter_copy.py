@@ -1,4 +1,4 @@
-"""HandlerPipeline: the G-17 DLQ copy for failures outside RetryMiddleware,
+"""HandlerPipeline: the metadata-stamped DLQ copy for failures outside RetryMiddleware,
 and the completed-dead-letter hook RetryMiddleware attaches."""
 
 from __future__ import annotations

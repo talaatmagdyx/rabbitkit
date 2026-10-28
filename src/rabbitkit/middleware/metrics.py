@@ -73,7 +73,7 @@ REASON_OTHER = "other"
 
 
 def _publish_reason_label(result: Any) -> str:
-    """Bounded ``reason`` label for a publish result (G-22)."""
+    """Bounded ``reason`` label for a publish result."""
     reason = getattr(result, "reason", None) if isinstance(result, PublishOutcome) else None
     if reason is None:
         return REASON_NONE
@@ -101,6 +101,22 @@ CONNECTION_FAILURE_REASONS: frozenset[str] = frozenset(
     }
 )
 
+#: Bounded ``reason`` values of ``connection_blocked_reason``.
+BLOCKED_REASONS: tuple[str, ...] = ("disk", "memory", "other")
+
+
+def blocked_reason_labels(reason: str | None) -> frozenset[str]:
+    """The alarms a ``connection.blocked`` reason names (a metric label set).
+
+    RabbitMQ sends ``"low on disk"`` / ``"low on memory"`` (both alarms at
+    once name both). Anything else, or no reason at all (a client that could
+    not read it), is ``other``. Never returns the broker's text itself.
+    """
+    text = reason.lower() if isinstance(reason, str) else ""
+    found = frozenset(alarm for alarm in ("disk", "memory") if alarm in text)
+    return found or frozenset({"other"})
+
+
 # Client-library exception class names (aiormq / pika), matched by name so
 # this module stays transport-free.
 _BROKER_CLOSED_NAMES = frozenset({"ConnectionClosed", "ConnectionClosedByBroker"})
@@ -111,7 +127,7 @@ _MAX_CAUSE_DEPTH = 4
 
 
 def connection_failure_reason(error: BaseException | None) -> str:
-    """Bounded reason code for a connection failure (a metric label, G-22).
+    """Bounded reason code for a connection failure (a metric label).
 
     A :class:`~rabbitkit.core.errors.TerminalConnectionError` keeps its own
     ``reason``. Otherwise *error* and its ``__cause__`` chain are mapped to
@@ -335,7 +351,7 @@ class MetricsMiddleware(BaseMiddleware):
         # and publish the gauge on every enter/exit.
         self._in_flight: dict[str, int] = {}
         self._in_flight_lock = threading.Lock()
-        # G-22: set by the broker when its transport reports the real
+        # set by the broker when its transport reports the real
         # send-to-confirm latency (BrokerMetrics); this middleware then stops
         # timing the whole publish call as "confirm latency".
         self._confirm_latency_from_transport = False
@@ -367,7 +383,7 @@ class MetricsMiddleware(BaseMiddleware):
         """Publish-side counters + histograms shared by both scopes.
 
         ``messages_published_total`` carries the outcome's ``status`` and a
-        bounded ``reason`` (G-22). ``publish_confirm_latency_seconds`` is
+        bounded ``reason``. ``publish_confirm_latency_seconds`` is
         observed here only when no transport reports it (TestBroker, a
         custom publish fn): then it is the whole call for a CONFIRMED
         outcome. Under ``SyncBroker`` / ``AsyncBroker`` the transport times
@@ -576,7 +592,7 @@ class MetricsMiddleware(BaseMiddleware):
             return result
 
 
-# ── Broker/transport metrics (G-22) ───────────────────────────────────────
+# ── Broker/transport metrics ───────────────────────────────────────
 
 #: Connection roles: the async broker's two connections, the sync broker's
 #: one shared connection, and a terminal failure with no role.
@@ -600,7 +616,7 @@ def _routing_failure_reason(outcome: PublishOutcome) -> str | None:
 
 
 class BrokerMetrics:
-    """Connection, channel, flow-control and transport-publish metrics (G-22).
+    """Connection, channel, flow-control and transport-publish metrics.
 
     Transport-free: the brokers feed it from their transport's hooks
     (``on_connection_state``, ``on_reconnect_attempt``,
@@ -697,8 +713,9 @@ class BrokerMetrics:
             self._up = dict.fromkeys(self._roles, False)
             states = dict(self._up)
         self._publish_states(states)
-        for name in (self._cfg.channels_active, self._cfg.publish_in_flight, self._cfg.connection_blocked):
+        for name in (self._cfg.channels_active, self._cfg.publish_in_flight):
             self._gauge(name, {}, 0.0)
+        self.blocked(False)
         for queue in routes:
             self._gauge(self._cfg.route_consuming, {"queue": queue}, 0.0)
 
@@ -710,9 +727,17 @@ class BrokerMetrics:
     def channel_rebuilt(self) -> None:
         self._collector.inc_counter(self._cfg.channel_rebuilds_total, {})
 
-    def blocked(self, is_blocked: bool) -> None:
-        """``connection.blocked`` / ``connection.unblocked`` from RabbitMQ."""
+    def blocked(self, is_blocked: bool, reason: str | None = None) -> None:
+        """``connection.blocked`` / ``connection.unblocked`` from RabbitMQ.
+
+        *reason* is the broker's blocked reason text (``"low on disk"``); it
+        sets ``connection_blocked_reason`` per bounded alarm label, so disk and
+        memory alarms are told apart without the broker's Prometheus plugin.
+        """
         self._gauge(self._cfg.connection_blocked, {}, 1.0 if is_blocked else 0.0)
+        active = blocked_reason_labels(reason) if is_blocked else frozenset()
+        for label in BLOCKED_REASONS:
+            self._gauge(self._cfg.connection_blocked_reason, {"reason": label}, 1.0 if label in active else 0.0)
 
     # ── consumers ─────────────────────────────────────────────────────
 
@@ -748,8 +773,11 @@ class BrokerMetrics:
         publish_channels_in_use: int | None = None,
         connection_blocked: bool | None = None,
         consuming: dict[str, bool] | None = None,
+        connection_blocked_reason: str | None = None,
     ) -> None:
-        """Set the sampled gauges (``None`` = not available, not emitted)."""
+        """Set the sampled gauges (``None`` = not available, not emitted).
+        *connection_blocked_reason* is the broker's text, read only while
+        *connection_blocked* is true."""
         for name, value in (
             (self._cfg.channels_active, channels_active),
             (self._cfg.publish_in_flight, publish_in_flight),
@@ -759,7 +787,7 @@ class BrokerMetrics:
             if value is not None:
                 self._gauge(name, {}, float(value))
         if connection_blocked is not None:
-            self.blocked(connection_blocked)
+            self.blocked(connection_blocked, connection_blocked_reason)
         for queue, active in (consuming or {}).items():
             self._gauge(self._cfg.route_consuming, {"queue": queue}, 1.0 if active else 0.0)
 
@@ -867,9 +895,15 @@ _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
         _BROKER,
         "Unroutable publishes: returned or exchange_not_found (all transport publishes).",
     ),
-    ("publish_in_flight", "gauge", (), _BROKER, "Async publishes between admission and outcome (sampled)."),
+    ("publish_in_flight", "gauge", (), _BROKER, "Publishes between admission and outcome (sampled)."),
     ("publish_in_flight_bytes", "gauge", (), _BROKER, "Bytes held by max_in_flight_bytes (sampled; only when set)."),
-    ("publish_channels_in_use", "gauge", (), _BROKER, "Async publisher channels checked out (sampled)."),
+    (
+        "publish_channels_in_use",
+        "gauge",
+        (),
+        _BROKER,
+        "Async publisher channels checked out (sampled; the sync broker has one publisher channel).",
+    ),
     ("bulk_publish_items_total", "counter", ("status", "reason"), _BULK, "publish_many/iter_publish item outcomes."),
     ("bulk_publish_batch_size", "histogram", (), _BULK, "publish_many input sizes."),
     ("settlement_items_total", "counter", ("action", "status"), _BULK, "ack_many/nack_many item outcomes."),
@@ -890,6 +924,13 @@ _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
         "Connections lost, reconnect attempts failed, terminal give-ups.",
     ),
     ("connection_blocked", "gauge", (), _BROKER, "1 while RabbitMQ blocks the connection (memory/disk alarm)."),
+    (
+        "connection_blocked_reason",
+        "gauge",
+        ("reason",),
+        _BROKER,
+        "1 per alarm (disk, memory, other) the active connection.blocked reason names.",
+    ),
     # settlement coordinator / coalescing acker
     ("settlement_pending", "gauge", (), _ACKER, "Registered deliveries not yet settled."),
     ("settlement_ack_ready", "gauge", (), _ACKER, "Deliveries approved for ack, not yet sent."),
@@ -903,6 +944,8 @@ _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
     ("queue_messages_unacked", "gauge", ("queue",), _POLLER, "Messages delivered, not yet acked."),
     ("queue_messages_total", "gauge", ("queue",), _POLLER, "Ready plus unacked."),
     ("queue_consumers", "gauge", ("queue",), _POLLER, "Consumers attached to the queue."),
+    ("queue_quorum_members", "gauge", ("queue",), _POLLER, "Quorum queues: Raft members configured."),
+    ("queue_quorum_online", "gauge", ("queue",), _POLLER, "Quorum queues: members online (majority = available)."),
 )
 
 #: ``HealthWatcher``'s default gauge (its name is a constructor argument).
@@ -948,6 +991,7 @@ def bounded_label_values() -> dict[str, frozenset[str] | None]:
             PublishReason.ALL
             | ALL_REASONS
             | CONNECTION_FAILURE_REASONS
+            | set(BLOCKED_REASONS)
             | {REASON_NONE, REASON_EXCEPTION, REASON_OTHER, "nack", "drop", "wait_deadline_exceeded"}
         ),
         "category": frozenset(c.value for c in ErrorCategory),

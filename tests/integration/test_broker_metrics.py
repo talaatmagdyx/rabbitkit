@@ -1,4 +1,4 @@
-"""Real-broker coverage for the observability foundation (G-22, G-23, PUB-017, CON-005).
+"""Real-broker coverage for the broker metrics and tracing.
 
 * publish outcomes are counted by status AND bounded reason; routing failures
   (returned / exchange_not_found) are counted by the broker itself; confirm
@@ -8,7 +8,9 @@
   killed and come back after the reconnect; the failure reason is counted
 * failed reconnect attempts are counted per role while the broker is down
 * ``channels_active`` stays bounded under concurrent publishing
-* ``connection_blocked`` follows a disk alarm (connection.blocked/unblocked)
+* ``connection_blocked`` follows a disk or memory alarm, and
+  ``connection_blocked_reason`` says which (async and sync)
+* ``QueueMetricsPoller`` reports a quorum queue's members / online counts
 * a trace id propagates producer -> RabbitMQ -> consumer, and a retry copy
   stays in the producer's trace
 * the shipped alert rules pass ``promtool check rules`` / ``promtool test rules``
@@ -351,26 +353,146 @@ async def test_channels_active_stays_bounded_under_concurrent_publishes(own_rabb
 # ── connection.blocked ───────────────────────────────────────────────────
 
 
-async def test_connection_blocked_gauge_follows_a_disk_alarm(own_rabbit: dict[str, Any]) -> None:
+_REASONS = ("disk", "memory", "other")
+
+# (rabbitmqctl command raising the alarm, command clearing it, expected reason label)
+_ALARMS = {
+    "disk": (("set_disk_free_limit", "100000GB"), ("set_disk_free_limit", "50MB")),
+    "memory": (("set_vm_memory_high_watermark", "absolute", "1MB"), ("set_vm_memory_high_watermark", "0.4")),
+}
+
+
+def _blocked_reasons(history: History) -> dict[str, float | None]:
+    return {r: history.gauge("rabbitkit_connection_blocked_reason", reason=r) for r in _REASONS}
+
+
+@pytest.mark.parametrize("alarm", ["disk", "memory"])
+async def test_connection_blocked_gauge_follows_an_alarm_with_its_reason(
+    own_rabbit: dict[str, Any], alarm: str
+) -> None:
+    """Before: the gauge said a connection was blocked, never why; telling a
+    disk alarm from a memory alarm needed the broker's rabbitmq_prometheus
+    plugin. aiormq only logged connection.blocked's reason."""
     from rabbitkit import AsyncBroker
     from rabbitkit.core.types import MessageEnvelope
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
+    raise_cmd, clear_cmd = _ALARMS[alarm]
     history = History()
     broker = AsyncBroker(_config(own_rabbit), middlewares=[MetricsMiddleware(history)])
     async with asyncio.timeout(90), _started(broker):
         assert history.gauge("rabbitkit_connection_blocked") == 0.0
         trigger: asyncio.Task[Any] | None = None
         try:
-            await actl(own_rabbit, "set_disk_free_limit", "100000GB")
+            await actl(own_rabbit, *raise_cmd)
             # RabbitMQ blocks a connection when it next publishes.
             trigger = asyncio.create_task(broker.publish(MessageEnvelope(routing_key="", body=b"t"), timeout=20))
             await _until(lambda: history.gauge("rabbitkit_connection_blocked") == 1.0, 20, "connection.blocked")
+            assert broker._transport.blocked_reason == f"low on {alarm}"
+            assert _blocked_reasons(history) == {r: 1.0 if r == alarm else 0.0 for r in _REASONS}
         finally:
-            await actl(own_rabbit, "set_disk_free_limit", "50MB")
+            await actl(own_rabbit, *clear_cmd)
         await _until(lambda: history.gauge("rabbitkit_connection_blocked") == 0.0, 30, "connection.unblocked")
+        assert _blocked_reasons(history) == dict.fromkeys(_REASONS, 0.0)
         if trigger is not None:
             await trigger
+
+
+async def test_sync_broker_reports_the_blocked_reason(own_rabbit: dict[str, Any]) -> None:
+    """pika hands connection.blocked's reason to the sync transport.
+
+    pika runs the blocked/unblocked callbacks from its I/O loop
+    (``pump_idle()`` / the consume loop), not while a publish waits for its
+    confirm, so this publisher sends without confirms: the publish that makes
+    the broker block the connection returns at once and the next pump sees
+    the alarm."""
+    from rabbitkit import SyncBroker
+    from rabbitkit.core.config import PublisherConfig
+    from rabbitkit.core.types import MessageEnvelope, PublishStatus
+    from rabbitkit.middleware.metrics import MetricsMiddleware
+
+    history = History()
+    broker = SyncBroker(
+        _config(own_rabbit, publisher=PublisherConfig(confirm_delivery=False)), middlewares=[MetricsMiddleware(history)]
+    )
+    blocked_seen = threading.Event()
+    cleared = threading.Event()
+    seen: list[Any] = []
+
+    def pump_until(predicate: Any, what: str) -> None:
+        deadline = time.monotonic() + 30
+        while not predicate():
+            assert time.monotonic() < deadline, f"timed out waiting for {what}"
+            broker.pump_idle(0.1)
+
+    def run() -> None:
+        broker.start()
+        try:
+            transport = broker._transport
+            seen.append(broker.publish(MessageEnvelope(routing_key="", body=b"t")).status)
+            pump_until(lambda: transport.is_blocked, "connection.blocked (sync)")
+            seen.append(transport.blocked_reason)
+            blocked_seen.set()
+            assert cleared.wait(30)
+            pump_until(lambda: not transport.is_blocked, "connection.unblocked (sync)")
+            seen.append(transport.blocked_reason)
+        finally:
+            blocked_seen.set()
+            broker.stop()
+
+    runner: asyncio.Future[None] | None = None
+    try:
+        await actl(own_rabbit, *_ALARMS["disk"][0])
+        runner = asyncio.ensure_future(asyncio.to_thread(run))
+        assert await asyncio.to_thread(blocked_seen.wait, 40)
+        assert _blocked_reasons(history) == {"disk": 1.0, "memory": 0.0, "other": 0.0}
+        assert history.gauge("rabbitkit_connection_blocked") == 1.0
+    finally:
+        await actl(own_rabbit, *_ALARMS["disk"][1])
+        cleared.set()
+    assert runner is not None
+    await asyncio.wait_for(runner, 60)
+    assert seen == [PublishStatus.SENT, "low on disk", None]
+    assert _blocked_reasons(history) == dict.fromkeys(_REASONS, 0.0)
+
+
+# ── quorum health from the management API (QueueMetricsPoller) ───────────
+
+
+def test_queue_metrics_poller_reports_quorum_members_on_a_single_node(rabbit_container: dict[str, Any]) -> None:
+    """A single-node broker: a quorum queue has one member, online. Classic
+    queues get no quorum gauges."""
+    import pika
+
+    from rabbitkit.management import ManagementConfig, RabbitManagementClient
+    from rabbitkit.queue_metrics import QueueMetricsPoller
+
+    quorum, classic = _name("qq"), _name("cq")
+    conn = pika.BlockingConnection(pika.URLParameters(rabbit_container["url"]))
+    try:
+        channel = conn.channel()
+        channel.queue_declare(quorum, durable=True, arguments={"x-queue-type": "quorum"})
+        channel.queue_declare(classic, durable=True)
+        client = RabbitManagementClient(
+            ManagementConfig(url=rabbit_container["mgmt"], username="guest", password="guest")
+        )
+        history = History()
+        poller = QueueMetricsPoller(client, history, queue_filter=lambda q: q in (quorum, classic))
+        deadline = time.monotonic() + 30
+        # The management API can list a just-declared quorum queue with no
+        # online members until its next stats refresh; wait for the settled state.
+        while history.gauge("rabbitkit_queue_quorum_online", queue=quorum) != 1.0:
+            assert time.monotonic() < deadline, "the management API never reported the quorum member online"
+            poller.poll_once()
+            time.sleep(0.5)
+        assert history.gauge("rabbitkit_queue_quorum_members", queue=quorum) == 1.0
+        assert history.gauge("rabbitkit_queue_quorum_online", queue=quorum) == 1.0
+        assert history.gauge("rabbitkit_queue_consumers", queue=classic) == 0.0  # the classic queue is polled
+        assert history.gauge("rabbitkit_queue_quorum_members", queue=classic) is None
+        channel.queue_delete(quorum)
+        channel.queue_delete(classic)
+    finally:
+        conn.close()
 
 
 # ── trace propagation ────────────────────────────────────────────────────
@@ -477,7 +599,7 @@ def test_alert_rules_pass_promtool() -> None:
         pytest.skip("Docker daemon not reachable: cannot run promtool")
     check = _promtool(docker_cli, "check", "rules", "../rabbitkit-alerts.yaml")
     assert check.returncode == 0, check.stdout + check.stderr
-    assert "SUCCESS: 16 rules found" in check.stdout
+    assert "SUCCESS: 27 rules found" in check.stdout
     test = _promtool(docker_cli, "test", "rules", "rabbitkit-alerts.test.yaml")
     assert test.returncode == 0, test.stdout + test.stderr
     assert "SUCCESS" in test.stdout

@@ -1451,23 +1451,35 @@ result = await backend.fetch(correlation_id)
 ## 20. Stream Queues
 
 ```python
-from rabbitkit.experimental import StreamOffset, StreamOffsetType, StreamConsumerConfig
+from rabbitkit import QueueType, RabbitMessage, RabbitQueue, StreamConsumerConfig
 
+events = RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D", max_length_bytes=20_000_000_000)
+
+# Start from the oldest retained message; commit the processed offset to your
+# own OffsetStore (load/save over your storage) so a restart resumes after the
+# last committed one. Without one, offsets survive reconnects, not restarts.
 @broker.subscriber(
-    queue=RabbitQueue(name="telemetry", queue_type=QueueType.STREAM),
-)
-async def handle(body: bytes) -> None:
-    ...
-
-# With stream offset configuration
-config = StreamConsumerConfig(
-    offset=StreamOffset(
-        type=StreamOffsetType.FIRST,  # FIRST | LAST | NEXT | TIMESTAMP | OFFSET
-        value=None,                    # for TIMESTAMP: unix ms; for OFFSET: int
+    events,
+    stream=StreamConsumerConfig(
+        offset="first",                   # "first" | "last" | "next" | int offset | datetime
+        offset_store=my_offset_store,   # your OffsetStore; see docs/streams.md
+        commit_every=100,                 # commit after 100 processed messages ...
+        commit_interval=5.0,              # ... or 5 s, and always at stop()
     ),
-    consumer_name="consumer-1",        # for single-active-consumer
 )
+async def project(body: dict, message: RabbitMessage) -> None:
+    print(message.stream_offset, body)
+
+# Shorthand when the in-memory offset store (reconnects only) is enough
+@broker.subscriber(RabbitQueue("audit", queue_type=QueueType.STREAM), stream_offset="last")
+async def audit(body: bytes) -> None:
+    ...
 ```
+
+At-least-once; a handler failure is skipped (streams never redeliver or
+dead-letter), and retry / `ACK_FIRST` are refused on stream routes. See
+[Streams](../streams.md) for offsets, the replay window, retention and when to
+choose a stream over a quorum queue.
 
 ---
 
@@ -1890,7 +1902,7 @@ IDLE → STARTING → RUNNING → STOPPING → STOPPED
 - **Settlement order differs by transport** — the sync `RabbitMessage.ack()` sets the
   disposition only after `_ack_fn()` returns (a failed ack propagates and the message stays
   pending); the async `ack_async()` / `nack_async()` / `reject_async()` claim the disposition
-  before awaiting the transport, so one delivery never gets two frames (G-15); a failed write
+  before awaiting the transport, so one delivery never gets two frames; a failed write
   propagates and sets `settlement_outcome_unknown`.
 
 ### Sync vs. async: two different connection models

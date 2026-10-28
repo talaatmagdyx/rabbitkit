@@ -80,6 +80,7 @@ it is not part of the "understand rabbitkit in 10 minutes" story.
 | DLQ inspection (`DLQInspector`) + the CLI's `dlq` commands | `rabbitkit` | |
 | RabbitMQ Management API client (`RabbitManagementClient`) | `rabbitkit` | Async methods require `rabbitkit[management]` (aiohttp). |
 | CLI (`rabbitkit run`/`health`/`topology`/`routes`/`shell`) | `rabbitkit[cli]` | |
+| Stream queues (`StreamOffset`, `StreamOffsetType`, `StreamConsumerConfig`, `OffsetStore`, `InMemoryOffsetStore`; `subscriber(stream=` / `stream_offset=)`; `RabbitMessage.stream_offset`) | `rabbitkit` / `rabbitkit.streams` | Consumed over AMQP 0.9.1 with client-side offset tracking; see [Streams](streams.md). Promoted from Experimental: the `rabbitkit.experimental` names still import, with a `DeprecationWarning`, for one minor version. |
 | `CircuitBreakerMiddleware` | `rabbitkit` | **Requires a `CircuitBreakerProtocol`-compatible implementation (e.g. pybreaker) to do anything** — it's a no-op passthrough without one. Exported at the top level for convenience, but treat the dependency as a real one before adopting it. |
 
 ---
@@ -97,7 +98,6 @@ unless you're prepared to track changes closely.
 | Distributed locking (`DistributedLock`, `RedisLock`, `LockMiddleware`) | `rabbitkit.experimental` | `RedisLock` has no TTL auto-renewal — a slow handler can lose the lock mid-work. See the locking guide before using this for anything correctness-critical. |
 | Message signing (`SigningMiddleware`) | `rabbitkit.experimental` | The default nonce cache is per-process/in-memory — replay protection is not real across multiple workers/pods without explicitly wiring a shared (Redis) cache. |
 | Result backends (`ResultBackend`, `RedisResultBackend`, `ResultMiddleware`) | `rabbitkit.experimental` | This is task-queue-style result correlation, which is deliberately out of scope for a RabbitMQ-first toolkit — see the comparison doc for why rabbitkit doesn't try to be Celery. Use with that tradeoff in mind. |
-| Stream queues (`StreamOffset`, `StreamConsumerConfig`) | `rabbitkit.experimental` | Smaller audience, different protocol semantics than classic/quorum queues. |
 | Dashboard (`create_dashboard_app`) | `rabbitkit.experimental` | **Unauthenticated by default.** Never bind it to a non-loopback interface without `auth_token=` and a reverse proxy. |
 
 Experimental APIs:

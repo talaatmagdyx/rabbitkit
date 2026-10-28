@@ -53,7 +53,7 @@ jobs:
           path: benchmarks/results/
           if-no-files-found: ignore
 
-  # Multi-node failure tests (failure-matrix F19 quorum loss, F20 network
+  # Multi-node failure tests (quorum loss, network
   # partition): a 3-node RabbitMQ cluster on a private Docker network, and a
   # broker behind toxiproxy. Several minutes of container churn, so they are
   # marked `cluster_chaos` (not `integration`) and run here, nightly, instead

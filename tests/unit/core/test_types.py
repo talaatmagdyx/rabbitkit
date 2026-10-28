@@ -385,7 +385,7 @@ class TestClassifiedError:
 
 
 class TestPublishOutcomeContract:
-    """G-03: NOT_SENT / UNKNOWN statuses and the typed reason fields."""
+    """NOT_SENT / UNKNOWN statuses and the typed reason fields."""
 
     @pytest.mark.parametrize(
         ("status", "unknown"),

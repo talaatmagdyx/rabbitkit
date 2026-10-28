@@ -1,12 +1,12 @@
-"""Multi-node failure tests against real brokers (failure-matrix rows F19, F20).
+"""Multi-node failure tests against real brokers (quorum loss, network partition).
 
-* **F19 -- quorum loss.** A 3-node RabbitMQ cluster with a 3-replica quorum
+* **quorum loss.** A 3-node RabbitMQ cluster with a 3-replica quorum
   queue loses 2 of its 3 nodes. A publish to the queue must not be reported
   CONFIRMED (the broker cannot commit it without a majority), it must resolve
   within the confirm timeout instead of hanging, and once the nodes come back
   publishing confirms again and every message ever reported CONFIRMED is
   still in the queue -- exactly once.
-* **F20 -- network partition.** Toxiproxy sits between the client and a single
+* **network partition.** Toxiproxy sits between the client and a single
   broker. A blackhole toxic (``timeout`` with ``timeout=0``: data is dropped,
   the TCP connection is NOT closed) must be detected by the AMQP heartbeat,
   in-flight publishes must resolve as TIMEOUT/UNKNOWN (never CONFIRMED), the
@@ -123,7 +123,8 @@ def _run_rabbit(client: Any, name: str, hostname: str, network: str, cookie: str
         hostname=hostname,
         network=network,
         environment={"RABBITMQ_ERLANG_COOKIE": cookie},
-        ports={"5672/tcp": (HOST, None)},
+        # 15672: the management API, for the QueueMetricsPoller quorum test.
+        ports={"5672/tcp": (HOST, None), "15672/tcp": (HOST, None)},
         labels=LABEL,
         detach=True,
     )
@@ -154,7 +155,7 @@ def _node_up(container: Any) -> bool:
     return _running(container) and _exec(container, "rabbitmq-diagnostics", "-q", "check_running")[0] == 0
 
 
-# ── F19 fixture: a 3-node cluster ────────────────────────────────────────────
+# ── quorum-loss fixture: a 3-node cluster ────────────────────────────────────────────
 
 
 @dataclass
@@ -165,6 +166,9 @@ class Cluster:
 
     def url(self, index: int = 0) -> str:
         return f"amqp://guest:guest@{HOST}:{_host_port(self.nodes[index], '5672/tcp')}/"
+
+    def mgmt(self, index: int = 0) -> str:
+        return f"http://{HOST}:{_host_port(self.nodes[index], '15672/tcp')}"
 
     def running_nodes(self) -> int:
         code, out = _exec(self.nodes[0], "rabbitmqctl", "cluster_status", "--formatter", "json")
@@ -202,7 +206,7 @@ class Cluster:
                     if "exited" not in str(exc) or attempt == 2:
                         raise
                     self.events.append(f"{name}: exited during boot, restarted (attempt {attempt + 2})")
-                    logger.warning("F19: node %s exited during boot; starting it again", name)
+                    logger.warning("node %s exited during boot; starting it again", name)
         _wait(lambda: self.running_nodes() == len(self.nodes), 120, "all nodes to rejoin the cluster")
 
 
@@ -303,11 +307,11 @@ def _assert_no_loss(confirmed: list[str], drained: list[str]) -> None:
 
 CONFIRM_TIMEOUT = 3.0
 # A publish must resolve within its confirm timeout plus scheduling slack.
-# Anything longer is the "client hangs" failure F19 is about.
+# Anything longer is the "client hangs" failure this test is about.
 RESOLVE_BOUND = CONFIRM_TIMEOUT + 5.0
 
 
-# ── F19: quorum loss (async) ─────────────────────────────────────────────────
+# ── quorum loss (async) ─────────────────────────────────────────────────
 
 
 @pytest.mark.timeout(600)
@@ -339,7 +343,7 @@ async def test_async_quorum_loss_never_confirms_and_loses_no_confirmed_message(c
         )
         resolved_in = time.monotonic() - started
         statuses = [o.status for o in outcomes]
-        logger.warning("F19 async: quorum-loss publishes resolved in %.2fs as %s", resolved_in, statuses)
+        logger.warning("quorum loss (async): quorum-loss publishes resolved in %.2fs as %s", resolved_in, statuses)
         assert PublishStatus.CONFIRMED not in statuses, outcomes
         assert all(o.is_unknown or o.status is PublishStatus.NACKED for o in outcomes), outcomes
 
@@ -359,7 +363,7 @@ async def test_async_quorum_loss_never_confirms_and_loses_no_confirmed_message(c
             if outcome.status is PublishStatus.CONFIRMED:
                 confirmed.append(mid)
                 recovered_in = time.monotonic() - started
-        logger.warning("F19 async: confirms resumed %.1fs after the quorum loss began", recovered_in)
+        logger.warning("quorum loss (async): confirms resumed %.1fs after the quorum loss began", recovered_in)
 
         for i in range(20):
             outcome = await broker.publish(_envelope(queue, f"after-{i}"))
@@ -370,7 +374,7 @@ async def test_async_quorum_loss_never_confirms_and_loses_no_confirmed_message(c
 
     drained = await asyncio.to_thread(_drain_ids, url, queue)
     logger.warning(
-        "F19 async: %d confirmed, %d in queue, unconfirmed quorum-loss publishes present: %s",
+        "quorum loss (async): %d confirmed, %d in queue, unconfirmed quorum-loss publishes present: %s",
         len(confirmed),
         len(drained),
         sorted(set(during) & set(drained)),
@@ -378,7 +382,7 @@ async def test_async_quorum_loss_never_confirms_and_loses_no_confirmed_message(c
     _assert_no_loss(confirmed, drained)
 
 
-# ── F19: quorum loss (sync) ──────────────────────────────────────────────────
+# ── quorum loss (sync) ──────────────────────────────────────────────────
 
 
 @pytest.mark.timeout(600)
@@ -407,7 +411,7 @@ def test_sync_quorum_loss_never_confirms_and_loses_no_confirmed_message(cluster:
             started = time.monotonic()
             outcome = broker.publish(_envelope(queue, mid))
             took = time.monotonic() - started
-            logger.warning("F19 sync: quorum-loss publish resolved in %.2fs as %s", took, outcome.status)
+            logger.warning("quorum loss (sync): quorum-loss publish resolved in %.2fs as %s", took, outcome.status)
             assert took < RESOLVE_BOUND, f"publish took {took:.1f}s (confirm_timeout={CONFIRM_TIMEOUT})"
             assert outcome.status is not PublishStatus.CONFIRMED, outcome
             assert outcome.is_unknown or outcome.status is PublishStatus.NACKED, outcome
@@ -434,7 +438,7 @@ def test_sync_quorum_loss_never_confirms_and_loses_no_confirmed_message(cluster:
 
     drained = _drain_ids(url, queue)
     logger.warning(
-        "F19 sync: %d confirmed, %d in queue, unconfirmed quorum-loss publishes present: %s",
+        "quorum loss (sync): %d confirmed, %d in queue, unconfirmed quorum-loss publishes present: %s",
         len(confirmed),
         len(drained),
         sorted(set(during) & set(drained)),
@@ -442,7 +446,46 @@ def test_sync_quorum_loss_never_confirms_and_loses_no_confirmed_message(cluster:
     _assert_no_loss(confirmed, drained)
 
 
-# ── F20 fixture: broker behind toxiproxy ─────────────────────────────────────
+# ── quorum health gauges (QueueMetricsPoller) ───────────────────────────────
+
+
+@pytest.mark.timeout(600)
+def test_queue_metrics_poller_quorum_online_drops_when_a_member_stops(cluster: Cluster) -> None:
+    """The management API's ``members`` / ``online`` lists, exported as
+    rabbitkit_queue_quorum_members / _online, follow a member going down and
+    coming back: what RabbitMQQuorumUnhealthy / RabbitMQQuorumMajorityLost
+    alert on, with no broker plugin."""
+    from rabbitkit.management import ManagementConfig, RabbitManagementClient
+    from rabbitkit.queue_metrics import QueueMetricsPoller
+
+    queue = f"rk-chaos-qq-poll-{uuid.uuid4().hex[:8]}"
+    _declare_quorum(cluster.url(0), queue)
+    client = RabbitManagementClient(ManagementConfig(url=cluster.mgmt(0), username="guest", password="guest"))
+    gauges: dict[str, float] = {}
+
+    class Collector:
+        def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+            gauges[name] = value
+
+    poller = QueueMetricsPoller(client, Collector(), queue_filter=lambda name: name == queue)
+
+    def online_is(expected: float) -> bool:
+        poller.poll_once()
+        return gauges.get("rabbitkit_queue_quorum_online") == expected
+
+    _wait(lambda: online_is(3.0), 60, "3 of 3 members online", interval=1.0)
+    assert gauges["rabbitkit_queue_quorum_members"] == 3.0
+    cluster.stop(2)
+    try:
+        took = _wait(lambda: online_is(2.0), 120, "the stopped member to drop out of `online`", interval=1.0)
+        logger.warning("quorum poller: online dropped to 2 of 3 %.1fs after the node stopped", took)
+        assert gauges["rabbitkit_queue_quorum_members"] == 3.0  # still a member, just not online
+    finally:
+        cluster.start(2)
+    _wait(lambda: online_is(3.0), 120, "the member to come back online", interval=1.0)
+
+
+# ── partition fixture: broker behind toxiproxy ─────────────────────────────────────
 
 #: Which directions the blackhole drops. ``both``: a full partition (the
 #: broker also stops hearing the client, so after its own heartbeat timeout
@@ -611,7 +654,7 @@ async def _disconnected(broker: Any) -> bool:
     return not await _connected(broker)
 
 
-# ── F20: network partition (async) ───────────────────────────────────────────
+# ── network partition (async) ───────────────────────────────────────────
 
 
 @pytest.mark.timeout(300)
@@ -649,7 +692,7 @@ async def test_async_blackhole_partition_detected_unknown_then_recovers_without_
             asyncio.gather(*(broker.publish(_envelope(queue, mid)) for mid in during)), timeout=resolve_bound
         )
         logger.warning(
-            "F20[%s]: publishes during the partition resolved within %.1fs as %s",
+            "partition[%s]: publishes during the partition resolved within %.1fs as %s",
             direction,
             time.monotonic() - partitioned_at,
             [(o.status.value, o.reason) for o in outcomes],
@@ -659,7 +702,7 @@ async def test_async_blackhole_partition_detected_unknown_then_recovers_without_
         assert outcomes[0].is_unknown, outcomes[0]
 
         detected_in = await detection
-        logger.warning("F20[%s]: broker reported not connected %.1fs into the partition", direction, detected_in)
+        logger.warning("partition[%s]: broker reported not connected %.1fs into the partition", direction, detected_in)
         assert not (await broker_health_check_async(broker)).connected
 
         await asyncio.to_thread(partition.heal)
@@ -667,7 +710,9 @@ async def test_async_blackhole_partition_detected_unknown_then_recovers_without_
         # The consumer connection reconnects on its own (with backoff) and
         # re-registers its consumer.
         await asyncio.to_thread(wait_for_consumers, partition.direct_url, queue, timeout=60)
-        logger.warning("F20[%s]: consumer re-registered %.1fs after the heal", direction, time.monotonic() - healed_at)
+        logger.warning(
+            "partition[%s]: consumer re-registered %.1fs after the heal", direction, time.monotonic() - healed_at
+        )
 
         for i in range(10):
             outcome = await broker.publish(_envelope(queue, f"after-{i}"))
@@ -678,13 +723,13 @@ async def test_async_blackhole_partition_detected_unknown_then_recovers_without_
         # test_async_readiness_recovers_after_partition_without_publish_traffic).
         await _until(lambda: _connected(broker), 30, "the broker to report connected")
         back_in = time.monotonic() - healed_at
-        logger.warning("F20[%s]: publishing and readiness back %.1fs after the heal", direction, back_in)
+        logger.warning("partition[%s]: publishing and readiness back %.1fs after the heal", direction, back_in)
         await _until(lambda: set(confirmed) <= set(received), 30, "the consumer to resume")
 
     leftover = await asyncio.to_thread(_drain_ids, partition.direct_url, queue)
     delivered = received + leftover
     logger.warning(
-        "F20[%s]: %d confirmed, %d delivered, unconfirmed publishes from the partition delivered: %s",
+        "partition[%s]: %d confirmed, %d delivered, unconfirmed publishes from the partition delivered: %s",
         direction,
         len(confirmed),
         len(delivered),
@@ -714,7 +759,7 @@ async def test_async_heartbeat_detects_a_silent_partition(partition: Partition, 
         await asyncio.to_thread(partition.blackhole, direction)
         detected_in = await _until(lambda: _disconnected(broker), DETECTION_BOUND, "heartbeat detection")
         logger.warning(
-            "F20[%s]: idle partition detected after %.1fs (heartbeat=%ss, bound %.0fs)",
+            "partition[%s]: idle partition detected after %.1fs (heartbeat=%ss, bound %.0fs)",
             direction,
             detected_in,
             HEARTBEAT,
@@ -727,7 +772,7 @@ async def test_async_heartbeat_detects_a_silent_partition(partition: Partition, 
         await _until(lambda: {"warm", "after"} <= set(received), 30, "the consumer to resume")
 
 
-# ── F20: bounded admission, readiness recovery and stop() during a partition ──
+# ── bounded admission, readiness recovery and stop() during a partition ──
 #
 # These were strict xfails pinning three defects; fixed in the publish path
 # (pool deadline-bounded reconnects, background publisher restore, bounded
@@ -749,7 +794,7 @@ async def test_async_publishes_queued_during_partition_resolve_within_their_own_
         for task in tasks:
             task.add_done_callback(lambda _t: took.append(time.monotonic() - started))
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=120)
-        logger.warning("F20 admission: queued publishes resolved after %s s", [round(t, 1) for t in took])
+        logger.warning("partition admission: queued publishes resolved after %s s", [round(t, 1) for t in took])
         # Each publish has its own budget: admission (ACQUIRE_TIMEOUT) plus
         # the confirm wait, independent of how many others are queued.
         assert max(took) <= ACQUIRE_TIMEOUT + CONFIRM_TIMEOUT + 5.0
@@ -806,7 +851,7 @@ async def test_async_stop_during_partition_honours_its_timeout(partition: Partit
         stop = asyncio.create_task(broker.stop(timeout=stop_timeout))
         done, _ = await asyncio.wait({stop}, timeout=stop_timeout + 10.0)
         took = time.monotonic() - started
-        logger.warning("F20 stop: stop(timeout=%.0f) %s after %.1fs", stop_timeout, bool(done), took)
+        logger.warning("partition stop: stop(timeout=%.0f) %s after %.1fs", stop_timeout, bool(done), took)
         assert done, f"stop(timeout={stop_timeout}) still running after {took:.1f}s of partition"
     finally:
         await asyncio.to_thread(partition.heal)

@@ -258,11 +258,17 @@ def _emit_settlement_metric(route: RouteDefinition, message: RabbitMessage) -> N
     A "pending" disposition (e.g. a MANUAL-policy handler that hasn't
     settled its message yet by the time this runs) emits nothing — there is
     nothing final to report yet. Neither does a claimed settlement whose send
-    failed (``settlement_outcome_unknown``, G-15): the frame may not have
+    failed (``settlement_outcome_unknown``): the frame may not have
     reached the broker, and an ack's unknown outcome is counted separately.
     """
     if message.disposition == "pending" or message.settlement_outcome_unknown:
         return
+    once = message._settlement_metric_once
+    if once is not None:
+        try:
+            once.pop()  # atomic: only the first of two racing reporters counts
+        except IndexError:
+            return
     from rabbitkit.middleware.metrics import MetricsMiddleware
 
     for mw in route.route_middlewares:
@@ -537,17 +543,19 @@ class HandlerPipeline:
         self._serializer = serializer
         self._di_resolver = di_resolver
         self._context_repo = context_repo
-        # M6 / F15: 2-strike cap on transient hot-loops (see ConsumerConfig).
+        # M6 / 2-strike cap on transient hot-loops (see ConsumerConfig).
         self._reject_transient_on_redelivery = reject_transient_on_redelivery
         # MANUAL handler raised without settling: apply the failure policy.
         self._manual_settle_on_error = manual_settle_on_error
-        # Async-only per-delivery deadline (ConsumerConfig.processing_timeout).
+        # Per-delivery deadline (ConsumerConfig.processing_timeout) of the
+        # async pipeline; the sync broker enforces it around the pipeline
+        # (sync/deadlines.py) and settles through settle_expired_sync().
         self._processing_timeout = processing_timeout
-        # F17: verify the dead-letter target before rejecting into it (async).
+        # verify the dead-letter target before rejecting into it (async).
         self._dead_letter_check = dead_letter_check
-        # §15.6: raw-body cap (ConsumerConfig.max_body_bytes); None = no cap.
+        # raw-body cap (ConsumerConfig.max_body_bytes); None = no cap.
         self._max_body_bytes = max_body_bytes
-        # G-17 (async): publish a confirmed, metadata-stamped DLQ copy before
+        # publish a confirmed, metadata-stamped DLQ copy before
         # a dead-lettering settlement that RetryMiddleware never saw; True =
         # the copy is confirmed and the delivery may be acked.
         self._dead_letter_copy = dead_letter_copy
@@ -707,7 +715,7 @@ class HandlerPipeline:
         3. Process result (serialize + publish if applicable)
         4. Settle message (ack/nack/reject per AckPolicy)
         """
-        # §15.6: an oversized delivery is dead-lettered before anything
+        # an oversized delivery is dead-lettered before anything
         # (filter, middleware, decode, handler) looks at its body.
         oversized = self._oversized(message)
         if oversized is not None:
@@ -762,7 +770,7 @@ class HandlerPipeline:
                     return
 
                 # Settle on success. A failing ack is NOT a handler failure:
-                # the work is done, only the ack's fate is unknown (§11.3).
+                # the work is done, only the ack's fate is unknown.
                 self._ack_after_success_sync(route, message, strategy)
 
             except AckMessage:
@@ -795,7 +803,7 @@ class HandlerPipeline:
 
         Same stages as sync, but async.
         """
-        oversized = self._oversized(message)  # §15.6, see process_sync
+        oversized = self._oversized(message)  # see process_sync
         if oversized is not None:
             await self._dead_letter_oversized_async(route, message, oversized)
             return
@@ -877,7 +885,7 @@ class HandlerPipeline:
             if debug:
                 structlog.contextvars.clear_contextvars()
 
-    # ── Internal: raw-body cap (§15.6) ───────────────────────────────────
+    # ── Internal: raw-body cap ───────────────────────────────────
 
     def _oversized(self, message: RabbitMessage) -> InboundMessageTooLargeError | None:
         limit = self._max_body_bytes
@@ -905,7 +913,7 @@ class HandlerPipeline:
     async def _dead_letter_oversized_async(
         self, route: RouteDefinition, message: RabbitMessage, exc: InboundMessageTooLargeError
     ) -> None:
-        """Async variant of :meth:`_dead_letter_oversized_sync` (verifies the DLQ exists first, F17)."""
+        """Async variant of :meth:`_dead_letter_oversized_sync` (verifies the DLQ exists first)."""
         try:
             if not message.is_settled:
                 await self._settle_failure_async(
@@ -1586,6 +1594,30 @@ class HandlerPipeline:
 
     # ── Internal: exception handling ─────────────────────────────────────
 
+    def settle_expired_sync(self, route: RouteDefinition, message: RabbitMessage, exc: HandlerTimeoutError) -> bool:
+        """Settle a delivery whose handler outran ``processing_timeout`` (sync broker).
+
+        The sync broker cannot cancel the handler thread, so it settles the
+        delivery itself, on the connection's owner thread, through the same
+        failure path the async pipeline takes for a cancelled handler: the
+        AckPolicy decision for a transient ``UNKNOWN_OUTCOME`` failure
+        (requeue, or dead-letter on a redelivery), one log line, and the
+        settlement metric.
+
+        Returns False when the policy leaves the delivery to the handler
+        (``AckPolicy.MANUAL`` with ``manual_settle_on_error=False``, logged):
+        the handler may still settle it when it returns.
+        """
+        try:
+            self._handle_sync_exception(route, message, exc)
+        except HandlerTimeoutError as raised:
+            if raised is not exc:
+                raise
+            return False
+        finally:
+            _emit_settlement_metric(route, message)
+        return True
+
     def _handle_sync_exception(
         self,
         route: RouteDefinition,
@@ -1668,7 +1700,7 @@ class HandlerPipeline:
             return ("nack", False, "nack_on_error")
         if classify_error(exc).severity is not ErrorSeverity.TRANSIENT:
             return ("reject", False, "permanent")
-        # F15 / M6: 2-strike cap on the transient hot-loop. A transient error on
+        # M6: 2-strike cap on the transient hot-loop. A transient error on
         # a message the broker has already redelivered dead-letters instead of
         # requeueing again (ConsumerConfig.reject_transient_on_redelivery).
         if self._reject_transient_on_redelivery and message.redelivered:
@@ -1685,7 +1717,7 @@ class HandlerPipeline:
         *,
         level: str = "warning",
     ) -> None:
-        """One structured, rate-limited line per handler failure (INV-009).
+        """One structured, rate-limited line per handler failure.
 
         Carries identifiers and the decision only: never the body, headers
         or the exception text (either may hold payload data or secrets). The
@@ -1715,7 +1747,7 @@ class HandlerPipeline:
             logger.debug("Handler failure traceback (queue=%s)", route.queue.name, exc_info=exc)
 
     def _record_ack_outcome_unknown(self, route: RouteDefinition, message: RabbitMessage, exc: Exception) -> None:
-        """A handler succeeded but its ack raised (§11.3).
+        """A handler succeeded but its ack raised.
 
         The ack frame may or may not have reached the broker, so this is an
         ambiguous outcome, not a failure: nothing else is sent for the
@@ -1778,14 +1810,14 @@ class HandlerPipeline:
         log: bool = True,
     ) -> None:
         """Nack/reject *message*; a dead-lettering settlement (``requeue=False``)
-        first verifies the dead-letter target (F17).
+        first verifies the dead-letter target.
 
         If the DLQ is missing, dead-lettering would DROP the message (classic
         queues dead-letter at most once). It is requeued instead, after a
         capped backoff that keeps a missing DLQ from becoming a hot loop,
         and an ERROR is logged every window until the DLQ is restored.
 
-        G-17: a failure RetryMiddleware never handled (an ``on_receive``
+        a failure RetryMiddleware never handled (an ``on_receive``
         failure, a body over ``max_body_bytes``, a route without retry, a
         transient failure on redelivery) first gets a confirmed DLQ copy with
         rabbitkit's failure metadata, and only then is the delivery acked.

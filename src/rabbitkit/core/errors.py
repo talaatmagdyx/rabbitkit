@@ -59,7 +59,7 @@ class MissingDependencyError(Exception):
         self.param_name = param_name
 
 
-# ── Handler deadline (CONSUMER-006) ─────────────────────────────────────
+# ── Handler deadline ─────────────────────────────────────
 
 
 class HandlerTimeoutError(TimeoutError):
@@ -104,21 +104,6 @@ class InvalidMessageError(ValueError):
     """
 
     rabbitkit_error_category = ErrorCategory.INVALID_MESSAGE
-
-
-class EventMetadataError(InvalidMessageError):
-    """Event metadata is missing or invalid (:mod:`rabbitkit.core.event_metadata`).
-
-    Raised when building :class:`~rabbitkit.core.event_metadata.EventMetadata`
-    (a producer bug, raised before anything is published) and when reading
-    it from a delivery (``INVALID_MESSAGE``: dead-lettered, never retried).
-    ``fields`` names the offending fields; the message never contains their
-    values, which may carry payload data.
-    """
-
-    def __init__(self, message: str, *, fields: tuple[str, ...] = ()) -> None:
-        super().__init__(message)
-        self.fields = fields
 
 
 class InboundMessageTooLargeError(InvalidMessageError):
@@ -411,7 +396,7 @@ class BrokerNotStartedError(RuntimeError):
     """
 
 
-# ── Terminal connection failures (G-08) ──────────────────────────────────
+# ── Terminal connection failures ──────────────────────────────────
 # All subclass the builtin ConnectionError (an OSError): the client-library
 # errors these replace (aiormq's ProbableAuthenticationError, ssl's
 # SSLCertVerificationError) were OSErrors too, so ``except ConnectionError`` /

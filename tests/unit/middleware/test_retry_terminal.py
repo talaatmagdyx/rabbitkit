@@ -1,6 +1,6 @@
 """RetryMiddleware: settlement signals, terminal DLQ handoff with metadata,
 message identity/attempt count across retries, retry policy, and the
-handoff-failure brake (audit items R-D1, R-D2, R-D3, R-D5, F30, 12.2, 13.x)."""
+handoff-failure brake."""
 
 from __future__ import annotations
 
@@ -248,7 +248,7 @@ class TestTerminalDeadLetterHandoff:
         assert info.value._rabbitkit_dead_lettered is True  # type: ignore[attr-defined]
 
     def test_terminal_log_is_sanitized(self, caplog: pytest.LogCaptureFixture) -> None:
-        """F30: the 'Terminal failure' log used to print raw exception text."""
+        """the 'Terminal failure' log used to print raw exception text."""
         mw = _mw(_Recorder())
         with caplog.at_level(logging.WARNING, logger="rabbitkit.middleware.retry"), pytest.raises(ValueError):
             mw.consume_scope(lambda m: (_ for _ in ()).throw(ValueError(f"db password={SECRET}")), _message())

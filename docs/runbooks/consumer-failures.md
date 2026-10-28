@@ -23,8 +23,8 @@ failure taxonomy:
 `ConsumerNotConsuming`: `rabbitkit_route_consuming == 0`. Usually RabbitMQ
 cancelled the consumer (`basic.cancel`: queue deleted, quorum leader moved,
 operator action); `rabbitkit_consumer_cancelled_total{queue}` counts those.
-The async broker re-subscribes once the queue exists again; it never
-re-creates the queue.
+Both brokers re-subscribe once the queue exists again; they never re-create
+the queue.
 
 ## Triage
 

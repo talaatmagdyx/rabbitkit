@@ -1226,7 +1226,7 @@ class TestWorkerPoolWarning:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
-        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # Sync registration methods: an AsyncMock attribute would leave
         # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
         mock_transport.on_consumer_cancelled = MagicMock()
         mock_transport.on_consumer_resumed = MagicMock()
@@ -1297,7 +1297,7 @@ class TestRPCClient:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
-        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # Sync registration methods: an AsyncMock attribute would leave
         # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
         mock_transport.on_consumer_cancelled = MagicMock()
         mock_transport.on_consumer_resumed = MagicMock()
@@ -1470,7 +1470,7 @@ class TestOnMessageCallback:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
-        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # Sync registration methods: an AsyncMock attribute would leave
         # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
         mock_transport.on_consumer_cancelled = MagicMock()
         mock_transport.on_consumer_resumed = MagicMock()
@@ -1626,7 +1626,7 @@ class TestBatchPublisherAutoCap:
         mock_transport.consume = AsyncMock(return_value="tag")
         mock_transport.cancel_consumer = AsyncMock()
         mock_transport.disconnect = AsyncMock()
-        # Sync registration methods (G-26): an AsyncMock attribute would leave
+        # Sync registration methods: an AsyncMock attribute would leave
         # an un-awaited coroutine, i.e. a RuntimeWarning this class counts.
         mock_transport.on_consumer_cancelled = MagicMock()
         mock_transport.on_consumer_resumed = MagicMock()
@@ -2285,7 +2285,7 @@ class TestPublishSizeGuardAsync:
 
 class TestWireReconnectMetricAsync:
     """Connection-churn counter wiring via the first route MetricsMiddleware's
-    collector. ``reconnects_total`` is wired like on sync (G-08)."""
+    collector. ``reconnects_total`` is wired like on sync."""
 
     def _wired(self, collector: MagicMock) -> AsyncBroker:
         from rabbitkit.middleware.metrics import MetricsMiddleware
@@ -2531,7 +2531,7 @@ class TestUserSuppliedRetryMiddlewareWiring:
 
 
 class TestAsyncWaitInFlightIsBounded:
-    """INV-008: a handler that swallows CancelledError must not hold stop()
+    """a handler that swallows CancelledError must not hold stop()
     open past the graceful deadline plus the short cancel-join bound."""
 
     async def test_cancellation_swallowing_handler_is_abandoned(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2571,7 +2571,7 @@ class TestAsyncWaitInFlightIsBounded:
         await task
 
 
-# ── G-26: broker-initiated consumer cancel → route state + hooks ─────────
+# ── broker-initiated consumer cancel → route state + hooks ─────────
 
 
 class TestConsumerCancelledByBroker:
@@ -2644,7 +2644,7 @@ class TestConsumerCancelledByBroker:
         await broker.stop()
 
 
-# ── G-24: signal handlers of an embedding application survive start()/stop() ──
+# ── signal handlers of an embedding application survive start()/stop() ──
 
 
 class TestEmbeddingAppSignalHandlers:
@@ -2780,7 +2780,7 @@ class TestEmbeddingAppSignalHandlers:
 
 
 class TestDeadLetterGuardProbe:
-    """F17: the broker's queue-existence probe used by the dead-letter guard."""
+    """the broker's queue-existence probe used by the dead-letter guard."""
 
     async def test_without_a_transport_the_queue_is_reported_missing(self) -> None:
         assert await AsyncBroker()._queue_exists_for_guard("orders.dlq") is False
@@ -2811,10 +2811,10 @@ class TestBulkSettlementMetricsHook:
             mw.config.settlement_items_total, {"action": "ack", "status": "settled"}
         )
         broker._set_lifecycle_gauges(connected=True)  # collector without set_gauge: no-op
-# ── G-10: a failed start() undoes itself; G-08: terminal failures ───────
+# ── a failed start() undoes itself; terminal failures ───────
 
 
-def _foundation_transport(*, consume: Any = None) -> MagicMock:
+def _stub_transport(*, consume: Any = None) -> MagicMock:
     transport = MagicMock()
     for name in (
         "connect",
@@ -2853,7 +2853,7 @@ class TestFailedStartCleanup:
         from rabbitkit.core.config import BatchPublishConfig
 
         broker = self._broker(batch_config=BatchPublishConfig(batch_size=10, flush_workers=1))
-        failing = _foundation_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
+        failing = _stub_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
         batch = MagicMock()
         batch.start = AsyncMock()
         batch.stop = AsyncMock()
@@ -2874,7 +2874,7 @@ class TestFailedStartCleanup:
         assert all(route.consumer_tag is None for route in broker.routes)
         failing.on_connection_failed.assert_called_once_with(broker._on_connection_failed)
 
-        working = _foundation_transport()
+        working = _stub_transport()
         with (
             patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=working),
             patch("rabbitkit.async_.batch.AsyncBatchPublisher", return_value=batch),
@@ -2887,7 +2887,7 @@ class TestFailedStartCleanup:
     @pytest.mark.asyncio
     async def test_cleanup_errors_never_mask_the_start_failure(self) -> None:
         broker = self._broker()
-        transport = _foundation_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
+        transport = _stub_transport(consume=AsyncMock(side_effect=["tag-1", RuntimeError("consume refused")]))
         transport.cancel_consumer = AsyncMock(side_effect=RuntimeError("cancel failed"))
         transport.disconnect = AsyncMock(side_effect=RuntimeError("disconnect failed"))
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
@@ -2900,7 +2900,7 @@ class TestFailedStartCleanup:
         from rabbitkit.core.errors import AuthenticationFailedError
 
         broker = self._broker()
-        transport = _foundation_transport()
+        transport = _stub_transport()
         transport.connect = AsyncMock(side_effect=AuthenticationFailedError("refused", reason="authentication_failed"))
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
             with pytest.raises(AuthenticationFailedError):
@@ -2911,7 +2911,7 @@ class TestFailedStartCleanup:
     @pytest.mark.asyncio
     async def test_failure_after_the_heartbeat_started_stops_it(self) -> None:
         broker = self._broker()
-        transport = _foundation_transport()
+        transport = _stub_transport()
         with (
             patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport),
             patch.object(broker, "_install_signal_handlers", side_effect=RuntimeError("no signals here")),
@@ -2925,7 +2925,7 @@ class TestFailedStartCleanup:
     @pytest.mark.asyncio
     async def test_cancelled_start_cleans_up(self) -> None:
         broker = self._broker()
-        transport = _foundation_transport()
+        transport = _stub_transport()
         entered = asyncio.Event()
 
         async def slow_declare(*_a: Any, **_kw: Any) -> None:
@@ -2955,7 +2955,7 @@ class TestTerminalConnectionFailure:
         from rabbitkit.core.errors import AuthenticationFailedError
 
         broker = AsyncBroker()
-        transport = _foundation_transport()
+        transport = _stub_transport()
         with patch("rabbitkit.async_.broker.AsyncTransportImpl", return_value=transport):
             run_task = asyncio.ensure_future(broker.run())
             for _ in range(200):
@@ -2996,13 +2996,13 @@ class TestQueueExistsForGuard:
     @pytest.mark.asyncio
     async def test_asks_the_transport(self) -> None:
         broker = AsyncBroker()
-        broker._transport = _foundation_transport()
+        broker._transport = _stub_transport()
         broker._transport.queue_exists = AsyncMock(return_value=True)
         assert await broker._queue_exists_for_guard("orders.dlq") is True
         broker._transport.queue_exists.assert_awaited_once_with("orders.dlq")
 
 
-# ── async context manager (contract §4.3) ─────────────────────────────────
+# ── async context manager ─────────────────────────────────
 
 
 class TestAsyncContextManager:
@@ -3043,7 +3043,7 @@ class TestAsyncContextManager:
         assert stopped == [True]
 
 
-# ── G-17: DLQ copies for failures outside RetryMiddleware ─────────────────
+# ── DLQ copies for failures outside RetryMiddleware ─────────────────
 
 
 class TestDeadLetterCopyWiring:

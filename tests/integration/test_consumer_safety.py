@@ -121,7 +121,7 @@ async def _await_ready(url: str, queue: str, expected: int, timeout: float = 20.
     raise AssertionError(f"{queue}: expected {expected} ready, last saw {seen}")
 
 
-# ── F15: the default transient-failure loop is bounded ───────────────────
+# ── the default transient-failure loop is bounded ───────────────────
 
 
 @pytest.mark.parametrize("queue_type", ["classic", "quorum"])
@@ -211,7 +211,7 @@ async def test_manual_handler_failures_do_not_stall_the_consumer(rabbit: dict[st
         await broker.stop()
 
 
-# ── F17: a missing DLQ never swallows a rejected message ────────────────
+# ── a missing DLQ never swallows a rejected message ────────────────
 
 
 async def test_missing_dlq_does_not_lose_a_rejected_message(rabbit: dict[str, Any]) -> None:
@@ -250,7 +250,7 @@ async def test_missing_dlq_does_not_lose_a_rejected_message(rabbit: dict[str, An
     await await_counts(rabbit, queue, (1, 0), timeout=20)
 
 
-# ── CONSUMER-006: processing deadline produces an explicit outcome ──────
+# ── processing deadline produces an explicit outcome ──────
 
 
 async def test_processing_timeout_cancels_and_dead_letters_on_the_second_attempt(
@@ -285,7 +285,7 @@ async def test_processing_timeout_cancels_and_dead_letters_on_the_second_attempt
         await broker.stop()
 
 
-# ── INV-008: stop() is bounded even when a handler ignores cancellation ─
+# ── stop() is bounded even when a handler ignores cancellation ─
 
 
 async def test_stop_is_bounded_when_a_handler_swallows_cancellation(rabbit: dict[str, Any]) -> None:

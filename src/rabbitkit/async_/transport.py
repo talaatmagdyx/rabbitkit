@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from rabbitkit.async_.connection import get_connection_errors
@@ -151,6 +152,21 @@ def _connection_live(conn: Any) -> bool:
     return True
 
 
+def _utc_timestamp(value: Any) -> datetime | None:
+    """The AMQP ``timestamp`` property as an AWARE UTC datetime, like the sync
+    transport surfaces it.
+
+    The wire value is Unix seconds. pamqp >= 3.3 decodes it to an aware UTC
+    datetime, but pamqp 3.2 (what aio-pika 9.1 resolves) returns a NAIVE one
+    from ``utcfromtimestamp``. ``naive.timestamp()`` reads it as LOCAL time,
+    so on any host not on UTC a consumer saw the producer's timestamp shifted
+    by the host's UTC offset. A naive value is UTC by construction: tag it.
+    """
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value if isinstance(value, datetime) else None
+
+
 class AsyncTransportImpl:
     """aio-pika-based async transport adapter.
 
@@ -182,12 +198,12 @@ class AsyncTransportImpl:
         # broker that never confirms would block the publish coroutine forever;
         # on timeout we release/close the channel and return PublishStatus.TIMEOUT.
         self._confirm_timeout = float(confirm_timeout)
-        # G-14: PublisherConfig.max_in_flight_bytes, shared by publish() and
+        # PublisherConfig.max_in_flight_bytes, shared by publish() and
         # the batch publisher (None = no byte bound).
         self._byte_limiter: InFlightByteLimiter | None = (
             InFlightByteLimiter(max_in_flight_bytes) if max_in_flight_bytes is not None else None
         )
-        # G-12 publisher shutdown state (see close_publishing).
+        # Publisher shutdown state (see close_publishing).
         self._publish_closed = False
         self._publish_shutdown = False
         self._publishes_in_flight = 0
@@ -217,7 +233,7 @@ class AsyncTransportImpl:
         # unhandled and the publish resolve as CONFIRMED (a false success).
         self._inflight_message_ids: dict[tuple[int, str], asyncio.Future[None]] = {}
         self._consumer_tags: dict[str, str] = {}  # queue_name -> consumer_tag
-        # G-26 / CONSUMER-007: the queue object each consumer was started on
+        # the queue object each consumer was started on
         # (cancel goes through it so robust restore forgets the consumer) and
         # detection + re-subscription of consumers the SERVER cancelled.
         self._consumer_supervisor = ConsumerSupervisor(self.queue_exists)
@@ -258,10 +274,10 @@ class AsyncTransportImpl:
         # Connection-churn metric hook (see on_reconnect) -- adapted from
         # aio-pika's RobustConnection.reconnect_callbacks.
         self._reconnect_callbacks: list[Callable[[], None]] = []
-        # G-08: failed reconnect attempts and the terminal connection failure.
+        # failed reconnect attempts and the terminal connection failure.
         self._reconnect_attempt_callbacks: list[Callable[[ReconnectAttempt], None]] = []
         self._connection_failed_callbacks: list[Callable[[TerminalConnectionError], None]] = []
-        # G-22: connection up/down per role, and publish outcomes with the
+        # connection up/down per role, and publish outcomes with the
         # send-to-broker-answer latency (metrics hooks).
         self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
         self._publish_outcome_callbacks: list[Callable[[PublishOutcome, float | None], None]] = []
@@ -295,7 +311,7 @@ class AsyncTransportImpl:
 
     def on_reconnect_attempt(self, callback: Callable[[ReconnectAttempt], None]) -> None:
         """Register a callback fired after every FAILED reconnect attempt of a
-        connection that had been up (G-08).
+        connection that had been up.
 
         It receives a :class:`~rabbitkit.async_.reconnect.ReconnectAttempt`:
         the attempt number within the outage, the backoff delay chosen before
@@ -306,7 +322,7 @@ class AsyncTransportImpl:
 
     def on_connection_failed(self, callback: Callable[[TerminalConnectionError], None]) -> None:
         """Register a callback fired once when a connection stops reconnecting
-        for good after startup (G-08): a permanent failure (refused login or
+        for good after startup: a permanent failure (refused login or
         vhost, TLS verification) or a spent reconnect budget. From then on
         :meth:`is_connected` is False, :attr:`connection_failure` holds the
         error, and no connect is attempted again.
@@ -333,7 +349,7 @@ class AsyncTransportImpl:
                 logger.exception("connection_failed callback raised")
 
     def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
-        """Register ``callback(role, up, error)`` for connection state changes (G-22).
+        """Register ``callback(role, up, error)`` for connection state changes.
 
         ``role`` is ``"publisher"`` or ``"consumer"``. Fired with ``up=True``
         when a connection is created or reconnects after a drop, and with
@@ -352,7 +368,7 @@ class AsyncTransportImpl:
 
     def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
         """Register ``callback(outcome, seconds)`` for every publish whose
-        frame was handed to aio-pika (G-22).
+        frame was handed to aio-pika.
 
         ``seconds`` is the time from handing the frame to aio-pika until the
         broker answered (confirm, nack or return), or ``None`` when no broker
@@ -545,6 +561,14 @@ class AsyncTransportImpl:
         ``FlowController``."""
         return self._blocked_state
 
+    @property
+    def blocked_reason(self) -> str | None:
+        """The broker's ``connection.blocked`` reason (``"low on disk"``,
+        ``"low on memory"``) while :attr:`is_blocked`, else ``None``."""
+        if not self._blocked_state:
+            return None
+        return next((m.blocked_reason for m in self._blocked_monitors if m.blocked_reason is not None), None)
+
     def _start_blocked_monitor(self, connection: Any) -> None:
         """Watch *connection* for ``connection.blocked`` (issue #37).
 
@@ -602,7 +626,7 @@ class AsyncTransportImpl:
     async def connect(self) -> None:
         """Establish publisher and consumer connections.
 
-        All or nothing (G-10): if any step fails (or is cancelled), every
+        All or nothing: if any step fails (or is cancelled), every
         connection, channel and monitor it created is closed before the error
         propagates, so a failed connect leaks nothing and can be retried.
         """
@@ -630,9 +654,12 @@ class AsyncTransportImpl:
         # aio-pika 9's pamqp can't encode field-table ints from -128 to -1
         # (queue/consume/bind arguments, publish headers); fix it before any
         # frame is built. A no-op on pamqp 4.
-        from rabbitkit.async_.connection import ensure_pamqp_encodes_negative_ints
+        from rabbitkit.async_.connection import ensure_aiormq_records_blocked_reason, ensure_pamqp_encodes_negative_ints
 
         ensure_pamqp_encodes_negative_ints()
+        # Before any aiormq connection exists (aiormq 6 binds frame handlers
+        # when its reader starts): keeps the connection.blocked reason.
+        ensure_aiormq_records_blocked_reason()
 
         await self._conn_pool.connect()
 
@@ -812,7 +839,7 @@ class AsyncTransportImpl:
         awaitable "reconnected" event.
         """
         if self._conn_pool.terminal_error is not None:
-            return False  # G-08: closed for good, nothing will recover
+            return False  # closed for good, nothing will recover
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self._publish_shutdown:
             if self._publisher_live():
@@ -923,7 +950,7 @@ class AsyncTransportImpl:
         messages instead of N separate round-trips.
 
         A ``mandatory=True`` publish the broker cannot route is RETURNED on
-        every channel kind (G-01): a channel with ``on_return_raises=True``
+        every channel kind: a channel with ``on_return_raises=True``
         (the mandatory pool) raises ``aio_pika.exceptions.PublishError``; any
         other confirmed channel (batch workers, the direct reply-to channel)
         resolves the confirm with the returned message instead of an ack,
@@ -1071,12 +1098,12 @@ class AsyncTransportImpl:
         * A broker channel close that refused THIS publish (404 missing
           exchange, 403 access refused, 406 precondition failed) is ERROR
           with a reason and the broker's reply code/text. It is not a
-          connection error, so nothing retries it (G-03/PUB-016). On a shared
+          connection error, so nothing retries it. On a shared
           channel the refusal may belong to a sibling publish, so it counts
           as ours only if the channel is exclusive or the 404 names our
           exchange; otherwise this publish is UNKNOWN (``channel_closed``).
         * Anything connection- or channel-shaped is UNKNOWN: the frames may
-          already have reached the broker. Never retried (INV-003).
+          already have reached the broker. Never retried.
         * Invalid input caught while encoding is ERROR ``invalid_envelope``;
           anything else is ERROR ``publish_error``.
         """
@@ -1156,7 +1183,7 @@ class AsyncTransportImpl:
         return True
 
     async def close_publishing(self, timeout: float | None = None) -> None:
-        """Publisher shutdown (G-12), bounded by *timeout*.
+        """Publisher shutdown, bounded by *timeout*.
 
         1. Close admission: every later :meth:`publish` returns ``NOT_SENT``
            (``publisher_closed``) and nothing reconnects.
@@ -1223,7 +1250,7 @@ class AsyncTransportImpl:
         publish per channel: a publish the broker refuses closes its channel
         and fails everything in flight on it.
 
-        Outcome contract (G-03): ``NOT_SENT`` when the message definitely
+        Outcome contract: ``NOT_SENT`` when the message definitely
         never left the client (publisher closed, byte budget or channel
         admission timed out, no connection, no channel), ``UNKNOWN`` /
         ``TIMEOUT`` when it may have, ``ERROR`` only for a refused or
@@ -1323,19 +1350,18 @@ class AsyncTransportImpl:
         """Confirmed (pooled-channel) publish path — one pool channel per
         publish so each confirm is isolated.
 
-        * No hidden retry (G-03): once ``basic.publish`` may have left the
+        * No hidden retry: once ``basic.publish`` may have left the
           client the outcome is reported as observed (UNKNOWN on a lost
           connection) and never republished here. Failures BEFORE the frame
           (no channel, admission timeout, connection still recovering) are
           ``NOT_SENT``; only those are retried, inside the pool's
           connection self-heal.
-        * The channel is returned on every path (G-04), including
+        * The channel is returned on every path, including
           cancellation. A channel whose confirm state is unknown (cancelled
           or failed mid-publish, timed out) is discarded — closed and never
           reused — instead of going back to the pool.
         * Pool exhaustion waits up to the admission timeout and then returns
-          ``NOT_SENT(admission_timeout)``; it never rebuilds the connection
-          (G-05).
+          ``NOT_SENT(admission_timeout)``; it never rebuilds the connection.
         """
         pool = self._conn_pool
         if envelope.mandatory:
@@ -1389,7 +1415,7 @@ class AsyncTransportImpl:
                 raise
             except Exception as e:  # defensive: _publish_on_channel classifies its own failures
                 outcome = self._classify_publish_failure(e, envelope, exclusive=True)
-            # M17 + G-04: only a channel whose publish reached a broker answer
+            # M17 + only a channel whose publish reached a broker answer
             # goes back to the pool; a timed-out or broken one is discarded
             # (closed) so the pool never hands out a possibly-wedged channel.
             reusable = outcome.status in _REUSABLE_STATUSES and not channel.is_closed
@@ -1409,6 +1435,7 @@ class AsyncTransportImpl:
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue.
 
@@ -1436,6 +1463,14 @@ class AsyncTransportImpl:
         consumer's channel is also remembered as ``self._reply_to_channel`` so
         :meth:`publish` can route matching requests onto the SAME channel —
         required by RabbitMQ's direct reply-to (see :meth:`publish`).
+
+        ``arguments`` are the ``basic.consume`` arguments (e.g.
+        ``x-stream-offset`` for a stream queue). The dict is passed BY
+        REFERENCE: aio-pika keeps it in the queue's restore record and sends
+        its current contents when ``connect_robust`` re-subscribes after a
+        reconnect (and the consumer supervisor re-subscribes with it after a
+        broker cancel), so the caller can keep the resume point up to date
+        in place.
         """
         await self._ensure_connected()
 
@@ -1464,7 +1499,7 @@ class AsyncTransportImpl:
 
         async def on_message(message: Any) -> None:
             if record.stopped:
-                # CONSUMER-007: rabbitkit cancelled this consumer, yet a
+                # rabbitkit cancelled this consumer, yet a
                 # delivery arrived (a reconnect restored it). Hand it back.
                 await self._refuse_stray_delivery(record, message)
                 return
@@ -1479,8 +1514,12 @@ class AsyncTransportImpl:
             callback=on_message,
             no_ack=no_ack,
             supervised=declare,
+            arguments=arguments,
         )
-        await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack)
+        consume_kwargs: dict[str, Any] = {}
+        if arguments is not None:
+            consume_kwargs["arguments"] = arguments  # by reference: see docstring
+        await q.consume(on_message, consumer_tag=consumer_tag, no_ack=no_ack, **consume_kwargs)
         self._consumer_tags[queue] = consumer_tag
         await self._consumer_supervisor.register(record)
         logger.info("Started consuming from queue '%s' with tag '%s' (async)", queue, consumer_tag)
@@ -1634,7 +1673,7 @@ class AsyncTransportImpl:
         like a failed one: the consumer is forgotten locally and aio-pika's
         restore record is dropped, so a later reconnect cannot resurrect it.
 
-        CONSUMER-007: the cancel goes through the queue object the consumer
+        the cancel goes through the queue object the consumer
         was started on. aio-pika's robust restore re-subscribes every
         consumer recorded on that object after a reconnect; cancelling via a
         fresh ``get_queue()`` wrapper left the record in place, so a
@@ -1652,7 +1691,7 @@ class AsyncTransportImpl:
                     isinstance(getattr(consumer_conn, "terminal_error", None), BaseException)
                     or bool(getattr(consumer_conn, "is_closed", False))
                 ):
-                    # G-08: the connection is closed for good (terminal
+                    # the connection is closed for good (terminal
                     # failure). The broker dropped the consumer with it, and
                     # an AMQP cancel would wait forever for a reconnect.
                     # (aio-pika 9.1 never sets is_closed on a connection that
@@ -1700,7 +1739,7 @@ class AsyncTransportImpl:
             await message.channel.basic_cancel(record.tag)
 
     def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
-        """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled.
 
         Fires when RabbitMQ sends ``basic.cancel`` (queue deleted, quorum
         leader change, ...). The transport re-subscribes when the queue exists
@@ -1826,7 +1865,7 @@ class AsyncTransportImpl:
             expiration=(str(round(aio_message.expiration * 1000)) if aio_message.expiration is not None else None),
             user_id=aio_message.user_id,
             delivery_mode=(int(aio_message.delivery_mode) if aio_message.delivery_mode is not None else None),
-            timestamp=aio_message.timestamp,  # was never surfaced on consume
+            timestamp=_utc_timestamp(aio_message.timestamp),
             routing_key=aio_message.routing_key,
             exchange=aio_message.exchange or "",
             delivery_tag=aio_message.delivery_tag,

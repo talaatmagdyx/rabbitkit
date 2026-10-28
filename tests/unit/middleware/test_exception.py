@@ -141,7 +141,7 @@ class TestExceptionMiddlewareAsync:
 
 
 def test_terminal_log_is_sanitized(caplog: pytest.LogCaptureFixture) -> None:
-    """F30: the terminal log must not print raw exception text."""
+    """the terminal log must not print raw exception text."""
     import logging
 
     from rabbitkit.core.message import RabbitMessage

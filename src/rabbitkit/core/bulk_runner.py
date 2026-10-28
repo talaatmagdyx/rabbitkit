@@ -216,7 +216,7 @@ async def iter_publish_async(
     done_q: asyncio.Queue[BulkPublishItem] = asyncio.Queue()
     tasks: set[asyncio.Task[None]] = set()
     inflight: dict[asyncio.Task[None], tuple[int, MessageEnvelope, str, float]] = {}
-    # INV-009 bookkeeping: every submitted index, and every index already
+    # Accounting: every submitted index, and every index already
     # reported. Each input yields exactly one item (duplicates are dropped,
     # a missing one is synthesized UNKNOWN — see _missing_items).
     admitted: dict[int, tuple[MessageEnvelope, str, float]] = {}
@@ -242,7 +242,7 @@ async def iter_publish_async(
             except asyncio.CancelledError as exc:
                 if task.cancelling():
                     raise  # really cancelled (deadline / consumer): _abandon_inflight reports it
-                # G-13: the publish raised CancelledError without this task
+                # the publish raised CancelledError without this task
                 # being cancelled (aio-pika closing a channel under it). It
                 # may have reached the broker: UNKNOWN, never dropped.
                 item = _from_exception(index, env, attempt_id, exc, submitted_at)

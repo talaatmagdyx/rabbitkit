@@ -8,7 +8,7 @@ tables describe `AsyncBroker`; `SyncBroker` differences are listed where they
 exist.
 
 Related pages: [Message Safety](message-safety.md) (details and real-broker
-evidence), [Retry and DLQ](retry-and-dlq.md), [Event Metadata](event-metadata.md),
+evidence), [Retry and DLQ](retry-and-dlq.md),
 [Idempotency Contract](production/idempotency.md),
 [Ordering Guarantees](ordering-guarantees.md), [Kubernetes](kubernetes.md).
 
@@ -42,8 +42,7 @@ confirms off). `outcome.reason` is a bounded code (`PublishReason`).
 | `ERROR` | Broker refused the publish, invalid input, or unclassified | `exchange_not_found`, `access_refused`, `precondition_failed`, `invalid_envelope`, `publish_error` | After fixing the cause |
 
 Raised instead of returned: `MessageTooLargeError` (body above
-`PublisherConfig.max_message_bytes`), `EventMetadataError` (invalid
-[event metadata](event-metadata.md), when you use it), `ValueError` for an
+`PublisherConfig.max_message_bytes`), `ValueError` for an
 invalid `timeout` or `message_id` with an envelope, `BrokerNotStartedError`
 before `start()` / after `stop()` began, and `CancelledError` (treat a
 cancelled publish as unknown; its channel and bytes are released).
@@ -75,8 +74,15 @@ Rules the async broker follows:
   `PublisherConfig.max_in_flight_bytes` when set, and the per-call
   `publish(..., timeout=)`. Expiry before sending is `NOT_SENT`
   (`admission_timeout`); after sending, `TIMEOUT` (`publish_timeout`). A busy
-  pool never rebuilds the connection. `timeout=` and the byte budget are
-  async-only.
+  pool never rebuilds the connection. `timeout=` is async-only. The byte
+  budget is enforced by both brokers with the same rules: a body larger than
+  the whole budget is `NOT_SENT` (`exceeds_max_in_flight_bytes`) at once;
+  otherwise the publish waits, first come first served, up to
+  `channel_acquire_timeout` for room; its bytes are held until its outcome
+  is known, whatever it is. On `SyncBroker` the budget covers worker-thread
+  publishes waiting for the I/O thread too, and the I/O (owner) thread keeps
+  running those publishes while it waits for room itself, so it never waits
+  on a worker that is waiting on it.
 - To republish the same logical message after an unknown outcome, reuse its
   id: `MessageEnvelope.message_id` or `publish(..., message_id=...)`.
 
@@ -117,9 +123,9 @@ middlewares).
 | Returns, but its result publish is not `ok` | — | nack(requeue) | same |
 | Raises a transient error (`TimeoutError`, `OSError`/`ConnectionError`, `EOFError`) | `RETRYABLE` | copy to `<queue>.retry.<n>` (mandatory, confirmed), then ack | first delivery: nack(requeue); redelivery (`redelivered=True`): reject → DLQ (`reject_transient_on_redelivery`, default on) |
 | Raises an AMQP client error or `InfrastructureError` | `INFRASTRUCTURE` | as `RETRYABLE` | as `RETRYABLE` |
-| Exceeds `ConsumerConfig.processing_timeout` (async only) | `UNKNOWN_OUTCOME` | task cancelled, then as `RETRYABLE` | as `RETRYABLE` |
+| Exceeds `ConsumerConfig.processing_timeout` | `UNKNOWN_OUTCOME` | async: task cancelled; sync: settled at the deadline, handler thread left running (see [Processing deadline](#processing-deadline-processing_timeout)). Then first delivery: nack(requeue); redelivery: reject → DLQ. The deadline wraps the retry middleware, so no retry copy is made | same |
 | Raises anything else (unclassified) or a permanent error | `PERMANENT` | confirmed DLQ copy with failure metadata, then ack | reject → source queue's DLX → `<queue>.dlq` |
-| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` (incl. `EventMetadataError`) | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
+| Body cannot be decoded, an `on_receive` hook fails, `InvalidMessageError` | `INVALID_MESSAGE` | decode/validation inside the chain: confirmed DLQ copy with metadata; `on_receive` failure: reject → DLX (copy with metadata first when `dead_letter_with_metadata`) | reject → DLX (copy with metadata first when `dead_letter_with_metadata`) |
 | Body larger than `ConsumerConfig.max_body_bytes` | `INVALID_MESSAGE` | reject → DLX, before the filter, middleware or handler (copy with metadata first when `dead_letter_with_metadata`, e.g. under CRITICAL) | same |
 | Retries exhausted, or `max_retry_age` passed | terminal | confirmed DLQ copy with metadata, then ack | — |
 | Cancelled by `stop()` | `SHUTDOWN` | nack(requeue); `CancelledError` propagates | same |
@@ -150,6 +156,51 @@ Rules:
   and counted, nothing else is sent; the handler runs again if the broker
   redelivers.
 
+### Processing deadline (`processing_timeout`)
+
+`ConsumerConfig.processing_timeout` (seconds, default off; the CRITICAL
+profile requires it) bounds each handler run on both brokers. The deadline
+starts when the handler starts (not while a delivery waits for a worker) and
+covers the route's middlewares and the handler. When it passes, the delivery
+is settled as a `HandlerTimeoutError` (`UNKNOWN_OUTCOME`, transient): the
+first delivery is nack-requeued, a redelivery is rejected into the DLQ, and
+the failure line logs `outcome_unknown=True`. Handlers must be idempotent:
+the timed-out run's side effects may or may not have happened.
+
+- **`AsyncBroker`** cancels the handler task.
+- **`SyncBroker`** cannot interrupt a thread. Handlers run off the I/O thread
+  (on the worker pool; with `worker_count=1`, on one dedicated handler thread
+  that keeps the inline path's order and one-at-a-time processing), and the
+  I/O thread settles the delivery at the deadline, within about
+  `min(1 s, processing_timeout / 4)` of it. The handler thread is **not
+  stopped**: it keeps its worker until it returns, so at most `worker_count`
+  handlers ever run, and a handler that never returns holds its worker for
+  good (with `worker_count=1` the route then stops taking deliveries). When
+  it returns, its result is discarded and logged: settlement is claimed once
+  per delivery, so its ack/nack/reject is dropped, and its handler-result,
+  retry and DLQ publishes are refused (`NOT_SENT`, reason `cancelled`).
+  Publishes the handler makes itself (`broker.publish()`) are its own side
+  effects and are not blocked. While a deadline is set, sync handlers never
+  run on the I/O thread, so a handler that relies on running on the thread
+  that called `start()` (thread-local state, `broker.request()`) needs the
+  deadline off. `TimeoutMiddleware` remains available but starts a thread per
+  message; prefer `processing_timeout`.
+
+### Broker-cancelled consumers
+
+RabbitMQ cancels a consumer itself (`basic.cancel`) when its queue is
+deleted, a quorum queue's leader moves, or an operator closes it. Both
+brokers detect it at once (the sync broker through pika's channel cancel
+callback), log a WARNING, report the route as not consuming
+(`RouteRuntimeState.consumer_cancelled`: health and readiness drop it,
+`route_consuming` goes to 0, `consumer_cancelled_total` counts it), call
+`broker.on_consumer_cancelled(queue)`, and re-subscribe with the same
+consumer tag once a passive declare finds the queue again (probes back off
+from 1 s, doubling, to 30 s), then call `broker.on_consumer_resumed(queue)`.
+They never re-create the queue. `SyncBroker` probes and re-subscribes on its
+I/O thread, from the consume loop (`run()`), never from a worker thread, and
+calls both hooks there.
+
 ### Retry and DLQ guarantees
 
 - A retry or DLQ copy is published with `mandatory=True` and must be
@@ -169,12 +220,12 @@ Rules:
   duplicate in the DLQ after that fallback.
 - `rabbitkit_messages_dead_lettered_total` counts completed dead-letters:
   a confirmed DLQ copy, or the reject the pipeline actually sent. A delivery
-  requeued because its DLQ is missing is not counted. The G-17 copies of
+  requeued because its DLQ is missing is not counted. The metadata-stamped copies of
   failures outside `RetryMiddleware` are not counted by it.
 - Copies keep the wire body and encoding, `message_id` (a message without one
   gets a stable id on its first handoff), `correlation_id`, `type`, `app_id`,
   `user_id`, `reply_to`, `priority`, `timestamp`, `delivery_mode` and every
-  header, including [event metadata](event-metadata.md). `expiration` is moved
+  header. `expiration` is moved
   to `x-rabbitkit-original-expiration`.
 - Failure metadata on retry and DLQ copies: `x-rabbitkit-retry-count`,
   `-attempts`, `-first-failed-at`, `-last-failed-at`, `-error-category`
@@ -242,7 +293,7 @@ tuple; then `RetryConfig.unknown_policy` (default `PERMANENT`).
 | `INFRASTRUCTURE` | yes, labelled separately | AMQP client errors in the handler, `InfrastructureError` |
 | `UNKNOWN_OUTCOME` | yes (handler must be idempotent) | `processing_timeout` expired |
 | `PERMANENT` | no → DLQ | Business rule violation, unclassified exceptions |
-| `INVALID_MESSAGE` | no → DLQ | Decode failure, `on_receive` failure, `InvalidMessageError`, `EventMetadataError`, body over `max_body_bytes` |
+| `INVALID_MESSAGE` | no → DLQ | Decode failure, `on_receive` failure, `InvalidMessageError`, body over `max_body_bytes` |
 | `SHUTDOWN` | no; requeued | Cancellation |
 
 The category is written to `x-rabbitkit-error-category` and used as the
@@ -270,6 +321,8 @@ request; the multi-node scenarios are slow and run nightly
 | Broker `basic.nack` (a full `x-overflow=reject-publish` queue) | `NACKED`, reason `nacked`, never republished; `publish_many` reports `NACKED` per item. Async and sync |
 | Quorum loss: 2 of 3 nodes of a 3-replica quorum queue stopped | Publishes resolve `TIMEOUT` at `confirm_timeout`, never `CONFIRMED`, and do not hang. Once the nodes return, publishing confirms again (10 to 18 s after the loss began, in local runs). Every `CONFIRMED` message is in the queue exactly once. Async and sync |
 | Network partition (toxiproxy blackhole: bytes dropped, TCP left open), both directions or broker-to-client only | The publish on the wire resolves `TIMEOUT`, never `CONFIRMED`. Publishes queued behind it resolve `NOT_SENT`, each within its own admission budget however many are queued. Readiness reports not connected. After the partition heals, the consumer reconnects and resubscribes on its own, the publisher connection is restored in the background (readiness recovers with no publish traffic), publishing confirms again, and no `CONFIRMED` message is lost. `stop(timeout)` during the partition returns within its timeout. Async |
+| A queue deleted under a running consumer, then re-created | Health and readiness report the route as not consuming and `on_consumer_cancelled` fires; nothing re-creates the queue; once it is declared again the consumer re-subscribes, `on_consumer_resumed` fires and new messages are handled by exactly one consumer. Async (aio-pika 9 and 10) and sync (inline and worker pool; the hooks run on the I/O thread) |
+| A handler that sleeps past `processing_timeout` | The first delivery is requeued and the redelivery dead-lettered within about the deadline of each run; with one sync worker the redelivery waits for the timed-out handler to return. Sync: both late returns settle nothing (the consumer's channel stays open and keeps consuming), and a late result publish is not sent. Async and sync |
 | Silent partition, no traffic | Detected only by the heartbeat. With `heartbeat=2`, about 9 s when only the broker-to-client direction is cut (aiormq gives up after `(heartbeat + 1) × 3` s), and about 6 s when both are cut (the broker drops its side after 2 missed heartbeats). Budget about 5 × `heartbeat`, not 2 × |
 
 A `TIMEOUT` or `UNKNOWN` publish really can be on the broker. In these runs,
@@ -288,19 +341,19 @@ bounded by its deadline.
 ## Idempotency
 
 1. rabbitkit propagates `message_id`, `correlation_id` and every header
-   (including `idempotency-key` from [event metadata](event-metadata.md))
    unchanged through publish, retry, DLQ and replay. RabbitMQ does not
    deduplicate, and neither does rabbitkit by default.
 2. Handlers with side effects need a **durable deduplication record keyed by
-   the idempotency key, committed in the same transaction as the business
+   your idempotency key (for example `message_id`, or a key your application
+   puts in a header), committed in the same transaction as the business
    change, before the ack** (an "inbox"). This is application code; rabbitkit
    does not ship a database-backed deduplication engine (**Not implemented**,
    by design). Sketch:
 
    ```python
-   @broker.subscriber("orders", middlewares=[EventMetadataMiddleware(validate_publish=False)])
+   @broker.subscriber("orders")
    async def handle(body: dict, message: RabbitMessage) -> None:
-       key = EventMetadata.from_message(message).idempotency_key
+       key = message.message_id  # or your application's own idempotency header
        async with db.transaction() as tx:
            inserted = await tx.execute(
                "INSERT INTO inbox (idempotency_key) VALUES ($1) ON CONFLICT DO NOTHING", key
@@ -325,6 +378,36 @@ worker pool and no retry. Retries (delay queues), DLQ replay, requeues,
 redeliveries after a reconnect, and several consumers all reorder messages.
 rabbitkit adds no ordering features. See
 [Ordering Guarantees](ordering-guarantees.md).
+
+## Streams
+
+A route on a `QueueType.STREAM` queue (both brokers) reads an append-only
+log; consuming does not remove messages. Its contract differs from the
+queue contract above (details: [Streams](streams.md)):
+
+- **At-least-once, by client-side offset.** AMQP 0.9.1 has no server-side
+  offset storage. rabbitkit advances a processed offset over the contiguous
+  prefix of settled deliveries and commits it to an `OffsetStore` every
+  `commit_every` messages / `commit_interval` seconds and at `stop()`. A
+  restart resumes at the committed offset + 1 (a crash replays at most the
+  messages processed since the last commit); a reconnect resumes at the
+  processed offset + 1, never at `"next"`. Deliveries in flight when a
+  channel dies are delivered again.
+- **No retry, no DLQ, no redelivery.** RabbitMQ neither redelivers nor
+  dead-letters a nacked or rejected stream message. A handler failure is
+  logged and skipped (the offset moves past it; the message stays in the
+  stream for replay). `RetryConfig` (per route or inherited) and
+  `AckPolicy.ACK_FIRST` are refused at registration; no safety DLQ is
+  provisioned.
+- **Durability** is the stream's (replicated like a quorum queue) for the
+  messages; the consumer position is as durable as its `OffsetStore`
+  (`InMemoryOffsetStore`: process lifetime; an application-supplied store:
+  as durable as that storage).
+- **Ordering**: one consumer reads in log order; concurrent handlers may
+  finish out of order, but the committed position never passes an
+  unfinished message.
+- The CRITICAL profile requires quorum queues and reports stream routes as
+  violations.
 
 ## Enabling the CRITICAL profile
 
@@ -392,7 +475,6 @@ profile forbids, and when `consumer.processing_timeout` is unset.
 | Source `x-dead-letter-strategy=at-least-once` + `overflow=reject-publish` | — | per route: warning if not declared; verified on the broker by `preflight(management_client=...)` (which then replaces the warning) | — |
 | Dead-letter path never `discard` | — | yes | `reject_without_dlx="discard"` |
 | DLQ copy with metadata for failures outside retry (`on_receive`, body cap, no-retry routes) | `safety.dead_letter_with_metadata=True` (async) | yes | — |
-| Event metadata validation | — (opt-in) | not checked | — |
 | Heartbeat on (`connection.heartbeat > 0`) | — (default 30 s) | yes | `heartbeat=0` |
 | Async reconnect budget | — (unlimited by default) | warning when `reconnect_budget_seconds < reconnect_backoff_max` | — |
 | TLS | — (deployment choice) | warning when enabled with `cert_reqs="CERT_NONE"` | — |
@@ -428,6 +510,6 @@ not perform as `UNVERIFIED`, never as passed. `policy_templates()` renders
 policies (at-least-once dead-lettering, `reject-publish`, delivery limits) for
 whoever owns the cluster to apply.
 
-`processing_timeout` and `max_in_flight_bytes` are enforced by `AsyncBroker`
-only. `SyncBroker` logs that it ignores `processing_timeout`; use
-`TimeoutMiddleware` there.
+`max_in_flight_bytes` and `processing_timeout` are enforced by both brokers; on `SyncBroker` the timed-out handler thread
+keeps running until it returns (see
+[Processing deadline](#processing-deadline-processing_timeout)).

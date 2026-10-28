@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 from datetime import UTC
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -626,6 +627,20 @@ class TestConsume:
 
         call_kwargs = channel.basic_consume.call_args.kwargs
         assert call_kwargs["auto_ack"] is False
+        assert "arguments" not in call_kwargs
+
+    def test_consume_passes_arguments_as_read_at_subscribe_time(self) -> None:
+        """Stream routes: basic_consume gets the arguments as they are when
+        consume() subscribes (a snapshot; the broker passes the current
+        resume point again on each re-subscription)."""
+        transport = _make_transport()
+        channel = self._connect_transport(transport)
+        arguments: dict[str, Any] = {"x-stream-offset": 7}
+
+        transport.consume("events", lambda msg: None, arguments=arguments)
+        arguments["x-stream-offset"] = 9
+
+        assert channel.basic_consume.call_args.kwargs["arguments"] == {"x-stream-offset": 7}
 
     def test_consume_fires_channel_opened_not_rebuilt_first_time(self) -> None:
         """Item 3: the first consume() call for a queue opens a fresh
@@ -1486,6 +1501,26 @@ class TestBlockedUnblockedCallbacksSync:
         transport.on_unblocked(lambda: called.append("cb2"))
         transport._pika_unblocked(None)
         assert called == ["cb1", "cb2"]
+
+    def test_pika_blocked_keeps_the_broker_reason_while_blocked(self) -> None:
+        """pika hands the Connection.Blocked frame to the callback; its reason
+        ("low on disk" / "low on memory") says which alarm is active."""
+        from types import SimpleNamespace
+
+        transport = _make_transport()
+        assert transport.blocked_reason is None
+        frame = SimpleNamespace(method=SimpleNamespace(reason="low on disk"))
+        transport._pika_blocked(None, frame)
+        assert transport.is_blocked and transport.blocked_reason == "low on disk"
+        transport._pika_unblocked(None, SimpleNamespace(method=SimpleNamespace()))
+        assert not transport.is_blocked and transport.blocked_reason is None
+
+    def test_pika_blocked_without_a_readable_reason(self) -> None:
+        from types import SimpleNamespace
+
+        transport = _make_transport()
+        transport._pika_blocked(None, SimpleNamespace(method=SimpleNamespace(reason=b"bytes")))
+        assert transport.is_blocked and transport.blocked_reason is None
 
     def test_pika_blocked_no_callbacks_is_noop(self) -> None:
         """_pika_blocked() with no callbacks does nothing."""
@@ -3219,7 +3254,7 @@ class TestInspectionPrimitivesSync:
         assert props.delivery_mode == 1
 
 
-# ── G-22: metrics hooks (connection state, reconnect attempts, publish outcome) ──
+# ── metrics hooks (connection state, reconnect attempts, publish outcome) ──
 
 
 class TestObservabilityHooks:

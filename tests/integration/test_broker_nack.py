@@ -1,6 +1,6 @@
-"""Real-broker tests for the hardening stream (failure-matrix row F04).
+"""Real-broker tests: a broker ``basic.nack`` surfaces as NACKED.
 
-F04: a publisher-confirm ``basic.nack`` from RabbitMQ must surface as
+a publisher-confirm ``basic.nack`` from RabbitMQ must surface as
 ``PublishStatus.NACKED`` -- never CONFIRMED, never silently republished.
 
 The reliable way to make a real broker nack a publish is a full queue that
@@ -116,7 +116,7 @@ def _sync_broker(url: str) -> Iterator[Any]:
         broker.stop()
 
 
-# ── F04: async ───────────────────────────────────────────────────────────────
+# ── async ───────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -167,7 +167,7 @@ async def test_async_publish_many_reports_a_broker_nack_per_item(rabbit: dict[st
         await asyncio.to_thread(_delete, url, queue)
 
 
-# ── F04: sync ────────────────────────────────────────────────────────────────
+# ── sync ────────────────────────────────────────────────────────────────
 
 
 def test_sync_broker_nack_surfaces_as_nacked_and_is_not_republished(rabbit: dict[str, Any]) -> None:

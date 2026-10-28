@@ -312,7 +312,7 @@ class TestHandoffFailureAsync:
         assert mw.handoff_tracker is tracker
 
 
-# ── Quorum options for the retry chain (§7.2, 16.2) ───────────────────────
+# ── Quorum options for the retry chain (16.2) ───────────────────────
 
 
 class TestRetryChainQuorumOptions:

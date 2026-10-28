@@ -54,7 +54,7 @@ class OTelTracingMiddleware(BaseMiddleware):
     Span names follow the OTel messaging convention: ``{destination} receive``
     / ``{destination} send``.
 
-    Publish outcomes (G-22): ``broker.publish()`` returns a
+    Publish outcomes: ``broker.publish()`` returns a
     :class:`~rabbitkit.core.types.PublishOutcome` instead of raising, so the
     PRODUCER span records it: ``messaging.rabbitmq.publish.status`` (always)
     and ``messaging.rabbitmq.publish.reason`` (when set), and a status of

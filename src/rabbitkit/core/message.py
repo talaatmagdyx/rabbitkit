@@ -7,7 +7,7 @@ Pipeline calls the appropriate variant internally.
 MANUAL mode handlers choose ack() or ack_async() based on their runtime.
 Idempotent: double-ack is a no-op (guarded by _disposition state). The async
 variants claim the disposition before awaiting the transport, so concurrent
-settlements never send two frames for one delivery tag (G-15).
+settlements never send two frames for one delivery tag.
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ class RabbitMessage:
         "_reject_async_fn",
         "_reject_fn",
         "_settle_unknown",
+        "_settlement_metric_once",
         "_wire_body",
         "_wire_content_encoding",
         "app_id",
@@ -143,7 +144,7 @@ class RabbitMessage:
         self.raw_message = raw_message
         # The body and encoding as delivered, before any on_receive hook
         # (decompression, decryption) rewrites them: retry and DLQ copies
-        # republish these, so the copy decodes like the original (G-07).
+        # republish these, so the copy decodes like the original.
         self._wire_body = body
         self._wire_content_encoding = content_encoding
 
@@ -155,9 +156,13 @@ class RabbitMessage:
         self._reject_fn: Callable[[bool], None] | None = None
         self._reject_async_fn: Callable[[bool], Awaitable[None]] | None = None
         self._disposition: str = "pending"
-        # G-15: True when a claimed async settlement's transport call raised
+        # True when a claimed async settlement's transport call raised
         # or was cancelled -- the frame may or may not have reached the broker.
         self._settle_unknown = False
+        # One-element token taken (``pop()``) by the first settlement-metric
+        # emission when two threads may report the same delivery (the sync
+        # processing deadline and its late handler); None = no such race.
+        self._settlement_metric_once: list[None] | None = None
         # Transport-injected liveness probe for the channel this delivery
         # arrived on (``lambda: channel.is_open``). Delivery tags are only
         # meaningful on their own channel generation; ``ack_many`` /
@@ -180,6 +185,20 @@ class RabbitMessage:
     def wire_content_encoding(self) -> str | None:
         """``content_encoding`` exactly as the broker delivered it."""
         return self._wire_content_encoding
+
+    @property
+    def stream_offset(self) -> int | None:
+        """This delivery's offset in a stream queue, else None.
+
+        RabbitMQ stamps every delivery from a stream with an
+        ``x-stream-offset`` header (overwriting any value a publisher set).
+        On a classic or quorum queue the header is whatever the publisher
+        sent, so only read this for deliveries from a stream.
+        """
+        value = self.headers.get("x-stream-offset")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return int(value)
 
     @property
     def is_settled(self) -> bool:
@@ -258,7 +277,7 @@ class RabbitMessage:
 
     # ── Async settlement ──────────────────────────────────────────────────
     #
-    # G-15: the async variants CLAIM the settlement before awaiting the
+    # the async variants CLAIM the settlement before awaiting the
     # transport. The old guard checked ``_disposition`` and set it only after
     # the await, so two coroutines (a concurrent ack/nack, or ``stop()``
     # nacking a handler that was cancelled mid-ack) could both pass the check

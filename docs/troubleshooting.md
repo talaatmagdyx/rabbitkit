@@ -150,6 +150,19 @@ Two aio-pika 10 notes:
   patches that one encoder function at connect; it changes only values that
   raised before. pamqp 4 (aio-pika 10) needs no patch.
 
+Two aio-pika 9.x notes (both handled by rabbitkit since the 9.1 floor got
+its own nightly real-broker run):
+
+- aio-pika 9.x drops `connect_robust(client_properties=...)` when it is
+  given a URL, so `ConnectionConfig.connection_name` and `client_properties`
+  never reached the broker. rabbitkit's robust connection class now hands
+  them to aiormq itself, on the first connect and on every reconnect. If an
+  older rabbitkit shows nameless connections in the management UI on
+  aio-pika 9, this is why.
+- pamqp 3.2 (what aio-pika 9.1 resolves) decodes the AMQP `timestamp`
+  property to a naive datetime. `RabbitMessage.timestamp` is now always an
+  aware UTC datetime, as on the sync transport.
+
 ## Installation
 
 **`ModuleNotFoundError: No module named 'pkg_resources'` when importing

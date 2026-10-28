@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.0] — 2026-10-28
+## [0.20.0] — 2026-10-29
 
 Reliability foundation for the async (aio-pika) path, with sync parity. Every
 gap from the RabbitMQ Async Messaging Foundation audit is closed; see

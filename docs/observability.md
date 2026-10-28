@@ -436,8 +436,10 @@ healthy system, so their threshold is any), `ConnectionConfig` defaults
 (quorum end-to-end p99 27.5 ms at 2,778 msg/s, a 200,000-message burst
 drained in 5–7.5 s, quorum loss recovered 10–18 s after the nodes return,
 silent-partition detection about 5 × `heartbeat`). Those numbers come from
-a single-node broker on one machine; measure your own cluster before
-paging on anything tighter.
+a single-node broker on one machine; on a 3-node cluster sharing that
+machine the confirm p99 was 185 ms and the end-to-end p99 800 ms (see
+`docs/benchmarking.md`). Measure your own cluster before paging on anything
+tighter.
 
 Most thresholds are ratios or times, so they do not depend on traffic.
 What to change, and how:

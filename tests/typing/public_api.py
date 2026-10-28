@@ -39,7 +39,9 @@ from rabbitkit import (
     EventMetadataError,
     HealthCheckConfig,
     HealthStatus,
+    InMemoryOffsetStore,
     MessageEnvelope,
+    OffsetStore,
     PublisherConfig,
     PublishOutcome,
     PublishReason,
@@ -50,6 +52,10 @@ from rabbitkit import (
     RabbitQueue,
     ReliabilityProfile,
     RetryConfig,
+    SQLiteOffsetStore,
+    StreamConsumerConfig,
+    StreamOffset,
+    StreamOffsetType,
     SyncBroker,
     apply_profile,
     broker_health_check,
@@ -248,3 +254,32 @@ def exercise_test_broker() -> int:
     finally:
         broker.stop()
     return len(seen)
+
+
+# ── stream queues ─────────────────────────────────────────────────────────────
+
+
+def exercise_streams(path: str) -> None:
+    broker = AsyncBroker(RabbitConfig())
+    events = RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D", max_length_bytes=10_000_000)
+    store: OffsetStore = SQLiteOffsetStore(path)
+    config = StreamConsumerConfig(offset=StreamOffset.first(), offset_store=store, commit_every=50)
+    assert_type(config.offset, StreamOffset)
+    assert_type(config.offset.type, StreamOffsetType)
+    assert_type(store.load("events"), int | None)
+    memory: OffsetStore = InMemoryOffsetStore()
+    memory.save("events", 3)
+
+    @broker.subscriber(events, stream=config)
+    async def project(body: bytes, message: RabbitMessage) -> None:
+        assert_type(message.stream_offset, int | None)
+
+    @broker.subscriber(RabbitQueue("audit", queue_type=QueueType.STREAM), stream_offset=datetime.now(UTC))
+    async def audit(body: bytes) -> None: ...
+
+    sync = SyncBroker(RabbitConfig())
+
+    @sync.subscriber(RabbitQueue("replay", queue_type=QueueType.STREAM), stream_offset=42)
+    def replay(body: bytes) -> None: ...
+
+    assert_type(StreamOffset.parse("first"), StreamOffset)

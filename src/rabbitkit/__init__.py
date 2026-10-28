@@ -173,6 +173,14 @@ from rabbitkit.serialization.pipeline import (
     RawDecoder,
     SerializationPipeline,
 )
+from rabbitkit.streams import (
+    InMemoryOffsetStore,
+    OffsetStore,
+    SQLiteOffsetStore,
+    StreamConsumerConfig,
+    StreamOffset,
+    StreamOffsetType,
+)
 from rabbitkit.sync.batch import SyncBatchPublisher
 from rabbitkit.sync.broker import SyncBroker
 
@@ -250,6 +258,7 @@ __all__ = [
     "HealthCheckConfig",
     "HealthStatus",
     "HealthWatcher",
+    "InMemoryOffsetStore",
     "InboundMessageTooLargeError",
     "InfrastructureError",
     "InvalidMessageError",
@@ -267,6 +276,7 @@ __all__ = [
     "MissingDependencyError",
     "NackMessage",
     "OTelTracingMiddleware",
+    "OffsetStore",
     "Path",
     "PermanentConnectionError",
     "PolicyTemplate",
@@ -304,6 +314,7 @@ __all__ = [
     "RetryDisabled",
     "RetryHandoffConfig",
     "RetryHandoffTracker",
+    "SQLiteOffsetStore",
     "SSLConfig",
     "SafetyConfig",
     "SanitizedError",
@@ -319,6 +330,9 @@ __all__ = [
     "SettlementReportError",
     "SocketConfig",
     "StaleGenerationError",
+    "StreamConsumerConfig",
+    "StreamOffset",
+    "StreamOffsetType",
     "SyncBatchPublisher",
     "SyncBroker",
     "SyncWorkerPool",

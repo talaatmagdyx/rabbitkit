@@ -26,8 +26,9 @@ samples queue depth. Every run accounts for every message: lost (never
 consumed), duplicated (consumed twice) and non-CONFIRMED publishes are reported,
 never dropped from the numbers.
 
-Caveats printed with every report: a single-node broker (quorum replication
-factor 1, so no Raft network round trip) on the same machine as the clients.
+Every report states the broker topology (``--cluster-nodes``, default 1: a
+single node, so quorum replication factor 1 and no Raft network round trip) and
+that the broker runs on the same machine as the clients.
 
 Usage::
 
@@ -450,6 +451,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--url", default=None, help="existing broker; omitted → throwaway testcontainers broker")
     parser.add_argument("--image", default="rabbitmq:3.13-management-alpine")
+    parser.add_argument(
+        "--cluster-nodes", type=int, default=1, help="nodes behind --url (reported; quorum replicas follow it)"
+    )
     parser.add_argument("--scenario", choices=["publish", "consume", "sustained", "burst", "all"], default="all")
     parser.add_argument("--queue-type", choices=["quorum", "classic"], default="quorum")
     parser.add_argument("--size", type=int, default=1024)
@@ -482,6 +486,7 @@ def main() -> None:
         container.start()
         url = f"amqp://guest:guest@{container.get_container_host_ip()}:{container.get_exposed_port(5672)}/"
     report: dict[str, Any] = {"environment": environment(args.image, args.url is not None), "args": vars(args)}
+    report["environment"]["cluster_nodes"] = args.cluster_nodes
     run = {args.scenario} if args.scenario != "all" else {"publish", "consume", "sustained", "burst"}
     try:
         if "publish" in run:
@@ -537,10 +542,12 @@ def main() -> None:
     finally:
         if container is not None:
             container.stop()
-    print(
-        "caveat: single-node broker (quorum replication factor 1, no Raft network hop) on the same host as the "
-        "clients; absolute numbers are this machine's."
+    topology = (
+        "single-node broker (quorum replication factor 1, no Raft network hop)"
+        if args.cluster_nodes == 1
+        else f"{args.cluster_nodes}-node cluster (quorum replicas across nodes)"
     )
+    print(f"caveat: {topology} on the same host as the clients; absolute numbers are this machine's.")
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(report, fh, indent=2, default=str)

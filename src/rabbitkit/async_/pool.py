@@ -1065,7 +1065,11 @@ class AsyncConnectionPool:
                 on_lost=self._connection_lost,
                 on_restored=self._connection_restored,
             )
-            kwargs["connection_class"] = functools.partial(RabbitkitRobustConnection, rk_policy=policy)
+            kwargs["connection_class"] = functools.partial(
+                RabbitkitRobustConnection,
+                rk_policy=policy,
+                rk_client_properties=kwargs.get("client_properties"),
+            )
             try:
                 connection = await aio_pika.connect_robust(**kwargs)
             except BaseException as e:

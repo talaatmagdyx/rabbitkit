@@ -310,6 +310,34 @@ async def test_connect_robust_builds_the_subclass(monkeypatch: pytest.MonkeyPatc
     assert conn.reconnect_interval == 2.0
 
 
+async def test_client_properties_reach_aiormq_on_every_aio_pika_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """aio-pika 9.x drops ``connect_robust(client_properties=...)`` when given
+    a URL (only aio-pika 10 forwards them), so ``connection_name`` never
+    reached the broker on 9.x. The subclass puts them in ``self.kwargs``,
+    which aio-pika hands to ``aiormq.connect`` on every (re)connect."""
+
+    async def no_connect(self: Any, timeout: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr(RabbitkitRobustConnection, "connect", no_connect)
+    props = {"connection_name": "orders-worker", "library": "rabbitkit"}
+    conn = await aio_pika.connect_robust(
+        "amqp://u:p@h:5672/",
+        reconnect_interval=2.0,
+        client_properties=props,
+        connection_class=functools.partial(  # type: ignore[arg-type]
+            RabbitkitRobustConnection, rk_policy=ReconnectPolicy(ConnectionConfig()), rk_client_properties=props
+        ),
+    )
+    assert conn.kwargs["client_properties"] == props
+    assert conn.kwargs["client_properties"] is not props  # a copy: aiormq may not mutate the caller's dict
+
+
+async def test_no_client_properties_leaves_aio_pika_kwargs_alone() -> None:
+    conn = RabbitkitRobustConnection(_URL, rk_policy=ReconnectPolicy(ConnectionConfig()))
+    assert "client_properties" not in conn.kwargs
+
+
 @pytest.mark.usefixtures("connected_ok", "no_jitter")
 class TestConnectionStateHooks:
     """G-22: the policy reports a live drop and a recovery, per role, so the

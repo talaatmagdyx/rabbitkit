@@ -307,6 +307,54 @@ async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: di
         assert collector.counts.get("rabbitkit_reconnects_total", 0) >= 2
 
 
+async def _client_properties_named(rabbit: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    """Client properties of the broker's connections called *name*."""
+    import json
+
+    out = await actl(rabbit, "list_connections", "client_properties", "--formatter", "json", "--quiet")
+    start = out.find("[")
+    rows = json.loads(out[start:]) if start >= 0 else []
+    # rabbitmqctl renders the AMQP field table as [key, type, value] triples.
+    tables = [{k: v for k, _type, v in row["client_properties"]} for row in rows]
+    return [t for t in tables if t.get("connection_name") == name]
+
+
+async def test_connection_name_and_client_properties_reach_the_broker_and_survive_reconnect(
+    own_rabbit: dict[str, Any],
+) -> None:
+    """Before: aio-pika 9.x dropped connect_robust(client_properties=...), so
+    ConnectionConfig.connection_name / client_properties never reached the
+    broker on the 9.x line (the management UI showed nameless connections and
+    anything that found a service's connections by name found none)."""
+    from dataclasses import replace
+
+    from rabbitkit import AsyncBroker
+    from rabbitkit.core.config import ConnectionConfig, RabbitConfig
+
+    name = f"svc-{uuid.uuid4().hex[:8]}"
+    connection = replace(
+        ConnectionConfig.from_url(own_rabbit["url"]),
+        connection_name=name,
+        client_properties={"team": "orders"},
+        reconnect_backoff_base=0.1,
+        reconnect_backoff_max=0.5,
+    )
+    broker = AsyncBroker(RabbitConfig(connection=connection))
+
+    async def both_named() -> bool:
+        return len(await _client_properties_named(own_rabbit, name)) == 2  # publisher + consumer
+
+    async with asyncio.timeout(90), _started(broker):
+        await _wait_until(both_named, 20, "two connections named by connection_name")
+        for props in await _client_properties_named(own_rabbit, name):
+            assert props["library"] == "rabbitkit"
+            assert props["team"] == "orders"
+        events = _Events(broker._transport)
+        await actl(own_rabbit, "close_all_connections", "rename")
+        await _wait_until(lambda: _true(events.reconnects >= 2 and broker._transport.is_connected()), 30, "reconnect")
+        await _wait_until(both_named, 20, "the reconnected connections to keep their name")
+
+
 class _Counter:
     """Minimal MetricsCollector: records counter increments."""
 

@@ -398,8 +398,10 @@ def make_aio_pika_connect_kwargs(
     # aiormq.connection.Connection._client_properties), so a same-named key
     # replaces aiormq's: rabbitkit's names avoid "product"/"version"/
     # "platform"/"capabilities"/"information", and ConnectionConfig rejects a
-    # user "capabilities". Note aio-pika 9 drops client_properties when given
-    # a URL, so these reach the broker only on aio-pika 10+.
+    # user "capabilities". aio-pika 9.x drops connect_robust(client_properties=)
+    # when given a URL; the pool also hands them to RabbitkitRobustConnection
+    # (rk_client_properties), which sets them where aiormq reads them on
+    # every aio-pika version.
     client_properties: dict[str, str] = {
         "library": "rabbitkit",
         "library_version": __version__,
@@ -414,9 +416,7 @@ def make_aio_pika_connect_kwargs(
 
 def has_small_negative_int(arguments: dict[str, Any] | None) -> bool:
     """True if a field table holds an int pamqp < 4 can't encode (-128..-1)."""
-    return any(
-        isinstance(v, int) and not isinstance(v, bool) and -128 <= v < 0 for v in (arguments or {}).values()
-    )
+    return any(isinstance(v, int) and not isinstance(v, bool) and -128 <= v < 0 for v in (arguments or {}).values())
 
 
 def ensure_pamqp_encodes_negative_ints() -> None:

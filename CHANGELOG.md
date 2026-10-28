@@ -9,10 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.20.0] — 2026-10-28
 
-Reliability foundation for the async (aio-pika) path. Every gap from the
-RabbitMQ Async Messaging Foundation audit is closed or documented; see
-`docs/reliable-messaging.md` for the resulting contract. Several defaults
-change behaviour: read **Changed (behaviour)** before upgrading.
+Reliability foundation for the async (aio-pika) path, with sync parity. Every
+gap from the RabbitMQ Async Messaging Foundation audit is closed; see
+`docs/reliable-messaging.md` for the resulting contract. Also new: an opt-in
+durable producer outbox (`docs/outbox.md`), supported RabbitMQ Streams
+consumption with resumable offsets (`docs/streams.md`), and alert rules that
+work from rabbitkit's own metrics. Several defaults change behaviour: read
+**Changed (behaviour)** before upgrading.
+
+0.19.2 was never published to PyPI; upgrading from 0.19.1 also brings its
+fixes (see below).
 
 ### Changed (behaviour)
 
@@ -428,6 +434,89 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   terminal failure back, so a delivery requeued because its DLQ was missing
   was counted on every redelivery.
 
+#### Sync broker parity
+
+- **`SyncBroker` enforces `ConsumerConfig.processing_timeout`.** It used to
+  ignore it and log a warning. Python cannot interrupt a thread, so the
+  semantics are: when a handler run passes its deadline, the I/O thread
+  settles the delivery through the pipeline's normal failure path with
+  `HandlerTimeoutError` (`UNKNOWN_OUTCOME`, transient: first delivery
+  nack-requeued, a redelivery rejected into the DLQ, logged with
+  `outcome_unknown=True`), exactly as `AsyncBroker` settles its cancelled
+  handler task. The handler thread is not stopped: it keeps its worker until
+  it returns, so no more than `worker_count` handlers ever run; when it
+  returns, its result is logged and discarded. Settlement is claimed once per
+  delivery, so the late handler's ack/nack/reject never reaches the channel
+  (a second settlement of a settled tag would close it), and its
+  handler-result, retry and DLQ publishes are refused (`NOT_SENT`, reason
+  `cancelled`). The deadline starts when the handler starts and is checked
+  on every consume-loop tick (at most `min(1 s, processing_timeout / 4)`
+  apart) and during the `stop()` drain.
+  **Observable change:** with `processing_timeout` set, sync handlers no
+  longer run inline on the I/O thread. `worker_count > 1` uses the worker
+  pool as before; `worker_count = 1` now runs handlers on one dedicated
+  handler thread (same order, one at a time), chosen over refusing to start
+  because the CRITICAL profile requires `processing_timeout` and inline
+  sync consumers under it were valid configurations. Handlers that depend on
+  running on the thread that called `start()` (thread-local state,
+  `broker.request()`) need the deadline off. Unchanged when
+  `processing_timeout` is `None` (the default). A handler that never returns
+  holds its worker for good; with one worker the route then stops taking
+  deliveries (they stay prefetched, unacked).
+- **`SyncBroker` reports a consumer the broker cancelled as not consuming.**
+  Before, a server `basic.cancel` (queue deleted, quorum leader moved,
+  operator action) left the route reported as consuming while nothing was
+  delivered, and it never subscribed again. `broker_health_check()` now
+  reports such a route as not consuming (DEGRADED) and `broker_readiness()`
+  fails until the consumer is back.
+
+#### Streams
+
+- **Stream routes refuse retry and `ACK_FIRST` at registration**
+  (`ConfigurationError`), including a `RetryConfig` inherited from the
+  broker (pass `retry=RETRY_DISABLED` on the stream route). RabbitMQ neither
+  redelivers nor dead-letters a nacked or rejected stream message, so retry
+  could not work; before this change such a route failed at startup instead,
+  when the retry topology declared `x-dead-letter-exchange` on the stream
+  (406).
+- **Stream routes get no safety DLQ.** `SafetyConfig.reject_without_dlx`
+  (default `auto_provision`) no longer adds `x-dead-letter-exchange` to a
+  stream or declares `<stream>.dlq`; RabbitMQ refused the argument (406), so
+  every stream route under the default safety config failed at startup. A
+  rejected stream message is not discarded, it stays in the stream.
+- **A handler failure on a stream route is skipped**, logged as a WARNING
+  with its offset (`Stream route ...: the message at offset N failed and is
+  not retried`), and counted; the consumer moves on. This is what RabbitMQ
+  already did with the nack/reject; it is now explicit.
+- **A stream route resumes after a reconnect** from the last processed
+  offset instead of the broker default `"next"`, which skipped what was
+  published during the outage.
+- `RabbitQueue(queue_type=STREAM)` now raises `TopologyValidationError` for
+  `dead_letter_exchange`, `dead_letter_routing_key`, `max_length`,
+  `overflow`, `expires`, `delivery_limit` and `single_active_consumer`, and
+  for a non-positive `max_length_bytes`. RabbitMQ 3.13 and 4.1 refuse each
+  on a stream with 406 `invalid arg`, so these declarations already failed,
+  at startup.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **Alert thresholds are reasoned defaults, no longer placeholders.** Every
+  alert has a `rationale` annotation and a `source` label. Changed
+  expressions (alert names unchanged): `PublisherUnknownOutcomes` is a ratio
+  (> 1% for 10m, was any for 5m); `RabbitMQConnectionFailures` is > 10 failed
+  attempts in 5m for 5m (was > 5 in 10m for 10m, which a single broker
+  restart could trip); `RabbitMQConnectionBlocked` averages over 2m so the
+  blocked-connection watchdog's reconnects do not hide an alarm, and no
+  longer fires for disk/memory alarms (their own alerts do);
+  `ConsumerBacklogGrowing` uses the drain time (backlog / delivery rate >
+  10 min and growing, was > 1000 ready); `ConsumerUnackedHigh` fires on
+  unacked deliveries with no handler completion for 10m (was > 5000 unacked);
+  `ConsumerProcessingFailures` and `RetryStormDetected` need at least one
+  handler run a minute; the plugin `RabbitMQQuorumUnhealthy` compares the
+  node count with its own 1-day maximum (no hardcoded `3`) and no longer
+  uses `rabbitmq_raft_term_total`, whose rate scales with the number of
+  queues.
+
 ### Added
 
 #### Earlier consumer and retry hardening
@@ -786,6 +875,179 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   directions and one-way, with traffic and idle. The three defects they
   found are fixed (see Fixed).
 
+#### Sync broker parity
+
+- **Broker-cancelled consumers on `SyncBroker` (G-26 parity).** The sync
+  transport registers pika's `BlockingChannel.add_on_cancel_callback` on every
+  consumer channel. On a server `basic.cancel` (dispatched by pika on the I/O
+  thread) it logs a WARNING, sets `RouteRuntimeState.consumer_cancelled`,
+  counts `consumer_cancelled_total{queue}`, sets `route_consuming{queue}` to 0
+  and calls `SyncBroker.on_consumer_cancelled(queue)`. The consume loop then
+  probes the queue with a passive declare (backoff 1 s, doubling, capped at
+  30 s) and re-subscribes with the same consumer tag once it exists, on the
+  I/O thread (never from a worker thread, never re-creating the queue,
+  reusing the consumer channel or opening a fresh one if the broker closed
+  it), then calls `SyncBroker.on_consumer_resumed(queue)`. A reconnect that
+  re-subscribes a cancelled route also reports it resumed. New:
+  `SyncBroker.on_consumer_cancelled` / `on_consumer_resumed`
+  (`Callable[[str], None] | None`, as on `AsyncBroker`), and on
+  `SyncTransport` `on_consumer_cancelled(cb)`, `on_consumer_resumed(cb)`,
+  `cancelled_consumers`; module `rabbitkit.sync.consumers`
+  (`SyncConsumerSupervisor`).
+- **`rabbitkit_publish_in_flight` on `SyncBroker` (G-22).**
+  `SyncTransport.publishes_in_flight` counts `publish()` calls between entry
+  and outcome, including worker-thread publishes waiting for the I/O thread;
+  the broker samples it with the other gauges (I/O-loop tick, throttled to
+  5 s) and now also from `pump_idle()`, so a publish-only sync broker samples
+  its gauges too. `publish_in_flight_bytes` stays async-only (the byte budget
+  is enforced by `AsyncBroker` only) and so does `publish_channels_in_use`
+  (the sync broker has one publisher channel, not a pool); the metric
+  inventory says so.
+- `SyncTransport.poll_interval` (default 1.0 s): the consume loop's longest
+  `process_data_events` wait. `SyncWorkerPool(config, threaded=True)` runs a
+  single worker on its own thread. `HandlerPipeline.settle_expired_sync()`.
+  Module `rabbitkit.sync.deadlines` (`SyncDeadlines`, `DeliveryClaim`,
+  `LateSettlementError`).
+
+#### Producer outbox
+
+- **Producer outbox (opt-in): a producer crash no longer loses messages that
+  were not yet confirmed.** Closes the 0.20.0 known limit. `AsyncOutbox` /
+  `SyncOutbox` (`rabbitkit.outbox`) over one transport-free
+  `OutboxStore` (`rabbitkit.core.outbox`, stdlib `sqlite3`, no new
+  dependency):
+  - `enqueue(envelope)` commits the whole `MessageEnvelope` (body, every
+    property and header with its type, `mandatory`, a `message_id` fixed at
+    enqueue time) to a SQLite file in WAL mode with `synchronous=FULL` and
+    returns after the commit. `enqueue_many()` writes a batch in one
+    transaction.
+  - Bounded: `OutboxConfig.max_entries` / `max_bytes` (pending and failed
+    together, kept exact by triggers); beyond them `OutboxFullError`
+    (`limit="max_entries"` / `"max_bytes"`) and nothing is written.
+  - The relay publishes due entries in enqueue order through the broker's
+    normal `publish()` (confirms, `mandatory`, publish middlewares apply),
+    `max_in_flight` per pass, and records each pass in one transaction. An
+    entry is deleted only after `CONFIRMED`. `NOT_SENT` / `UNKNOWN` /
+    `TIMEOUT` (and `BrokerNotStartedError`) leave it pending and back the
+    relay off (capped exponential, jitter), without limit. `RETURNED` /
+    `NACKED` / `ERROR` / a publish exception: per-entry backoff, then the
+    failed state after `max_refusals`. `SENT` and `MessageTooLargeError`:
+    failed at once. Failed entries are listed (`list_entries`), replayed
+    (`replay_failed`) or purged (`purge_failed`, the only way to discard
+    one), never dropped.
+  - Crash recovery: no in-flight state is stored, so a new relay on the same
+    file republishes everything not yet recorded as confirmed: at-least-once,
+    at most `max_in_flight` duplicates per relay crash, same `message_id`.
+  - `AsyncOutbox`: `start()`, `stop(timeout)` (drains until nothing is due or
+    the timeout, then cancels; nothing is lost), every SQLite call in
+    `asyncio.to_thread`. `SyncOutbox`: no thread of its own; `relay_once()`,
+    `drain(timeout)`, `run()` / `request_stop()` on the broker's owner
+    thread, `enqueue()` from any thread.
+  - Transactional enqueue: `store.enqueue_in(conn, envelope)` inside the
+    application's own SQLite transaction (`store.connect()` returns a
+    correctly configured connection).
+  - Both relays require publisher confirms (`ConfigValidationError`
+    otherwise).
+  - Metrics (bounded labels, in `metric_inventory()`):
+    `rabbitkit_outbox_pending`, `_failed_entries`, `_bytes` (gauges),
+    `_enqueued_total`, `_relayed_total`,
+    `_publish_retries_total{status,reason}`, `_failed_total{status,reason}`,
+    `_full_total{reason}`; logs on the `rabbitkit.outbox` logger with
+    `outbox_id` / `message_id` / `publish_status` / `publish_reason`.
+  - New public names: `AsyncOutbox`, `SyncOutbox`, `OutboxStore`,
+    `OutboxConfig`, `OutboxEntry`, `OutboxEntryState`, `OutboxStats`,
+    `OutboxPassReport`, `OutboxError`, `OutboxFullError`,
+    `OutboxClosedError`; `MetricsConfig.outbox_*` names.
+  - Real-broker tests (`tests/integration/test_outbox_foundation.py`): a
+    relay process SIGKILLed mid-flight and restarted on the same file
+    delivers all 1,500 messages, duplicates within `max_in_flight`; the same
+    for a sync relay; entries stay pending through `rabbitmqctl stop_app`
+    and are delivered after `start_app`; an unroutable mandatory message
+    fails, is kept, and is delivered after a replay.
+
+#### Streams
+
+- **RabbitMQ streams are a supported feature on both brokers** (closes the
+  0.20.0 known limit "Streams remain experimental"). Consumed over AMQP
+  0.9.1; the `rabbitmq_stream` plugin is not needed. See `docs/streams.md`.
+  - `subscriber(..., stream_offset=...)` on a `QueueType.STREAM` queue:
+    `"first"`, `"last"`, `"next"` (default), an int offset or a `datetime`;
+    or `stream=StreamConsumerConfig(offset=..., offset_store=...,
+    commit_every=100, commit_interval=5.0, consumer_name=...)` for the full
+    configuration. On `AsyncBroker`, `SyncBroker`, `RabbitRouter`,
+    `TestBroker`.
+  - `RabbitMessage.stream_offset`: each delivery's offset (from the
+    broker-set `x-stream-offset` header).
+  - Client-side offset tracking (AMQP 0.9.1 has no server-side offset
+    storage): the processed offset advances over the contiguous prefix of
+    settled deliveries (out-of-order handlers never move it past an
+    unfinished message) and is committed to an `OffsetStore` every
+    `commit_every` messages / `commit_interval` seconds and at `stop()`. A
+    restart resumes at the committed offset + 1 (a crash replays at most the
+    messages processed since the last commit: at-least-once).
+  - Offset stores: `OffsetStore` protocol (`load` / `save`),
+    `InMemoryOffsetStore` (default; process lifetime) and `SQLiteOffsetStore`
+    (stdlib `sqlite3`, WAL, `synchronous=FULL`; durable across crashes).
+    `AsyncBroker` commits to a non-memory store in a worker thread.
+  - Reconnect: the consume arguments are updated in place as messages are
+    processed, so aio-pika's robust restore, the consumer supervisor's
+    re-subscribe after a broker cancel, and `SyncBroker.run()`'s recovery all
+    resume at the processed offset + 1, never at `"next"` (which skipped
+    everything published during the outage) or at `"first"` again. Before the
+    first delivery a `"next"`/`"last"` consumer re-subscribes from its
+    subscription time minus 5 s.
+  - `RabbitQueue` stream retention options: `max_age` (`x-max-age`, format
+    validated) and `stream_max_segment_size_bytes`
+    (`x-stream-max-segment-size-bytes`), with `max_length_bytes`.
+  - Exported from `rabbitkit` and `rabbitkit.streams`: `StreamOffset`,
+    `StreamOffsetType`, `StreamConsumerConfig`, `OffsetStore`,
+    `InMemoryOffsetStore`, `SQLiteOffsetStore` (Advanced Stable tier).
+  - `consume(..., arguments=...)` on both transports (and the transport
+    protocols): `basic.consume` arguments; the brokers pass it only for
+    stream routes.
+- Real-broker tests `tests/integration/test_streams_foundation.py` (async and
+  sync, RabbitMQ 3.13 and 4.1): "first" sees every message in order with its
+  offset (a publisher-set `x-stream-offset` header is overwritten by the
+  broker); "next" sees only new messages; a timestamp start; stop after K and
+  restart with `SQLiteOffsetStore` resumes at K with no gap or duplicate; a
+  crash replays exactly the uncommitted messages (at most `commit_every`); a
+  connection kill mid-stream resumes without skipping and not from "first";
+  a reconnect before the first delivery does not skip; a failed message is
+  skipped, not redelivered; retry / ACK_FIRST are refused at registration.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **Resource alarms by cause, from the client.** RabbitMQ's
+  `connection.blocked` carries a reason (`"low on disk"` / `"low on
+  memory"`). New gauge `rabbitkit_connection_blocked_reason{reason}` with the
+  bounded labels `disk`, `memory`, `other` is 1 for each alarm the active
+  reason names (all 0 while unblocked), and `transport.blocked_reason` (sync
+  and async) has the broker's text. On async, aiormq only logged the reason:
+  `ensure_aiormq_records_blocked_reason()` (called at connect) wraps aiormq's
+  private blocked handler at class level to keep it; on an aiormq without
+  that handler the reason is reported as `other`.
+  `BrokerMetrics.blocked(is_blocked, reason=None)` and
+  `BrokerMetrics.sample(..., connection_blocked_reason=None)` take it
+  (both new parameters optional).
+- **Quorum-queue health from the management API.** `QueueMetricsPoller` now
+  exports `rabbitkit_queue_quorum_members{queue}` and
+  `rabbitkit_queue_quorum_online{queue}` for every quorum queue, counted from
+  the `members` / `online` lists the management API reports (verified on
+  RabbitMQ 3.13 and 4.1, and on a 3-node cluster where `online` drops when a
+  member's node stops). `QueueInfo` gains `members`, `online`, `leader`.
+- **Alert rules that need no broker plugin.** `deploy/prometheus/rabbitkit-alerts.yaml`:
+  `RabbitMQDiskAlarm` / `RabbitMQMemoryAlarm` now come from
+  `connection_blocked_reason` (default groups, `source: rabbitkit`); new
+  `RabbitMQQuorumMajorityLost` (critical, `online <= members / 2`) and a
+  per-queue `RabbitMQQuorumUnhealthy` (warning, `online < members`) from the
+  poller; new `PublisherConfirmLatencyHigh` (p99 confirm latency); a
+  `rabbitkit-recording` group with the ratios the alerts compare. The
+  plugin-based rules moved to an alternative group,
+  `rabbitmq-broker-plugin` (`source: rabbitmq_prometheus`).
+- Nightly real-broker run on the aio-pika 9.1.0 floor:
+  `.github/workflows/dependency-matrix.yml`'s `integration-aio-pika-9` job is
+  now a matrix over 9.1.0 and 9.6.2.
+
 ### Fixed
 
 #### Earlier consumer and retry hardening
@@ -1036,6 +1298,40 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   the function unchanged and are now typed that way (`HandlerT -> HandlerT`).
   Annotations only, with no runtime change.
 
+#### Sync broker parity
+
+- The settlement metric (`messages_acked/nacked/rejected_total`) is counted
+  once per delivery when the sync processing deadline and the late handler
+  both report it.
+
+#### Streams
+
+- `StreamOffset.timestamp(dt).to_consume_arguments()` returns the
+  `datetime` (sent as an AMQP timestamp) instead of `int(dt.timestamp())`.
+  RabbitMQ reads an integer `x-stream-offset` as a numeric offset, so the
+  old value started from the wrong place (verified: it delivered nothing). A
+  naive `datetime` is taken as UTC. `StreamOffset(...)` now validates its
+  value at construction (an `OFFSET` needs a non-negative int, a `TIMESTAMP`
+  a datetime, the relative types no value).
+
+#### Alerts and aio-pika 9.x compatibility
+
+- **aio-pika 9.x: `connection_name` and `client_properties` never reached
+  the broker.** aio-pika 9.x `connect_robust()` folds `client_properties`
+  into `make_url()`, which returns a caller-supplied URL untouched, and never
+  passes them to the connection class (only aio-pika 10 does). On the whole
+  9.x line (the 9.1.0 floor through 9.6.2) connections were nameless in the
+  management UI. `RabbitkitRobustConnection` now sets them where aiormq reads
+  them, on every connect and reconnect.
+- **aio-pika 9.1: `RabbitMessage.timestamp` was a naive datetime.** pamqp
+  3.2 (resolved by aio-pika 9.1) decodes the AMQP timestamp with
+  `utcfromtimestamp()`; `.timestamp()` on it read it as local time, shifting
+  it by the host's UTC offset. The async transport now returns an aware UTC
+  datetime, like the sync transport.
+- Tests: the aiormq transport-factory unit test and the integration helper
+  that holds confirms open now work on aiormq 6.7 (aio-pika 9.1), so the
+  nightly dependency-matrix unit run on 9.1.0 passes.
+
 ### Deprecated
 
 #### Earlier consumer and retry hardening
@@ -1045,6 +1341,14 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `DeprecationWarning`. `jitter_factor` is documented as effective only with
   `jitter_mode="sharded"`: per-message-TTL jitter is not offered because a
   classic queue only expires its head message (head-of-line blocking).
+
+#### Streams
+
+- `from rabbitkit.experimental import StreamOffset, StreamOffsetType,
+  StreamConsumerConfig` still works but emits a `DeprecationWarning`; import
+  them from `rabbitkit` (or `rabbitkit.streams`). The aliases are removed no
+  earlier than the next minor release. They are no longer in
+  `rabbitkit.experimental.__all__`.
 
 ### Documentation
 
@@ -1166,6 +1470,57 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   and heartbeat detection, with measured timings. The heartbeat budget is
   about 5 × `heartbeat` with aio-pika (`(heartbeat + 1) × 3` s), not 2 ×.
   `TIMEOUT` publishes were observed to be committed later.
+
+#### Sync broker parity
+
+- `docs/reliable-messaging.md`: new "Processing deadline" and
+  "Broker-cancelled consumers" sections; the settlement table row for
+  `processing_timeout` no longer says "async only" and now states what both
+  brokers do (no retry copy: the deadline wraps the retry middleware); two
+  verified failure scenarios added (sync and async); the "enforced by
+  `AsyncBroker` only" note now covers only `max_in_flight_bytes`.
+- `docs/concurrency-model.md`: which thread runs sync handlers under a
+  deadline, settles expired deliveries and re-subscribes cancelled
+  consumers; the claim protocol; the M5 note applies only without a deadline.
+- `docs/observability.md`: `publish_in_flight` is no longer async-only;
+  `consumer_cancelled_total` / `route_consuming` cover the sync broker;
+  sync sampling caveat (gauges hold their last value while the I/O thread is
+  blocked inside a publish).
+- `docs/message-safety.md`, `docs/ack-policy.md`,
+  `docs/runbooks/consumer-failures.md`, `ConsumerConfig` / `WorkerConfig` /
+  `TimeoutMiddleware` docstrings: the sync caveats these changes make untrue
+  are removed or rewritten.
+
+#### Producer outbox
+
+- New `docs/outbox.md` (design, guarantees and what they do not cover,
+  async/sync/dedicated-thread usage, transactional enqueue, operations,
+  configuration) and `docs/api/outbox.md`.
+- `docs/reliable-messaging.md`: the producer-side loss window and the
+  durability scope now point to the outbox; `docs/observability.md` lists
+  the outbox metrics; `docs/bulk-operations.md` links the built-in outbox
+  from the outbox recipe; README section.
+
+#### Streams
+
+- New `docs/streams.md` (in the nav): when to choose a stream over a quorum
+  queue, declaring and retention, start offsets, offset tracking and stores,
+  the at-least-once replay window, reconnect behaviour, settlement and
+  failure semantics, limits (no single active consumer or server-side
+  offsets over AMQP 0.9.1, no filtering, CRITICAL requires quorum).
+- `docs/reliable-messaging.md`: a "Streams" section with the stream delivery
+  semantics.
+- `docs/stability-policy.md`: streams moved from Experimental to Advanced
+  Stable. `docs/api/streams.md`, the Full Guide's stream section and the
+  README updated.
+
+#### Alerts and aio-pika 9.x compatibility
+
+- `docs/observability.md`: the new metrics, the alert table, the plugin
+  alternative, and a "Tuning the alerts" section (which knob, how to derive
+  it from an SLO, examples). Runbooks updated (flow control, quorum,
+  consumer backlog, connection storm, publisher). `docs/troubleshooting.md`:
+  the two aio-pika 9.x notes.
 
 ## [0.19.2] — 2026-10-02
 

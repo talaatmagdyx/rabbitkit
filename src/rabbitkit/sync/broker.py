@@ -814,6 +814,7 @@ class SyncBroker:
             metrics.sample(
                 channels_active=transport.channels_active,
                 connection_blocked=transport.is_blocked,
+                connection_blocked_reason=transport.blocked_reason,
                 consuming={route.queue.name: bool(route.consumer_tag) for route in self._registry.routes},
             )
             pool = self._worker_pool
@@ -1137,7 +1138,7 @@ class SyncBroker:
         transport.on_channel_rebuilt(metrics.channel_rebuilt)
         transport.on_connection_state(metrics.connection_state)
         transport.on_reconnect_attempt(lambda _attempt, error: metrics.reconnect_failed("shared", error))
-        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_blocked(lambda: metrics.blocked(True, transport.blocked_reason))
         transport.on_unblocked(lambda: metrics.blocked(False))
         transport.on_publish_outcome(metrics.publish_outcome)
         metrics.take_over_confirm_latency(

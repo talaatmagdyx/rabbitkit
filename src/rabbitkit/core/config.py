@@ -183,8 +183,7 @@ class ConnectionConfig:
             _, sep, port = node.partition(":")
             if sep and not port.isdigit():
                 raise ConfigValidationError(
-                    f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; "
-                    "use 'host' or 'host:port'."
+                    f"ConnectionConfig.nodes entry {node!r} has a non-numeric port; use 'host' or 'host:port'."
                 )
         if self.reconnect_max_attempts < 1:
             raise ConfigValidationError(
@@ -206,8 +205,7 @@ class ConnectionConfig:
                 )
             if not isinstance(key, str) or not isinstance(cp_value, str):
                 raise ConfigValidationError(
-                    f"ConnectionConfig.client_properties keys and values must be "
-                    f"strings, got {key!r}={cp_value!r}."
+                    f"ConnectionConfig.client_properties keys and values must be strings, got {key!r}={cp_value!r}."
                 )
             if len(cp_value) > _CLIENT_PROPERTY_VALUE_MAX_LEN:
                 raise ConfigValidationError(
@@ -520,9 +518,7 @@ class ConsumerConfig:
                 "buffered in process memory)."
             )
         if self.graceful_timeout <= 0:
-            raise ConfigValidationError(
-                f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}"
-            )
+            raise ConfigValidationError(f"ConsumerConfig.graceful_timeout must be > 0, got {self.graceful_timeout}")
         if self.processing_timeout is not None and self.processing_timeout <= 0:
             raise ConfigValidationError(
                 f"ConsumerConfig.processing_timeout must be > 0 or None, got {self.processing_timeout}"
@@ -607,9 +603,7 @@ class RetryHandoffConfig:
 
     def __post_init__(self) -> None:
         if self.backoff_initial <= 0:
-            raise ConfigValidationError(
-                f"RetryHandoffConfig.backoff_initial must be > 0, got {self.backoff_initial}"
-            )
+            raise ConfigValidationError(f"RetryHandoffConfig.backoff_initial must be > 0, got {self.backoff_initial}")
         if self.backoff_max < self.backoff_initial:
             raise ConfigValidationError(
                 f"RetryHandoffConfig.backoff_max ({self.backoff_max}) must be >= backoff_initial "
@@ -779,14 +773,11 @@ class RetryConfig:
                 f"RetryConfig.error_detail must be 'sanitized', 'omit' or 'raw', got {self.error_detail!r}"
             )
         if self.jitter_mode not in ("off", "sharded"):
-            raise ConfigValidationError(
-                f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}"
-            )
+            raise ConfigValidationError(f"RetryConfig.jitter_mode must be 'off' or 'sharded', got {self.jitter_mode!r}")
         if self.jitter_mode == "sharded":
             if self.jitter_shards < 2:
                 raise ConfigValidationError(
-                    f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', "
-                    f"got {self.jitter_shards}"
+                    f"RetryConfig.jitter_shards must be >= 2 with jitter_mode='sharded', got {self.jitter_shards}"
                 )
             if not (0 < self.jitter_factor < 1):
                 raise ConfigValidationError(
@@ -819,7 +810,6 @@ class RetryConfig:
             if self.strict_delays:
                 raise ConfigValidationError(msg)
             warnings.warn(msg, UserWarning, stacklevel=2)
-
 
     @classmethod
     def exponential(
@@ -1115,6 +1105,17 @@ class MetricsConfig:
         """Number of consumers attached to the queue (0 = nothing draining)."""
         return f"{self.namespace}_queue_consumers"
 
+    @property
+    def queue_quorum_members(self) -> str:
+        """Quorum queues only: Raft members the queue is configured with."""
+        return f"{self.namespace}_queue_quorum_members"
+
+    @property
+    def queue_quorum_online(self) -> str:
+        """Quorum queues only: members currently online. The queue is
+        available while more than half of its members are online."""
+        return f"{self.namespace}_queue_quorum_online"
+
     # ── Broker/transport metrics (G-22, §19). Emitted by the broker itself
     # whenever any MetricsMiddleware with a collector is configured (publish
     # middlewares or any route), so publish-only brokers get them too. ──
@@ -1181,6 +1182,14 @@ class MetricsConfig:
         """Gauge: 1 while RabbitMQ has the connection blocked
         (``connection.blocked``: a memory or disk alarm), else 0."""
         return f"{self.namespace}_connection_blocked"
+
+    @property
+    def connection_blocked_reason(self) -> str:
+        """Gauge per bounded ``reason`` (``disk`` / ``memory`` / ``other``): 1
+        while the connection is blocked and the broker's ``connection.blocked``
+        reason names that alarm, else 0. The client-side form of the broker's
+        disk and memory alarms; needs no broker plugin."""
+        return f"{self.namespace}_connection_blocked_reason"
 
     @property
     def consumer_cancelled_total(self) -> str:
@@ -1316,8 +1325,7 @@ class DeduplicationConfig:
             )
         if self.on_in_flight not in ("nack_requeue", "ack_skip"):
             raise ConfigValidationError(
-                f"DeduplicationConfig.on_in_flight must be 'nack_requeue' or "
-                f"'ack_skip'; got {self.on_in_flight!r}"
+                f"DeduplicationConfig.on_in_flight must be 'nack_requeue' or 'ack_skip'; got {self.on_in_flight!r}"
             )
         if self.processing_timeout <= 0:
             raise ConfigValidationError(
@@ -1428,13 +1436,9 @@ class BatchPublishConfig:
                 f"BatchPublishConfig.flush_interval_ms must be >= 0, got {self.flush_interval_ms}"
             )
         if self.max_in_flight <= 0:
-            raise ConfigValidationError(
-                f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}"
-            )
+            raise ConfigValidationError(f"BatchPublishConfig.max_in_flight must be > 0, got {self.max_in_flight}")
         if self.flush_workers < 0:
-            raise ConfigValidationError(
-                f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}"
-            )
+            raise ConfigValidationError(f"BatchPublishConfig.flush_workers must be >= 0, got {self.flush_workers}")
 
 
 #: Settlement modes accepted by ``BatchAckConfig.mode``.

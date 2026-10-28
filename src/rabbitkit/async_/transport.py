@@ -561,6 +561,14 @@ class AsyncTransportImpl:
         ``FlowController``."""
         return self._blocked_state
 
+    @property
+    def blocked_reason(self) -> str | None:
+        """The broker's ``connection.blocked`` reason (``"low on disk"``,
+        ``"low on memory"``) while :attr:`is_blocked`, else ``None``."""
+        if not self._blocked_state:
+            return None
+        return next((m.blocked_reason for m in self._blocked_monitors if m.blocked_reason is not None), None)
+
     def _start_blocked_monitor(self, connection: Any) -> None:
         """Watch *connection* for ``connection.blocked`` (issue #37).
 
@@ -646,9 +654,12 @@ class AsyncTransportImpl:
         # aio-pika 9's pamqp can't encode field-table ints from -128 to -1
         # (queue/consume/bind arguments, publish headers); fix it before any
         # frame is built. A no-op on pamqp 4.
-        from rabbitkit.async_.connection import ensure_pamqp_encodes_negative_ints
+        from rabbitkit.async_.connection import ensure_aiormq_records_blocked_reason, ensure_pamqp_encodes_negative_ints
 
         ensure_pamqp_encodes_negative_ints()
+        # Before any aiormq connection exists (aiormq 6 binds frame handlers
+        # when its reader starts): keeps the connection.blocked reason.
+        ensure_aiormq_records_blocked_reason()
 
         await self._conn_pool.connect()
 

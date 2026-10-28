@@ -95,6 +95,8 @@ def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = N
         error=error,
         reason=reason,
     )
+
+
 # Shared with RabbitApp (core/signals.py); kept under the old private names.
 _is_loop_signal_handler = is_loop_signal_handler
 _is_default_signal_handler = is_default_signal_handler
@@ -1268,6 +1270,7 @@ class AsyncBroker:
                 publish_in_flight_bytes=limiter.used if limiter is not None else None,
                 publish_channels_in_use=transport.publish_channels_in_use,
                 connection_blocked=transport.is_blocked,
+                connection_blocked_reason=transport.blocked_reason,
                 consuming={
                     route.queue.name: bool(route.consumer_tag) and not route.runtime_state.consumer_cancelled
                     for route in self._registry.routes
@@ -1600,7 +1603,7 @@ class AsyncBroker:
         transport.on_connection_state(metrics.connection_state)
         transport.on_reconnect_attempt(lambda attempt: metrics.reconnect_failed(attempt.role, attempt.error))
         transport.on_connection_failed(metrics.connection_failed)
-        transport.on_blocked(lambda: metrics.blocked(True))
+        transport.on_blocked(lambda: metrics.blocked(True, transport.blocked_reason))
         transport.on_unblocked(lambda: metrics.blocked(False))
         transport.on_publish_outcome(metrics.publish_outcome)
         metrics.take_over_confirm_latency(

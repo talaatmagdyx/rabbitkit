@@ -531,6 +531,67 @@ class TestAiormqContract:
         assert not hasattr(conn, "connection_unblocked")
 
 
+class TestBlockedReason:
+    """aiormq only logs the connection.blocked reason; rabbitkit keeps it so
+    a disk alarm and a memory alarm can be told apart from client metrics."""
+
+    async def test_patched_handler_records_the_reason_and_still_blocks(self) -> None:
+        from types import SimpleNamespace
+
+        from rabbitkit.async_.connection import aiormq_blocked_reason, ensure_aiormq_records_blocked_reason
+
+        assert ensure_aiormq_records_blocked_reason() is True
+        assert ensure_aiormq_records_blocked_reason() is True  # idempotent
+        underlay = _aiormq_connection()
+        robust = _robust(underlay)
+        assert aiormq_blocked_reason(robust) is None
+        _unblocked(underlay).set()
+        await underlay._Connection__handle_connection_blocked(SimpleNamespace(reason="low on disk"))
+        assert aiormq_blocked_reason(robust) == "low on disk"
+        assert not _unblocked(underlay).is_set()  # aiormq's own handling still ran
+        await underlay._Connection__handle_connection_blocked(SimpleNamespace(reason=None))
+        assert aiormq_blocked_reason(robust) is None
+
+    def test_no_handler_on_this_aiormq_changes_nothing(self) -> None:
+        from aiormq.connection import Connection
+
+        from rabbitkit.async_.connection import ensure_aiormq_records_blocked_reason
+
+        name = "_Connection__handle_connection_blocked"
+        original = getattr(Connection, name)
+        delattr(Connection, name)
+        try:
+            assert ensure_aiormq_records_blocked_reason() is False
+            assert not hasattr(Connection, name)
+        finally:
+            setattr(Connection, name, original)
+
+    def test_no_live_transport_has_no_reason(self) -> None:
+        from unittest.mock import MagicMock
+
+        from rabbitkit.async_.connection import aiormq_blocked_reason
+
+        conn = MagicMock()
+        conn.transport = None
+        assert aiormq_blocked_reason(conn) is None
+
+    async def test_monitor_reports_the_reason_only_while_blocked(self) -> None:
+        from rabbitkit.async_.connection import BlockedConnectionMonitor
+
+        underlay = _aiormq_connection()
+        monitor = BlockedConnectionMonitor(_robust(underlay), blocked_timeout=0)
+        underlay._rabbitkit_blocked_reason = "low on memory"
+        _unblocked(underlay).set()
+        await monitor.poll(0.0)
+        assert monitor.blocked_reason is None
+        _unblocked(underlay).clear()
+        await monitor.poll(1.0)
+        assert monitor.is_blocked and monitor.blocked_reason == "low on memory"
+        _unblocked(underlay).set()
+        await monitor.poll(2.0)
+        assert monitor.blocked_reason is None
+
+
 class TestBlockedConnectionMonitor:
     async def test_transitions_fire_callbacks(self) -> None:
         from rabbitkit.async_.connection import BlockedConnectionMonitor

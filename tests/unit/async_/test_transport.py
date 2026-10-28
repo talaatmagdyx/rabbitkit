@@ -1654,6 +1654,18 @@ class TestBlockedUnblockedCallbacks:
         transport._aio_unblocked()
         assert events == ["blocked", "unblocked"] and not transport.is_blocked
 
+    def test_blocked_reason_comes_from_a_blocked_monitor(self) -> None:
+        transport = _make_transport()
+        assert transport.blocked_reason is None
+        pub = MagicMock(is_blocked=True, blocked_reason=None)
+        con = MagicMock(is_blocked=True, blocked_reason="low on disk")
+        transport._blocked_monitors = [pub, con]
+        assert transport.blocked_reason is None  # not blocked yet at the transport level
+        transport._aio_blocked()
+        assert transport.blocked_reason == "low on disk"
+        con.blocked_reason = None
+        assert transport.blocked_reason is None
+
     def test_aio_blocked_with_no_callbacks_is_noop(self) -> None:
         """_aio_blocked() with empty list does nothing."""
         transport = _make_transport()
@@ -2951,7 +2963,10 @@ class TestReviewFindingsAsyncTransport:
 
     async def test_connect_fixes_pamqp_before_any_frame(self) -> None:
         transport = _make_transport()
-        with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
+        with (
+            patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix,
+            patch("rabbitkit.async_.connection.ensure_aiormq_records_blocked_reason") as reason,
+        ):
             with patch(
                 "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
                 return_value={"url": "amqp://guest:guest@localhost/"},
@@ -2959,6 +2974,7 @@ class TestReviewFindingsAsyncTransport:
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()
         fix.assert_called_once()
+        reason.assert_called_once()
 
 
 # ── G-08 / G-10: connection hooks, terminal failure, atomic connect ─────

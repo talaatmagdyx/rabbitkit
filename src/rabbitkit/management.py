@@ -121,6 +121,11 @@ class QueueInfo(TypedDict, total=False):
     messages_unacknowledged: int
     consumers: int
     state: str
+    # Quorum queues only: node names of the Raft members, the ones online,
+    # and the current leader (RabbitMQ 3.8+).
+    members: list[str]
+    online: list[str]
+    leader: str
 
 
 class ExchangeInfo(TypedDict, total=False):

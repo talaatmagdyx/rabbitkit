@@ -33,8 +33,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
-import sqlite3
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -184,6 +182,11 @@ class OffsetStore(Protocol):
     else the queue name). ``save`` stores the last *processed* offset; the
     consumer resumes at ``load(key) + 1``.
 
+    rabbitkit ships only :class:`InMemoryOffsetStore` (offsets survive
+    reconnects, not restarts). For restarts, implement these two methods over
+    the storage your service already uses (its database, a key-value store, a
+    file), ideally in the same transaction as the handler's own writes.
+
     Called from whichever thread settles messages (SyncBroker: the I/O or a
     worker thread) or from a worker thread (AsyncBroker offloads every
     store except :class:`InMemoryOffsetStore`), so implementations must be
@@ -224,69 +227,6 @@ class InMemoryOffsetStore:
             self._offsets.pop(key, None)
 
 
-class SQLiteOffsetStore:
-    """Durable offsets in a local SQLite file (stdlib ``sqlite3``).
-
-    Each ``save`` is one committed transaction with ``synchronous=FULL``, so
-    a committed offset survives a process or machine crash. One file can hold
-    any number of consumers (one row per key, table
-    ``rabbitkit_stream_offsets``); several processes may share it
-    (SQLite serialises writers), as long as no two run the same key.
-
-    The parent directory must exist; the file and table are created on
-    construction, so a bad path fails at startup.
-    """
-
-    def __init__(self, path: str | os.PathLike[str], *, timeout: float = 5.0) -> None:
-        self._path = os.fspath(path)
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self._path, timeout=timeout, check_same_thread=False, isolation_level=None)
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS rabbitkit_stream_offsets "
-                "(key TEXT PRIMARY KEY, offset INTEGER NOT NULL, updated_at REAL NOT NULL)"
-            )
-        except BaseException:
-            self._conn.close()
-            raise
-
-    @property
-    def path(self) -> str:
-        """The database file."""
-        return self._path
-
-    def load(self, key: str) -> int | None:
-        with self._lock:
-            row = self._conn.execute("SELECT offset FROM rabbitkit_stream_offsets WHERE key = ?", (key,)).fetchone()
-        return None if row is None else int(row[0])
-
-    def save(self, key: str, offset: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO rabbitkit_stream_offsets (key, offset, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET offset = excluded.offset, updated_at = excluded.updated_at",
-                (key, offset, time.time()),
-            )
-
-    def reset(self, key: str) -> None:
-        """Forget *key*: its consumer starts at its configured offset again."""
-        with self._lock:
-            self._conn.execute("DELETE FROM rabbitkit_stream_offsets WHERE key = ?", (key,))
-
-    def close(self) -> None:
-        """Close the database connection."""
-        with self._lock:
-            self._conn.close()
-
-    def __enter__(self) -> SQLiteOffsetStore:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
-
 # ── Consumer configuration ────────────────────────────────────────────────
 
 
@@ -304,8 +244,8 @@ class StreamConsumerConfig:
             same stream through one store.
         offset_store: where the processed offset is committed. ``None``: an
             :class:`InMemoryOffsetStore` (reconnects resume, restarts start at
-            *offset* again). Use :class:`SQLiteOffsetStore` or your own
-            :class:`OffsetStore` to resume across restarts.
+            *offset* again). Pass your own :class:`OffsetStore`, backed by
+            your service's storage, to resume across restarts.
         commit_every: commit after this many newly processed messages.
         commit_interval: also commit when this many seconds passed since the
             last commit (checked when a message is settled; ``None``: count
@@ -632,7 +572,6 @@ __all__ = [
     "STREAM_OFFSET_ARG",
     "InMemoryOffsetStore",
     "OffsetStore",
-    "SQLiteOffsetStore",
     "StreamConsumerConfig",
     "StreamOffset",
     "StreamOffsetLike",

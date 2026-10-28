@@ -100,7 +100,7 @@ class TestStreamsGraduated:
     DeprecationWarning (docs/stability-policy.md)."""
 
     MOVED: ClassVar[list[str]] = ["StreamConsumerConfig", "StreamOffset", "StreamOffsetType"]
-    TOP_LEVEL: ClassVar[list[str]] = [*MOVED, "OffsetStore", "InMemoryOffsetStore", "SQLiteOffsetStore"]
+    TOP_LEVEL: ClassVar[list[str]] = [*MOVED, "OffsetStore", "InMemoryOffsetStore"]
 
     @pytest.mark.parametrize("name", TOP_LEVEL)
     def test_exported_at_top_level_and_from_streams(self, name: str) -> None:

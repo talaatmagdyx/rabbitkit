@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import signal
 import threading
 import time
@@ -36,6 +38,38 @@ from typing import Any
 import pytest
 
 from tests.integration.conftest import skip_without_docker
+
+
+class _FileOffsetStore:
+    """A durable OffsetStore written the way an application would: one JSON
+    file, replaced atomically on every save. rabbitkit ships no durable store;
+    the service brings its own storage."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+
+    def load(self, key: str) -> int | None:
+        with self._lock:
+            if not self._path.exists():
+                return None
+            value = json.loads(self._path.read_text()).get(key)
+        return None if value is None else int(value)
+
+    def save(self, key: str, offset: int) -> None:
+        with self._lock:
+            data = json.loads(self._path.read_text()) if self._path.exists() else {}
+            data[key] = offset
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            os.replace(tmp, self._path)
+
+    def __enter__(self) -> _FileOffsetStore:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
 
 pytestmark = pytest.mark.integration
 
@@ -428,8 +462,6 @@ def _sync_run(url: str, queue: Any, store: Any, until: Callable[[_Seen], bool], 
 
 
 async def test_async_restart_resumes_from_the_durable_store(rabbit: dict[str, Any], tmp_path: Path) -> None:
-    from rabbitkit import SQLiteOffsetStore
-
     url = rabbit["url"]
     queue = _stream(_name("resume-a"))
     await asyncio.to_thread(_declare, url, queue)
@@ -437,7 +469,7 @@ async def test_async_restart_resumes_from_the_durable_store(rabbit: dict[str, An
     db = tmp_path / "offsets.db"
 
     first = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         await _async_run(url, queue, store, lambda s: len(s.offsets) >= K, first)
         stored = store.load(queue.name)
     processed = first.offsets
@@ -448,7 +480,7 @@ async def test_async_restart_resumes_from_the_durable_store(rabbit: dict[str, An
     await asyncio.to_thread(_publish, url, queue.name, _bodies(N, 2 * N))
 
     second = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         await _async_run(url, queue, store, lambda s: bool(s.offsets) and s.offsets[-1] == 2 * N - 1, second)
         assert store.load(queue.name) == 2 * N - 1
     assert second.offsets[0] == stored + 1, "the restart resumes right after the committed offset"
@@ -456,8 +488,6 @@ async def test_async_restart_resumes_from_the_durable_store(rabbit: dict[str, An
 
 
 def test_sync_restart_resumes_from_the_durable_store(rabbit: dict[str, Any], tmp_path: Path) -> None:
-    from rabbitkit import SQLiteOffsetStore
-
     url = rabbit["url"]
     queue = _stream(_name("resume-s"))
     _declare(url, queue)
@@ -465,7 +495,7 @@ def test_sync_restart_resumes_from_the_durable_store(rabbit: dict[str, Any], tmp
     db = tmp_path / "offsets.db"
 
     first = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         _sync_run(url, queue, store, lambda s: len(s.offsets) >= K, first)
         stored = store.load(queue.name)
     processed = first.offsets
@@ -475,7 +505,7 @@ def test_sync_restart_resumes_from_the_durable_store(rabbit: dict[str, Any], tmp
     _publish(url, queue.name, _bodies(N, 2 * N))
 
     second = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         _sync_run(url, queue, store, lambda s: bool(s.offsets) and s.offsets[-1] == 2 * N - 1, second)
         assert store.load(queue.name) == 2 * N - 1
     assert second.offsets[0] == stored + 1
@@ -483,8 +513,6 @@ def test_sync_restart_resumes_from_the_durable_store(rabbit: dict[str, Any], tmp
 
 
 async def test_async_crash_replays_at_most_the_commit_window(rabbit: dict[str, Any], tmp_path: Path) -> None:
-    from rabbitkit import SQLiteOffsetStore
-
     url = rabbit["url"]
     queue = _stream(_name("crash-a"))
     await asyncio.to_thread(_declare, url, queue)
@@ -492,14 +520,14 @@ async def test_async_crash_replays_at_most_the_commit_window(rabbit: dict[str, A
     db = tmp_path / "offsets.db"
 
     first = _Seen()
-    with SQLiteOffsetStore(db) as inner:
+    with _FileOffsetStore(db) as inner:
         await _async_run(url, queue, _CrashingStore(inner), lambda s: len(s.offsets) >= K, first)
         stored = inner.load(queue.name)
     assert first.offsets == list(range(K))
     assert stored == 9, "commits landed at offsets 4 and 9 (commit_every=5); 10 and 11 were not committed"
 
     second = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         await _async_run(url, queue, store, lambda s: bool(s.offsets) and s.offsets[-1] == N - 1, second)
     assert second.offsets == list(range(stored + 1, N))
     duplicates = set(first.offsets) & set(second.offsets)
@@ -508,8 +536,6 @@ async def test_async_crash_replays_at_most_the_commit_window(rabbit: dict[str, A
 
 
 def test_sync_crash_replays_at_most_the_commit_window(rabbit: dict[str, Any], tmp_path: Path) -> None:
-    from rabbitkit import SQLiteOffsetStore
-
     url = rabbit["url"]
     queue = _stream(_name("crash-s"))
     _declare(url, queue)
@@ -517,14 +543,14 @@ def test_sync_crash_replays_at_most_the_commit_window(rabbit: dict[str, Any], tm
     db = tmp_path / "offsets.db"
 
     first = _Seen()
-    with SQLiteOffsetStore(db) as inner:
+    with _FileOffsetStore(db) as inner:
         _sync_run(url, queue, _CrashingStore(inner), lambda s: len(s.offsets) >= K, first)
         stored = inner.load(queue.name)
     assert first.offsets == list(range(K))
     assert stored == 9
 
     second = _Seen()
-    with SQLiteOffsetStore(db) as store:
+    with _FileOffsetStore(db) as store:
         _sync_run(url, queue, store, lambda s: bool(s.offsets) and s.offsets[-1] == N - 1, second)
     assert second.offsets == list(range(stored + 1, N))
     assert set(first.offsets) & set(second.offsets) == {10, 11}

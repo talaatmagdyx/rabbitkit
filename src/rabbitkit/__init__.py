@@ -176,7 +176,6 @@ from rabbitkit.serialization.pipeline import (
 from rabbitkit.streams import (
     InMemoryOffsetStore,
     OffsetStore,
-    SQLiteOffsetStore,
     StreamConsumerConfig,
     StreamOffset,
     StreamOffsetType,
@@ -314,7 +313,6 @@ __all__ = [
     "RetryDisabled",
     "RetryHandoffConfig",
     "RetryHandoffTracker",
-    "SQLiteOffsetStore",
     "SSLConfig",
     "SafetyConfig",
     "SanitizedError",

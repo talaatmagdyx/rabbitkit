@@ -402,8 +402,8 @@ queue contract above (details: [Streams](streams.md)):
   provisioned.
 - **Durability** is the stream's (replicated like a quorum queue) for the
   messages; the consumer position is as durable as its `OffsetStore`
-  (`InMemoryOffsetStore`: process lifetime; `SQLiteOffsetStore`: survives a
-  crash).
+  (`InMemoryOffsetStore`: process lifetime; an application-supplied store:
+  as durable as that storage).
 - **Ordering**: one consumer reads in log order; concurrent handlers may
   finish out of order, but the committed position never passes an
   unfinished message.

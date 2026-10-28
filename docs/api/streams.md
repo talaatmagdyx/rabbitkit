@@ -8,4 +8,3 @@ Consuming streams (offsets, offset stores, delivery semantics): see the
 ::: rabbitkit.streams.StreamOffsetType
 ::: rabbitkit.streams.OffsetStore
 ::: rabbitkit.streams.InMemoryOffsetStore
-::: rabbitkit.streams.SQLiteOffsetStore

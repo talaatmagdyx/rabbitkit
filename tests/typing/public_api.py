@@ -52,7 +52,6 @@ from rabbitkit import (
     RabbitQueue,
     ReliabilityProfile,
     RetryConfig,
-    SQLiteOffsetStore,
     StreamConsumerConfig,
     StreamOffset,
     StreamOffsetType,
@@ -262,7 +261,7 @@ def exercise_test_broker() -> int:
 def exercise_streams(path: str) -> None:
     broker = AsyncBroker(RabbitConfig())
     events = RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D", max_length_bytes=10_000_000)
-    store: OffsetStore = SQLiteOffsetStore(path)
+    store: OffsetStore = InMemoryOffsetStore()
     config = StreamConsumerConfig(offset=StreamOffset.first(), offset_store=store, commit_every=50)
     assert_type(config.offset, StreamOffset)
     assert_type(config.offset.type, StreamOffsetType)

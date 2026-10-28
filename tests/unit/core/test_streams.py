@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,7 +15,6 @@ from rabbitkit.core.streams import (
     STREAM_OFFSET_ARG,
     InMemoryOffsetStore,
     OffsetStore,
-    SQLiteOffsetStore,
     StreamConsumerConfig,
     StreamOffset,
     StreamOffsetTracker,
@@ -158,39 +155,6 @@ class TestInMemoryOffsetStore:
         store.reset("a")
         store.reset("missing")
         assert store.load("a") is None
-
-
-class TestSQLiteOffsetStore:
-    def test_offsets_survive_a_new_store_on_the_same_file(self, tmp_path: Path) -> None:
-        db = tmp_path / "offsets.db"
-        with SQLiteOffsetStore(db) as store:
-            assert isinstance(store, OffsetStore)
-            assert store.path == str(db)
-            assert store.load("events") is None
-            store.save("events", 10)
-            store.save("events", 11)
-            store.save("audit", 3)
-        with SQLiteOffsetStore(db) as reopened:
-            assert reopened.load("events") == 11
-            assert reopened.load("audit") == 3
-            reopened.reset("events")
-            assert reopened.load("events") is None
-            assert reopened.load("audit") == 3
-
-    def test_close_closes_the_connection(self, tmp_path: Path) -> None:
-        store = SQLiteOffsetStore(tmp_path / "o.db")
-        store.close()
-        with pytest.raises(sqlite3.ProgrammingError):
-            store.load("x")
-
-    def test_a_file_that_is_not_a_database_fails_at_construction(self, tmp_path: Path) -> None:
-        bogus = tmp_path / "not.db"
-        bogus.write_bytes(b"this is not a sqlite database, just some bytes" * 100)
-        with pytest.raises(sqlite3.DatabaseError):
-            SQLiteOffsetStore(bogus)
-
-
-# ── tracker ──────────────────────────────────────────────────────────────
 
 
 class _Clock:
@@ -519,21 +483,31 @@ class TestTrackerAsync:
         await tracker.flush_async()
         assert tracker.committed_offset == 2
 
-    async def test_a_durable_store_is_committed_off_the_loop(self, tmp_path: Path) -> None:
-        with SQLiteOffsetStore(tmp_path / "o.db") as store:
-            tracker = _tracker(store=store, commit_every=1)
-            first, second = _async_msg(0, 1), _async_msg(1, 2)
-            tracker.track(first)
-            tracker.track(second)
-            await first.ack_async()
-            task = tracker._commit_task
-            assert task is not None
-            await second.ack_async()  # a commit is already running: no second task
-            assert tracker._commit_task is task
-            await tracker.flush_async()
-            assert tracker._commit_task is None
-            assert store.load("events") == 1
-            assert tracker.committed_offset == 1
+    async def test_a_durable_store_is_committed_off_the_loop(self) -> None:
+        class ApplicationStore:  # any OffsetStore that is not the in-memory default
+            def __init__(self) -> None:
+                self.offsets: dict[str, int] = {}
+
+            def load(self, key: str) -> int | None:
+                return self.offsets.get(key)
+
+            def save(self, key: str, offset: int) -> None:
+                self.offsets[key] = offset
+
+        store = ApplicationStore()
+        tracker = _tracker(store=store, commit_every=1)
+        first, second = _async_msg(0, 1), _async_msg(1, 2)
+        tracker.track(first)
+        tracker.track(second)
+        await first.ack_async()
+        task = tracker._commit_task
+        assert task is not None
+        await second.ack_async()  # a commit is already running: no second task
+        assert tracker._commit_task is task
+        await tracker.flush_async()
+        assert tracker._commit_task is None
+        assert store.load("events") == 1
+        assert tracker.committed_offset == 1
 
     async def test_flush_async_survives_a_failed_commit_task(self) -> None:
         tracker = _tracker(store=_RecordingStore())

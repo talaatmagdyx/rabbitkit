@@ -7,10 +7,10 @@ removes them. rabbitkit consumes streams over AMQP 0.9.1 through ordinary
 routes, on `AsyncBroker` and `SyncBroker`.
 
 ```python
-from rabbitkit import AsyncBroker, QueueType, RabbitMessage, RabbitQueue, SQLiteOffsetStore, StreamConsumerConfig
+from rabbitkit import AsyncBroker, QueueType, RabbitMessage, RabbitQueue, StreamConsumerConfig
 
 broker = AsyncBroker()
-offsets = SQLiteOffsetStore("/var/lib/billing/offsets.db")
+offsets = BillingOffsets(db)  # your OffsetStore over your own storage (below)
 
 events = RabbitQueue(
     "events",
@@ -26,7 +26,7 @@ async def project(body: dict, message: RabbitMessage) -> None:
 ```
 
 The first run reads from the oldest retained message. Each processed offset
-is committed to `offsets.db`; a restart resumes right after the last
+is committed to your offset store; a restart resumes right after the last
 committed one, and a reconnect resumes right after the last processed one.
 
 The `rabbitmq_stream` plugin is **not** needed: AMQP 0.9.1 consumers read
@@ -87,8 +87,8 @@ route's queue anyway: that is how rabbitkit knows to consume it as a stream.
 
 The start position applies only when the offset store has nothing for this
 consumer. Once an offset is stored, the consumer resumes at `stored + 1`
-whatever `offset` says. To replay from the start, reset the stored offset
-(`SQLiteOffsetStore.reset(key)`) or use a new `consumer_name`.
+whatever `offset` says. To replay from the start, delete the stored offset
+for that key in your store, or use a new `consumer_name`.
 
 `message.stream_offset` is each delivery's offset, from the
 `x-stream-offset` header RabbitMQ sets on every stream delivery (a
@@ -122,13 +122,30 @@ Stores:
 
 - `InMemoryOffsetStore` (default): survives reconnects, not restarts. A
   restarted process starts at `offset` again.
-- `SQLiteOffsetStore(path)`: one SQLite file (stdlib `sqlite3`, WAL,
-  `synchronous=FULL`), one row per consumer key. Each commit is a durable
-  transaction. Several processes may share the file as long as they do not
-  share a key.
-- Your own: any object with `load(key) -> int | None` and
-  `save(key, offset) -> None` (the `OffsetStore` protocol), thread-safe;
-  for example a table in your application database.
+- Your own, for restarts: rabbitkit is a RabbitMQ library and ships no
+  storage. Any thread-safe object with `load(key) -> int | None` and
+  `save(key, offset) -> None` (the `OffsetStore` protocol) works. Keep it in
+  the storage your service already uses, ideally in the same transaction as
+  the handler's writes, so the offset and the effect commit together.
+
+```python
+class BillingOffsets:
+    """OffsetStore over a table the service already owns."""
+
+    def __init__(self, db) -> None:
+        self.db = db
+
+    def load(self, key: str) -> int | None:
+        row = self.db.execute("SELECT offset FROM stream_offsets WHERE key = %s", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def save(self, key: str, offset: int) -> None:
+        self.db.execute(
+            "INSERT INTO stream_offsets (key, offset) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET offset = EXCLUDED.offset",
+            (key, offset),
+        )
+```
 
 `AsyncBroker` runs commits to any store other than `InMemoryOffsetStore` in
 a worker thread, so a commit never blocks the event loop; `SyncBroker`
@@ -219,8 +236,7 @@ no `<queue>.dlq` is provisioned (RabbitMQ would refuse the
 ## API
 
 See [API: Streams](api/streams.md): `StreamOffset`, `StreamOffsetType`,
-`StreamConsumerConfig`, `OffsetStore`, `InMemoryOffsetStore`,
-`SQLiteOffsetStore`. All are exported from `rabbitkit` and
+`StreamConsumerConfig`, `OffsetStore`, `InMemoryOffsetStore`. All are exported from `rabbitkit` and
 `rabbitkit.streams`. Importing `StreamOffset`, `StreamOffsetType` or
 `StreamConsumerConfig` from `rabbitkit.experimental` still works but emits a
 `DeprecationWarning`.

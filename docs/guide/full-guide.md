@@ -1451,17 +1451,18 @@ result = await backend.fetch(correlation_id)
 ## 20. Stream Queues
 
 ```python
-from rabbitkit import QueueType, RabbitMessage, RabbitQueue, SQLiteOffsetStore, StreamConsumerConfig
+from rabbitkit import QueueType, RabbitMessage, RabbitQueue, StreamConsumerConfig
 
 events = RabbitQueue("events", queue_type=QueueType.STREAM, max_age="7D", max_length_bytes=20_000_000_000)
 
-# Start from the oldest retained message; commit the processed offset to a
-# local SQLite file so a restart resumes after the last committed one.
+# Start from the oldest retained message; commit the processed offset to your
+# own OffsetStore (load/save over your storage) so a restart resumes after the
+# last committed one. Without one, offsets survive reconnects, not restarts.
 @broker.subscriber(
     events,
     stream=StreamConsumerConfig(
         offset="first",                   # "first" | "last" | "next" | int offset | datetime
-        offset_store=SQLiteOffsetStore("offsets.db"),
+        offset_store=my_offset_store,   # your OffsetStore; see docs/streams.md
         commit_every=100,                 # commit after 100 processed messages ...
         commit_interval=5.0,              # ... or 5 s, and always at stop()
     ),

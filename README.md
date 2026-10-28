@@ -471,8 +471,8 @@ topology validation/drift/migration CLI, health watcher, circuit-breaker
 middleware (bring any `CircuitBreakerProtocol` implementation, e.g.
 pybreaker), and RabbitMQ streams: `subscriber(stream_offset="first")` on a
 `QueueType.STREAM` queue, per-delivery `message.stream_offset`, retention
-options, a durable `SQLiteOffsetStore` so restarts and reconnects resume
-where they left off (at-least-once; no retry/DLQ on streams). See
+options, and an `OffsetStore` protocol (in-memory by default; plug in your
+own storage) so restarts and reconnects resume where they left off (at-least-once; no retry/DLQ on streams). See
 [Streams](https://github.com/talaatmagdyx/rabbitkit/blob/main/docs/streams.md).
 
 **Experimental** (may change without a deprecation cycle — read the

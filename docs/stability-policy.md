@@ -80,7 +80,7 @@ it is not part of the "understand rabbitkit in 10 minutes" story.
 | DLQ inspection (`DLQInspector`) + the CLI's `dlq` commands | `rabbitkit` | |
 | RabbitMQ Management API client (`RabbitManagementClient`) | `rabbitkit` | Async methods require `rabbitkit[management]` (aiohttp). |
 | CLI (`rabbitkit run`/`health`/`topology`/`routes`/`shell`) | `rabbitkit[cli]` | |
-| Stream queues (`StreamOffset`, `StreamOffsetType`, `StreamConsumerConfig`, `OffsetStore`, `InMemoryOffsetStore`, `SQLiteOffsetStore`; `subscriber(stream=` / `stream_offset=)`; `RabbitMessage.stream_offset`) | `rabbitkit` / `rabbitkit.streams` | Consumed over AMQP 0.9.1 with client-side offset tracking; see [Streams](streams.md). Promoted from Experimental: the `rabbitkit.experimental` names still import, with a `DeprecationWarning`, for one minor version. |
+| Stream queues (`StreamOffset`, `StreamOffsetType`, `StreamConsumerConfig`, `OffsetStore`, `InMemoryOffsetStore`; `subscriber(stream=` / `stream_offset=)`; `RabbitMessage.stream_offset`) | `rabbitkit` / `rabbitkit.streams` | Consumed over AMQP 0.9.1 with client-side offset tracking; see [Streams](streams.md). Promoted from Experimental: the `rabbitkit.experimental` names still import, with a `DeprecationWarning`, for one minor version. |
 | `CircuitBreakerMiddleware` | `rabbitkit` | **Requires a `CircuitBreakerProtocol`-compatible implementation (e.g. pybreaker) to do anything** — it's a no-op passthrough without one. Exported at the top level for convenience, but treat the dependency as a real one before adopting it. |
 
 ---

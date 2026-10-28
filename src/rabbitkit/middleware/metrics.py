@@ -831,7 +831,6 @@ _RETRY = "RetryMiddleware"
 _BULK = "broker bulk API"
 _ACKER = "coalescing acker"
 _POLLER = "QueueMetricsPoller"
-_OUTBOX = "producer outbox"
 
 # (MetricsConfig property, kind, labels, emitter, help)
 _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
@@ -945,21 +944,6 @@ _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
     ("queue_messages_unacked", "gauge", ("queue",), _POLLER, "Messages delivered, not yet acked."),
     ("queue_messages_total", "gauge", ("queue",), _POLLER, "Ready plus unacked."),
     ("queue_consumers", "gauge", ("queue",), _POLLER, "Consumers attached to the queue."),
-    # producer outbox (rabbitkit.outbox)
-    ("outbox_pending", "gauge", (), _OUTBOX, "Entries waiting to be published and confirmed."),
-    ("outbox_failed_entries", "gauge", (), _OUTBOX, "Entries in the failed state (kept until replayed or purged)."),
-    ("outbox_bytes", "gauge", (), _OUTBOX, "Bytes held by the outbox (pending and failed)."),
-    ("outbox_enqueued_total", "counter", (), _OUTBOX, "Entries durably written."),
-    ("outbox_relayed_total", "counter", (), _OUTBOX, "Entries confirmed by the broker and deleted."),
-    (
-        "outbox_publish_retries_total",
-        "counter",
-        ("status", "reason"),
-        _OUTBOX,
-        "Relay publishes not confirmed; the entry stays pending.",
-    ),
-    ("outbox_failed_total", "counter", ("status", "reason"), _OUTBOX, "Entries moved to the failed state."),
-    ("outbox_full_total", "counter", ("reason",), _OUTBOX, "Enqueues refused at max_entries or max_bytes."),
     ("queue_quorum_members", "gauge", ("queue",), _POLLER, "Quorum queues: Raft members configured."),
     ("queue_quorum_online", "gauge", ("queue",), _POLLER, "Quorum queues: members online (majority = available)."),
 )
@@ -1009,7 +993,6 @@ def bounded_label_values() -> dict[str, frozenset[str] | None]:
             | CONNECTION_FAILURE_REASONS
             | set(BLOCKED_REASONS)
             | {REASON_NONE, REASON_EXCEPTION, REASON_OTHER, "nack", "drop", "wait_deadline_exceeded"}
-            | {"max_entries", "max_bytes"}
         ),
         "category": frozenset(c.value for c in ErrorCategory),
         "role": CONNECTION_ROLES,

@@ -98,14 +98,6 @@ state also updates the moment a connection drops or comes back.
 | `rabbitkit_queue_messages_unacked` | gauge | `queue` | QueueMetricsPoller | Messages delivered, not yet acked. |
 | `rabbitkit_queue_messages_total` | gauge | `queue` | QueueMetricsPoller | Ready plus unacked. |
 | `rabbitkit_queue_consumers` | gauge | `queue` | QueueMetricsPoller | Consumers attached to the queue. |
-| `rabbitkit_outbox_pending` | gauge | — | producer outbox | Entries waiting to be published and confirmed. |
-| `rabbitkit_outbox_failed_entries` | gauge | — | producer outbox | Entries in the failed state (kept until replayed or purged). |
-| `rabbitkit_outbox_bytes` | gauge | — | producer outbox | Bytes held by the outbox (pending and failed). |
-| `rabbitkit_outbox_enqueued_total` | counter | — | producer outbox | Entries durably written. |
-| `rabbitkit_outbox_relayed_total` | counter | — | producer outbox | Entries confirmed by the broker and deleted. |
-| `rabbitkit_outbox_publish_retries_total` | counter | `status`, `reason` | producer outbox | Relay publishes not confirmed; the entry stays pending. |
-| `rabbitkit_outbox_failed_total` | counter | `status`, `reason` | producer outbox | Entries moved to the failed state. |
-| `rabbitkit_outbox_full_total` | counter | `reason` | producer outbox | Enqueues refused at max_entries or max_bytes. |
 | `rabbitkit_queue_quorum_members` | gauge | `queue` | QueueMetricsPoller | Quorum queues: Raft members configured. |
 | `rabbitkit_queue_quorum_online` | gauge | `queue` | QueueMetricsPoller | Quorum queues: members online (majority = available). |
 | `rabbitkit_health_state` | gauge | — | HealthWatcher | Debounced health: 0 healthy, 1 degraded, 2 unhealthy. |
@@ -127,7 +119,7 @@ emission path and checks each label against it).
 | `queue` | the bound queue name (`x-rabbitkit-original-queue`), never the routing key |
 | `exchange` | the exchange name, `default` for `""` |
 | `status` | `PublishStatus` values (`confirmed`, `sent`, `returned`, `nacked`, `timeout`, `not_sent`, `unknown`, `error`); `success`/`error` on `messages_consumed_total`; the bulk and settlement item statuses |
-| `reason` | `PublishReason` codes, plus `none` (no reason: a success), `exception` (the publish call raised) and `other` (a reason outside `PublishReason`); connection failure reasons (below); bulk reason codes; rate-limit reasons; `max_entries` / `max_bytes` (`outbox_full_total`); `disk` / `memory` / `other` on `connection_blocked_reason` |
+| `reason` | `PublishReason` codes, plus `none` (no reason: a success), `exception` (the publish call raised) and `other` (a reason outside `PublishReason`); connection failure reasons (below); bulk reason codes; rate-limit reasons; `disk` / `memory` / `other` on `connection_blocked_reason` |
 | `category` | `ErrorCategory`: `retryable`, `permanent`, `invalid_message`, `unknown_outcome`, `infrastructure`, `shutdown` |
 | `role` | `publisher`, `consumer` (async, two connections), `shared` (sync, one connection), `connection` (a terminal failure without a role) |
 | `action` | `ack`, `nack`, `reject` |
@@ -180,16 +172,6 @@ connection), `connection_lost` (any other drop), `other`, and the terminal
   and mandatory pools' channels plus the topology, fast-publish and one per
   consumed queue (bounded by `2 × channel_pool_size + 2 + routes`); sync, the
   publisher channel plus one per consumed queue.
-- **`outbox_*`** come from the [producer outbox](outbox.md), through the
-  collector passed to it or, by default, the broker's first
-  `MetricsMiddleware` collector. Alert on `outbox_pending` growing (the
-  relay is not keeping up or the broker is unreachable), on
-  `outbox_failed_entries > 0` (entries that need an operator: replay or
-  purge), and on `outbox_full_total` rising (enqueues refused).
-  `outbox_publish_retries_total{status,reason}` and
-  `outbox_failed_total{status,reason}` use the same values as
-  `messages_published_total`; an exception raised by `publish()` is
-  `status="error", reason="exception"`.
 - **`reconnect_attempts_total`** counts FAILED reconnect attempts;
   `reconnects_total` counts successful ones (one per connection).
 - **`connection_blocked`** is 1 between RabbitMQ's `connection.blocked` and

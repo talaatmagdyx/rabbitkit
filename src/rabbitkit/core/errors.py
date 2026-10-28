@@ -531,28 +531,3 @@ class BackpressureError(Exception):
 
     Only raised when ``BackpressureConfig.on_blocked == "raise"``.
     """
-
-
-# ── Producer outbox ──────────────────────────────────────────────────────
-
-
-class OutboxError(Exception):
-    """Base class for producer-outbox errors (:mod:`rabbitkit.core.outbox`)."""
-
-
-class OutboxFullError(OutboxError):
-    """An enqueue would exceed ``OutboxConfig.max_entries`` or ``max_bytes``.
-
-    Nothing was written. ``limit`` is ``"max_entries"`` or ``"max_bytes"``.
-    This is the outbox's backpressure signal: the relay is not keeping up
-    (broker down, failed entries piling up), so the caller must slow down,
-    fail the request, or fix the backlog.
-    """
-
-    def __init__(self, message: str, *, limit: str) -> None:
-        super().__init__(message)
-        self.limit = limit
-
-
-class OutboxClosedError(OutboxError):
-    """The outbox (or its store) was stopped or closed; nothing was written."""

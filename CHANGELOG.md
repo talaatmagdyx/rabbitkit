@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-28
+
 Reliability foundation for the async (aio-pika) path. Every gap from the
 RabbitMQ Async Messaging Foundation audit is closed or documented; see
 `docs/reliable-messaging.md` for the resulting contract. Several defaults
@@ -781,8 +783,8 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   `cluster_chaos`, nightly job `cluster-chaos` in `integration.yml` under
   `RK_REQUIRE_BROKER=1`). F19 covers quorum loss on a 3-node cluster (async
   and sync). F20 covers a network partition through toxiproxy, both
-  directions and one-way, with traffic and idle. Three defects they found
-  are pinned as strict xfails (see Documentation).
+  directions and one-way, with traffic and idle. The three defects they
+  found are fixed (see Fixed).
 
 ### Fixed
 
@@ -999,6 +1001,34 @@ change behaviour: read **Changed (behaviour)** before upgrading.
 
 #### Hardening
 
+- **Publishes queued during a network partition resolved one after
+  another.** With a 3 s `channel_acquire_timeout`, five concurrent publishes
+  resolved at 8 to 20 s: the publisher-connection rebuild ran under the pool
+  lock and neither it nor the lazy reconnect was bounded by the caller's
+  deadline. Both are now bounded by it (`NOT_SENT`, `admission_timeout`), and
+  the rebuild abandons the dead connection and channels instead of waiting
+  for a Close the broker never answers.
+- **Readiness stayed down after a partition until something published.** A
+  rebuild that failed during the partition left no publisher connection;
+  the pool now restores it in the background with the connection's backoff
+  and jitter (stopping on shutdown or a permanent failure).
+- **`AsyncBroker.stop(timeout)` was not bounded during a partition.** It
+  waited for consumer cancels and connection closes the broker never
+  answered. `cancel_consumer(timeout=)`, `disconnect(timeout=)` and
+  `AsyncConnectionPool.close_all(timeout=)` now take the remaining deadline;
+  past it, channels and connections are abandoned (their close is started in
+  the background, which stops aio-pika's reconnect loop).
+- **A channel waiter woken by a rebuild gave up** instead of waiting for the
+  replacement pool (failed on Python 3.11/3.13/3.15 in CI).
+- **Publish hot path regressions from this release's reliability work.**
+  Measured against 0.19.2 on identical dependencies (1 KiB, confirms): the
+  batch publisher cost +18 µs/message and the direct confirmed path +8 µs.
+  Per-call `asyncio.timeout` + `shield` in the batch publisher, two closures
+  and extra coroutine layers in `broker.publish()`, the self-healing channel
+  acquire wrapper and a per-publish import are replaced by a single deadline
+  timer, a direct fast path and a synchronous idle-channel fast path; see
+  `docs/benchmarking.md` for the before/after numbers.
+
 - The `@subscriber` / `@publisher` decorators (`AsyncBroker`, `SyncBroker`,
   `RabbitRouter`, `SubscriberRegistry`, `TestBroker.publisher`) were typed
   `Callable[[Callable[..., Any]], Callable[..., Any]]`. Under a strict type
@@ -1135,11 +1165,7 @@ change behaviour: read **Changed (behaviour)** before upgrading.
   real-broker tests prove for broker NACKs, quorum loss, network partitions
   and heartbeat detection, with measured timings. The heartbeat budget is
   about 5 × `heartbeat` with aio-pika (`(heartbeat + 1) × 3` s), not 2 ×.
-  `TIMEOUT` publishes were observed to be committed later. The section also
-  lists three known async defects found by the partition tests: queued
-  publishes resolve serially, one `channel_acquire_timeout` each; readiness
-  stays down after a partition until the next publish; `stop(timeout)` is not
-  bounded during a partition.
+  `TIMEOUT` publishes were observed to be committed later.
 
 ## [0.19.2] — 2026-10-02
 

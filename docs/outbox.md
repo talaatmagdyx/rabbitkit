@@ -91,10 +91,13 @@ Not covered:
   `fullfsync`) when that matters. It is slower.
 - **Storage that lies about `fsync`** (some virtual disks, write caches
   without battery backup).
-- **Ordering.** Entries are published in enqueue order, but a pass publishes
-  up to `max_in_flight` concurrently (async), and an entry that is retried is
-  overtaken by later ones. For strict order use `max_in_flight=1` and expect
-  head-of-line blocking only for the transient (broker-unreachable) case.
+- **Strict ordering.** Entries are taken in enqueue order, but the async
+  relay publishes up to `max_in_flight` of them concurrently, and a refused
+  entry (`RETURNED`, `NACKED`, `ERROR`) backs off while later entries
+  overtake it. With `max_in_flight=1`, order holds through broker outages
+  (the relay retries the same oldest entry) but not past a refusal. Consumer
+  side reordering (requeues, retries, several consumers) is described in
+  [Ordering guarantees](ordering-guarantees.md).
 - **Duplicates.** At-least-once, as above. Consumers deduplicate on
   `message_id` (see [Idempotency](production/idempotency.md)).
 - **Messages without `mandatory=True`** that no queue is bound for are

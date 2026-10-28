@@ -15,6 +15,9 @@ from typing import Any
 from rabbitkit.core.errors import TopologyValidationError
 from rabbitkit.core.types import DeadLetterStrategy, ExchangeType, QueueType, validate_amqp_shortstr
 
+#: RabbitMQ's x-max-age format: a positive integer and a unit (Y, M, D, h, m, s).
+_MAX_AGE = re.compile(r"[1-9][0-9]*[YMDhms]")
+
 
 @dataclass(frozen=True, slots=True)
 class RabbitExchange:
@@ -138,6 +141,16 @@ class RabbitQueue:
     # Extra arguments (escape hatch)
     arguments: dict[str, Any] = field(default_factory=dict)
 
+    # Stream retention (stream only). A stream keeps messages after they are
+    # consumed; retention is what removes them, a whole segment at a time.
+    # max_length_bytes (above) caps the total size; max_age is x-max-age, a
+    # positive integer and a unit: Y, M, D, h, m or s ("7D", "12h").
+    max_age: str | None = None
+    # x-stream-max-segment-size-bytes: size of one segment file (broker
+    # default 500 MB). Retention deletes whole segments, so smaller segments
+    # make it finer-grained.
+    stream_max_segment_size_bytes: int | None = None
+
     def __post_init__(self) -> None:
         if self.dead_letter_strategy is not None and not isinstance(self.dead_letter_strategy, DeadLetterStrategy):
             try:
@@ -204,6 +217,55 @@ class RabbitQueue:
                 raise TopologyValidationError(msg)
             if self.consumer_timeout is not None:
                 msg = "Stream queues do not support consumer_timeout (per-message ack timeouts do not apply to streams)"
+                raise TopologyValidationError(msg)
+            # RabbitMQ rejects each of these on a stream (406 "invalid arg ...
+            # of queue type rabbit_stream_queue", verified on 3.13 and 4.1).
+            # Fail at construction instead of at declaration.
+            unsupported = {
+                "dead_letter_exchange": (
+                    self.dead_letter_exchange is not None,
+                    "streams do not dead-letter; a nack or reject leaves the message in the stream",
+                ),
+                "dead_letter_routing_key": (
+                    self.dead_letter_routing_key is not None,
+                    "streams do not dead-letter; a nack or reject leaves the message in the stream",
+                ),
+                "max_length": (
+                    self.max_length is not None,
+                    "use max_length_bytes or max_age (stream retention)",
+                ),
+                "overflow": (self.overflow is not None, "a stream never rejects publishes for length"),
+                "expires": (self.expires is not None, "streams cannot expire"),
+                "delivery_limit": (self.delivery_limit is not None, "quorum queues only"),
+                "single_active_consumer": (
+                    self.single_active_consumer,
+                    "stream single active consumer needs the stream protocol, not AMQP 0.9.1",
+                ),
+            }
+            for option, (is_set, why) in unsupported.items():
+                if is_set:
+                    msg = f"Stream queue '{self.name}' does not support {option}: {why}"
+                    raise TopologyValidationError(msg)
+        else:
+            if self.max_age is not None:
+                msg = f"Queue '{self.name}': max_age (x-max-age) is only valid for stream queues"
+                raise TopologyValidationError(msg)
+            if self.stream_max_segment_size_bytes is not None:
+                msg = f"Queue '{self.name}': stream_max_segment_size_bytes is only valid for stream queues"
+                raise TopologyValidationError(msg)
+
+        if self.max_age is not None and (not isinstance(self.max_age, str) or not _MAX_AGE.fullmatch(self.max_age)):
+            msg = (
+                f"Queue '{self.name}': max_age must be a positive integer followed by Y, M, D, h, m or s "
+                f"(e.g. '7D', '12h'), got {self.max_age!r}"
+            )
+            raise TopologyValidationError(msg)
+        for option, value in (
+            ("max_length_bytes", self.max_length_bytes),
+            ("stream_max_segment_size_bytes", self.stream_max_segment_size_bytes),
+        ):
+            if value is not None and self.queue_type == QueueType.STREAM and (isinstance(value, bool) or value < 1):
+                msg = f"Queue '{self.name}': {option} must be a positive number of bytes, got {value!r}"
                 raise TopologyValidationError(msg)
 
         if self.consumer_timeout is not None and self.consumer_timeout <= 0:
@@ -279,6 +341,8 @@ class RabbitQueue:
                 self.max_length is not None,
                 self.consumer_timeout is not None,
                 self.quorum_initial_group_size is not None,
+                self.max_age is not None,
+                self.stream_max_segment_size_bytes is not None,
             ]
         ):
             warnings.warn(
@@ -334,6 +398,12 @@ class RabbitQueue:
         # Expiry
         if self.expires is not None:
             args["x-expires"] = self.expires
+
+        # Stream retention
+        if self.max_age is not None:
+            args["x-max-age"] = self.max_age
+        if self.stream_max_segment_size_bytes is not None:
+            args["x-stream-max-segment-size-bytes"] = self.stream_max_segment_size_bytes
 
         # Merge user-provided arguments (escape hatch takes precedence)
         args.update(self.arguments)

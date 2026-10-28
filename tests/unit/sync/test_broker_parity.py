@@ -13,12 +13,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from rabbitkit.core.config import ConsumerConfig, MetricsConfig, RabbitConfig, WorkerConfig
+from rabbitkit.core.config import (
+    ConsumerConfig,
+    MetricsConfig,
+    PoolConfig,
+    PublisherConfig,
+    RabbitConfig,
+    WorkerConfig,
+)
 from rabbitkit.core.message import RabbitMessage
 from rabbitkit.core.types import AckPolicy, MessageEnvelope, PublishReason, PublishStatus
 from rabbitkit.middleware.metrics import MetricsMiddleware
 from rabbitkit.sync.broker import SyncBroker
 from rabbitkit.sync.deadlines import LateSettlementError
+from rabbitkit.sync.pool import InFlightByteLimiter
 from tests.unit.middleware.test_metrics_foundation import RecordingCollector
 
 _CFG = MetricsConfig()
@@ -30,6 +38,7 @@ def _transport() -> MagicMock:
     transport.is_connected.return_value = True
     transport.channels_active = 2
     transport.publishes_in_flight = 3
+    transport.byte_limiter = None
     transport.is_blocked = False
     transport.poll_interval = 1.0
     return transport
@@ -344,3 +353,51 @@ class TestPublishInFlightGauge:
         broker.pump_idle(0.0)
         transport.pump.assert_called_once_with(0.0)
         assert collector.gauge(_CFG.publish_in_flight) == 3.0
+
+
+# ── max_in_flight_bytes on the sync broker ───────────────────────────────
+
+
+class TestByteBudget:
+    def test_start_passes_the_budget_and_the_admission_timeout(self) -> None:
+        config = RabbitConfig(
+            publisher=PublisherConfig(max_message_bytes=1000, max_in_flight_bytes=4096),
+            pool=PoolConfig(channel_acquire_timeout=2.5),
+        )
+        broker = SyncBroker(config)
+        with patch("rabbitkit.sync.broker.SyncTransport", return_value=_transport()) as cls:
+            broker.start()
+        try:
+            kwargs = cls.call_args.kwargs
+            assert (kwargs["max_in_flight_bytes"], kwargs["admission_timeout"]) == (4096, 2.5)
+        finally:
+            broker.stop(timeout=2)
+
+    def test_no_budget_by_default(self) -> None:
+        broker = SyncBroker()
+        with patch("rabbitkit.sync.broker.SyncTransport", return_value=_transport()) as cls:
+            broker.start()
+        try:
+            assert cls.call_args.kwargs["max_in_flight_bytes"] is None
+        finally:
+            broker.stop(timeout=2)
+
+    def test_bytes_in_flight_are_sampled_when_a_budget_is_set(self) -> None:
+        collector = RecordingCollector()
+        broker = SyncBroker(middlewares=[MetricsMiddleware(collector)])
+        transport = _transport()
+        limiter = InFlightByteLimiter(1024)
+        assert limiter.acquire(512, timeout=0.1)
+        transport.byte_limiter = limiter
+        broker._transport = transport
+        broker._wire_reconnect_metric()
+        broker._sample_metrics()
+        assert collector.gauge(_CFG.publish_in_flight_bytes) == 512.0
+
+    def test_bytes_in_flight_are_not_emitted_without_a_budget(self) -> None:
+        collector = RecordingCollector()
+        broker = SyncBroker(middlewares=[MetricsMiddleware(collector)])
+        broker._transport = _transport()
+        broker._wire_reconnect_metric()
+        broker._sample_metrics()
+        assert collector.gauge(_CFG.publish_in_flight_bytes) is None

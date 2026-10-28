@@ -9,9 +9,12 @@ dedicated connections per role (publisher vs consumer).
 
 from __future__ import annotations
 
+import collections
 import logging
 import queue
 import threading
+import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
@@ -19,6 +22,114 @@ from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig, 
 from rabbitkit.sync.connection import make_pika_connection_params
 
 logger = logging.getLogger(__name__)
+
+#: Longest single I/O pump while a pumping waiter waits for byte budget.
+_BUDGET_PUMP_SLICE = 0.01
+
+
+class _ByteWaiter:
+    __slots__ = ("granted", "n")
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.granted = False
+
+
+class InFlightByteLimiter:
+    """Thread-safe FIFO budget on the sum of in-flight message bytes.
+
+    The sync counterpart of :class:`rabbitkit.async_.pool.InFlightByteLimiter`
+    with the same rules: a request larger than the whole limit is refused at
+    once; waiters are granted strictly in arrival order (a small request
+    never overtakes a large one queued before it, so the large one is not
+    starved); a wait is bounded by *timeout*; :meth:`release` wakes the
+    waiters that now fit.
+
+    *pump*: a waiter that other threads depend on must not block idly. On a
+    sync broker the connection's owner thread runs every worker thread's
+    publish (they are marshalled onto it), so if the owner slept here while
+    a worker held the bytes it needs, neither could move until the timeout.
+    Such a waiter passes ``pump(seconds)``, called WITHOUT the lock held
+    between admission checks instead of sleeping; it drives the I/O loop for
+    at most that long and returns False when it could not (closed
+    connection), in which case the waiter sleeps on the condition instead.
+    An exception from *pump* propagates after the waiter is withdrawn.
+    """
+
+    def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        self._limit = limit
+        self._used = 0
+        self._cond = threading.Condition()
+        self._waiters: collections.deque[_ByteWaiter] = collections.deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def used(self) -> int:
+        """Bytes currently reserved (a sample; may be stale by the time it is read)."""
+        return self._used
+
+    def acquire(self, n: int, timeout: float, *, pump: Callable[[float], bool] | None = None) -> bool:
+        """Reserve ``n`` bytes. False when ``n`` exceeds the limit or the wait expires."""
+        if n > self._limit:
+            return False
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            if not self._waiters and self._used + n <= self._limit:
+                self._used += n
+                return True
+            waiter = _ByteWaiter(n)
+            self._waiters.append(waiter)
+        try:
+            while True:
+                with self._cond:
+                    if waiter.granted:
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._waiters.remove(waiter)
+                        self._grant()  # we may have been blocking the head
+                        return False
+                    if pump is None:
+                        self._cond.wait(remaining)
+                        continue
+                    step = min(remaining, _BUDGET_PUMP_SLICE)
+                if not pump(step):
+                    with self._cond:
+                        if not waiter.granted:
+                            self._cond.wait(step)
+        except BaseException:
+            with self._cond:
+                if waiter.granted:  # granted just as we failed: hand it back
+                    self._used = max(0, self._used - n)
+                else:
+                    self._waiters.remove(waiter)
+                self._grant()
+            raise
+
+    def release(self, n: int) -> None:
+        """Return ``n`` bytes and grant the waiters that now fit (FIFO)."""
+        with self._cond:
+            self._used = max(0, self._used - n)
+            self._grant()
+
+    def _grant(self) -> None:
+        """Grant queued waiters in order while the head fits. Lock held."""
+        granted = False
+        while self._waiters:
+            head = self._waiters[0]
+            if self._used + head.n > self._limit:
+                break
+            self._waiters.popleft()
+            self._used += head.n
+            head.granted = True
+            granted = True
+        if granted:
+            self._cond.notify_all()
 
 
 class SyncChannelPool:

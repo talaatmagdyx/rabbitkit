@@ -2,8 +2,14 @@
 
 **Alerts:**
 
-- `PublisherConfirmFailures` — `messages_published_total{status=~"nacked|error"}` rising.
-- `PublisherUnknownOutcomes` — `messages_published_total{status=~"unknown|timeout"}` rising.
+- `PublisherConfirmFailures` — `messages_published_total{status=~"nacked|error"}`
+  above 0, sustained for 5 minutes.
+- `PublisherUnknownOutcomes` — more than 1% of publishes end `unknown` or
+  `timeout`, for 10 minutes (a reconnect or a quorum election alone stays
+  well below that).
+- `PublisherConfirmLatencyHigh` — the p99 of
+  `publish_confirm_latency_seconds` above 250 ms for 10 minutes (10× the
+  measured quorum p99), with at least 0.1 confirms a second.
 
 ## What it means
 

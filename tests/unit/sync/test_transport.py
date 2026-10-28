@@ -1502,6 +1502,26 @@ class TestBlockedUnblockedCallbacksSync:
         transport._pika_unblocked(None)
         assert called == ["cb1", "cb2"]
 
+    def test_pika_blocked_keeps_the_broker_reason_while_blocked(self) -> None:
+        """pika hands the Connection.Blocked frame to the callback; its reason
+        ("low on disk" / "low on memory") says which alarm is active."""
+        from types import SimpleNamespace
+
+        transport = _make_transport()
+        assert transport.blocked_reason is None
+        frame = SimpleNamespace(method=SimpleNamespace(reason="low on disk"))
+        transport._pika_blocked(None, frame)
+        assert transport.is_blocked and transport.blocked_reason == "low on disk"
+        transport._pika_unblocked(None, SimpleNamespace(method=SimpleNamespace()))
+        assert not transport.is_blocked and transport.blocked_reason is None
+
+    def test_pika_blocked_without_a_readable_reason(self) -> None:
+        from types import SimpleNamespace
+
+        transport = _make_transport()
+        transport._pika_blocked(None, SimpleNamespace(method=SimpleNamespace(reason=b"bytes")))
+        assert transport.is_blocked and transport.blocked_reason is None
+
     def test_pika_blocked_no_callbacks_is_noop(self) -> None:
         """_pika_blocked() with no callbacks does nothing."""
         transport = _make_transport()

@@ -398,8 +398,10 @@ def make_aio_pika_connect_kwargs(
     # aiormq.connection.Connection._client_properties), so a same-named key
     # replaces aiormq's: rabbitkit's names avoid "product"/"version"/
     # "platform"/"capabilities"/"information", and ConnectionConfig rejects a
-    # user "capabilities". Note aio-pika 9 drops client_properties when given
-    # a URL, so these reach the broker only on aio-pika 10+.
+    # user "capabilities". aio-pika 9.x drops connect_robust(client_properties=)
+    # when given a URL; the pool also hands them to RabbitkitRobustConnection
+    # (rk_client_properties), which sets them where aiormq reads them on
+    # every aio-pika version.
     client_properties: dict[str, str] = {
         "library": "rabbitkit",
         "library_version": __version__,
@@ -414,9 +416,7 @@ def make_aio_pika_connect_kwargs(
 
 def has_small_negative_int(arguments: dict[str, Any] | None) -> bool:
     """True if a field table holds an int pamqp < 4 can't encode (-128..-1)."""
-    return any(
-        isinstance(v, int) and not isinstance(v, bool) and -128 <= v < 0 for v in (arguments or {}).values()
-    )
+    return any(isinstance(v, int) and not isinstance(v, bool) and -128 <= v < 0 for v in (arguments or {}).values())
 
 
 def ensure_pamqp_encodes_negative_ints() -> None:
@@ -477,6 +477,50 @@ def aiormq_unblocked_event(connection: Any) -> asyncio.Event | None:
     return event if isinstance(event, asyncio.Event) else None
 
 
+_BLOCKED_REASON_ATTR = "_rabbitkit_blocked_reason"
+
+
+def ensure_aiormq_records_blocked_reason() -> bool:
+    """Make aiormq keep the ``connection.blocked`` reason it receives.
+
+    aiormq (6.x and 7.x) only LOGS ``Connection.Blocked.reason`` (``"low on
+    disk"`` / ``"low on memory"``) before clearing its private unblocked
+    event, so the reason that tells a disk alarm from a memory alarm is lost.
+    This wraps the private ``Connection.__handle_connection_blocked`` at
+    class level to store ``frame.reason`` on the connection first, then runs
+    the original. Class level, before the connection exists, because aiormq
+    6 binds the handler into a dispatch table when the reader starts.
+    Idempotent. Returns False (and changes nothing) when aiormq has no such
+    handler; :func:`aiormq_blocked_reason` then reports ``None``.
+    """
+    from aiormq.connection import Connection
+
+    name = "_Connection__handle_connection_blocked"
+    original = getattr(Connection, name, None)
+    if original is None:
+        return False
+    if getattr(original, "_rabbitkit_records_reason", False):
+        return True
+
+    async def handle_connection_blocked(self: Any, frame: Any) -> None:
+        reason = getattr(frame, "reason", None)
+        setattr(self, _BLOCKED_REASON_ATTR, reason if isinstance(reason, str) else None)
+        await original(self, frame)
+
+    handle_connection_blocked._rabbitkit_records_reason = True  # type: ignore[attr-defined]
+    setattr(Connection, name, handle_connection_blocked)
+    return True
+
+
+def aiormq_blocked_reason(connection: Any) -> str | None:
+    """The last ``connection.blocked`` reason the live aiormq connection under
+    an aio-pika *connection* received, or ``None`` (none received, no live
+    transport, or :func:`ensure_aiormq_records_blocked_reason` not active)."""
+    underlay = getattr(getattr(connection, "transport", None), "connection", None)
+    reason = getattr(underlay, _BLOCKED_REASON_ATTR, None)
+    return reason if isinstance(reason, str) else None
+
+
 class BlockedConnectionMonitor:
     """Track RabbitMQ's ``connection.blocked`` state for one aio-pika connection.
 
@@ -512,6 +556,7 @@ class BlockedConnectionMonitor:
         self._poll_interval = poll_interval
         self._may_force_reconnect = may_force_reconnect
         self._blocked = False
+        self._blocked_reason: str | None = None
         self._blocked_since: float | None = None
         self._underlay: Any = None
         self._task: asyncio.Task[None] | None = None
@@ -520,6 +565,11 @@ class BlockedConnectionMonitor:
     @property
     def is_blocked(self) -> bool:
         return self._blocked
+
+    @property
+    def blocked_reason(self) -> str | None:
+        """The broker's blocked reason while :attr:`is_blocked`, else ``None``."""
+        return self._blocked_reason if self._blocked else None
 
     @staticmethod
     def supported(connection: Any) -> bool:
@@ -571,6 +621,7 @@ class BlockedConnectionMonitor:
         blocked = not event.is_set()
         if blocked and not self._blocked:
             self._blocked = True
+            self._blocked_reason = aiormq_blocked_reason(self._connection)
             self._blocked_since = now
             if self._blocked_timeout > 0:
                 logger.warning(
@@ -578,10 +629,11 @@ class BlockedConnectionMonitor:
                     self._blocked_timeout,
                 )
             else:
-                logger.warning("Connection blocked by RabbitMQ (resource alarm)")
+                logger.warning("Connection blocked by RabbitMQ (resource alarm: %s)", self._blocked_reason)
             self._fire(self._on_blocked)
         elif not blocked and self._blocked:
             self._blocked = False
+            self._blocked_reason = None
             self._blocked_since = None
             logger.info("Connection unblocked by RabbitMQ")
             self._fire(self._on_unblocked)

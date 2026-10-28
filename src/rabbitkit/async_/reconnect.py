@@ -34,7 +34,7 @@ import contextlib
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -153,11 +153,31 @@ class RabbitkitRobustConnection(RobustConnection):
     """aio-pika ``RobustConnection`` whose reconnects follow rabbitkit's policy.
 
     Built by ``aio_pika.connect_robust(..., connection_class=partial(cls,
-    rk_policy=policy))``. See the module docstring.
+    rk_policy=policy, rk_client_properties=...))``. See the module docstring.
+
+    ``rk_client_properties`` are the AMQP client properties (``connection_name``,
+    ``library``, ...) to send on every connect. aio-pika 10 forwards
+    ``connect_robust(client_properties=...)`` to the connection class and on
+    to aiormq; aio-pika 9.x does neither: ``connect_robust`` only folds them
+    into ``make_url``, which returns a given URL untouched, so on 9.x they
+    never reached the broker (no ``connection_name`` in the management UI).
+    Setting them on ``self.kwargs``, which aio-pika passes to
+    ``aiormq.connect`` on the first connect and on every reconnect, works on
+    both majors; on 10.x it is the value aio-pika already set.
     """
 
-    def __init__(self, url: Any, loop: Any = None, *, rk_policy: ReconnectPolicy, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        url: Any,
+        loop: Any = None,
+        *,
+        rk_policy: ReconnectPolicy,
+        rk_client_properties: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(url, loop=loop, **kwargs)
+        if rk_client_properties is not None:
+            self.kwargs["client_properties"] = dict(rk_client_properties)
         self._rk_policy = rk_policy
         self._rk_endpoint_index = rk_policy.endpoint_index
         # aio-pika also sleeps reconnect_interval after a SUCCESSFUL connect

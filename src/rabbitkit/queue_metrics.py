@@ -14,6 +14,15 @@ and it lives on the broker, not in-process.
 - ``{ns}_queue_messages_unacked`` — delivered-but-unacked
 - ``{ns}_queue_messages_total``   — ready + unacked
 - ``{ns}_queue_consumers``        — 0 means nothing is draining
+- ``{ns}_queue_quorum_members``   — quorum queues only: Raft members
+- ``{ns}_queue_quorum_online``    — quorum queues only: members online
+
+The quorum gauges come from the ``members`` / ``online`` node lists the
+management API reports for every quorum queue (RabbitMQ 3.8+, verified on
+3.13 and 4.1). A quorum queue serves publishes and deliveries while MORE
+than half of its members are online, so ``online <= members / 2`` means
+the queue is unavailable and ``online < members`` means it has lost
+redundancy. No broker plugin needed; the alert rules use these.
 
 Usage (sync)::
 
@@ -55,7 +64,8 @@ class QueueMetricsPoller:
         management_client: object with ``list_queues(vhost)`` (sync) and/or
             ``list_queues_async(vhost)`` (async) returning a list of dicts
             with ``name``/``messages``/``messages_ready``/
-            ``messages_unacknowledged``/``consumers`` keys (rabbitkit's
+            ``messages_unacknowledged``/``consumers`` keys, plus
+            ``type``/``members``/``online`` for quorum queues (rabbitkit's
             ``RabbitManagementClient`` satisfies this).
         collector: any ``MetricsCollector`` (needs ``set_gauge``).
         config: metric-naming config (defaults to ``MetricsConfig()``).
@@ -108,8 +118,22 @@ class QueueMetricsPoller:
             self._collector.set_gauge(self._cfg.queue_messages_unacked, labels, unacked)
             self._collector.set_gauge(self._cfg.queue_messages_total, labels, total)
             self._collector.set_gauge(self._cfg.queue_consumers, labels, consumers)
+            self._emit_quorum(q, labels)
             emitted += 1
         return emitted
+
+    def _emit_quorum(self, queue: dict[str, Any], labels: dict[str, str]) -> None:
+        """Members / online gauges for a quorum queue; nothing for any other.
+
+        Counts nodes, never labels by them: the only label stays ``queue``.
+        """
+        members = queue.get("members")
+        if queue.get("type") != "quorum" or not isinstance(members, list):
+            return
+        online = queue.get("online")
+        online_count = len(online) if isinstance(online, list) else 0
+        self._collector.set_gauge(self._cfg.queue_quorum_members, labels, len(members))
+        self._collector.set_gauge(self._cfg.queue_quorum_online, labels, online_count)
 
     def poll_once(self) -> int:
         """Fetch queues once (sync) and emit gauges. Returns count emitted.
@@ -141,9 +165,7 @@ class QueueMetricsPoller:
         if self._thread is not None:
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop, name="rabbitkit-queue-metrics", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run_loop, name="rabbitkit-queue-metrics", daemon=True)
         self._thread.start()
 
     def _run_loop(self) -> None:

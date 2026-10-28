@@ -1108,6 +1108,17 @@ class MetricsConfig:
         """Number of consumers attached to the queue (0 = nothing draining)."""
         return f"{self.namespace}_queue_consumers"
 
+    @property
+    def queue_quorum_members(self) -> str:
+        """Quorum queues only: Raft members the queue is configured with."""
+        return f"{self.namespace}_queue_quorum_members"
+
+    @property
+    def queue_quorum_online(self) -> str:
+        """Quorum queues only: members currently online. The queue is
+        available while more than half of its members are online."""
+        return f"{self.namespace}_queue_quorum_online"
+
     # ── Broker/transport metrics (G-22, §19). Emitted by the broker itself
     # whenever any MetricsMiddleware with a collector is configured (publish
     # middlewares or any route), so publish-only brokers get them too. ──
@@ -1174,6 +1185,14 @@ class MetricsConfig:
         """Gauge: 1 while RabbitMQ has the connection blocked
         (``connection.blocked``: a memory or disk alarm), else 0."""
         return f"{self.namespace}_connection_blocked"
+
+    @property
+    def connection_blocked_reason(self) -> str:
+        """Gauge per bounded ``reason`` (``disk`` / ``memory`` / ``other``): 1
+        while the connection is blocked and the broker's ``connection.blocked``
+        reason names that alarm, else 0. The client-side form of the broker's
+        disk and memory alarms; needs no broker plugin."""
+        return f"{self.namespace}_connection_blocked_reason"
 
     @property
     def consumer_cancelled_total(self) -> str:

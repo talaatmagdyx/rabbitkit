@@ -86,19 +86,24 @@ async def _await_ready(url: str, queue: str, expected: int, timeout: float = 10.
 
 @contextlib.contextmanager
 def _dropping_confirms() -> Iterator[None]:
-    """Ignore incoming publisher confirms while active (see module docstring)."""
+    """Ignore incoming publisher confirms while active (see module docstring).
+
+    Patches ``Channel._confirm_delivery``, which ``_on_confirm_frame`` looks
+    up on every Ack/Nack. Patching ``_on_confirm_frame`` itself only works on
+    aiormq 7: aiormq 6 (aio-pika 9.x) binds it into a dispatch table when the
+    channel's reader starts, so channels already open ignored the patch."""
     from aiormq.channel import Channel
 
-    original = Channel._on_confirm_frame
+    original = Channel._confirm_delivery
 
-    async def _drop(self: Any, frame: Any) -> None:
+    def _drop(self: Any, delivery_tag: Any, frame: Any) -> None:
         return None
 
-    Channel._on_confirm_frame = _drop  # type: ignore[method-assign]
+    Channel._confirm_delivery = _drop  # type: ignore[method-assign]
     try:
         yield
     finally:
-        Channel._on_confirm_frame = original  # type: ignore[method-assign]
+        Channel._confirm_delivery = original  # type: ignore[method-assign]
 
 
 def _kill_connections_named(rabbit: dict[str, Any], connection_name: str) -> int:

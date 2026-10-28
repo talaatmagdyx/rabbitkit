@@ -1150,6 +1150,9 @@ class TestPoolConnectionFoundation:
         policy = factory.keywords["rk_policy"]
         assert policy.role == "consumer"
         assert policy.on_terminal == pool._record_terminal
+        # aio-pika 9.x drops connect_robust(client_properties=); the class gets them too.
+        assert factory.keywords["rk_client_properties"] == connect.call_args.kwargs["client_properties"]
+        assert factory.keywords["rk_client_properties"]["library"] == "rabbitkit"
 
     @pytest.mark.asyncio
     async def test_abandoned_connection_objects_are_closed(self) -> None:

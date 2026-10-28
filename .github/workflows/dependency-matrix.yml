@@ -52,19 +52,26 @@ jobs:
       - name: Tests
         run: .venv/bin/pytest tests/unit/ -q --tb=short
 
-  # Real-broker suite on the last aio-pika 9.x. The PR-time integration job
-  # in ci.yml resolves the newest aio-pika, which is 10.x now that both
-  # majors are supported, so the 9.x line (aiormq 6, pamqp 3, which needs the
-  # negative-integer encoder fix) is exercised against a broker here.
+  # Real-broker suite on the 9.x line: the pinned floor (9.1.0: aiormq 6.7,
+  # pamqp 3.2) and the last 9.x (9.6.2: aiormq 6.9, pamqp 3.3). The PR-time
+  # integration job in ci.yml resolves the newest aio-pika (10.x), so without
+  # this the 9.x line is never run against a broker. The floor run exists
+  # because 9.x-only defects hid there: aio-pika 9.x dropped
+  # connect_robust(client_properties=) (no connection_name on the broker) and
+  # pamqp 3.2 decodes the AMQP timestamp as a naive datetime.
   integration-aio-pika-9:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        aio-pika-version: ["9.1.0", "9.6.2"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install uv && uv venv && uv pip install -e ".[integration]" "aio-pika==9.6.2"
+      - run: pip install uv && uv venv && uv pip install -e ".[integration]" "aio-pika==${{ matrix.aio-pika-version }}"
       - name: Report resolved versions
         run: |
           .venv/bin/python -c "import importlib.metadata as m; print({p: m.version(p) for p in ('aio-pika', 'aiormq', 'pamqp')})"

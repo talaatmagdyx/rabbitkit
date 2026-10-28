@@ -176,6 +176,7 @@ class SyncTransport:
         # reads this (via the is_blocked property) so a broker/disk/memory
         # alarm is visible even when the caller never opted into FlowController.
         self._blocked_state: bool = False
+        self._blocked_reason: str | None = None
 
         # L14: fired once per start_consuming() loop iteration (after each
         # process_data_events() call returns), i.e. once per I/O loop tick --
@@ -346,6 +347,12 @@ class SyncTransport:
         ``FlowController``."""
         return self._blocked_state
 
+    @property
+    def blocked_reason(self) -> str | None:
+        """The broker's ``connection.blocked`` reason (``"low on disk"``,
+        ``"low on memory"``) while :attr:`is_blocked`, else ``None``."""
+        return self._blocked_reason if self._blocked_state else None
+
     def on_io_tick(self, callback: Callable[[], None]) -> None:
         """Register a callback fired once per ``start_consuming()`` loop
         iteration (L14) -- e.g. the broker's liveness heartbeat refresh."""
@@ -358,7 +365,10 @@ class SyncTransport:
             except Exception:  # pragma: no cover — never let a cb break the I/O loop
                 logger.exception("io_tick callback raised")
 
-    def _pika_blocked(self, _connection: Any, *_args: Any) -> None:
+    def _pika_blocked(self, _connection: Any, method_frame: Any = None, *_args: Any) -> None:
+        # pika passes the Connection.Blocked frame: method_frame.method.reason.
+        reason = getattr(getattr(method_frame, "method", None), "reason", None)
+        self._blocked_reason = reason if isinstance(reason, str) else None
         self._blocked_state = True
         for cb in list(self._blocked_callbacks):
             try:
@@ -368,6 +378,7 @@ class SyncTransport:
 
     def _pika_unblocked(self, _connection: Any, *_args: Any) -> None:
         self._blocked_state = False
+        self._blocked_reason = None
         for cb in list(self._unblocked_callbacks):
             try:
                 cb()

@@ -123,7 +123,8 @@ def _run_rabbit(client: Any, name: str, hostname: str, network: str, cookie: str
         hostname=hostname,
         network=network,
         environment={"RABBITMQ_ERLANG_COOKIE": cookie},
-        ports={"5672/tcp": (HOST, None)},
+        # 15672: the management API, for the QueueMetricsPoller quorum test.
+        ports={"5672/tcp": (HOST, None), "15672/tcp": (HOST, None)},
         labels=LABEL,
         detach=True,
     )
@@ -165,6 +166,9 @@ class Cluster:
 
     def url(self, index: int = 0) -> str:
         return f"amqp://guest:guest@{HOST}:{_host_port(self.nodes[index], '5672/tcp')}/"
+
+    def mgmt(self, index: int = 0) -> str:
+        return f"http://{HOST}:{_host_port(self.nodes[index], '15672/tcp')}"
 
     def running_nodes(self) -> int:
         code, out = _exec(self.nodes[0], "rabbitmqctl", "cluster_status", "--formatter", "json")
@@ -440,6 +444,45 @@ def test_sync_quorum_loss_never_confirms_and_loses_no_confirmed_message(cluster:
         sorted(set(during) & set(drained)),
     )
     _assert_no_loss(confirmed, drained)
+
+
+# ── quorum health gauges (QueueMetricsPoller) ───────────────────────────────
+
+
+@pytest.mark.timeout(600)
+def test_queue_metrics_poller_quorum_online_drops_when_a_member_stops(cluster: Cluster) -> None:
+    """The management API's ``members`` / ``online`` lists, exported as
+    rabbitkit_queue_quorum_members / _online, follow a member going down and
+    coming back: what RabbitMQQuorumUnhealthy / RabbitMQQuorumMajorityLost
+    alert on, with no broker plugin."""
+    from rabbitkit.management import ManagementConfig, RabbitManagementClient
+    from rabbitkit.queue_metrics import QueueMetricsPoller
+
+    queue = f"rk-chaos-qq-poll-{uuid.uuid4().hex[:8]}"
+    _declare_quorum(cluster.url(0), queue)
+    client = RabbitManagementClient(ManagementConfig(url=cluster.mgmt(0), username="guest", password="guest"))
+    gauges: dict[str, float] = {}
+
+    class Collector:
+        def set_gauge(self, name: str, labels: dict[str, str], value: float) -> None:
+            gauges[name] = value
+
+    poller = QueueMetricsPoller(client, Collector(), queue_filter=lambda name: name == queue)
+
+    def online_is(expected: float) -> bool:
+        poller.poll_once()
+        return gauges.get("rabbitkit_queue_quorum_online") == expected
+
+    _wait(lambda: online_is(3.0), 60, "3 of 3 members online", interval=1.0)
+    assert gauges["rabbitkit_queue_quorum_members"] == 3.0
+    cluster.stop(2)
+    try:
+        took = _wait(lambda: online_is(2.0), 120, "the stopped member to drop out of `online`", interval=1.0)
+        logger.warning("quorum poller: online dropped to 2 of 3 %.1fs after the node stopped", took)
+        assert gauges["rabbitkit_queue_quorum_members"] == 3.0  # still a member, just not online
+    finally:
+        cluster.start(2)
+    _wait(lambda: online_is(3.0), 120, "the member to come back online", interval=1.0)
 
 
 # ── F20 fixture: broker behind toxiproxy ─────────────────────────────────────

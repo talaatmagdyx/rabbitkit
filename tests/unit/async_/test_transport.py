@@ -1015,6 +1015,33 @@ class TestBuildMessage:
 
         assert message.timestamp == ts
 
+    def test_build_message_tags_a_naive_timestamp_as_utc(self) -> None:
+        """pamqp 3.2 (aio-pika 9.1) decodes the AMQP timestamp to a NAIVE UTC
+        datetime; ``.timestamp()`` on it read it as local time, shifting the
+        producer's epoch by the host's UTC offset."""
+        from datetime import UTC, datetime
+
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = datetime(2026, 1, 1)
+
+        message = transport._build_message(mock_aio_msg)
+
+        assert message.timestamp == datetime(2026, 1, 1, tzinfo=UTC)
+        assert message.timestamp is not None
+        assert int(message.timestamp.timestamp()) == 1767225600
+
+    def test_build_message_without_timestamp(self) -> None:
+        transport = _make_transport()
+        mock_aio_msg = MagicMock()
+        mock_aio_msg.body = b"{}"
+        mock_aio_msg.headers = {}
+        mock_aio_msg.timestamp = None
+
+        assert transport._build_message(mock_aio_msg).timestamp is None
+
     def test_build_message_from_aio_pika(self) -> None:
         transport = _make_transport()
 
@@ -1643,6 +1670,18 @@ class TestBlockedUnblockedCallbacks:
         con.is_blocked = False
         transport._aio_unblocked()
         assert events == ["blocked", "unblocked"] and not transport.is_blocked
+
+    def test_blocked_reason_comes_from_a_blocked_monitor(self) -> None:
+        transport = _make_transport()
+        assert transport.blocked_reason is None
+        pub = MagicMock(is_blocked=True, blocked_reason=None)
+        con = MagicMock(is_blocked=True, blocked_reason="low on disk")
+        transport._blocked_monitors = [pub, con]
+        assert transport.blocked_reason is None  # not blocked yet at the transport level
+        transport._aio_blocked()
+        assert transport.blocked_reason == "low on disk"
+        con.blocked_reason = None
+        assert transport.blocked_reason is None
 
     def test_aio_blocked_with_no_callbacks_is_noop(self) -> None:
         """_aio_blocked() with empty list does nothing."""
@@ -2941,7 +2980,10 @@ class TestReviewFindingsAsyncTransport:
 
     async def test_connect_fixes_pamqp_before_any_frame(self) -> None:
         transport = _make_transport()
-        with patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix:
+        with (
+            patch("rabbitkit.async_.connection.ensure_pamqp_encodes_negative_ints") as fix,
+            patch("rabbitkit.async_.connection.ensure_aiormq_records_blocked_reason") as reason,
+        ):
             with patch(
                 "rabbitkit.async_.pool.make_aio_pika_connect_kwargs",
                 return_value={"url": "amqp://guest:guest@localhost/"},
@@ -2949,6 +2991,7 @@ class TestReviewFindingsAsyncTransport:
                 with patch("aio_pika.connect_robust", new_callable=AsyncMock, return_value=_make_mock_connection()):
                     await transport.connect()
         fix.assert_called_once()
+        reason.assert_called_once()
 
 
 # ── G-08 / G-10: connection hooks, terminal failure, atomic connect ─────

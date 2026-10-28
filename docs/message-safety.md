@@ -187,9 +187,12 @@ unchanged: a failed `ack()` leaves the message unsettled.
 - `MANUAL`, handler raises without settling: settled with the `AUTO` failure
   policy and logged, so it cannot hold a prefetch slot. With `prefetch_count=1`
   the next message is delivered.
-- `ConsumerConfig.processing_timeout`: the handler task is cancelled and the
-  failure is a `HandlerTimeoutError` with `outcome_unknown=True` (its side
-  effects may or may not have happened), settled as a transient failure.
+- `ConsumerConfig.processing_timeout`: the failure is a `HandlerTimeoutError`
+  with `outcome_unknown=True` (its side effects may or may not have happened),
+  settled as a transient failure. The async broker cancels the handler task;
+  the sync broker settles the delivery from its I/O thread at the deadline
+  and lets the handler thread finish, discarding its late result (see
+  [Reliable Messaging](reliable-messaging.md#processing-deadline-processing_timeout)).
 
 ### Connection or channel loss while a handler runs
 
@@ -226,10 +229,11 @@ latency in separate brokers (or processes) if that matters.
 ### Consumers cancelled by the broker
 
 RabbitMQ cancels a consumer itself (`basic.cancel`) when its queue is deleted,
-a quorum queue's leader moves, or an operator closes it. The async broker:
+a quorum queue's leader moves, or an operator closes it. Both brokers:
 
-- detects it (aiormq's consumer-cancel callback on aiormq 7, otherwise by
-  checking the channel's consumer table every second);
+- detect it (async: aiormq's consumer-cancel callback on aiormq 7, otherwise
+  by checking the channel's consumer table every second; sync: pika's channel
+  cancel callback, dispatched on the I/O thread);
 - logs a WARNING, sets the route's `runtime_state.consumer_cancelled`, so
   `broker_health_check()` reports it as not consuming (DEGRADED) and
   `broker_readiness()` fails, and calls `broker.on_consumer_cancelled(queue)`
@@ -238,8 +242,10 @@ a quorum queue's leader moves, or an operator closes it. The async broker:
   queue again, waiting 1 s, then doubling up to 30 s between probes; then
   calls `broker.on_consumer_resumed(queue)`.
 
-It never re-creates the queue. aio-pika 10 also re-subscribes such consumers
+They never re-create the queue. aio-pika 10 also re-subscribes such consumers
 on its own; whichever gets there first wins, without a duplicate consumer.
+`SyncBroker` probes and re-subscribes from its consume loop (`run()`), on the
+thread that owns the connection, and calls both hooks on that thread.
 
 Limitation (from reading aio-pika, not reproduced): if the connection drops
 while the queue is still missing, aio-pika's reconnect re-declares the

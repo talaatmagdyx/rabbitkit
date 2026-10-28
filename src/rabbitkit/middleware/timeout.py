@@ -25,8 +25,11 @@ part-way, so its side effects may or may not have happened
 (``exc.outcome_unknown`` is True, and ``classify_error`` reports
 ``outcome_unknown=True``). Retrying it is only safe for idempotent handlers.
 
-For async brokers, ``ConsumerConfig(processing_timeout=...)`` applies the
-same deadline to every route without this middleware.
+``ConsumerConfig(processing_timeout=...)`` applies the same deadline to every
+route without this middleware, on both brokers. On the sync broker it also
+settles the delivery at the deadline from the I/O thread, keeps the late
+handler on its worker (no extra thread per message) and discards its late
+settlement and publishes; prefer it to this middleware there.
 
 Quick start
 -----------

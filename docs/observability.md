@@ -36,8 +36,11 @@ broker = AsyncBroker(config, middlewares=[MetricsMiddleware(collector)])
 Gauges that change on every publish (publishes and bytes in flight, channels
 in use, open channels) are **sampled**, not updated on the hot path: at start
 and then every 5 seconds (the async broker's heartbeat task; the sync
-broker's I/O loop, throttled to once per 5 seconds). Connection state also
-updates the moment a connection drops or comes back.
+broker's I/O loop, or `pump_idle()` on a publish-only sync broker, throttled
+to once per 5 seconds). The sync broker samples on its I/O thread, so while
+that thread is itself blocked inside a publish (a connection blocked by a
+broker alarm) its gauges keep their last value until it returns. Connection
+state also updates the moment a connection drops or comes back.
 
 ## Metric inventory
 
@@ -67,9 +70,9 @@ updates the moment a connection drops or comes back.
 | `rabbitkit_message_publish_seconds` | histogram | `exchange` | MetricsMiddleware | Whole publish call, including admission. |
 | `rabbitkit_publish_confirm_latency_seconds` | histogram | `exchange` | broker (BrokerMetrics) | Send to broker confirm for CONFIRMED publishes (transport-timed). |
 | `rabbitkit_publish_routing_failures_total` | counter | `exchange`, `reason` | broker (BrokerMetrics) | Unroutable publishes: returned or exchange_not_found (all transport publishes). |
-| `rabbitkit_publish_in_flight` | gauge | — | broker (BrokerMetrics) | Async publishes between admission and outcome (sampled). |
+| `rabbitkit_publish_in_flight` | gauge | — | broker (BrokerMetrics) | Publishes between admission and outcome (sampled). |
 | `rabbitkit_publish_in_flight_bytes` | gauge | — | broker (BrokerMetrics) | Bytes held by max_in_flight_bytes (sampled; only when set). |
-| `rabbitkit_publish_channels_in_use` | gauge | — | broker (BrokerMetrics) | Async publisher channels checked out (sampled). |
+| `rabbitkit_publish_channels_in_use` | gauge | — | broker (BrokerMetrics) | Async publisher channels checked out (sampled; the sync broker has one publisher channel). |
 | `rabbitkit_bulk_publish_items_total` | counter | `status`, `reason` | broker bulk API | publish_many/iter_publish item outcomes. |
 | `rabbitkit_bulk_publish_batch_size` | histogram | — | broker bulk API | publish_many input sizes. |
 | `rabbitkit_settlement_items_total` | counter | `action`, `status` | broker bulk API | ack_many/nack_many item outcomes. |
@@ -147,11 +150,16 @@ connection), `connection_lost` (any other drop), `other`, and the terminal
   could not route: `returned` (`mandatory=True`, no binding) and
   `exchange_not_found` (404). It needs no `MetricsMiddleware` in the publish
   chain: any collector on the broker is enough.
-- **`publish_in_flight`** counts async `publish()` calls between admission
-  and their outcome (batch-publisher items are not included).
+- **`publish_in_flight`** counts transport `publish()` calls between
+  admission and their outcome (batch-publisher items are not included), on
+  both brokers. Async: including the wait for a pooled channel and the byte
+  budget. Sync: including a worker thread's wait for the I/O thread to pick
+  its publish up; the sync broker publishes on one channel, one publish at a
+  time, so a value above 1 means publishes are queued behind the I/O thread.
   **`publish_in_flight_bytes`** is the `PublisherConfig.max_in_flight_bytes`
   budget in use (publish and batch); it is only emitted when that budget is
-  set.
+  set, which only `AsyncBroker` enforces. **`publish_channels_in_use`** is
+  async only: the sync broker has a single publisher channel, not a pool.
 - **`broker_connected`** is 1 only while every connection is up and follows
   drops and reconnects (it used to be set only at `start()`/`stop()`);
   `connection_up{role}` and `connections_active` break it down.
@@ -164,9 +172,9 @@ connection), `connection_lost` (any other drop), `other`, and the terminal
 - **`connection_blocked`** is 1 between RabbitMQ's `connection.blocked` and
   `connection.unblocked` (a memory or disk alarm).
 - **`consumer_cancelled_total` / `route_consuming`**: RabbitMQ cancelled a
-  consumer (`basic.cancel`); the async broker re-subscribes when the queue
-  exists again. The sync broker samples `route_consuming` but cannot detect a
-  broker-initiated cancel.
+  consumer (`basic.cancel`); both brokers report it at once and re-subscribe
+  when the queue exists again (the sync broker on its I/O thread, from the
+  consume loop).
 - **`messages_failed_total{queue,category}`** classifies handler failures with
   the failure taxonomy (the same classification as the pipeline's
   "Handler failed" log line); `messages_retried_total` and
@@ -254,7 +262,9 @@ your own metrics and logs:
 
 The broker wires all of these to `BrokerMetrics` when metrics are on. The
 sync transport has `on_connection_state` (role `shared`), `on_reconnect_attempt`
-(`(attempt, error)`), `on_publish_outcome`, `on_blocked` / `on_unblocked`.
+(`(attempt, error)`), `on_publish_outcome`, `on_blocked` / `on_unblocked`,
+`on_consumer_cancelled` / `on_consumer_resumed` (called on the I/O thread),
+`cancelled_consumers` and `publishes_in_flight`.
 
 Reconnect attempts back off exponentially with full jitter
 (`reconnect_backoff_base` doubling to `reconnect_backoff_max`), unlimited by

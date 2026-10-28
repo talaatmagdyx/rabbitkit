@@ -36,6 +36,7 @@ from rabbitkit.core.types import (
     TopologyMode,
 )
 from rabbitkit.sync.connection import get_connection_errors, make_pika_connection_params
+from rabbitkit.sync.consumers import SyncConsumerRecord, SyncConsumerSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,24 @@ class SyncTransport:
         self._channel_opened_callbacks: list[Callable[[], None]] = []
         self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
 
+        # G-26 (sync parity): consumers the BROKER cancelled (basic.cancel:
+        # queue deleted, quorum leader change, operator action). pika calls
+        # the consumer channel's cancel callback on the owner thread; the
+        # consume loop re-subscribes once a passive declare finds the queue.
+        self._consumer_supervisor = SyncConsumerSupervisor(self._queue_exists_now, self._resubscribe)
+
+        # G-22: publish() calls between entry and their outcome (worker
+        # threads waiting for the I/O thread count too). Sampled by the
+        # broker's metrics, never read on the hot path.
+        self._publishes_in_flight = 0
+        self._publishes_lock = threading.Lock()
+
+        #: Longest single ``process_data_events`` wait of the consume loop, in
+        #: seconds. The loop runs its per-tick work (liveness heartbeat,
+        #: metrics sampling, consumer re-subscription, the broker's
+        #: ``processing_timeout`` deadlines) at least this often.
+        self.poll_interval: float = 1.0
+
     def on_reconnect(self, callback: Callable[[], None]) -> None:
         """Register a callback fired on every re-connection after the first
         successful connect (connection-churn metric hook)."""
@@ -256,6 +275,34 @@ class SyncTransport:
         queue (and cancelled ones still draining)."""
         channels = (self._channel, *self._consumer_channels.values(), *self._cancelled_channels)
         return sum(1 for channel in channels if channel is not None and bool(getattr(channel, "is_open", False)))
+
+    @property
+    def publishes_in_flight(self) -> int:
+        """``publish()`` calls between entry and their outcome (G-22).
+
+        Includes worker-thread publishes waiting for the I/O thread to pick
+        them up. One publisher channel serves them one at a time, so more
+        than one means publishes are queued behind the I/O thread.
+        """
+        return self._publishes_in_flight
+
+    def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
+
+        Fires on the owner thread when RabbitMQ sends ``basic.cancel`` (queue
+        deleted, quorum leader change, ...). The consume loop re-subscribes
+        when the queue exists again and then fires :meth:`on_consumer_resumed`.
+        """
+        self._consumer_supervisor.on_cancelled(callback)
+
+    def on_consumer_resumed(self, callback: Callable[[str], None]) -> None:
+        """Register ``callback(queue)`` for a broker-cancelled consumer that is consuming again."""
+        self._consumer_supervisor.on_resumed(callback)
+
+    @property
+    def cancelled_consumers(self) -> frozenset[str]:
+        """Queues whose consumer the broker cancelled and that are not consuming again yet."""
+        return self._consumer_supervisor.cancelled_queues
 
     def on_channel_opened(self, callback: Callable[[], None]) -> None:
         """Register a callback fired every time this transport creates a new
@@ -406,6 +453,7 @@ class SyncTransport:
             self._consumer_channels.clear()
             self._cancelled_channels.clear()
             self._consumer_tags = {}
+            self._consumer_supervisor.clear()
 
             if self._channel and self._channel.is_open:
                 self._channel.close()
@@ -757,6 +805,7 @@ class SyncTransport:
         self._consumer_channels = {}
         self._cancelled_channels = []
         self._consumer_tags = {}
+        self._consumer_supervisor.clear()
         self._confirmed_channel_ids = set()
         self._connected = False
         self._owner_ident = None
@@ -764,6 +813,17 @@ class SyncTransport:
         # _ever_consumed_any stays True (sticky) — see __init__.
 
     def publish(self, envelope: MessageEnvelope) -> PublishOutcome:
+        """Publish a message to RabbitMQ (see :meth:`_publish`); counted in
+        :attr:`publishes_in_flight` until its outcome is known."""
+        with self._publishes_lock:
+            self._publishes_in_flight += 1
+        try:
+            return self._publish(envelope)
+        finally:
+            with self._publishes_lock:
+                self._publishes_in_flight -= 1
+
+    def _publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.
 
         Returns PublishOutcome with status indicating success/failure.
@@ -1176,6 +1236,7 @@ class SyncTransport:
             message = self._build_message(ch, method, properties, body, no_ack=no_ack)
             callback(message)
 
+        consumer_channel.add_on_cancel_callback(self._on_broker_cancel)
         consumer_channel.basic_consume(
             queue=queue,
             on_message_callback=on_message,
@@ -1184,8 +1245,86 @@ class SyncTransport:
         )
 
         self._consumer_tags[queue] = consumer_tag
+        self._consumer_supervisor.register(
+            SyncConsumerRecord(
+                queue=queue,
+                tag=consumer_tag,
+                on_message=on_message,
+                prefetch=prefetch,
+                no_ack=no_ack,
+                supervised=declare,
+            )
+        )
         logger.info("Started consuming from queue '%s' with tag '%s'", queue, consumer_tag)
         return consumer_tag
+
+    # ── Broker-initiated consumer cancel (G-26, sync) ─────────────────────
+
+    def _on_broker_cancel(self, method_frame: Any) -> None:
+        """pika's ``add_on_cancel_callback`` entry: the server sent ``basic.cancel``.
+
+        pika dispatches it on the owner thread, inside ``process_data_events``.
+        """
+        tag = getattr(getattr(method_frame, "method", None), "consumer_tag", None)
+        if isinstance(tag, str):
+            self._consumer_supervisor.broker_cancelled(tag)
+
+    def _queue_exists_now(self, queue: str) -> bool:
+        """Passive-declare probe for the re-subscribe path (owner thread).
+
+        Unlike :meth:`queue_exists` it never reconnects: it runs inside the
+        consume loop, and a fresh connection there would carry none of the
+        loop's consumers. A dead connection reports False; the loop's next
+        ``process_data_events`` raises and the broker's recovery takes over.
+        """
+        import pika.exceptions
+
+        if not self.is_connected():
+            return False
+        channel = self._connection.channel()
+        try:
+            channel.queue_declare(queue=queue, passive=True)
+            return True
+        except pika.exceptions.ChannelClosedByBroker as exc:
+            if exc.reply_code != 404:
+                logger.warning("Probing queue '%s' for re-subscription failed: %s", queue, exc)
+            return False
+        finally:
+            if channel.is_open:
+                channel.close()
+
+    def _resubscribe(self, record: SyncConsumerRecord) -> bool:
+        """Re-issue ``basic.consume`` for a broker-cancelled consumer, same tag.
+
+        Reuses the queue's consumer channel while it is open (the deliveries
+        still unacked on it stay settleable); opens a fresh one if the broker
+        closed it. Never declares the queue. A channel-level refusal (the
+        queue vanished again, an exclusive consumer holds it) is logged and
+        retried on the next backoff step.
+        """
+        import pika.exceptions
+
+        channel = self._consumer_channels.get(record.queue)
+        try:
+            if channel is None or not channel.is_open:
+                channel = self._connection.channel()
+                self._fire_channel_opened()
+                self._fire_channel_rebuilt()
+                channel.basic_qos(prefetch_count=record.prefetch)
+                channel.add_on_cancel_callback(self._on_broker_cancel)
+                self._consumer_channels[record.queue] = channel
+            channel.basic_consume(
+                queue=record.queue,
+                on_message_callback=record.on_message,
+                auto_ack=record.no_ack,
+                consumer_tag=record.tag,
+            )
+        except pika.exceptions.DuplicateConsumerTag:
+            return True  # already consuming under this tag
+        except pika.exceptions.AMQPChannelError as exc:
+            logger.warning("Re-subscribing to queue '%s' failed (%s); retrying later", record.queue, exc)
+            return False
+        return True
 
     def declare_exchange(self, exchange: RabbitExchange) -> None:
         """Declare an exchange on RabbitMQ."""
@@ -1369,8 +1508,11 @@ class SyncTransport:
             return
 
         channel = self._consumer_channels.get(queue_name)
+        record = self._consumer_supervisor.unregister(queue_name)
+        # A consumer the broker already cancelled is unknown to pika: nothing to cancel.
+        broker_cancelled = record is not None and record.broker_cancelled
         try:
-            if channel is not None and channel.is_open:
+            if channel is not None and channel.is_open and not broker_cancelled:
                 channel.basic_cancel(consumer_tag=consumer_tag)
         except Exception as e:
             logger.warning("Failed to cancel consumer %s: %s", consumer_tag, e)
@@ -1416,7 +1558,7 @@ class SyncTransport:
                 # process_data_events drains ALL channels' consumers + queued
                 # add_callback_threadsafe callbacks (acks from worker threads).
                 try:
-                    self._connection.process_data_events(time_limit=1.0)
+                    self._connection.process_data_events(time_limit=self.poll_interval)
                 except ValueError as exc:
                     # pika's SelectConnection ioloop raises a bare
                     # ValueError("Timeout closed before call") when the
@@ -1434,6 +1576,9 @@ class SyncTransport:
                 # and pumping -- fire once per tick regardless of whether any
                 # message was actually delivered this iteration.
                 self._fire_io_tick()
+                # G-26: re-subscribe broker-cancelled consumers whose queue is
+                # back -- here, on the owner thread, never from a worker.
+                self._consumer_supervisor.check_once()
                 # Safety: if no consumers are registered, exit (avoids looping
                 # forever in tests/embeds that call start_consuming without a
                 # consumer). Real consumers are cancelled by stop_consuming which

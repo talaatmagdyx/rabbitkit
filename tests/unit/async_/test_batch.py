@@ -108,7 +108,7 @@ class TestStartStop:
 
     @pytest.mark.asyncio
     async def test_stop_resolves_queued_items_not_sent(self) -> None:
-        """G-12: an item still queued at stop() never left the client: the
+        """an item still queued at stop() never left the client: the
         caller gets NOT_SENT(publisher_closed), not a bare RuntimeError."""
         transport, _, _ = _make_transport()
         pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=0, batch_size=100, max_in_flight=100))
@@ -255,7 +255,7 @@ class TestPublish:
         await pub.stop()
 
 
-# ── bounded waits (G-14) ─────────────────────────────────────────────────────
+# ── bounded waits ─────────────────────────────────────────────────────
 
 
 class TestBoundedWaits:
@@ -399,7 +399,7 @@ class TestBoundedWaits:
         transport._publish_on_channel.assert_not_awaited()
 
 
-# ── byte budget (G-14) ───────────────────────────────────────────────────────
+# ── byte budget ───────────────────────────────────────────────────────
 
 
 class TestByteBudget:

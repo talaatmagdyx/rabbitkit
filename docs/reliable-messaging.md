@@ -220,7 +220,7 @@ calls both hooks there.
   duplicate in the DLQ after that fallback.
 - `rabbitkit_messages_dead_lettered_total` counts completed dead-letters:
   a confirmed DLQ copy, or the reject the pipeline actually sent. A delivery
-  requeued because its DLQ is missing is not counted. The G-17 copies of
+  requeued because its DLQ is missing is not counted. The metadata-stamped copies of
   failures outside `RetryMiddleware` are not counted by it.
 - Copies keep the wire body and encoding, `message_id` (a message without one
   gets a stable id on its first handoff), `correlation_id`, `type`, `app_id`,

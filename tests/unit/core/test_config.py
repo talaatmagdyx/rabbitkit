@@ -202,7 +202,7 @@ class TestReconnectMaxAttempts:
 
 
 class TestConnectionTimingValidation:
-    """G-08: timing values that silently broke reconnects are rejected."""
+    """timing values that silently broke reconnects are rejected."""
 
     def test_defaults_are_valid(self) -> None:
         config = ConnectionConfig()
@@ -292,7 +292,7 @@ class TestClientProperties:
 
 class TestConsumerConfigM6:
     def test_reject_transient_on_redelivery_default_on(self) -> None:
-        """F15: the transient-failure loop is bounded by default."""
+        """the transient-failure loop is bounded by default."""
         assert ConsumerConfig().reject_transient_on_redelivery is True
 
     def test_manual_settle_on_error_default_on(self) -> None:
@@ -480,7 +480,7 @@ class TestPoolConfig:
 
     @pytest.mark.parametrize("size", [0, -1])
     def test_pool_size_must_be_positive(self, size: int) -> None:
-        """G-25: channel_pool_size=0 made the pool unbounded."""
+        """channel_pool_size=0 made the pool unbounded."""
         from rabbitkit.core.errors import ConfigValidationError
 
         with pytest.raises(ConfigValidationError, match="channel_pool_size"):

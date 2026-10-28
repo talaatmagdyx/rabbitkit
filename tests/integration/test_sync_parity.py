@@ -1,16 +1,16 @@
-"""Real-broker tests for the SyncBroker parity work (wave 4, sync stream).
+"""Real-broker tests for SyncBroker parity with AsyncBroker.
 
 Each test asserts what the BROKER reports (queue counts, consumer counts),
 not only what the client believes it did:
 
-* G-26 (sync): a queue deleted under a running SyncBroker consumer is
+* a queue deleted under a running SyncBroker consumer is
   reported as not consuming; recreating it resumes consumption, on the
   consume loop's own thread, without rabbitkit re-creating the queue.
-* CONSUMER-006 (sync): ``ConsumerConfig.processing_timeout`` settles a
+* ``ConsumerConfig.processing_timeout`` settles a
   delivery whose handler sleeps past it (requeue, then DLQ on the
   redelivery); the late handler return settles nothing a second time and
   the channel stays open.
-* G-22 (sync): ``publish_in_flight`` is sampled from the sync transport.
+* ``publish_in_flight`` is sampled from the sync transport.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from tests.integration.conftest import QueueProbe, wait_for_consumers, wait_for_counts
-from tests.integration.test_observability_foundation import History
+from tests.integration.test_broker_metrics import History
 
 pytestmark = pytest.mark.integration
 
@@ -98,7 +98,7 @@ def _running(broker: Any, worker_config: Any = None) -> Iterator[None]:
         assert not failure, failure
 
 
-# ── G-26: broker-initiated basic.cancel ──────────────────────────────────
+# ── broker-initiated basic.cancel ──────────────────────────────────
 
 
 @pytest.mark.parametrize("workers", [1, 3], ids=["inline", "pool"])
@@ -155,7 +155,7 @@ def test_deleted_queue_reports_not_consuming_and_resumes_when_recreated(
             assert probe.consumers(queue) == 1  # exactly one consumer
 
 
-# ── CONSUMER-006 on the sync broker: processing_timeout ──────────────────
+# ── processing_timeout on the sync broker ──────────────────
 
 
 @pytest.mark.parametrize("workers", [1, 2], ids=["single-worker", "pool"])
@@ -243,7 +243,7 @@ def test_processing_timeout_refuses_the_late_handlers_result_publish(rabbit: dic
         assert wait_for_counts(rabbit, queue, (0, 0), timeout=20) == (0, 0)
 
 
-# ── G-22: publish_in_flight on the sync broker ───────────────────────────
+# ── publish_in_flight on the sync broker ───────────────────────────
 
 
 def test_publish_in_flight_is_sampled_from_the_sync_transport(rabbit: dict[str, Any]) -> None:

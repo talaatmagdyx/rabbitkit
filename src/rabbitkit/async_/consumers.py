@@ -1,4 +1,4 @@
-"""Consumer supervision for the async transport (G-26, CONSUMER-007).
+"""Consumer supervision for the async transport.
 
 RabbitMQ cancels a consumer on its own (``basic.cancel`` from the server)
 when the queue is deleted, when a quorum or mirrored queue loses its leader,

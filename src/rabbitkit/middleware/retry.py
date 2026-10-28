@@ -57,8 +57,8 @@ logger = logging.getLogger(__name__)
 _SETTLEMENT_SIGNALS = (AckMessage, NackMessage, RejectMessage)
 
 # Item 7: DLQ-triage headers (error-message is length-capped) and the
-# retry/DLQ metadata header names (spec §13.4 / §14.1) live in
-# core/failure_copy.py, shared with the pipeline's DLQ copy (G-17).
+# retry/DLQ metadata header names live in
+# core/failure_copy.py, shared with the pipeline's DLQ copy.
 _ERROR_MESSAGE_MAX_LEN = ERROR_MESSAGE_MAX_LEN
 _H_ORIGINAL_QUEUE = H_ORIGINAL_QUEUE
 _H_FIRST_FAILED_AT = H_FIRST_FAILED_AT
@@ -480,7 +480,7 @@ class RetryMiddleware(BaseMiddleware):
 
         With ``RetryConfig.trust_retry_header=False`` the header is not
         read at all: only the broker's ``x-death`` history counts, so a
-        producer cannot skip retries by claiming a high count (G-19).
+        producer cannot skip retries by claiming a high count.
 
         For a broker-enforced backstop on top of this (e.g. against a
         misbehaving consumer that never expires/dead-letters a message),
@@ -530,7 +530,7 @@ class RetryMiddleware(BaseMiddleware):
     def _copy_envelope(
         self, message: RabbitMessage, *, routing_key: str, headers: dict[str, Any], message_id: str
     ) -> MessageEnvelope:
-        """See :func:`rabbitkit.core.failure_copy.copy_envelope` (wire body, G-07)."""
+        """See :func:`rabbitkit.core.failure_copy.copy_envelope` (wire body)."""
         return copy_envelope(message, routing_key=routing_key, headers=headers, message_id=message_id)
 
     def _build_retry_envelope(
@@ -833,7 +833,7 @@ class RetryMiddleware(BaseMiddleware):
         ``ExceptionMiddleware(swallow_permanent=True)`` must not swallow it,
         or the pipeline would ack a message that exists nowhere else.
 
-        The log line uses the same sanitizer as the headers (F30): raw
+        The log line uses the same sanitizer as the headers: raw
         exception text routinely embeds credentials.
         """
         exc._rabbitkit_terminal = True  # type: ignore[attr-defined]
@@ -979,7 +979,7 @@ class RetryRouter:
                     "x-message-ttl": max(1, int(delay_ms * mult)),
                     "x-dead-letter-exchange": "",  # default exchange (M5)
                     "x-dead-letter-routing-key": source_queue_name,
-                    # Plan §5.1: configurable. The legacy default is
+                    # Plan configurable. The legacy default is
                     # CLASSIC (delay queues hold messages only for the
                     # delay window, have no consumers, and quorum queues
                     # historically had weaker per-message TTL behavior).

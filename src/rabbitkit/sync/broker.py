@@ -110,7 +110,7 @@ class SyncBroker:
         # after the first publish() call would silently reuse the stale
         # pre-mutation chain.
         self._publish_middlewares: list[BaseMiddleware] = middlewares or []
-        # G-19: PublisherConfig.strip_reserved_headers (None = off).
+        # PublisherConfig.strip_reserved_headers (None = off).
         self._reserved_header_stripper: ReservedHeaderStripper | None = (
             ReservedHeaderStripper(extra=(self._config.retry.retry_header,) if self._config.retry is not None else ())
             if self._config.publisher.strip_reserved_headers
@@ -146,14 +146,14 @@ class SyncBroker:
             )
 
         self._transport: SyncTransport | None = None
-        # G-22: connection/channel/flow-control metrics (see AsyncBroker).
+        # connection/channel/flow-control metrics (see AsyncBroker).
         self._broker_metrics: BrokerMetrics | None = None
         self._metrics_sampled_at = 0.0
         self._worker_pool: SyncWorkerPool | None = None
         self._started = False
         self._rpc_client: Any | None = None
 
-        # G-26: optional hooks called with the queue name when the BROKER
+        # optional hooks called with the queue name when the BROKER
         # cancels a route's consumer (queue deleted, quorum leader change, ...)
         # and when it is consuming again. The consume loop re-subscribes on
         # its own; the route reports as not consuming in health checks
@@ -340,7 +340,7 @@ class SyncBroker:
         # Reconnect-attempts bound: previously hardcoded on the transport
         # and unreachable from config (see ConnectionConfig.reconnect_max_attempts).
         self._transport.max_reconnect_attempts = self._config.connection.reconnect_max_attempts
-        # Before connect(), so the first connection and channel count (G-22).
+        # Before connect(), so the first connection and channel count.
         self._wire_reconnect_metric()
 
         self._transport.connect()
@@ -736,7 +736,7 @@ class SyncBroker:
             if message_id is not None:
                 envelope = replace(envelope, message_id=message_id)
 
-        # G-19: an application publish cannot carry rabbitkit's retry/DLQ
+        # an application publish cannot carry rabbitkit's retry/DLQ
         # bookkeeping headers (opt-in; the library's own republishes bypass this).
         if self._reserved_header_stripper is not None:
             envelope = self._reserved_header_stripper(envelope)
@@ -855,7 +855,7 @@ class SyncBroker:
             self._sample_metrics()
 
     def _sample_metrics(self) -> None:
-        """Refresh the sampled broker gauges (G-22): connection state, open
+        """Refresh the sampled broker gauges: connection state, open
         channels, publishes and bytes in flight, blocked state, per-route
         consuming, worker-pool backlog."""
         metrics, transport = self._broker_metrics, self._transport
@@ -1187,7 +1187,7 @@ class SyncBroker:
     def _wire_reconnect_metric(self) -> None:
         """Wire the broker metrics (:class:`BrokerMetrics`) to the transport's
         hooks via the first ``MetricsMiddleware`` with a collector: publish
-        middlewares first, then any route (G-22: a publish-only broker gets
+        middlewares first, then any route (a publish-only broker gets
         connection and channel metrics too). No-op without metrics. The sync
         broker has one connection, reported as role ``"shared"``.
         """
@@ -1493,7 +1493,7 @@ class SyncBroker:
             tracker.subscribed()
 
     def _wire_consumer_state(self) -> None:
-        """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
+        """Mirror broker-initiated consumer cancels into route state and the hooks."""
         transport: Any = self._transport  # set: _start_consumer returns early without one
         if self._consumer_state_wired is transport:
             return

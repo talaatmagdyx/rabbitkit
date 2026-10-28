@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from tests.integration.conftest import QueueProbe, wait_for_consumers
-from tests.integration.test_observability_foundation import History
+from tests.integration.test_broker_metrics import History
 from tests.integration.test_sync_parity import _config, _name, _publish, _running, _until, _with_channel
 
 pytestmark = pytest.mark.integration

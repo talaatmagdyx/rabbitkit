@@ -73,7 +73,7 @@ REASON_OTHER = "other"
 
 
 def _publish_reason_label(result: Any) -> str:
-    """Bounded ``reason`` label for a publish result (G-22)."""
+    """Bounded ``reason`` label for a publish result."""
     reason = getattr(result, "reason", None) if isinstance(result, PublishOutcome) else None
     if reason is None:
         return REASON_NONE
@@ -127,7 +127,7 @@ _MAX_CAUSE_DEPTH = 4
 
 
 def connection_failure_reason(error: BaseException | None) -> str:
-    """Bounded reason code for a connection failure (a metric label, G-22).
+    """Bounded reason code for a connection failure (a metric label).
 
     A :class:`~rabbitkit.core.errors.TerminalConnectionError` keeps its own
     ``reason``. Otherwise *error* and its ``__cause__`` chain are mapped to
@@ -351,7 +351,7 @@ class MetricsMiddleware(BaseMiddleware):
         # and publish the gauge on every enter/exit.
         self._in_flight: dict[str, int] = {}
         self._in_flight_lock = threading.Lock()
-        # G-22: set by the broker when its transport reports the real
+        # set by the broker when its transport reports the real
         # send-to-confirm latency (BrokerMetrics); this middleware then stops
         # timing the whole publish call as "confirm latency".
         self._confirm_latency_from_transport = False
@@ -383,7 +383,7 @@ class MetricsMiddleware(BaseMiddleware):
         """Publish-side counters + histograms shared by both scopes.
 
         ``messages_published_total`` carries the outcome's ``status`` and a
-        bounded ``reason`` (G-22). ``publish_confirm_latency_seconds`` is
+        bounded ``reason``. ``publish_confirm_latency_seconds`` is
         observed here only when no transport reports it (TestBroker, a
         custom publish fn): then it is the whole call for a CONFIRMED
         outcome. Under ``SyncBroker`` / ``AsyncBroker`` the transport times
@@ -592,7 +592,7 @@ class MetricsMiddleware(BaseMiddleware):
             return result
 
 
-# ── Broker/transport metrics (G-22) ───────────────────────────────────────
+# ── Broker/transport metrics ───────────────────────────────────────
 
 #: Connection roles: the async broker's two connections, the sync broker's
 #: one shared connection, and a terminal failure with no role.
@@ -616,7 +616,7 @@ def _routing_failure_reason(outcome: PublishOutcome) -> str | None:
 
 
 class BrokerMetrics:
-    """Connection, channel, flow-control and transport-publish metrics (G-22).
+    """Connection, channel, flow-control and transport-publish metrics.
 
     Transport-free: the brokers feed it from their transport's hooks
     (``on_connection_state``, ``on_reconnect_attempt``,

@@ -1,6 +1,6 @@
-"""Failure settlement policy of HandlerPipeline: bounded transient loop (F15),
-MANUAL failures, diagnostics (INV-009), ambiguous acks (§11.3), processing
-deadline (CONSUMER-006) and dead-letter target verification (F17)."""
+"""Failure settlement policy of HandlerPipeline: bounded transient loop,
+MANUAL failures, diagnostics, ambiguous acks, processing
+deadline and dead-letter target verification."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def _captured(pipeline: HandlerPipeline) -> MagicMock:
     return log
 
 
-# ── F15: transient failures are bounded by default ────────────────────────
+# ── transient failures are bounded by default ────────────────────────
 
 
 class TestTransientLoopIsBoundedByDefault:
@@ -161,7 +161,7 @@ class TestManualFailureIsSettled:
         reject.assert_called_once_with(False)
 
 
-# ── INV-009: every handler failure is logged, without payload, rate-limited
+# ── every handler failure is logged, without payload, rate-limited
 
 
 class TestFailureDiagnostics:
@@ -210,7 +210,7 @@ class TestFailureDiagnostics:
         assert len(w._windows) <= _WindowedLog.MAX_KEYS
 
 
-# ── §11.3: a failing ack after success is ambiguous, not a handler failure
+# ── a failing ack after success is ambiguous, not a handler failure
 
 
 class TestAckOutcomeUnknown:
@@ -273,11 +273,11 @@ class TestAckOutcomeUnknown:
         await pipeline.process_async(_route(handler, route_middlewares=[mw]), msg)
         names = [c.args[0] for c in collector.inc_counter.call_args_list]
         assert "rabbitkit_settlement_outcome_unknown_total" in names
-        # G-15: the claimed-but-unsent ack is not also counted as acked.
+        # the claimed-but-unsent ack is not also counted as acked.
         assert "rabbitkit_messages_acked_total" not in names
 
 
-# ── CONSUMER-006: processing deadline ─────────────────────────────────────
+# ── processing deadline ─────────────────────────────────────
 
 
 class TestProcessingTimeout:
@@ -332,7 +332,7 @@ class TestProcessingTimeout:
         assert classify_error(TimeoutError()).outcome_unknown is False
 
 
-# ── F17: never dead-letter into a missing DLQ ─────────────────────────────
+# ── never dead-letter into a missing DLQ ─────────────────────────────
 
 
 @pytest.fixture
@@ -400,7 +400,7 @@ class TestDeadLetterTargetMissing:
         assert delays == [0.001, 0.002, 0.004, 0.004, 0.001]
 
 
-# ── CONSUMER-006 on the sync broker: settling an expired delivery ─────────
+# ── sync broker: settling an expired delivery ─────────
 
 
 class TestSettleExpiredSync:
@@ -450,7 +450,7 @@ class TestSettleExpiredSync:
     def test_the_settlement_metric_is_counted_once_across_two_reporters(self) -> None:
         from rabbitkit.core.config import MetricsConfig
         from rabbitkit.middleware.metrics import MetricsMiddleware
-        from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+        from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
         collector = RecordingCollector()
         route = _route(_raiser(TimeoutError()))

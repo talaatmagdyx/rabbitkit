@@ -64,7 +64,7 @@ class TestAsyncBroker:
         assert broker.stopped is True
 
     async def test_async_broker_leaves_signal_handling_to_the_server(self) -> None:
-        """G-24: the ASGI server owns SIGINT/SIGTERM."""
+        """the ASGI server owns SIGINT/SIGTERM."""
         seen: list[bool] = []
 
         class _SignalAwareBroker(_FakeAsyncBroker):

@@ -348,7 +348,7 @@ class AsyncWorkerPool:
         self._task_messages: dict[asyncio.Task[None], RabbitMessage] = {}
         # Tasks that hold a worker slot (their handler has started). The rest
         # of ``_tasks`` are prefetched deliveries still waiting for a slot;
-        # stop() releases those at once instead of running them (§3.2).
+        # stop() releases those at once instead of running them.
         self._started: set[asyncio.Task[None]] = set()
         self._running = False
 
@@ -401,7 +401,7 @@ class AsyncWorkerPool:
                 return
             # asyncio.wait, not gather: a cancelled gather only completes once
             # every child has finished, so one handler that swallows
-            # CancelledError made stop() unbounded (INV-008).
+            # CancelledError made stop() unbounded.
             _done, pending = await asyncio.wait(tasks, timeout=effective)
             if not pending:
                 return

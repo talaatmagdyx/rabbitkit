@@ -434,7 +434,7 @@ class TestIterPublishSyncEdges:
 
 
 class TestIterPublishAsyncEveryIndexOnce:
-    """G-13 / INV-009: every input index yields exactly one item."""
+    """every input index yields exactly one item."""
 
     async def test_a_leaked_cancelled_error_yields_unknown_not_a_dropped_item(self) -> None:
         async def pub(e: MessageEnvelope) -> PublishOutcome:

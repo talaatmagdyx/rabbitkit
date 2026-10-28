@@ -1,4 +1,4 @@
-"""Real-broker tests for the cleanup stream (wave 3).
+"""Real-broker tests for sync publish outcomes and metadata DLQ copies.
 
 Each test asserts what the BROKER holds (queue counts, the copies on a
 queue, their headers), not only what the client reports:
@@ -8,7 +8,7 @@ queue, their headers), not only what the client reports:
   ERROR ``exchange_not_found``, sent once; a connection the broker closed
   while idle is replaced before sending.
 * ``async with AsyncBroker(...)`` starts and stops the broker.
-* G-17: failures that bypass RetryMiddleware reach the DLQ as a confirmed
+* failures that bypass RetryMiddleware reach the DLQ as a confirmed
   copy carrying rabbitkit's failure metadata, not only ``x-death``.
 """
 
@@ -97,7 +97,7 @@ def _kill_connection(rabbit: dict[str, Any], connection_name: str) -> None:
         names = _connections_named(client, connection_name)
     assert names, f"connection {connection_name} never appeared in the management API"
     for name in names:
-        client.close_connection(name, reason="cleanup foundation test")
+        client.close_connection(name, reason="rabbitkit test")
     while _connections_named(client, connection_name) and time.monotonic() < deadline:
         time.sleep(0.1)
     time.sleep(0.3)  # the Connection.Close frame has reached the client socket
@@ -234,7 +234,7 @@ def test_sync_idle_publisher_connection_closed_by_broker_is_replaced_before_send
             broker.stop()
 
 
-# ── async with AsyncBroker (contract §4.3) ─────────────────────────────────
+# ── async with AsyncBroker ─────────────────────────────────
 
 
 async def test_async_with_starts_consumes_and_stops(rabbit: dict[str, Any]) -> None:
@@ -266,7 +266,7 @@ def _consumers(url: str, queue: str) -> int | None:
         return probe.consumers(queue)
 
 
-# ── G-17: DLQ copies with metadata for failures outside RetryMiddleware ────
+# ── DLQ copies with metadata for failures outside RetryMiddleware ────
 
 
 def _get_one(url: str, queue: str) -> tuple[Any, bytes] | None:

@@ -202,7 +202,7 @@ class TestClassifyPublishOutcome:
         ],
     )
     def test_transport_reasons_are_kept(self, status: PublishStatus, reason: str, expected: BulkPublishStatus) -> None:
-        """G-03: the new statuses map one-to-one and keep the transport's reason."""
+        """the new statuses map one-to-one and keep the transport's reason."""
         got = classify_publish_outcome(PublishOutcome(status=status, reason=reason))
         assert got == (expected, reason)
         assert reason in ALL_REASONS

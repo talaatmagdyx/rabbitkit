@@ -1,5 +1,5 @@
-"""RetryMiddleware: wire body on retry/DLQ copies (G-07), the failure
-taxonomy on headers and metrics (G-16), producer-set retry counts (G-19),
+"""RetryMiddleware: wire body on retry/DLQ copies, the failure
+taxonomy on headers and metrics, producer-set retry counts,
 and the terminal handoff composed with ExceptionMiddleware."""
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def _raise(exc: Exception) -> Any:
     return handler
 
 
-# ── G-07: retry and DLQ copies carry the wire body ────────────────────────
+# ── retry and DLQ copies carry the wire body ────────────────────────
 
 
 class TestWireBody:
@@ -116,7 +116,7 @@ class TestWireBody:
         assert again.body == PAYLOAD
 
 
-# ── G-16: category on headers and metric labels ───────────────────────────
+# ── category on headers and metric labels ───────────────────────────
 
 
 class TestCategoryHeaders:
@@ -166,7 +166,7 @@ class TestCategoryHeaders:
         ) in calls
 
 
-# ── G-19: a producer-set retry count ──────────────────────────────────────
+# ── a producer-set retry count ──────────────────────────────────────
 
 
 class TestRetryCountTrust:

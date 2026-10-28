@@ -1,4 +1,4 @@
-"""rabbitkit-driven reconnects for aio-pika's ``RobustConnection`` (G-08, ADR-M8).
+"""rabbitkit-driven reconnects for aio-pika's ``RobustConnection``.
 
 aio-pika's robust connection restores channels, QoS, exchanges, queues and
 consumers after a reconnect, and rabbitkit keeps all of that. What it does

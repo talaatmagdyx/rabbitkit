@@ -338,7 +338,7 @@ class TestAsyncAlreadySettled:
 # ── ack-failure propagation (Core-H4) ─────────────────────────────────────
 # A failed settlement must RAISE. The sync variants leave the message
 # UNSETTLED so the recovery loop can redeliver; the async variants keep the
-# claim and report the outcome as unknown (G-15).
+# claim and report the outcome as unknown.
 
 
 class TestAckFailurePropagation:
@@ -418,7 +418,7 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.ack_async()
 
-        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        # the claim stays (the frame may have landed); the outcome is unknown.
         assert msg.is_settled is True
         assert msg._disposition == "acked"
         assert msg.settlement_outcome_unknown is True
@@ -435,7 +435,7 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.nack_async(requeue=True)
 
-        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        # the claim stays (the frame may have landed); the outcome is unknown.
         assert msg.is_settled is True
         assert msg._disposition == "nacked"
         assert msg.settlement_outcome_unknown is True
@@ -452,7 +452,7 @@ class TestAckFailurePropagation:
         with pytest.raises(RuntimeError, match="channel closed"):
             await msg.reject_async(requeue=False)
 
-        # G-15: the claim stays (the frame may have landed); the outcome is unknown.
+        # the claim stays (the frame may have landed); the outcome is unknown.
         assert msg.is_settled is True
         assert msg._disposition == "rejected"
         assert msg.settlement_outcome_unknown is True
@@ -481,7 +481,7 @@ class TestAsyncNoSettlementFn:
             await msg.reject_async()
 
 
-# ── G-15: async settlement is claimed atomically ──────────────────────────
+# ── async settlement is claimed atomically ──────────────────────────
 
 
 def _wire_async_gated(msg: RabbitMessage) -> tuple[list[tuple[str, bool | None]], asyncio.Event]:

@@ -1,4 +1,4 @@
-"""Tests for core/dead_letter.py — DeadLetterGuard (F17)."""
+"""Tests for core/dead_letter.py — DeadLetterGuard."""
 
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ class TestBrokerRetainedDeadLetters:
         probe.assert_awaited_once()
 
 
-# ── DeadLetterCopier (G-17) ──────────────────────────────────────────────
+# ── DeadLetterCopier ──────────────────────────────────────────────
 
 
 class _Publisher:

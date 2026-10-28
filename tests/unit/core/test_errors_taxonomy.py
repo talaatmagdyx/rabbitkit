@@ -1,4 +1,4 @@
-"""The failure taxonomy (G-16): ErrorCategory, ClassifiedError.category and
+"""The failure taxonomy: ErrorCategory, ClassifiedError.category and
 how classify_error assigns it."""
 
 from __future__ import annotations

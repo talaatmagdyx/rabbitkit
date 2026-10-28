@@ -3254,7 +3254,7 @@ class TestInspectionPrimitivesSync:
         assert props.delivery_mode == 1
 
 
-# ── G-22: metrics hooks (connection state, reconnect attempts, publish outcome) ──
+# ── metrics hooks (connection state, reconnect attempts, publish outcome) ──
 
 
 class TestObservabilityHooks:

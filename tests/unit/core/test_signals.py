@@ -1,4 +1,4 @@
-"""Tests for core/signals.py — signal-handler ownership helpers (G-24)."""
+"""Tests for core/signals.py — signal-handler ownership helpers."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Real-broker coverage for the observability foundation (G-22, G-23, PUB-017, CON-005).
+"""Real-broker coverage for the broker metrics and tracing.
 
 * publish outcomes are counted by status AND bounded reason; routing failures
   (returned / exchange_not_found) are counted by the broker itself; confirm

@@ -1902,7 +1902,7 @@ IDLE → STARTING → RUNNING → STOPPING → STOPPED
 - **Settlement order differs by transport** — the sync `RabbitMessage.ack()` sets the
   disposition only after `_ack_fn()` returns (a failed ack propagates and the message stays
   pending); the async `ack_async()` / `nack_async()` / `reject_async()` claim the disposition
-  before awaiting the transport, so one delivery never gets two frames (G-15); a failed write
+  before awaiting the transport, so one delivery never gets two frames; a failed write
   propagates and sets `settlement_outcome_unknown`.
 
 ### Sync vs. async: two different connection models

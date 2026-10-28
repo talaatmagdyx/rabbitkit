@@ -23,7 +23,7 @@ jobs:
       - name: mypy
         run: .venv/bin/mypy src/rabbitkit/ --strict --ignore-missing-imports
 
-  # G-29: the PUBLIC API must type-check under Pyright strict from a
+  # the PUBLIC API must type-check under Pyright strict from a
   # downstream application's point of view. tests/typing/public_api.py uses
   # the API the way a strictly typed app would and pins the types it relies
   # on with assert_type, so a public signature that degrades to Any (e.g. a

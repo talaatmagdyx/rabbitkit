@@ -118,7 +118,7 @@ python -m benchmarks.bench_bulk --url amqp://guest:guest@localhost:5672/ --mgmt-
 Results (with an environment fingerprint) land in
 `benchmarks/results/bulk_<timestamp>.json`.
 
-## Tier 2c: the reliability profile (`python -m benchmarks.bench_foundation`)
+## Tier 2c: the reliability profile (`python -m benchmarks.bench_reliability`)
 
 Measures the workload a reliable deployment actually runs, rather than a
 toy one. Every message is 1 KiB, persistent, published with confirms and
@@ -134,7 +134,7 @@ never dropped from the numbers.
 |---|---|
 | `publish` | `publish_many`, 256 in flight, 50,000 messages; confirm accounting |
 | `consume` | drain a preloaded queue of 50,000 messages, prefetch 256 |
-| `sustained` | open-loop at 2,778 msg/s for 60 s (the 10M events/hour design rate), 1 publisher and 1 consumer process |
+| `sustained` | open-loop at 2,778 msg/s for 60 s (about 10M messages an hour), 1 publisher and 1 consumer process |
 | `burst` | open-loop at 20,000 msg/s for 10 s, 4 publisher and 2 consumer processes; peak backlog and drain time |
 
 ### Results for 0.20.0

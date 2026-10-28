@@ -1,5 +1,5 @@
-"""SyncBroker parity with AsyncBroker (wave 4): ``processing_timeout``,
-broker-initiated consumer cancels (G-26) and the sampled publish gauge."""
+"""SyncBroker parity with AsyncBroker: ``processing_timeout``,
+broker-initiated consumer cancels and the sampled publish gauge."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from rabbitkit.middleware.metrics import MetricsMiddleware
 from rabbitkit.sync.broker import SyncBroker
 from rabbitkit.sync.deadlines import LateSettlementError
 from rabbitkit.sync.pool import InFlightByteLimiter
-from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
 _CFG = MetricsConfig()
 
@@ -252,7 +252,7 @@ class TestProcessingTimeout:
             assert broker._in_flight == 0
 
 
-# ── G-26: broker-initiated consumer cancel ───────────────────────────────
+# ── broker-initiated consumer cancel ───────────────────────────────
 
 
 class TestConsumerCancelledByBroker:
@@ -330,7 +330,7 @@ class TestConsumerCancelledByBroker:
             transport.on_consumer_cancelled.assert_called_once()
 
 
-# ── G-22: sampled publish gauge ──────────────────────────────────────────
+# ── sampled publish gauge ──────────────────────────────────────────
 
 
 class TestPublishInFlightGauge:

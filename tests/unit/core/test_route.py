@@ -478,7 +478,7 @@ class TestRouteDynamic:
             del route.name  # type: ignore[misc]
 
 
-# ── CONSUMER-005: per-route prefetch validation ──────────────────────────
+# ── per-route prefetch validation ──────────────────────────
 
 
 class TestPrefetchValidation:

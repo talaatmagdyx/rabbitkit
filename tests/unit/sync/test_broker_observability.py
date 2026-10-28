@@ -1,4 +1,4 @@
-"""SyncBroker metrics wiring (G-22): BrokerMetrics on the transport hooks
+"""SyncBroker metrics wiring: BrokerMetrics on the transport hooks
 (one "shared" connection), publish-only brokers included, sampled gauges."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.types import PublishOutcome, PublishStatus
 from rabbitkit.middleware.metrics import MetricsMiddleware
 from rabbitkit.sync.broker import SyncBroker
-from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
 _CFG = MetricsConfig()
 

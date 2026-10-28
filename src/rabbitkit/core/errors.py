@@ -59,7 +59,7 @@ class MissingDependencyError(Exception):
         self.param_name = param_name
 
 
-# ── Handler deadline (CONSUMER-006) ─────────────────────────────────────
+# ── Handler deadline ─────────────────────────────────────
 
 
 class HandlerTimeoutError(TimeoutError):
@@ -396,7 +396,7 @@ class BrokerNotStartedError(RuntimeError):
     """
 
 
-# ── Terminal connection failures (G-08) ──────────────────────────────────
+# ── Terminal connection failures ──────────────────────────────────
 # All subclass the builtin ConnectionError (an OSError): the client-library
 # errors these replace (aiormq's ProbableAuthenticationError, ssl's
 # SSLCertVerificationError) were OSErrors too, so ``except ConnectionError`` /

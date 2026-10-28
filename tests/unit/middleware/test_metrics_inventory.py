@@ -1,4 +1,4 @@
-"""middleware/metrics.py — G-22 metrics foundation: BrokerMetrics, bounded
+"""middleware/metrics.py — broker metrics: BrokerMetrics, bounded
 reason codes, the metric inventory and its bounded label allow-list."""
 
 from __future__ import annotations

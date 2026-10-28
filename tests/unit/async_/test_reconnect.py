@@ -1,4 +1,4 @@
-"""Tests for async_/reconnect.py — rabbitkit's reconnect policy on aio-pika's RobustConnection (G-08)."""
+"""Tests for async_/reconnect.py — rabbitkit's reconnect policy on aio-pika's RobustConnection."""
 
 from __future__ import annotations
 
@@ -340,7 +340,7 @@ async def test_no_client_properties_leaves_aio_pika_kwargs_alone() -> None:
 
 @pytest.mark.usefixtures("connected_ok", "no_jitter")
 class TestConnectionStateHooks:
-    """G-22: the policy reports a live drop and a recovery, per role, so the
+    """the policy reports a live drop and a recovery, per role, so the
     connection_up / broker_connected metrics follow reconnects."""
 
     async def test_drop_and_recovery_fire_once_each(self) -> None:

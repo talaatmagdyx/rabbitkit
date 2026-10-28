@@ -1,4 +1,4 @@
-"""Tests for async_/consumers.py — ConsumerSupervisor (G-26) with in-memory fakes."""
+"""Tests for async_/consumers.py — ConsumerSupervisor with in-memory fakes."""
 
 from __future__ import annotations
 

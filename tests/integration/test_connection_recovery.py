@@ -1,13 +1,13 @@
-"""Real-broker coverage for the connection foundation (G-08, G-10).
+"""Real-broker coverage for connection recovery.
 
-* G-08a  a refused login, vhost or TLS verification fails ``start()`` fast with
+* a refused login, vhost or TLS verification fails ``start()`` fast with
          a typed error; the same failure after startup stops the reconnect
          loop as a terminal failure instead of retrying forever
-* G-08b  reconnects after a drop back off exponentially and honour a budget
-* G-08c  ``credentials_provider`` is re-resolved on every in-place reconnect
-* G-08d  reconnect attempts, recovery and terminal failure reach the hooks,
+* reconnects after a drop back off exponentially and honour a budget
+* ``credentials_provider`` is re-resolved on every in-place reconnect
+* reconnect attempts, recovery and terminal failure reach the hooks,
          and the async broker counts ``reconnects_total``
-* G-10   a ``start()`` that fails part-way leaks no connection, consumer or
+* a ``start()`` that fails part-way leaks no connection, consumer or
          task, and can be retried
 
 The broker here is this module's own: tests stop its AMQP listener and kill
@@ -123,11 +123,11 @@ class _Events:
         self.reconnects += 1
 
 
-# ── G-08a: permanent failures at startup ─────────────────────────────────
+# ── permanent failures at startup ─────────────────────────────────
 
 
 async def test_wrong_password_fails_start_fast(own_rabbit: dict[str, Any]) -> None:
-    """S7: start() used to retry bad credentials 30 times (6-12 min)."""
+    """start() used to retry bad credentials 30 times (6-12 min)."""
     from rabbitkit import AsyncBroker, AuthenticationFailedError
 
     user = await _new_user(own_rabbit)
@@ -161,7 +161,7 @@ async def test_tls_verification_failure_fails_start_fast(
     tls_rabbit: dict[str, Any],  # noqa: F811 — the imported module fixture
     case: str,
 ) -> None:
-    """F22: SSLCertVerificationError is an OSError and was retried like a refused socket."""
+    """SSLCertVerificationError is an OSError and was retried like a refused socket."""
     from rabbitkit import AsyncBroker, TLSVerificationError
     from rabbitkit.core.config import RabbitConfig, SecurityConfig, SSLConfig
 
@@ -178,7 +178,7 @@ async def test_tls_verification_failure_fails_start_fast(
     assert caught.value.reason == "tls_verification_failed"
 
 
-# ── G-08a/d: permanent failures after startup are terminal ───────────────
+# ── permanent failures after startup are terminal ───────────────
 
 
 async def _assert_terminal(rabbit: dict[str, Any], broker: Any, events: _Events, user: str, expected: type) -> None:
@@ -256,7 +256,7 @@ async def test_terminal_failure_ends_run_with_the_error(own_rabbit: dict[str, An
     assert not broker.started
 
 
-# ── G-08c: credential rotation ───────────────────────────────────────────
+# ── credential rotation ───────────────────────────────────────────
 
 
 async def test_rotated_credentials_are_used_on_in_place_reconnect(own_rabbit: dict[str, Any]) -> None:
@@ -432,7 +432,7 @@ async def test_in_place_reconnect_fails_over_to_the_next_node(
         assert any(a.endpoint == f"{own_rabbit['host']}:{own_rabbit['port']}" for _, a in events.attempts)
 
 
-# ── G-08b: backoff and budget ────────────────────────────────────────────
+# ── backoff and budget ────────────────────────────────────────────
 
 
 async def test_reconnect_backoff_grows_while_broker_is_down(
@@ -491,7 +491,7 @@ async def test_reconnect_budget_exhausted_is_terminal(own_rabbit: dict[str, Any]
         assert await _connections_of(own_rabbit, user) == 0
 
 
-# ── G-10: a failed start() leaks nothing ─────────────────────────────────
+# ── a failed start() leaks nothing ─────────────────────────────────
 
 
 async def test_failed_start_leaks_nothing_and_can_be_retried(own_rabbit: dict[str, Any]) -> None:

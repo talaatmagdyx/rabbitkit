@@ -1,6 +1,6 @@
 """Reliability profiles, preflight verification, and broker policy templates.
 
-Two explicit profiles (plan §9; ADR-M1/M4 of the messaging contract):
+Two explicit profiles:
 
 ==========================  ========================  ==============================================
 Setting                     STANDARD                  CRITICAL

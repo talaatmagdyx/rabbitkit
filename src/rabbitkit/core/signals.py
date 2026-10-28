@@ -1,4 +1,4 @@
-"""Signal-handler ownership helpers shared by ``AsyncBroker`` and ``RabbitApp`` (G-24).
+"""Signal-handler ownership helpers shared by ``AsyncBroker`` and ``RabbitApp``.
 
 ``loop.remove_signal_handler()`` resets a signal to its DEFAULT disposition,
 not to what was installed before ``loop.add_signal_handler()``. Anything

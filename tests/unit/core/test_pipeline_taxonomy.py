@@ -1,4 +1,4 @@
-"""HandlerPipeline and the failure taxonomy (G-16): body-decode and
+"""HandlerPipeline and the failure taxonomy: body-decode and
 on_receive failures are INVALID_MESSAGE, and the failure log names the
 category."""
 

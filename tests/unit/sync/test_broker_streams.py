@@ -26,7 +26,7 @@ class _Transport:
         self.calls: list[dict[str, Any]] = []
         self.cancel_consumer = MagicMock()
         self.disconnect = MagicMock()
-        # Broker-cancel hooks the SyncBroker wires on every start (G-26).
+        # Broker-cancel hooks the SyncBroker wires on every start.
         self.on_consumer_cancelled = MagicMock()
         self.on_consumer_resumed = MagicMock()
 

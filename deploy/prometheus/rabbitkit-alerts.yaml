@@ -1,4 +1,4 @@
-# Prometheus alerting rules for services that use rabbitkit (G-23).
+# Prometheus alerting rules for services that use rabbitkit.
 #
 # A plain Prometheus rules file: load it with `rule_files:` or wrap the
 # `groups:` list in a PrometheusRule (`spec: {groups: [...]}`) for the

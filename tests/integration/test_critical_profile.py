@@ -122,7 +122,7 @@ def _mgmt_get(rabbit: dict[str, Any], path: str) -> Any:
         return json.loads(resp.read())
 
 
-# ── ADR-M1/M4: the profile's topology, and a transient failure retried ─────
+# ── M4: the profile's topology, and a transient failure retried ─────
 
 
 @pytest.mark.asyncio
@@ -226,7 +226,7 @@ async def test_permanent_failure_dlq_copy_keeps_failure_metadata_and_properties(
         _delete(rabbit, *_queues(q))
 
 
-# ── G-19: a forged retry count cannot skip retries ─────────────────────────
+# ── a forged retry count cannot skip retries ─────────────────────────
 
 
 @pytest.mark.asyncio
@@ -273,7 +273,7 @@ async def test_forged_retry_headers_are_stripped_and_the_message_is_retried(rabb
         _delete(rabbit, *_queues(q))
 
 
-# ── §15.6: oversized delivery dead-lettered, handler not run ───────────────
+# ── oversized delivery dead-lettered, handler not run ───────────────
 
 
 @pytest.mark.asyncio
@@ -301,7 +301,7 @@ async def test_oversized_delivery_is_dead_lettered_without_running_the_handler(r
         assert seen == [b"ok"]
         ((props, body),) = _drain(rabbit, f"{q}.dlq")
         assert props.message_id == "big-1" and len(body) == 4096
-        # CRITICAL sets safety.dead_letter_with_metadata (G-17): a confirmed
+        # CRITICAL sets safety.dead_letter_with_metadata: a confirmed
         # copy with rabbitkit's failure metadata, not a broker dead-letter.
         headers = props.headers
         assert headers["x-rabbitkit-error-category"] == "invalid_message"

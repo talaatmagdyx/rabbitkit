@@ -81,13 +81,13 @@ class ConnectionConfig:
     # (the frozen username/password fields are the static fallback). Excluded
     # from the AMQP URL/repr paths; only the connection builders call it. On
     # async this includes every in-place reconnect attempt of a live
-    # connection (G-08), not only rabbitkit-built connections.
+    # connection, not only rabbitkit-built connections.
     credentials_provider: Callable[[], tuple[str, str]] | None = None
     # M9: additional cluster nodes for failover, each "host" or "host:port".
     # The primary (host/port above) is tried first, then each node in order.
     # All share the same credentials/vhost/TLS/heartbeat. Sync (pika) tries
     # them natively via a ConnectionParameters list; async cycles endpoints on
-    # the initial connect AND on every reconnect attempt after a drop (G-08),
+    # the initial connect AND on every reconnect attempt after a drop,
     # moving to the next node after each failure.
     nodes: tuple[str, ...] = ()
     # Item 8: escape-hatch for extra AMQP client_properties, shown in the
@@ -103,7 +103,7 @@ class ConnectionConfig:
     # PII here; service_name/environment/pod_name/region are fine, customer
     # IDs or API keys are not.
     client_properties: dict[str, str] = field(default_factory=dict)
-    # G-08: bounds on the ASYNC transport's reconnects after the first
+    # bounds on the ASYNC transport's reconnects after the first
     # successful connect (an outage). Both default to None = unlimited, the
     # availability-first behaviour rabbitkit always had. When either runs
     # out, the connection gives up for good: ReconnectBudgetExhaustedError
@@ -215,7 +215,7 @@ class ConnectionConfig:
                 )
 
     def _validate_timing(self) -> None:
-        """G-08: reject timing values that silently break reconnects.
+        """reject timing values that silently break reconnects.
 
         ``reconnect_backoff_base=0`` made every retry immediate (a hot
         reconnect loop) and ``reconnect_backoff_max < base`` capped the
@@ -419,7 +419,7 @@ class PublisherConfig:
     # when ``max_message_bytes`` is set, >= ``max_message_bytes`` so every
     # admissible message fits.
     max_in_flight_bytes: int | None = None
-    # G-19: remove rabbitkit's retry/DLQ/replay bookkeeping headers
+    # remove rabbitkit's retry/DLQ/replay bookkeeping headers
     # (``x-rabbitkit-retry-count``, ``x-rabbitkit-first-failed-at``,
     # ``x-rabbitkit-original-queue`` ...) and the broker's ``x-death`` from
     # APPLICATION publishes (``broker.publish()`` and the bulk APIs built on
@@ -725,7 +725,7 @@ class RetryConfig:
     # expired message on the delay queue until the source queue confirms it
     # (also sets x-overflow=reject-publish on them, which RabbitMQ requires).
     delay_queue_dead_letter_strategy: str | None = None
-    # G-19: True (legacy) = the attempt count is the larger of the
+    # True (legacy) = the attempt count is the larger of the
     # retry_header value and the broker's x-death history. False = only the
     # x-death history counts: a producer cannot skip (or restart) retries by
     # setting the header. The header is still written for observability.
@@ -1124,7 +1124,7 @@ class MetricsConfig:
         available while more than half of its members are online."""
         return f"{self.namespace}_queue_quorum_online"
 
-    # ── Broker/transport metrics (G-22, §19). Emitted by the broker itself
+    # ── Broker/transport metrics. Emitted by the broker itself
     # whenever any MetricsMiddleware with a collector is configured (publish
     # middlewares or any route), so publish-only brokers get them too. ──
 
@@ -1364,7 +1364,7 @@ class SafetyConfig:
     Only applied under ``TopologyMode.AUTO_DECLARE``; per-route override via
     ``@subscriber(reject_without_dlx=...)``.
 
-    ``dead_letter_with_metadata`` (G-17, async broker; default ``False``) —
+    ``dead_letter_with_metadata`` (async broker; default ``False``) —
     failures that never reach ``RetryMiddleware`` (an ``on_receive`` failure
     such as a bad gzip body or signature, a body over
     ``ConsumerConfig.max_body_bytes``, a failure on a route without retry, a

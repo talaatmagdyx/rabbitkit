@@ -1,17 +1,17 @@
-"""Real-broker tests for the consumer foundation (wave 1, consumer stream).
+"""Real-broker tests for consumer settlement, cancellation and shutdown.
 
 Each test asserts what the BROKER reports (queue counts, consumer counts,
 channel state), not only what the client believes it did:
 
-* S4 / S5 repros from the Phase 2.1 audit (MANUAL failure stranding a
-  prefetch slot; default AUTO transient hot loop) stay fixed.
-* G-15: concurrent settlements of one delivery never close the channel.
-* G-26: a queue deleted under a running consumer is reported as not
+* a MANUAL handler failure no longer strands a prefetch slot, and the
+  default AUTO policy no longer hot-loops on a transient error.
+* concurrent settlements of one delivery never close the channel.
+* a queue deleted under a running consumer is reported as not
   consuming; recreating it resumes consumption.
-* CONSUMER-007: a reconnect during ``stop()``'s drain does not bring a
+* a reconnect during ``stop()``'s drain does not bring a
   cancelled consumer back.
-* CONSUMER-005: QoS is reapplied after a reconnect.
-* §3.2: worker-pool deliveries that had not started are handed back at once
+* QoS is reapplied after a reconnect.
+* worker-pool deliveries that had not started are handed back at once
   by ``stop()`` while in-flight handlers keep their grace period.
 """
 
@@ -104,7 +104,7 @@ def _kill_connections(rabbit: dict[str, Any], connection_name: str, *, at_least:
     killed = 0
     for name in names:
         with contextlib.suppress(Exception):
-            client.close_connection(name, reason="consumer foundation test")
+            client.close_connection(name, reason="rabbitkit test")
             killed += 1
     return killed
 
@@ -157,11 +157,11 @@ async def _declare_queue(url: str, queue: str) -> None:
         await ch.declare_queue(queue, durable=True)
 
 
-# ── S4 / S5: the base's fixes hold on a real broker ──────────────────────
+# ── MANUAL failures and the bounded transient policy ──────────────────────
 
 
 async def test_s4_manual_exception_does_not_strand_the_message(rabbit: dict[str, Any]) -> None:
-    """Audit S4 verbatim: prefetch=1, MANUAL, the first message raises before
+    """prefetch=1, MANUAL, the first message raises before
     settling. It used to hold the only prefetch slot, so message 2 was never
     delivered. Now the failure is dead-lettered and message 2 is handled."""
     from rabbitkit import AckPolicy, AsyncBroker, RabbitMessage
@@ -193,7 +193,7 @@ async def test_s4_manual_exception_does_not_strand_the_message(rabbit: dict[str,
 
 
 async def test_s5_default_transient_failure_is_bounded(rabbit: dict[str, Any]) -> None:
-    """Audit S5 verbatim: default config, handler always raises OSError. It
+    """default config, handler always raises OSError. It
     used to run thousands of times a second; now it runs twice (first
     delivery requeued, redelivery dead-lettered)."""
     from rabbitkit import AsyncBroker, RabbitMessage
@@ -219,7 +219,7 @@ async def test_s5_default_transient_failure_is_bounded(rabbit: dict[str, Any]) -
         await broker.stop(timeout=2)
 
 
-# ── G-15: concurrent settlement sends one frame per delivery ─────────────
+# ── concurrent settlement sends one frame per delivery ─────────────
 
 
 async def test_concurrent_settlements_never_close_the_channel(rabbit: dict[str, Any]) -> None:
@@ -263,7 +263,7 @@ async def test_concurrent_settlements_never_close_the_channel(rabbit: dict[str, 
         await broker.stop(timeout=2)
 
 
-# ── G-26: broker-initiated consumer cancel ────────────────────────────────
+# ── broker-initiated consumer cancel ────────────────────────────────
 
 
 @pytest.mark.parametrize("native_recovery", [True, False], ids=["with-aio-pika-recovery", "rabbitkit-only"])
@@ -335,7 +335,7 @@ async def test_deleted_queue_reports_not_consuming_and_resumes_when_recreated(
         await broker.stop(timeout=2)
 
 
-# ── CONSUMER-007: no resurrection during the drain ───────────────────────
+# ── no resurrection during the drain ───────────────────────
 
 
 async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(rabbit: dict[str, Any]) -> None:
@@ -391,7 +391,7 @@ async def test_reconnect_during_drain_does_not_resubscribe_a_cancelled_consumer(
     await await_counts(rabbit, queue, (2, 0), timeout=20)
 
 
-# ── CONSUMER-005: QoS survives a reconnect ───────────────────────────────
+# ── QoS survives a reconnect ───────────────────────────────
 
 
 async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> None:
@@ -435,7 +435,7 @@ async def test_prefetch_is_reapplied_after_reconnect(rabbit: dict[str, Any]) -> 
         await broker.stop(timeout=5)
 
 
-# ── §3.2: not-started pool work is released at stop() ────────────────────
+# ── not-started pool work is released at stop() ────────────────────
 
 
 async def test_stop_releases_prefetched_pool_work_while_in_flight_keeps_its_grace(rabbit: dict[str, Any]) -> None:

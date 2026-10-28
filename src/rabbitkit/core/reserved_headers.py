@@ -1,4 +1,4 @@
-"""Headers only rabbitkit (or the broker) may set (G-19).
+"""Headers only rabbitkit (or the broker) may set.
 
 ``RetryMiddleware`` decides how many retries a message has left from
 headers it carries: ``x-rabbitkit-retry-count`` (unless

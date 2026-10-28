@@ -140,7 +140,7 @@ class TestRepeatedUse:
 
 
 class TestInjectableRegistry:
-    """G-22: the collector no longer forces the global registry, and a second
+    """the collector no longer forces the global registry, and a second
     collector on the same registry reuses metrics instead of raising."""
 
     def test_default_is_the_global_registry(self) -> None:

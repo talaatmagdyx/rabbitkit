@@ -1,6 +1,6 @@
 """AsyncBroker.publish()/stop() publisher contract: admission closed by
-stop() (G-12), per-call timeout (PUB-004), kwargs-form message_id, and the
-byte budget / batch wiring (G-14)."""
+stop(), per-call timeout, kwargs-form message_id, and the
+byte budget / batch wiring."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ async def _started(config: RabbitConfig | None = None, **kwargs: Any) -> tuple[A
 class TestPublishAfterStop:
     @pytest.mark.asyncio
     async def test_publish_after_stop_raises_and_never_reconnects(self) -> None:
-        """S6/G-12: a publish after stop() used to reconnect silently and
+        """A publish after stop() used to reconnect silently and
         report CONFIRMED."""
         broker, transport = await _started()
         await broker.stop()

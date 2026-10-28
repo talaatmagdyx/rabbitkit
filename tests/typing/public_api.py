@@ -1,4 +1,4 @@
-"""Pyright-strict probe of rabbitkit's PUBLIC API (gap G-29).
+"""Pyright-strict probe of rabbitkit's PUBLIC API.
 
 This module is never executed: CI runs ``pyright -p tests/typing`` over it in
 strict mode and requires 0 errors. It uses the public API the way a strictly

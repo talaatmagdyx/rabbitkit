@@ -839,7 +839,7 @@ class TestGetInfrastructureErrors:
         assert get_infrastructure_errors() == ()
 
 
-# ── G-08: permanent connect failures ─────────────────────────────────────
+# ── permanent connect failures ─────────────────────────────────────
 
 
 class _AMQPInternalError(Exception):

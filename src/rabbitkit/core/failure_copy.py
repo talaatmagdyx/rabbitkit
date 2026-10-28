@@ -5,7 +5,7 @@ copies and its terminal DLQ copy) and :class:`~rabbitkit.core.dead_letter.DeadLe
 (the DLQ copy for failures that never reach ``RetryMiddleware``), so every
 copy a consumer of the DLQ sees carries the same headers.
 
-A copy keeps the WIRE body and ``content_encoding`` (G-07: an ``on_receive``
+A copy keeps the WIRE body and ``content_encoding`` (an ``on_receive``
 hook such as decompression may have rewritten ``message.body`` in place),
 every AMQP property except ``expiration`` (moved to
 ``x-rabbitkit-original-expiration``), every header, and a stable
@@ -30,7 +30,7 @@ ERROR_MESSAGE_MAX_LEN = 512
 #: ``RetryConfig.retry_header``'s default.
 DEFAULT_RETRY_HEADER = "x-rabbitkit-retry-count"
 
-# Retry/DLQ metadata headers (spec §13.4 / §14.1).
+# Retry/DLQ metadata headers.
 H_ORIGINAL_QUEUE = "x-rabbitkit-original-queue"
 H_ORIGINAL_MESSAGE_ID = "x-rabbitkit-original-message-id"
 H_ORIGINAL_EXPIRATION = "x-rabbitkit-original-expiration"
@@ -113,7 +113,7 @@ def stamp_failure(
         headers["x-rabbitkit-original-routing-key"] = message.routing_key
     if H_ORIGINAL_QUEUE not in headers:
         headers[H_ORIGINAL_QUEUE] = ""  # set by broker at consume time
-    # Item 7 / plan §5.3: allowlisted category/code + bounded, REDACTED
+    # Item 7 / plan allowlisted category/code + bounded, REDACTED
     # summary. ``error_detail="omit"`` writes no message text at all;
     # ``"raw"`` is the legacy opt-in. A previous attempt's message header
     # is dropped so a sanitized copy cannot carry forward stale raw text.
@@ -143,7 +143,7 @@ def copy_envelope(
     """A republish of *message* that keeps every AMQP property except
     ``expiration`` (see the note in the body).
 
-    The body and ``content_encoding`` are the WIRE values (G-07): an
+    The body and ``content_encoding`` are the WIRE values: an
     ``on_receive`` hook may have rewritten ``message.body`` in place
     (``CompressionMiddleware`` decompresses it but leaves
     ``content_encoding="gzip"``). Republishing that decoded body under

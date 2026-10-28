@@ -51,7 +51,7 @@ Read these first. They are the non-obvious facts that determine whether your ret
    terminal marker closed it. On **retry-less** routes a transient
    failure is requeued once and dead-lettered if the redelivery fails too
    (`ConsumerConfig(reject_transient_on_redelivery=True)` is the default;
-   set it False for the old unbounded requeue). Classification is TYPE-based (§7): custom transient errors must
+   set it False for the old unbounded requeue). Classification is TYPE-based: custom transient errors must
    subclass `OSError`/`TimeoutError`, or register a predicate — unknown
    errors default to PERMANENT and skip retries.
 
@@ -647,7 +647,7 @@ await inspector.purge_async("orders.queue.dlq")   # ⚠️ irreversible
 **Caveats baked into the library (be honest about them):**
 - `peek` uses `basic_get` + `nack(requeue=true)`, which **can change message order**. Treat peek as sampling, not a stable snapshot. For stable inspection, prefer the management API to read counts and a shadow/quarantine queue for content.
 - On a **quorum** DLQ every requeue counts as a delivery, and past the delivery limit (20 by default on RabbitMQ 4.x) the message is dropped. rabbitkit declares new quorum DLQs unlimited on 4.x, and the inspector refuses a limited one; see [Quorum DLQs and delivery limits](retry-and-dlq.md#quorum-dlqs-and-delivery-limits).
-- `DLQInspector` has **no built-in dry-run, throttling, or batching**. Build controlled replay yourself (§31) — replay-all into a degraded system is how you turn one incident into two. It does stamp `x-rabbitkit-replay-count` / `-replayed-at` / `-replayed-by`, refuses a message replayed `max_replays` (3) times, and logs start/finish audit records to `rabbitkit.dlq.audit`.
+- `DLQInspector` has **no built-in dry-run, throttling, or batching**. Build controlled replay yourself — replay-all into a degraded system is how you turn one incident into two. It does stamp `x-rabbitkit-replay-count` / `-replayed-at` / `-replayed-by`, refuses a message replayed `max_replays` (3) times, and logs start/finish audit records to `rabbitkit.dlq.audit`.
 
 **Replay targets:**
 - **Original queue** — after the root cause is fixed and deployed. The common case.
@@ -817,7 +817,7 @@ await broker.start(worker_config=WorkerConfig(worker_count=8, prefetch_per_worke
 
 **Critical interaction:** `channel_pool_size` must be `>= worker_count`. Handlers that publish (retry, outbox, results) acquire a channel; if the pool is smaller than the worker count, concurrent publishers block on `channel_acquire_timeout` and you get latency cliffs or deadlock-like stalls. The broker warns about this at start — heed it.
 
-**`connection.blocked`:** when the broker raises a memory/disk alarm, it stops accepting publishes. `FlowController(BackpressureConfig(on_blocked="wait"))` parks publishers (up to `blocked_timeout`) instead of erroring. Alert on blocked duration (§22) — it means the broker is in trouble.
+**`connection.blocked`:** when the broker raises a memory/disk alarm, it stops accepting publishes. `FlowController(BackpressureConfig(on_blocked="wait"))` parks publishers (up to `blocked_timeout`) instead of erroring. Alert on blocked duration — it means the broker is in trouble.
 
 ---
 

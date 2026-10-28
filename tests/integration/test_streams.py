@@ -161,7 +161,7 @@ def _kill_connections(rabbit: dict[str, Any], connection_name: str) -> int:
             if (connection.get("client_properties") or {}).get("connection_name") != connection_name:
                 continue
             with contextlib.suppress(Exception):
-                client.close_connection(str(connection["name"]), reason="streams foundation test")
+                client.close_connection(str(connection["name"]), reason="rabbitkit test")
                 killed += 1
         if killed == 0:
             time.sleep(0.2)  # the management API lists a new connection after a moment

@@ -912,7 +912,7 @@ class TestAsyncWorkerPoolStopIsBounded:
         await asyncio.sleep(0.01)
 
 
-# ── §3.2: prefetched-but-not-started deliveries are released at stop() ────
+# ── prefetched-but-not-started deliveries are released at stop() ────
 
 
 def _nack_recorder(message: RabbitMessage, *, fail: bool = False) -> list[bool]:
@@ -1023,7 +1023,7 @@ class TestAsyncWorkerPoolReleasesQueued:
         assert pool.pending_count == 0
 
     async def test_handler_cancelled_mid_ack_is_not_nacked_again(self) -> None:
-        """G-15 through the pool: stop()'s straggler nack must not send a
+        """Through the pool: stop()'s straggler nack must not send a
         second frame for a delivery whose ack was in flight when cancelled."""
         pool = AsyncWorkerPool(WorkerConfig(worker_count=2))
         pool.start()

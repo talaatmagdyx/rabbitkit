@@ -1,4 +1,4 @@
-"""Consumer supervision for the sync transport (G-26 parity with the async one).
+"""Consumer supervision for the sync transport (parity with the async one).
 
 RabbitMQ cancels a consumer on its own (``basic.cancel`` from the server)
 when the queue is deleted, when a quorum or mirrored queue loses its leader,

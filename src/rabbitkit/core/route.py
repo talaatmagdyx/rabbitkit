@@ -68,7 +68,7 @@ class RouteRuntimeState:
     """
 
     consumer_tag: str | None = None
-    #: G-26: the BROKER cancelled this route's consumer (queue deleted, quorum
+    #: the BROKER cancelled this route's consumer (queue deleted, quorum
     #: leader change, ...) and it is not consuming again yet. ``consumer_tag``
     #: is kept (the same tag is reused when the consumer is re-subscribed);
     #: health checks count the route as not consuming while this is True.
@@ -301,7 +301,7 @@ class RouteDefinition:
             )
 
     def validate_prefetch_count(self) -> None:
-        """Validate the per-route prefetch override (CONSUMER-005).
+        """Validate the per-route prefetch override.
 
         ``None`` inherits ``ConsumerConfig.prefetch_count``. ``0`` used to
         fall through to the global value silently (``route.prefetch_count or

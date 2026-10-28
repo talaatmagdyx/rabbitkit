@@ -337,7 +337,7 @@ logged at CRITICAL.
   PRODUCER span of their own.
 - Verified on a real broker: a trace id published by one broker reaches the
   consumer's span through RabbitMQ
-  (`tests/integration/test_observability_foundation.py`).
+  (`tests/integration/test_broker_metrics.py`).
 
 ## Logs
 

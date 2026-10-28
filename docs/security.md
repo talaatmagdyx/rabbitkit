@@ -67,7 +67,7 @@ For short-lived / rotated secrets (Vault, IAM), pass a `credentials_provider`
 instead of static `username`/`password`. It is called at every (re)connect,
 so a rotated secret is picked up on the next reconnect with no redeploy. On
 the async broker that includes every attempt of aio-pika's in-place
-reconnect after a dropped connection (before the connection-foundation fix,
+reconnect after a dropped connection (before 0.20.0,
 only connections rabbitkit built itself called it, so an in-place reconnect
 retried the old password forever):
 

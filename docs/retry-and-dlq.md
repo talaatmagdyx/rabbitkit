@@ -279,7 +279,7 @@ prefer **quorum queues** for the source queue and set `x-delivery-limit` — the
 broker itself dead-letters a message after that many redeliveries, with no
 dependency on any header at all.
 
-### Stripping reserved headers from application publishes (G-19)
+### Stripping reserved headers from application publishes
 
 `RetryConfig(trust_retry_header=False)` ignores the header and counts only the
 broker's `x-death` history, but a producer can put a forged `x-death` (or

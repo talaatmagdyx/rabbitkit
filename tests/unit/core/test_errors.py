@@ -285,7 +285,7 @@ class TestCustomErrorTaxonomy:
 
 
 class TestTerminalConnectionErrors:
-    """G-08: the typed connection failures keep ConnectionError as their base,
+    """the typed connection failures keep ConnectionError as their base,
     so ``except ConnectionError`` / ``except OSError`` around start() still
     catches what used to be aiormq's / ssl's OSError subclasses."""
 

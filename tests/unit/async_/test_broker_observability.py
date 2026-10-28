@@ -1,4 +1,4 @@
-"""AsyncBroker metrics wiring (G-22): BrokerMetrics on every transport hook,
+"""AsyncBroker metrics wiring: BrokerMetrics on every transport hook,
 publish-only brokers included, sampled gauges, consumer cancels, stop."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from rabbitkit.core.config import MetricsConfig
 from rabbitkit.core.errors import AuthenticationFailedError
 from rabbitkit.core.types import PublishOutcome, PublishStatus
 from rabbitkit.middleware.metrics import BrokerMetrics, MetricsMiddleware
-from tests.unit.middleware.test_metrics_foundation import RecordingCollector
+from tests.unit.middleware.test_metrics_inventory import RecordingCollector
 
 _CFG = MetricsConfig()
 

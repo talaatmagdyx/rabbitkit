@@ -1,4 +1,4 @@
-"""Reliability-profile benchmark: the workload the messaging foundation targets.
+"""Reliability-profile benchmark: confirmed, mandatory publishes into quorum queues.
 
 Every message here is what a reliable workload publishes: ``size`` bytes
 (1 KiB default), persistent, publisher confirms on, ``mandatory=True``, into a
@@ -14,8 +14,8 @@ Scenarios
 * ``sustained``: open-loop end-to-end at ``--rate`` msg/s for ``--seconds``.
   Publishers send on an absolute schedule (``t0 + i/rate``) and latency is
   measured from that *intended* send time, so publisher lag and broker queueing
-  are charged to the system (no coordinated omission). Default 2,778 msg/s,
-  the 10M events/hour design target.
+  are charged to the system (no coordinated omission). Default 2,778 msg/s
+  (about 10M messages an hour).
 * ``burst``: the same at ``--burst-rate`` (default 20,000 msg/s) for
   ``--burst-seconds``; reports the rate actually achieved, the peak backlog and
   the drain time.
@@ -32,9 +32,9 @@ that the broker runs on the same machine as the clients.
 
 Usage::
 
-    python -m benchmarks.bench_foundation                        # all scenarios, throwaway broker
-    python -m benchmarks.bench_foundation --scenario sustained --seconds 120
-    python -m benchmarks.bench_foundation --url amqp://... --json out.json
+    python -m benchmarks.bench_reliability                        # all scenarios, throwaway broker
+    python -m benchmarks.bench_reliability --scenario sustained --seconds 120
+    python -m benchmarks.bench_reliability --url amqp://... --json out.json
 """
 
 from __future__ import annotations
@@ -267,7 +267,7 @@ def end_to_end(
     import threading
 
     n = int(rate * seconds)
-    queue = f"bench-foundation-{uuid.uuid4().hex[:8]}"
+    queue = f"bench-reliability-{uuid.uuid4().hex[:8]}"
     asyncio.run(_declare(url, queue, queue_type))
     ctx = mp.get_context("spawn")
     results: Any = ctx.Queue()
@@ -357,7 +357,7 @@ async def publish_only(url: str, *, n: int, size: int, queue_type: str, max_in_f
     from rabbitkit.core.bulk import BulkPublishOptions
     from rabbitkit.core.types import MessageEnvelope
 
-    queue = f"bench-foundation-pub-{uuid.uuid4().hex[:8]}"
+    queue = f"bench-reliability-pub-{uuid.uuid4().hex[:8]}"
     await _declare(url, queue, queue_type)
     broker = AsyncBroker(_config(url, pool=max_in_flight))
     await broker.start(install_signal_handlers=False)
@@ -385,7 +385,7 @@ async def consume_only(url: str, *, n: int, size: int, queue_type: str, prefetch
     from rabbitkit.core.message import RabbitMessage
     from rabbitkit.core.types import MessageEnvelope
 
-    queue = f"bench-foundation-con-{uuid.uuid4().hex[:8]}"
+    queue = f"bench-reliability-con-{uuid.uuid4().hex[:8]}"
     await _declare(url, queue, queue_type)
     loader = AsyncBroker(_config(url, pool=128))
     await loader.start(install_signal_handlers=False)

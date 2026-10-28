@@ -81,7 +81,7 @@ def get_connection_errors() -> tuple[type[BaseException], ...]:
         return base_errors
 
 
-# ── Permanent connect failures (G-08) ─────────────────────────────────────
+# ── Permanent connect failures ─────────────────────────────────────
 
 # OpenSSL reasons for a handshake that fails the same way on every retry: the
 # broker rejected the client certificate, no protocol/cipher in common, or the
@@ -371,7 +371,7 @@ def make_aio_pika_connect_kwargs(
     sep = "&" if "?" in base_url else "?"
     url = f"{base_url}{sep}heartbeat={connection.heartbeat}"
 
-    # H4 / G-08: this is only aio-pika's STEADY-STATE interval: its pause
+    # H4 / this is only aio-pika's STEADY-STATE interval: its pause
     # after a successful (re)connect and between consumer-restore retries.
     # The delay after each FAILED reconnect attempt is set per attempt by
     # rabbitkit's RobustConnection subclass (async_/reconnect.py): exponential

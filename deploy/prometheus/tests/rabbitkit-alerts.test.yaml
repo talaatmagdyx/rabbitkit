@@ -1,6 +1,6 @@
-# Behaviour tests for ../rabbitkit-alerts.yaml (G-23):
+# Behaviour tests for ../rabbitkit-alerts.yaml:
 #   promtool test rules deploy/prometheus/tests/rabbitkit-alerts.test.yaml
-# Run by tests/integration/test_observability_foundation.py through the
+# Run by tests/integration/test_broker_metrics.py through the
 # prom/prometheus Docker image when Docker is available.
 #
 # Every alert has a positive case and a negative one (an `exp_alerts: []`

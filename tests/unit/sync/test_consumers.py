@@ -1,4 +1,4 @@
-"""Tests for sync/consumers.py — SyncConsumerSupervisor (G-26, sync)."""
+"""Tests for sync/consumers.py — SyncConsumerSupervisor (sync)."""
 
 from __future__ import annotations
 

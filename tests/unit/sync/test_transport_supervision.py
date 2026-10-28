@@ -1,5 +1,5 @@
-"""SyncTransport: broker-initiated consumer cancel (G-26, sync), the consume
-loop's poll interval, and the publish in-flight counter (G-22, sync)."""
+"""SyncTransport: broker-initiated consumer cancel (sync), the consume
+loop's poll interval, and the publish in-flight counter (sync)."""
 
 from __future__ import annotations
 

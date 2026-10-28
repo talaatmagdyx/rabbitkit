@@ -7,7 +7,7 @@ Pipeline calls the appropriate variant internally.
 MANUAL mode handlers choose ack() or ack_async() based on their runtime.
 Idempotent: double-ack is a no-op (guarded by _disposition state). The async
 variants claim the disposition before awaiting the transport, so concurrent
-settlements never send two frames for one delivery tag (G-15).
+settlements never send two frames for one delivery tag.
 """
 
 from __future__ import annotations
@@ -144,7 +144,7 @@ class RabbitMessage:
         self.raw_message = raw_message
         # The body and encoding as delivered, before any on_receive hook
         # (decompression, decryption) rewrites them: retry and DLQ copies
-        # republish these, so the copy decodes like the original (G-07).
+        # republish these, so the copy decodes like the original.
         self._wire_body = body
         self._wire_content_encoding = content_encoding
 
@@ -156,7 +156,7 @@ class RabbitMessage:
         self._reject_fn: Callable[[bool], None] | None = None
         self._reject_async_fn: Callable[[bool], Awaitable[None]] | None = None
         self._disposition: str = "pending"
-        # G-15: True when a claimed async settlement's transport call raised
+        # True when a claimed async settlement's transport call raised
         # or was cancelled -- the frame may or may not have reached the broker.
         self._settle_unknown = False
         # One-element token taken (``pop()``) by the first settlement-metric
@@ -277,7 +277,7 @@ class RabbitMessage:
 
     # ── Async settlement ──────────────────────────────────────────────────
     #
-    # G-15: the async variants CLAIM the settlement before awaiting the
+    # the async variants CLAIM the settlement before awaiting the
     # transport. The old guard checked ``_disposition`` and set it only after
     # the await, so two coroutines (a concurrent ack/nack, or ``stop()``
     # nacking a handler that was cancelled mid-ack) could both pass the check

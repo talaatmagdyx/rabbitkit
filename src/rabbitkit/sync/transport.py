@@ -209,7 +209,7 @@ class SyncTransport:
         # Fired on every successful connect() AFTER the first (see connect()).
         self._reconnect_callbacks: list[Callable[[], None]] = []
         self._ever_connected = False
-        # G-22 metrics hooks: connection up/down (role "shared": one pika
+        # Metrics hooks: connection up/down (role "shared": one pika
         # connection serves publishing and consuming), failed reconnect
         # attempts, and publish outcomes with the send-to-confirm latency.
         self._connection_state_callbacks: list[Callable[[str, bool, BaseException | None], None]] = []
@@ -225,13 +225,13 @@ class SyncTransport:
         self._channel_opened_callbacks: list[Callable[[], None]] = []
         self._channel_rebuilt_callbacks: list[Callable[[], None]] = []
 
-        # G-26 (sync parity): consumers the BROKER cancelled (basic.cancel:
+        # consumers the BROKER cancelled (basic.cancel:
         # queue deleted, quorum leader change, operator action). pika calls
         # the consumer channel's cancel callback on the owner thread; the
         # consume loop re-subscribes once a passive declare finds the queue.
         self._consumer_supervisor = SyncConsumerSupervisor(self._queue_exists_now, self._resubscribe)
 
-        # G-22: publish() calls between entry and their outcome (worker
+        # publish() calls between entry and their outcome (worker
         # threads waiting for the I/O thread count too). Sampled by the
         # broker's metrics, never read on the hot path.
         self._publishes_in_flight = 0
@@ -256,7 +256,7 @@ class SyncTransport:
                 logger.exception("reconnect callback raised")
 
     def on_connection_state(self, callback: Callable[[str, bool, BaseException | None], None]) -> None:
-        """Register ``callback(role, up, error)`` (G-22). ``role`` is always
+        """Register ``callback(role, up, error)``. ``role`` is always
         ``"shared"``: fired with ``up=True`` after every successful connect and
         with ``up=False`` once when a connection that was up is found down
         (before the reconnect starts). ``disconnect()`` does not fire it."""
@@ -271,12 +271,12 @@ class SyncTransport:
 
     def on_reconnect_attempt(self, callback: Callable[[int, BaseException], None]) -> None:
         """Register ``callback(attempt, error)`` fired after every FAILED
-        reconnect attempt of a connection that had been up (G-22)."""
+        reconnect attempt of a connection that had been up."""
         self._reconnect_attempt_callbacks.append(callback)
 
     def on_publish_outcome(self, callback: Callable[[PublishOutcome, float | None], None]) -> None:
         """Register ``callback(outcome, seconds)`` for every publish handed to
-        pika (G-22). ``seconds`` is the ``basic_publish`` call alone (frame
+        pika. ``seconds`` is the ``basic_publish`` call alone (frame
         write plus, in confirm mode, the wait for the broker's confirm, nack
         or return) when the broker answered, else ``None``."""
         self._publish_outcome_callbacks.append(callback)
@@ -290,7 +290,7 @@ class SyncTransport:
 
     @property
     def publishes_in_flight(self) -> int:
-        """``publish()`` calls between entry and their outcome (G-22).
+        """``publish()`` calls between entry and their outcome.
 
         Includes worker-thread publishes waiting for the I/O thread to pick
         them up. One publisher channel serves them one at a time, so more
@@ -304,7 +304,7 @@ class SyncTransport:
         return self._byte_limiter
 
     def on_consumer_cancelled(self, callback: Callable[[str], None]) -> None:
-        """Register ``callback(queue)`` for a consumer the BROKER cancelled (G-26).
+        """Register ``callback(queue)`` for a consumer the BROKER cancelled.
 
         Fires on the owner thread when RabbitMQ sends ``basic.cancel`` (queue
         deleted, quorum leader change, ...). The consume loop re-subscribes
@@ -1359,7 +1359,7 @@ class SyncTransport:
         logger.info("Started consuming from queue '%s' with tag '%s'", queue, consumer_tag)
         return consumer_tag
 
-    # ── Broker-initiated consumer cancel (G-26, sync) ─────────────────────
+    # ── Broker-initiated consumer cancel (sync) ─────────────────────
 
     def _on_broker_cancel(self, method_frame: Any) -> None:
         """pika's ``add_on_cancel_callback`` entry: the server sent ``basic.cancel``.
@@ -1678,7 +1678,7 @@ class SyncTransport:
                 # and pumping -- fire once per tick regardless of whether any
                 # message was actually delivered this iteration.
                 self._fire_io_tick()
-                # G-26: re-subscribe broker-cancelled consumers whose queue is
+                # re-subscribe broker-cancelled consumers whose queue is
                 # back -- here, on the owner thread, never from a worker.
                 self._consumer_supervisor.check_once()
                 # Safety: if no consumers are registered, exit (avoids looping

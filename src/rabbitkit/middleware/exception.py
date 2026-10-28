@@ -75,7 +75,7 @@ class ExceptionMiddleware(BaseMiddleware):
         """
         is_terminal = getattr(exc, "_rabbitkit_terminal", False)
 
-        # F30: raw str(exc) routinely embeds secrets; every log line here uses
+        # raw str(exc) routinely embeds secrets; every log line here uses
         # the same sanitizer as RetryMiddleware's headers.
         sanitized = ErrorSanitizer().sanitize(exc)
 

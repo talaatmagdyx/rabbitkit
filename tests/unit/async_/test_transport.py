@@ -587,7 +587,7 @@ class TestWaitForRecovery:
 
 
 class TestPublishConfirmedNoHiddenRetry:
-    """G-03: once basic.publish may have left the client, a connection-class
+    """once basic.publish may have left the client, a connection-class
     failure is reported UNKNOWN and never republished (the old retry-once
     could deliver a duplicate reported as CONFIRMED) -- and the pool-release
     cleanup can never overwrite an already-computed outcome."""
@@ -767,7 +767,7 @@ class TestConsume:
 
     @pytest.mark.asyncio
     async def test_cancel_consumer(self) -> None:
-        """CONSUMER-007: cancel through the queue object the consumer was
+        """cancel through the queue object the consumer was
         started on, so aio-pika's robust restore forgets it; a fresh
         get_queue() wrapper left the restore record in place."""
         transport = _make_transport()
@@ -819,7 +819,7 @@ class TestConsume:
 
     @pytest.mark.asyncio
     async def test_delivery_after_cancel_is_requeued_and_consumer_cancelled_again(self) -> None:
-        """CONSUMER-007: a consumer resurrected by a reconnect after rabbitkit
+        """a consumer resurrected by a reconnect after rabbitkit
         cancelled it must not run the handler: the delivery is requeued and the
         stray consumer cancelled."""
         transport = _make_transport()
@@ -1327,7 +1327,7 @@ class TestDisconnectEdgeCases:
         assert not transport.is_connected()
 
     async def test_disconnect_is_bounded_when_channel_closes_hang(self) -> None:
-        """F20: a partitioned broker never answers Close. disconnect(timeout)
+        """a partitioned broker never answers Close. disconnect(timeout)
         skips the remaining channel closes and still closes the connections."""
         transport = await self._connected_transport()
         stuck = MagicMock()
@@ -1560,7 +1560,7 @@ class TestCancelConsumerEdgeCases:
         await transport.cancel_consumer("rabbitkit.some-tag")
 
     async def test_cancel_consumer_that_is_never_answered_is_bounded_and_forgotten(self) -> None:
-        """F20: during a partition Basic.CancelOk never arrives; the cancel
+        """during a partition Basic.CancelOk never arrives; the cancel
         gives up at its timeout, forgets the consumer and drops aio-pika's
         restore record so a reconnect cannot bring it back."""
         transport = _make_transport()
@@ -2994,10 +2994,10 @@ class TestReviewFindingsAsyncTransport:
         reason.assert_called_once()
 
 
-# ── G-08 / G-10: connection hooks, terminal failure, atomic connect ─────
+# ── connection hooks, terminal failure, atomic connect ─────
 
 
-class TestConnectionFoundation:
+class TestConnectionRecovery:
     async def _connected(self) -> tuple[AsyncTransportImpl, AsyncMock]:
         transport = _make_transport()
         connection = _make_mock_connection()
@@ -3148,7 +3148,7 @@ class TestRecoveryWaitAfterTerminalFailure:
         assert loop.time() - started < 1.0
 
 
-# ── G-22: sampled state for the broker metrics ──────────────────────────
+# ── sampled state for the broker metrics ──────────────────────────
 
 
 class TestObservabilityState:

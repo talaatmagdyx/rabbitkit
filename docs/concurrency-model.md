@@ -72,6 +72,37 @@ this is why one was deliberately not added.
   `add_callback_threadsafe` and block for the result (bounded by an
   I/O-stall timeout). Handlers never touch the channel directly.
 
+### Publish byte budget (`max_in_flight_bytes`)
+
+With `PublisherConfig.max_in_flight_bytes` set, every sync transport publish
+reserves its body's bytes before anything else and holds them until its
+outcome is known. A worker thread's publish reserves them on the worker
+thread and then waits for the I/O thread to run it, so its bytes are held
+while it waits. That creates one hazard the async broker cannot have: if the
+I/O (owner) thread itself publishes (an I/O-tick hook, the deadline path
+settling an expired delivery through retry or DLQ) while workers hold the
+budget, and it simply slept until there was room, nothing would run the
+workers' publishes and both sides would wait until the admission timeout.
+
+So the waiters differ by thread:
+
+- **Worker threads** (and any thread when no consume loop has run on the
+  connection) sleep on the limiter's condition until they are granted or
+  `PoolConfig.channel_acquire_timeout` expires.
+- **The owner thread of a connection that has run a consume loop** never
+  sleeps there: between admission checks it drives
+  `process_data_events(time_limit<=10 ms)`, which runs the marshalled worker
+  publishes; when they finish and release their bytes it is admitted in its
+  turn (the queue is FIFO for every thread). A connection error raised while
+  it pumps makes its publish `NOT_SENT` (`not_connected`); the consume loop
+  then recovers as usual.
+
+pika runs marshalled callbacks only from the outermost `process_data_events`
+on the stack. An owner-thread publish made from *inside* a pika callback, an
+inline handler (`worker_count=1` without `processing_timeout`), therefore
+cannot run them while it waits. That case has no worker threads publishing
+on the connection, so nothing it could wait on is held by a worker.
+
 ### Processing deadline (`processing_timeout`)
 
 A thread cannot be killed, so the sync deadline works by keeping the I/O

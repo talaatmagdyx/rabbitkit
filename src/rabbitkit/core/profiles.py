@@ -82,7 +82,7 @@ from rabbitkit.core.types import (
 CRITICAL_MAX_MESSAGE_BYTES = 256 * 1024
 
 #: Default in-flight publish byte budget the critical profile sets when the
-#: config has none (``PublisherConfig.max_in_flight_bytes``, async broker):
+#: config has none (``PublisherConfig.max_in_flight_bytes``, both brokers):
 #: 64 MiB, i.e. 256 messages at the 256 KiB body limit. Set your own value to
 #: override it.
 CRITICAL_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024

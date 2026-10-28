@@ -78,11 +78,18 @@ def _is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, get_connection_errors())
 
 
-def _is_basic_return(frame: Any) -> bool:
-    """True if *frame* is an AMQP ``Basic.Return`` (never true for a mock)."""
+@functools.cache
+def _basic_return_type() -> type[Any]:
     from pamqp.commands import Basic
 
-    return isinstance(frame, Basic.Return)
+    return Basic.Return
+
+
+def _is_basic_return(frame: Any) -> bool:
+    """True if *frame* is an AMQP ``Basic.Return`` (never true for a mock).
+
+    Called on every confirmed publish: the pamqp import is resolved once."""
+    return isinstance(frame, _basic_return_type())
 
 
 def _return_fields(exc: BaseException) -> tuple[int | None, str | None]:

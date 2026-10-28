@@ -191,6 +191,8 @@ class AsyncChannelPool:
         self._in_use: set[Any] = set()
         self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
         self._closed = False
+        # try_acquire_idle() found closed channels: the next opened one is a rebuild.
+        self._found_closed_pending = False
         self._background: set[asyncio.Task[None]] = set()
         # Item 3: channel-lifecycle metric hooks (optional, no-op if None).
         self._on_channel_opened = on_channel_opened
@@ -222,6 +224,23 @@ class AsyncChannelPool:
             fut = self._waiters.popleft()
             if not fut.done():
                 fut.set_result(None)
+
+    def try_acquire_idle(self) -> Any:
+        """Check out a live idle channel without awaiting; ``None`` if none is idle.
+
+        The publish hot path: the same first step :meth:`acquire` takes,
+        minus two coroutine layers. Closed channels found on the way are
+        remembered so the channel :meth:`acquire` opens next counts as a
+        rebuild, exactly as if :meth:`acquire` had found them itself.
+        """
+        if self._closed:
+            return None
+        channel, found_closed = self._take_idle()
+        if found_closed:
+            self._found_closed_pending = True
+        if channel is not None:
+            self._in_use.add(channel)
+        return channel
 
     def _take_idle(self) -> tuple[Any, bool]:
         """Pop a live idle channel. Returns ``(channel | None, found_closed)``."""
@@ -257,6 +276,9 @@ class AsyncChannelPool:
         budget = self._acquire_timeout if timeout is None else min(timeout, self._acquire_timeout)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + budget
+        if self._found_closed_pending:
+            self._found_closed_pending = False
+            _found_closed = True
         while True:
             if self._closed:
                 raise ChannelPoolClosedError("channel pool is closed")
@@ -657,7 +679,12 @@ class AsyncConnectionPool:
         rather than looping on a dead one. Nothing has been sent at this
         point, so the retry cannot duplicate a message.
         """
-        if self._publisher_channel_pool is None:
+        pool = self._publisher_channel_pool
+        if pool is not None:
+            channel = pool.try_acquire_idle()
+            if channel is not None:
+                return channel
+        else:
             await self.get_publisher_connection()
         return await self._acquire_healing(self._current_publisher_pool, timeout, "Publisher")
 
@@ -811,6 +838,12 @@ class AsyncConnectionPool:
         """
         if self._publisher_connection is None:
             await self.get_publisher_connection()
+        else:
+            pool = self._mandatory_channel_pool
+            if pool is not None:
+                channel = pool.try_acquire_idle()
+                if channel is not None:
+                    return channel
         return await self._acquire_healing(self._current_mandatory_pool, timeout, "Mandatory")
 
     async def release_mandatory_channel(self, channel: Any) -> None:

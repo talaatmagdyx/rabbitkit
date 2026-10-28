@@ -49,7 +49,7 @@ _DONE = 2
 class _BatchItem:
     """One caller's publish while it moves through the batch queue."""
 
-    __slots__ = ("deadline", "envelope", "future", "limiter", "nbytes", "state")
+    __slots__ = ("caller", "deadline", "envelope", "future", "limiter", "nbytes", "state")
 
     def __init__(
         self,
@@ -65,6 +65,11 @@ class _BatchItem:
         self.nbytes = nbytes
         self.limiter = limiter
         self.state = _QUEUED
+        # What publish() awaits. Separate from ``future`` (the item's final
+        # outcome, which stop() waits on): a deadline may answer the caller
+        # (TIMEOUT) and a cancelled caller cancels only this one, while the
+        # item stays with its worker until it really resolves.
+        self.caller: asyncio.Future[PublishOutcome] | None = None
 
     def outcome(self, status: PublishStatus, reason: str | None, error: BaseException | None = None) -> PublishOutcome:
         return PublishOutcome(
@@ -84,6 +89,19 @@ class _BatchItem:
             self.limiter.release(self.nbytes)
         if not self.future.done():
             self.future.set_result(outcome)
+        caller = self.caller
+        if caller is not None and not caller.done():
+            caller.set_result(outcome)
+
+
+def _expire(item: _BatchItem) -> None:
+    """A caller's deadline passed: withdraw a still-queued item (NOT_SENT), or
+    report a flushing one as TIMEOUT. A flushing item stays with its worker,
+    which finishes it (and releases its bytes) when the confirm resolves."""
+    if item.state == _QUEUED:
+        item.finish(item.outcome(PublishStatus.NOT_SENT, PublishReason.ADMISSION_TIMEOUT))
+    elif item.state == _FLUSHING and item.caller is not None and not item.caller.done():
+        item.caller.set_result(item.outcome(PublishStatus.TIMEOUT, PublishReason.PUBLISH_TIMEOUT))
 
 
 class AsyncBatchPublisher:
@@ -256,23 +274,24 @@ class AsyncBatchPublisher:
             item.finish(item.outcome(PublishStatus.NOT_SENT, PublishReason.CANCELLED))
             raise
 
+        # The deadline is one plain loop timer that answers the caller's own
+        # future (_expire), not an asyncio.timeout + shield per call: those cost
+        # ~4 µs/message on this hot path. A cancelled caller cancels only its
+        # own future; the item is never cancelled (a worker may already be
+        # publishing it), and finish() still resolves it and releases its bytes.
+        if fut.done():  # pragma: no cover — nothing yields between enqueue and here
+            return fut.result()
+        caller: asyncio.Future[PublishOutcome] = loop.create_future()
+        item.caller = caller
+        timer = loop.call_at(deadline, _expire, item)
         try:
-            async with asyncio.timeout(max(0.0, deadline - loop.time())):
-                # shield: a cancelled CALLER must not cancel the item, which a
-                # worker may already be publishing.
-                return await asyncio.shield(fut)
-        except TimeoutError:
-            if item.state == _QUEUED:
-                # Still queued: withdraw it (the worker skips DONE items).
-                item.finish(item.outcome(PublishStatus.NOT_SENT, PublishReason.ADMISSION_TIMEOUT))
-                return fut.result()
-            if fut.done():  # pragma: no cover — resolved in the same tick the deadline fired
-                return fut.result()
-            return item.outcome(PublishStatus.TIMEOUT, PublishReason.PUBLISH_TIMEOUT)
+            return await caller
         except asyncio.CancelledError:
             if item.state == _QUEUED:
                 item.finish(item.outcome(PublishStatus.NOT_SENT, PublishReason.CANCELLED))
             raise
+        finally:
+            timer.cancel()
 
     async def _next_item(self) -> _BatchItem:
         """Next live item from the queue, skipping ones their caller withdrew."""

@@ -296,6 +296,50 @@ class TestBoundedWaits:
         await pub.stop(timeout=1.0)
 
     @pytest.mark.asyncio
+    async def test_stop_waits_for_the_real_outcome_after_the_caller_timed_out(self) -> None:
+        gate = asyncio.Event()
+
+        async def slow(ch: Any, env: MessageEnvelope, **_: Any) -> PublishOutcome:
+            await gate.wait()
+            return _ok()
+
+        transport, _, _ = _make_transport(publish_fn=slow)
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=1, batch_size=1, max_in_flight=10))
+        await pub.start()
+        outcome = await asyncio.wait_for(pub.publish(_env(), timeout=0.05), timeout=5.0)
+        assert outcome.status is PublishStatus.TIMEOUT
+        (item,) = pub._active
+        assert not item.future.done()  # the caller has its answer; the item is still in flight
+        stopping = asyncio.create_task(pub.stop(timeout=5.0))
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        gate.set()
+        await asyncio.wait_for(stopping, timeout=2.0)
+        assert item.future.result().status is PublishStatus.CONFIRMED
+
+    @pytest.mark.asyncio
+    async def test_cancelled_caller_keeps_the_item_outcome(self) -> None:
+        gate = asyncio.Event()
+
+        async def slow(ch: Any, env: MessageEnvelope, **_: Any) -> PublishOutcome:
+            await gate.wait()
+            return _ok()
+
+        transport, _, _ = _make_transport(publish_fn=slow)
+        pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=1, batch_size=1, max_in_flight=10))
+        await pub.start()
+        task = asyncio.create_task(pub.publish(_env()))
+        await _wait_until(lambda: any(i.state == _FLUSHING for i in pub._active))
+        (item,) = pub._active
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not item.future.cancelled()
+        gate.set()
+        await pub.stop(timeout=2.0)
+        assert item.future.result().status is PublishStatus.CONFIRMED
+
+    @pytest.mark.asyncio
     async def test_cancelled_caller_withdraws_a_queued_message(self) -> None:
         transport, _, _ = _make_transport()
         pub = AsyncBatchPublisher(transport, BatchPublishConfig(flush_workers=1, batch_size=1, max_in_flight=10))

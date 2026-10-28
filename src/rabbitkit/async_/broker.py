@@ -1137,6 +1137,10 @@ class AsyncBroker:
             raise BrokerNotStartedError("Broker is stopping or stopped; publishing is closed. Call start() first.")
 
         publish_fn = self._batch_publisher.publish if self._batch_publisher is not None else self._transport.publish
+        if timeout is None and self._flow_controller is None and not self._publish_middlewares:
+            # Hot path: nothing to wrap, so skip the per-call closures and the
+            # extra coroutine layers below (measurable at ~10k msg/s).
+            return await publish_fn(envelope)  # type: ignore[no-any-return]
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 

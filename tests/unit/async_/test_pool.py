@@ -255,6 +255,7 @@ class TestAsyncConnectionPool:
 
         bad_channel_pool = AsyncMock()
         bad_channel_pool.acquire = AsyncMock(side_effect=RuntimeError("dead connection"))
+        bad_channel_pool.try_acquire_idle = MagicMock(return_value=None)
         bad_conn = AsyncMock()
         bad_conn.is_closed = False
         pool._publisher_connection = bad_conn

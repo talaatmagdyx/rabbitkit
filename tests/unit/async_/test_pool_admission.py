@@ -265,6 +265,35 @@ class TestChannelPoolWaiting:
         assert not isinstance(info.value, ChannelPoolExhaustedError)
 
 
+class TestTryAcquireIdle:
+    @pytest.mark.asyncio
+    async def test_checks_out_an_idle_channel_without_awaiting(self) -> None:
+        pool = AsyncChannelPool(_conn(), pool_size=1)
+        channel = await pool.acquire()
+        await pool.release(channel)
+        assert pool.try_acquire_idle() is channel
+        assert pool.owns(channel)
+        assert pool.try_acquire_idle() is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_a_closed_pool(self) -> None:
+        pool = AsyncChannelPool(_conn(), pool_size=1)
+        await pool.release(await pool.acquire())
+        await pool.close_all()
+        assert pool.try_acquire_idle() is None
+
+    @pytest.mark.asyncio
+    async def test_a_closed_idle_channel_makes_the_next_open_a_rebuild(self) -> None:
+        rebuilt = MagicMock()
+        stale, fresh = _channel(), _channel()
+        pool = AsyncChannelPool(_conn(stale, fresh), pool_size=1, on_channel_rebuilt=rebuilt)
+        await pool.release(await pool.acquire())
+        stale.is_closed = True
+        assert pool.try_acquire_idle() is None
+        assert await pool.acquire() is fresh
+        rebuilt.assert_called_once()
+
+
 class TestChannelPoolClose:
     @pytest.mark.asyncio
     async def test_close_all_wakes_waiters_with_closed_error(self) -> None:
@@ -502,6 +531,7 @@ class TestRebuildIsGenerationSafe:
         pool = _connection_pool()
         broken = AsyncMock()
         broken.acquire = AsyncMock(side_effect=RuntimeError("dead"))
+        broken.try_acquire_idle = MagicMock(return_value=None)
         broken.closed = False
         pool._publisher_connection = _conn()
         pool._publisher_channel_pool = broken
@@ -518,6 +548,7 @@ class TestRebuildIsGenerationSafe:
         pool = _connection_pool()
         broken = AsyncMock()
         broken.acquire = AsyncMock(side_effect=RuntimeError("dead"))
+        broken.try_acquire_idle = MagicMock(return_value=None)
         pool._publisher_connection = _conn()
         pool._publisher_channel_pool = broken
         fresh_conn = _conn()

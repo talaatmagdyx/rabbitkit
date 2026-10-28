@@ -374,6 +374,36 @@ redeliveries after a reconnect, and several consumers all reorder messages.
 rabbitkit adds no ordering features. See
 [Ordering Guarantees](ordering-guarantees.md).
 
+## Streams
+
+A route on a `QueueType.STREAM` queue (both brokers) reads an append-only
+log; consuming does not remove messages. Its contract differs from the
+queue contract above (details: [Streams](streams.md)):
+
+- **At-least-once, by client-side offset.** AMQP 0.9.1 has no server-side
+  offset storage. rabbitkit advances a processed offset over the contiguous
+  prefix of settled deliveries and commits it to an `OffsetStore` every
+  `commit_every` messages / `commit_interval` seconds and at `stop()`. A
+  restart resumes at the committed offset + 1 (a crash replays at most the
+  messages processed since the last commit); a reconnect resumes at the
+  processed offset + 1, never at `"next"`. Deliveries in flight when a
+  channel dies are delivered again.
+- **No retry, no DLQ, no redelivery.** RabbitMQ neither redelivers nor
+  dead-letters a nacked or rejected stream message. A handler failure is
+  logged and skipped (the offset moves past it; the message stays in the
+  stream for replay). `RetryConfig` (per route or inherited) and
+  `AckPolicy.ACK_FIRST` are refused at registration; no safety DLQ is
+  provisioned.
+- **Durability** is the stream's (replicated like a quorum queue) for the
+  messages; the consumer position is as durable as its `OffsetStore`
+  (`InMemoryOffsetStore`: process lifetime; `SQLiteOffsetStore`: survives a
+  crash).
+- **Ordering**: one consumer reads in log order; concurrent handlers may
+  finish out of order, but the committed position never passes an
+  unfinished message.
+- The CRITICAL profile requires quorum queues and reports stream routes as
+  violations.
+
 ## Enabling the CRITICAL profile
 
 ```python

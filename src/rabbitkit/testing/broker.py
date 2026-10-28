@@ -33,6 +33,7 @@ from rabbitkit.core.pipeline import HandlerPipeline
 from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementReport, settle_many_async, settle_many_sync
+from rabbitkit.core.streams import StreamConsumerConfig, StreamOffsetLike
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
@@ -155,6 +156,8 @@ class TestBroker:
         prefetch_count: int | None = None,
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
+        stream: StreamConsumerConfig | None = None,
+        stream_offset: StreamOffsetLike | None = None,
     ) -> Callable[[Callable[_P, _R_co]], MockedHandler[_P, _R_co]]:
         """Register a subscriber — same API as real broker."""
         decorator = self._registry.subscriber(
@@ -163,6 +166,8 @@ class TestBroker:
             routing_key=routing_key,
             ack_policy=ack_policy,
             reply_to_allow=reply_to_allow,
+            stream=stream,
+            stream_offset=stream_offset,
             middlewares=middlewares,
             serializer=serializer,
             retry=retry,

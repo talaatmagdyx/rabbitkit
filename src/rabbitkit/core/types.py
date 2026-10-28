@@ -115,6 +115,24 @@ class QueueType(str, Enum):
     STREAM = "stream"
 
 
+class StreamOffsetType(str, Enum):
+    """Where a stream consumer starts reading (RabbitMQ ``x-stream-offset``).
+
+    - FIRST: the oldest message still retained by the stream.
+    - LAST: the last chunk written (the most recent messages).
+    - NEXT: only messages published after the consumer subscribes (the
+      broker's default).
+    - OFFSET: a numeric offset.
+    - TIMESTAMP: the first chunk published at or after a point in time.
+    """
+
+    FIRST = "first"
+    LAST = "last"
+    NEXT = "next"
+    OFFSET = "offset"
+    TIMESTAMP = "timestamp"
+
+
 class AckPolicy(str, Enum):
     """Message acknowledgement policies.
 

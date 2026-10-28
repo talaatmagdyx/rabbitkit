@@ -48,6 +48,7 @@ from rabbitkit.core.registry import HandlerT, SubscriberRegistry
 from rabbitkit.core.reserved_headers import ReservedHeaderStripper
 from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_sync
+from rabbitkit.core.streams import StreamConsumerConfig, StreamOffsetLike, StreamOffsetTracker
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
@@ -174,6 +175,9 @@ class SyncBroker:
         # a plain int for backward-compat reads (health checks).
         self._in_flight = 0
         self._in_flight_cond = threading.Condition()
+        # Stream routes: per-route offset tracker (route name -> tracker), kept
+        # across reconnects and stop()/start() (see AsyncBroker).
+        self._stream_trackers: dict[str, StreamOffsetTracker] = {}
 
         # Optional publish-side flow control (C-6). Opt-in via the
         # flow_controller setter; when set, publish() acquires/releases a
@@ -256,6 +260,8 @@ class SyncBroker:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
+        stream: StreamConsumerConfig | None = None,
+        stream_offset: StreamOffsetLike | None = None,
     ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -273,6 +279,8 @@ class SyncBroker:
             filter_fn=filter_fn,
             reject_without_dlx=reject_without_dlx,
             reply_to_allow=reply_to_allow,
+            stream=stream,
+            stream_offset=stream_offset,
         )
 
     def publisher(
@@ -494,6 +502,11 @@ class SyncBroker:
         effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
         deadline = None if effective is None else time.monotonic() + effective
 
+        # Stream routes: from here a nack/reject hands a delivery back, so
+        # its offset must not advance.
+        for tracker in self._stream_trackers.values():
+            tracker.begin_shutdown()
+
         # Cancel all consumers FIRST — stop new deliveries before draining
         # anything, so nothing new arrives while the pool/in-flight drain runs.
         if self._transport is None:  # pragma: no cover — defensive (assert was stripped under -O)
@@ -514,6 +527,11 @@ class SyncBroker:
 
         # Drain inline in-flight handlers (C-2).
         self._wait_in_flight(deadline)
+
+        # Commit the stream offsets, so the next start resumes right after
+        # the last processed message.
+        for tracker in self._stream_trackers.values():
+            tracker.flush()
 
         # Close RPC client if used
         if self._rpc_client is not None:
@@ -1436,6 +1454,21 @@ class SyncBroker:
         else:
             callback = on_message
 
+        consume_kwargs: dict[str, Any] = {}
+        tracker = self._stream_tracker(route)
+        if tracker is not None:
+            # Record each delivery's offset in arrival order (on the I/O
+            # thread, before a worker pool can reorder handling); a
+            # re-subscription after a reconnect starts at the processed position.
+            untracked = callback
+
+            def on_stream_message(message: RabbitMessage) -> None:
+                tracker.track(message)
+                untracked(message)
+
+            callback = on_stream_message
+            consume_kwargs["arguments"] = tracker.consume_arguments
+
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
         self._wire_consumer_state()
         was_cancelled = route.runtime_state.consumer_cancelled
@@ -1444,11 +1477,14 @@ class SyncBroker:
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
+            **consume_kwargs,
         )
         route.runtime_state.consumer_tag = consumer_tag
         if was_cancelled:
             # Re-subscribed by a reconnect while the broker had it cancelled.
             self._consumer_state_changed(route.queue.name, cancelled=False)
+        if tracker is not None:
+            tracker.subscribed()
 
     def _wire_consumer_state(self) -> None:
         """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""
@@ -1477,6 +1513,18 @@ class SyncBroker:
         except Exception:
             event = "cancelled" if cancelled else "resumed"
             logger.warning("on_consumer_%s hook raised (queue=%s)", event, queue, exc_info=True)
+
+    def _stream_tracker(self, route: RouteDefinition) -> StreamOffsetTracker | None:
+        """The offset tracker of a stream route (created on first use, which
+        loads the stored offset), else None."""
+        config = route.stream_config
+        if config is None:
+            return None
+        tracker = self._stream_trackers.get(route.name)
+        if tracker is None:
+            tracker = StreamOffsetTracker(route_name=route.name, queue=route.queue.name, config=config)
+            self._stream_trackers[route.name] = tracker
+        return tracker
 
     # ── Public topology API (16.6) — additive, retry/topology owner ─────
 

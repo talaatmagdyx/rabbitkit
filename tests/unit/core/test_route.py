@@ -490,3 +490,20 @@ class TestPrefetchValidation:
     def test_zero_negative_or_non_int_is_rejected(self, value: object) -> None:
         with pytest.raises(ConfigurationError, match="prefetch_count must be None"):
             _make_route(prefetch_count=value).validate()
+
+
+# ── stream routes: no safety DLQ ─────────────────────────────────────────
+
+
+class TestStreamRouteSafety:
+    def test_a_stream_route_never_rejects_into_nothing(self) -> None:
+        """A rejected stream message stays in the stream, so no safety DLQ is
+        provisioned (RabbitMQ refuses x-dead-letter-exchange on a stream) and
+        the 'error' policy does not fire."""
+        from rabbitkit.core.config import SafetyConfig
+        from rabbitkit.core.types import QueueType
+
+        route = _make_route(queue=RabbitQueue(name="events", queue_type=QueueType.STREAM))
+        assert route.can_reject_without_dlx() is False
+        assert route.resolve_safety_dlq(SafetyConfig()) is None
+        assert route.resolve_safety_dlq(SafetyConfig(reject_without_dlx="error")) is None

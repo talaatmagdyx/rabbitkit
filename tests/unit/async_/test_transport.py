@@ -919,6 +919,23 @@ class TestConsume:
         channel.declare_queue.assert_awaited_once_with("orders", passive=True)
         channel.get_queue.assert_not_called()
         assert mock_queue.consume.call_args.kwargs["no_ack"] is False
+        assert "arguments" not in mock_queue.consume.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_consume_passes_arguments_by_reference(self) -> None:
+        """Stream routes: the consume arguments reach aio-pika as the SAME dict,
+        so the robust restore record carries in-place updates of the resume
+        point; the supervisor record keeps it too."""
+        transport = _make_transport()
+        channel = await self._connect_transport(transport)
+        mock_queue = AsyncMock()
+        channel.declare_queue = AsyncMock(return_value=mock_queue)
+        arguments: dict[str, Any] = {"x-stream-offset": "first"}
+
+        await transport.consume("events", AsyncMock(), arguments=arguments)
+
+        assert mock_queue.consume.call_args.kwargs["arguments"] is arguments
+        assert transport._consumer_supervisor._records["events"].arguments is arguments
 
 
 # ── Message Building ────────────────────────────────────────────────────

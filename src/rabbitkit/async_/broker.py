@@ -58,6 +58,7 @@ from rabbitkit.core.route import RouteDefinition
 from rabbitkit.core.sanitizer import ErrorSanitizer
 from rabbitkit.core.settlement import SettlementItem, SettlementReport, settle_many_async
 from rabbitkit.core.signals import is_default_signal_handler, is_loop_signal_handler, loop_signal_handler_is
+from rabbitkit.core.streams import StreamConsumerConfig, StreamOffsetLike, StreamOffsetTracker
 from rabbitkit.core.topology import RabbitExchange, RabbitQueue
 from rabbitkit.core.types import (
     AckPolicy,
@@ -95,6 +96,8 @@ def _not_sent(env: MessageEnvelope, reason: str, error: BaseException | None = N
         error=error,
         reason=reason,
     )
+
+
 # Shared with RabbitApp (core/signals.py); kept under the old private names.
 _is_loop_signal_handler = is_loop_signal_handler
 _is_default_signal_handler = is_default_signal_handler
@@ -226,6 +229,11 @@ class AsyncBroker:
         # with delivery-tag logging, the same as the pooled path already does,
         # instead of silently abandoning them unacked.
         self._inflight_tasks: dict[asyncio.Task[None], RabbitMessage] = {}
+
+        # Stream routes: per-route offset tracker (route name -> tracker).
+        # Kept across reconnects and stop()/start() so a restarted consumer
+        # resumes from its processed position.
+        self._stream_trackers: dict[str, StreamOffsetTracker] = {}
 
         # Optional publish-side flow control (C-6).
         self._flow_controller: Any | None = None
@@ -366,6 +374,8 @@ class AsyncBroker:
         filter_fn: Callable[[RabbitMessage], bool] | None = None,
         reject_without_dlx: str | None = None,
         reply_to_allow: tuple[str, ...] | None = None,
+        stream: StreamConsumerConfig | None = None,
+        stream_offset: StreamOffsetLike | None = None,
     ) -> Callable[[HandlerT], HandlerT]:
         """Register a subscriber handler."""
         return self._registry.subscriber(
@@ -383,6 +393,8 @@ class AsyncBroker:
             filter_fn=filter_fn,
             reject_without_dlx=reject_without_dlx,
             reply_to_allow=reply_to_allow,
+            stream=stream,
+            stream_offset=stream_offset,
         )
 
     def publisher(
@@ -972,6 +984,11 @@ class AsyncBroker:
         effective = timeout if timeout is not None else self._consumer_config.graceful_timeout
         deadline = None if effective is None else time.monotonic() + effective
 
+        # Stream routes: from here a nack/reject hands a delivery back (pool
+        # hand-back, cancelled handler), so its offset must not advance.
+        for tracker in self._stream_trackers.values():
+            tracker.begin_shutdown()
+
         # L14: stop the periodic heartbeat first, alongside cancelling consumers.
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
@@ -999,6 +1016,10 @@ class AsyncBroker:
 
         # Drain inline in-flight handlers (C-2).
         await self._wait_in_flight(deadline)
+
+        # Every handler has settled or been handed back: commit the stream
+        # offsets, so the next start resumes right after the last processed one.
+        await self._flush_stream_offsets(deadline)
 
         # Publisher shutdown (G-12). After the consumer drain, so a handler
         # finishing inside the grace period can still publish its result or
@@ -1821,6 +1842,21 @@ class AsyncBroker:
         else:
             callback = on_message
 
+        consume_kwargs: dict[str, Any] = {}
+        tracker = await self._stream_tracker(route)
+        if tracker is not None:
+            # Record each delivery's offset in arrival order, before a worker
+            # pool can reorder handling; the live consume arguments make a
+            # reconnect resume at the processed position.
+            untracked = callback
+
+            async def on_stream_message(message: RabbitMessage) -> None:
+                tracker.track(message)
+                await untracked(message)
+
+            callback = on_stream_message
+            consume_kwargs["arguments"] = tracker.consume_arguments
+
         effective_prefetch = route.prefetch_count or self._consumer_config.prefetch_count
         self._wire_consumer_state()
         route.runtime_state.consumer_cancelled = False
@@ -1828,8 +1864,45 @@ class AsyncBroker:
             queue=route.queue.name,
             callback=callback,
             prefetch=effective_prefetch,
+            **consume_kwargs,
         )
         route.runtime_state.consumer_tag = consumer_tag
+        if tracker is not None:
+            tracker.subscribed()
+
+    async def _stream_tracker(self, route: RouteDefinition) -> StreamOffsetTracker | None:
+        """The offset tracker of a stream route (created on first use), else None.
+
+        Creating one loads the stored offset; a configured store is read off
+        the event loop.
+        """
+        config = route.stream_config
+        if config is None:
+            return None
+        tracker = self._stream_trackers.get(route.name)
+        if tracker is None:
+            if config.offset_store is None:
+                tracker = StreamOffsetTracker(route_name=route.name, queue=route.queue.name, config=config)
+            else:
+                tracker = await asyncio.to_thread(
+                    StreamOffsetTracker, route_name=route.name, queue=route.queue.name, config=config
+                )
+            self._stream_trackers[route.name] = tracker
+        return tracker
+
+    async def _flush_stream_offsets(self, deadline: float | None) -> None:
+        """Commit every stream route's processed offset (stop()), within the deadline."""
+        for name, tracker in self._stream_trackers.items():
+            try:
+                async with asyncio.timeout(self._remaining(deadline)):
+                    await tracker.flush_async()
+            except TimeoutError:
+                logger.warning(
+                    "Stream route %r: committing the final offset did not finish before the stop deadline; "
+                    "the next start replays from offset %s",
+                    name,
+                    tracker.committed_offset,
+                )
 
     def _wire_consumer_state(self) -> None:
         """Mirror broker-initiated consumer cancels into route state and the hooks (G-26)."""

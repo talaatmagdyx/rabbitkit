@@ -187,6 +187,20 @@ class RabbitMessage:
         return self._wire_content_encoding
 
     @property
+    def stream_offset(self) -> int | None:
+        """This delivery's offset in a stream queue, else None.
+
+        RabbitMQ stamps every delivery from a stream with an
+        ``x-stream-offset`` header (overwriting any value a publisher set).
+        On a classic or quorum queue the header is whatever the publisher
+        sent, so only read this for deliveries from a stream.
+        """
+        value = self.headers.get("x-stream-offset")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return int(value)
+
+    @property
     def is_settled(self) -> bool:
         """True if the message has been acked, nacked, or rejected."""
         return self._disposition != "pending"

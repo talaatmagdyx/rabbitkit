@@ -109,6 +109,22 @@ class TestResubscribe:
         assert resumed == ["orders"]
         assert transport.cancelled_consumers == frozenset()
 
+    def test_a_stream_consumer_resubscribes_at_its_current_offset(self) -> None:
+        transport, conn, channel = _connected()
+        live: dict[str, object] = {"x-stream-offset": "first"}
+        tag = transport.consume("events", lambda m: None, arguments=live)
+        assert channel.basic_consume.call_args.kwargs["arguments"] == {"x-stream-offset": "first"}
+        _cancel(transport, channel, tag)
+        record = transport._consumer_supervisor.record("events")
+        assert record is not None
+        record.next_attempt = 0.0
+        live["x-stream-offset"] = 42  # the offset tracker advanced while cancelled
+        probe = MagicMock()
+        probe.is_open = True
+        conn.channel.return_value = probe
+        transport._consumer_supervisor.check_once()
+        assert channel.basic_consume.call_args.kwargs["arguments"] == {"x-stream-offset": 42}
+
     def test_opens_a_fresh_channel_when_the_broker_closed_it(self) -> None:
         transport, conn, _channel, tag = self._cancelled()
         transport._consumer_channels["orders"] = MagicMock(is_open=False)  # closed by the broker

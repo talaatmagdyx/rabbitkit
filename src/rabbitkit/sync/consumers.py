@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +54,10 @@ class SyncConsumerRecord:
     no_ack: bool = False
     #: Only consumers on a declared queue are re-subscribed (not reply-to).
     supervised: bool = True
+    #: The consume arguments, by reference: a stream route's mapping is kept
+    #: current by its offset tracker, so a re-subscribe resumes at the
+    #: processed offset instead of the server default ("next").
+    arguments: Mapping[str, Any] | None = None
     #: The server cancelled the consumer and it has not been re-subscribed yet.
     broker_cancelled: bool = False
     retry_delay: float = RESUBSCRIBE_BACKOFF_INITIAL

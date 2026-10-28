@@ -50,6 +50,7 @@ class Transport(Protocol):
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue. Returns consumer_tag.
 
@@ -58,6 +59,8 @@ class Transport(Protocol):
         ``declare=False`` skips declaring/checking the queue first — required
         for AMQP pseudo-queues such as ``amq.rabbitmq.reply-to``, which the
         broker rejects any Queue.Declare for (active or passive).
+        ``arguments`` are ``basic.consume`` arguments (``x-stream-offset``);
+        the brokers pass it only for stream routes.
         """
         ...
 
@@ -128,6 +131,7 @@ class AsyncTransport(Protocol):
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue. Returns consumer_tag.
 
@@ -136,6 +140,8 @@ class AsyncTransport(Protocol):
         ``declare=False`` skips declaring/checking the queue first — required
         for AMQP pseudo-queues such as ``amq.rabbitmq.reply-to``, which the
         broker rejects any Queue.Declare for (active or passive).
+        ``arguments`` are ``basic.consume`` arguments (``x-stream-offset``);
+        the brokers pass it only for stream routes.
         """
         ...
 

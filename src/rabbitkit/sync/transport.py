@@ -1193,6 +1193,7 @@ class SyncTransport:
         *,
         no_ack: bool = False,
         declare: bool = True,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         """Start consuming from a queue.
 
@@ -1209,6 +1210,11 @@ class SyncTransport:
         remembered as ``self._reply_to_channel`` so :meth:`publish` can route
         matching requests onto the SAME channel — required by RabbitMQ's direct
         reply-to (see :meth:`publish`).
+
+        ``arguments`` are the ``basic.consume`` arguments (e.g.
+        ``x-stream-offset`` for a stream queue), read when this call
+        subscribes; the broker passes its current resume point on each
+        re-subscription after a reconnect.
         """
         self._ensure_connected()
 
@@ -1237,11 +1243,15 @@ class SyncTransport:
             callback(message)
 
         consumer_channel.add_on_cancel_callback(self._on_broker_cancel)
+        consume_kwargs: dict[str, Any] = {}
+        if arguments is not None:
+            consume_kwargs["arguments"] = dict(arguments)
         consumer_channel.basic_consume(
             queue=queue,
             on_message_callback=on_message,
             auto_ack=no_ack,
             consumer_tag=consumer_tag,
+            **consume_kwargs,
         )
 
         self._consumer_tags[queue] = consumer_tag
@@ -1253,6 +1263,7 @@ class SyncTransport:
                 prefetch=prefetch,
                 no_ack=no_ack,
                 supervised=declare,
+                arguments=arguments,
             )
         )
         logger.info("Started consuming from queue '%s' with tag '%s'", queue, consumer_tag)
@@ -1318,6 +1329,7 @@ class SyncTransport:
                 on_message_callback=record.on_message,
                 auto_ack=record.no_ack,
                 consumer_tag=record.tag,
+                **({"arguments": dict(record.arguments)} if record.arguments else {}),
             )
         except pika.exceptions.DuplicateConsumerTag:
             return True  # already consuming under this tag

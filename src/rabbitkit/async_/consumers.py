@@ -65,6 +65,10 @@ class ConsumerRecord:
     no_ack: bool = False
     #: Only consumers on a declared queue are re-subscribed (not reply-to).
     supervised: bool = True
+    #: ``basic.consume`` arguments (stream offset), re-sent on re-subscribe.
+    #: The same dict the transport passed to aio-pika, so it carries the
+    #: current resume point.
+    arguments: dict[str, Any] | None = None
     #: Set when rabbitkit itself cancels the consumer; never re-subscribe after.
     stopped: bool = False
     #: The server cancelled the consumer and it has not been re-subscribed yet.
@@ -244,8 +248,9 @@ class ConsumerSupervisor:
             from aiormq.exceptions import DuplicateConsumerTag
 
             try:
+                extra: dict[str, Any] = {} if record.arguments is None else {"arguments": record.arguments}
                 await record.queue_obj.consume(
-                    record.callback, consumer_tag=record.tag, no_ack=record.no_ack, robust=False
+                    record.callback, consumer_tag=record.tag, no_ack=record.no_ack, robust=False, **extra
                 )
             except DuplicateConsumerTag:
                 pass  # aio-pika re-subscribed it first

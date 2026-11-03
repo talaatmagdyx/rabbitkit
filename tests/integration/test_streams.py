@@ -428,11 +428,14 @@ async def _async_run(url: str, queue: Any, store: Any, until: Callable[[_Seen], 
         seen.add(message.stream_offset, body)
         if until(seen) and isinstance(store, _CrashingStore):
             # Crash right after the K-th message: let the commit that was
-            # already due (offset 9) land first, as it would have in a real
-            # process, then stop persisting (no final commit at stop()).
+            # already due (the offset-9 boundary) land first, as it would have
+            # in a real process, then stop persisting (no final commit at
+            # stop()). The commit takes the processed position when it runs,
+            # so it may land past 9: wait for the window, not the exact value.
             tracker = broker._stream_trackers[f"{queue.name}:{handle.__qualname__}"]
             for _ in range(500):
-                if tracker.committed_offset == 9:
+                committed = tracker.committed_offset
+                if committed is not None and committed >= 9:
                     break
                 await asyncio.sleep(0.01)
             store.crash()

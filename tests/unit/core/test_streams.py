@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -533,6 +534,54 @@ class TestTrackerAsync:
         assert tracker._commit_task is not task
         await tracker.flush_async()
         assert store.saves == [0, 1]
+
+    async def test_progress_made_during_a_running_commit_is_committed_when_due(self) -> None:
+        """Issue #59: a due commit is skipped while one runs; the running one must not forget
+        the progress made meanwhile, or the store falls more than commit_every behind."""
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingStore(_RecordingStore):
+            def save(self, key: str, offset: int) -> None:
+                if not self.saves:  # the first save waits until released
+                    entered.set()
+                    release.wait(5)
+                super().save(key, offset)
+
+        store = BlockingStore()
+        tracker = _tracker(store=store, commit_every=5)
+        messages = [_async_msg(i, i + 1) for i in range(12)]
+        for message in messages:
+            tracker.track(message)
+        for message in messages[:5]:
+            await message.ack_async()  # offset 4: a commit starts and blocks in save
+        assert await asyncio.to_thread(entered.wait, 5)
+        for message in messages[5:10]:
+            await message.ack_async()  # offset 9: due, skipped (a commit is running)
+        release.set()
+        task = tracker._commit_task
+        assert task is not None
+        await task
+        for message in messages[10:]:
+            await message.ack_async()  # offsets 10, 11: not a full window
+
+        assert store.saves == [4, 9]
+        assert tracker.committed_offset == 9
+
+    async def test_a_failing_store_does_not_retry_in_a_loop(self) -> None:
+        store = _RecordingStore()
+        store.fail = True
+        tracker = _tracker(store=store, commit_every=1)
+        messages = [_async_msg(i, i + 1) for i in range(3)]
+        for message in messages:
+            tracker.track(message)
+        for message in messages:
+            await message.ack_async()
+        task = tracker._commit_task
+        assert task is not None
+        await task
+
+        assert tracker.committed_offset is None
+        assert tracker.commit_failures >= 1
 
 
 # ── RabbitMessage.stream_offset ──────────────────────────────────────────

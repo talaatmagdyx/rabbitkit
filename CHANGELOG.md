@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] — 2026-11-03
+
+A crash of an async stream consumer replays at most `commit_every` messages again.
+
 ### Fixed
 
 - Streams, async broker with a durable offset store: the stored offset could fall more than

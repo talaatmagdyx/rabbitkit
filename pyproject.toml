@@ -1,6 +1,6 @@
 [project]
 name = "rabbitkit"
-version = "0.20.1"
+version = "0.20.2"
 description = "Production-grade RabbitMQ toolkit — sync/async, decorator routing, retry, compression, full configurability"
 readme = "README.md"
 license = "MIT"

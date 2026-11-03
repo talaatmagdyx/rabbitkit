@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import base64
 import json
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -194,12 +195,22 @@ class ManagementConfig:
         this is intended **only for local development**. In production use
         ``https://`` with non-default credentials. Schemes other than
         ``http``/``https`` are rejected to prevent SSRF via crafted URLs.
+
+    TLS (``https://`` only), named like :class:`~rabbitkit.core.config.SSLConfig`:
+    ``ca_certs`` is a PEM file of certificate authorities to trust instead of the
+    system store (a management API behind a private CA); ``certfile`` and
+    ``keyfile`` present a client certificate. Certificate and hostname
+    verification always stay on. The files are read once, when a
+    :class:`RabbitManagementClient` is created.
     """
 
     url: str = "http://localhost:15672"
     username: str = "guest"
     password: str = "guest"
     timeout: float = 10.0
+    ca_certs: str | None = None
+    certfile: str | None = None
+    keyfile: str | None = None
 
     def __repr__(self) -> str:
         """L2: mask the password — the default dataclass repr would leak it
@@ -212,6 +223,11 @@ class ManagementConfig:
         scheme = urllib.parse.urlparse(self.url).scheme.lower()
         if scheme not in {"http", "https"}:
             raise ValueError(f"Unsupported management URL scheme {scheme!r}; only 'http' and 'https' are allowed.")
+        # Config that lies: TLS files on a plaintext URL would never be used.
+        if scheme == "http" and (self.ca_certs or self.certfile or self.keyfile):
+            raise ValueError("ca_certs, certfile and keyfile need an https:// management URL.")
+        if self.keyfile and not self.certfile:
+            raise ValueError("keyfile needs certfile (the client certificate).")
         # Mirror ConnectionConfig.__post_init__: warn when the default 'guest'
         # credentials are used against a non-local host (dev convenience, but
         # flag the production misconfiguration once at construction).
@@ -225,6 +241,17 @@ class ManagementConfig:
             )
 
 
+def _ssl_context(config: ManagementConfig) -> ssl.SSLContext | None:
+    """A verifying TLS context trusting ``ca_certs`` and presenting ``certfile``, or
+    ``None`` when neither is set (the library defaults apply)."""
+    if not (config.ca_certs or config.certfile):
+        return None
+    context = ssl.create_default_context(cafile=config.ca_certs)
+    if config.certfile:
+        context.load_cert_chain(config.certfile, config.keyfile)
+    return context
+
+
 class RabbitManagementClient:
     """HTTP client for the RabbitMQ Management API."""
 
@@ -232,8 +259,14 @@ class RabbitManagementClient:
         self._config = config or ManagementConfig()
         credentials = f"{self._config.username}:{self._config.password}"
         self._auth_header = "Basic " + base64.b64encode(credentials.encode()).decode()
+        # TLS context for https:// with a private CA or a client certificate (None:
+        # the defaults, i.e. the system trust store). Shared by sync and async calls.
+        self._ssl_context = _ssl_context(self._config)
         # No-redirect opener: 3xx raise HTTPError instead of being followed.
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
+        if self._ssl_context is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=self._ssl_context))
+        self._opener = urllib.request.build_opener(*handlers)
         # Long-lived aiohttp session reused across *_async requests (L-6).
         # Lazily created on the first async request; closed via aclose().
         self._aiohttp_session: Any = None
@@ -512,6 +545,7 @@ class RabbitManagementClient:
             data=body,
             timeout=aiohttp.ClientTimeout(total=self._config.timeout),
             allow_redirects=False,  # never follow — surface 3xx as an error (SSRF guard)
+            ssl=self._ssl_context if self._ssl_context is not None else True,
         ) as resp:
             if 300 <= resp.status < 400:
                 raise ValueError(f"Unexpected redirect ({resp.status}) to {resp.headers.get('Location')}")

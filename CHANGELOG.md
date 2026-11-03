@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-11-03
+
+TLS for the management API client (a management API behind a private CA, or one that asks
+for a client certificate). No behaviour change when the new options are not set.
+
+### Added
+
+- `ManagementConfig` TLS options for `https://` management URLs, named like `SSLConfig`:
+  - `ca_certs`: a PEM file of certificate authorities to trust instead of the system store
+    (a management API behind a private CA);
+  - `certfile` / `keyfile`: present a client certificate.
+- Both the sync (`urllib`) and async (`aiohttp`) clients use them. Certificate and hostname
+  verification stay on, and redirects are still refused.
+- TLS files on an `http://` URL, or a `keyfile` without a `certfile`, raise `ValueError` at
+  construction.
+
 ## [0.20.0] — 2026-10-29
 
 Publish and consume reliability for both brokers: publish outcomes that say

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Streams, async broker with a durable offset store: the stored offset could fall more than
+  `commit_every` behind, so a crash replayed more than the documented window. A due commit is
+  skipped while another one runs, and the running one then reset its progress count to 0,
+  forgetting the settlements made during it (seen in CI as #59: stored 4 with 11 processed,
+  `commit_every=5`).
+  - A commit now subtracts only the settlements it covered.
+  - The off-loop commit repeats while the progress made meanwhile is itself due.
+  - A failing store is still retried by the next due settlement, not in a loop.
+  - The sync broker commits inline and was not affected.
+
 ## [0.20.1] — 2026-11-03
 
 TLS for the management API client (a management API behind a private CA, or one that asks

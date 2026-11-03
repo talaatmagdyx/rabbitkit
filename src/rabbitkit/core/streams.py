@@ -500,13 +500,7 @@ class StreamOffsetTracker:
                 assert self._processed is not None
                 self._arguments[STREAM_OFFSET_ARG] = self._processed + 1
                 self._since_commit += advanced
-            due = advanced > 0 and (
-                self._since_commit >= self._config.commit_every
-                or (
-                    self._config.commit_interval is not None
-                    and self._clock() - self._last_commit_at >= self._config.commit_interval
-                )
-            )
+            due = advanced > 0 and self._commit_due()
         if failed:
             logger.warning(
                 "Stream route %r: the message at offset %d failed and is not retried (a stream does not "
@@ -518,6 +512,13 @@ class StreamOffsetTracker:
 
     # ── commits ────────────────────────────────────────────────────────────
 
+    def _commit_due(self) -> bool:
+        """Whether the progress since the last commit calls for one (lock held)."""
+        return self._since_commit >= self._config.commit_every or (
+            self._config.commit_interval is not None
+            and self._clock() - self._last_commit_at >= self._config.commit_interval
+        )
+
     def commit(self) -> None:
         """Save the processed watermark if it moved. Blocking; thread-safe."""
         with self._commit_lock:
@@ -525,6 +526,7 @@ class StreamOffsetTracker:
                 target = self._processed
                 if target is None or (self._committed is not None and target <= self._committed):
                     return
+                covered = self._since_commit  # the settlements up to target
             try:
                 self._store.save(self._key, target)
             except Exception:
@@ -534,8 +536,23 @@ class StreamOffsetTracker:
                 return
             with self._lock:
                 self._committed = target
-                self._since_commit = 0
+                # Settlements made while the save ran are past target: they still count
+                # toward the next commit (resetting to 0 forgot them, issue #59).
+                self._since_commit = max(0, self._since_commit - covered)
                 self._last_commit_at = self._clock()
+
+    def _commit_while_due(self) -> None:
+        """Off-loop commit: commit, then again while the progress made meanwhile is itself
+        due. A due settlement does not start a second commit while one runs, so without the
+        repeat the store could fall more than ``commit_every`` behind, and a crash replay
+        more than that (issue #59). Stops when a commit makes no progress (a failing store
+        is retried by the next due settlement, not in a loop)."""
+        while True:
+            before = self._committed
+            self.commit()
+            with self._lock:
+                if self._committed == before or not self._commit_due():
+                    return
 
     def _commit_soon(self) -> None:
         """Async path: commit without holding up the settlement."""
@@ -544,9 +561,9 @@ class StreamOffsetTracker:
             return
         task = self._commit_task
         if task is not None and not task.done():
-            return  # the next due settlement commits again
+            return  # the running commit repeats while progress made meanwhile is due
         self._commit_task = asyncio.get_running_loop().create_task(
-            asyncio.to_thread(self.commit), name=f"rabbitkit-stream-commit:{self._route_name}"
+            asyncio.to_thread(self._commit_while_due), name=f"rabbitkit-stream-commit:{self._route_name}"
         )
 
     def flush(self) -> None:

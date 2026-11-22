@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sync transport with pika 1.5: a channel's close by the broker (a publish refused with 404,
+  the 404 of the re-subscribe probe's passive declare) made the transport reconnect, and a
+  reconnect declares every route again, re-creating a queue an operator had deleted. pika 1.5
+  raises a channel's close from the next `process_data_events` too, even after the call on that
+  channel raised it or its owner handled it; pika 1.4 raised it only there. The transport's I/O
+  loop now lets a channel-level close pass while the connection is open, as with pika 1.4. A
+  lost connection still raises.
+- `rabbitkit dlq` commands type-check against pika 1.5, which types every part of
+  `basic_get`'s answer as optional. Routing keys, exchanges and message ids pika leaves as
+  `bytes` (not UTF-8) are shown decoded.
+
 ## [0.20.2] — 2026-11-03
 
 A crash of an async stream consumer replays at most `commit_every` messages again.

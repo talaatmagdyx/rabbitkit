@@ -910,8 +910,27 @@ class SyncTransport:
         conn = self._connection
         if conn is None or not conn.is_open:
             return False
-        conn.process_data_events(time_limit=seconds)
+        self._process_data_events(seconds)
         return True
+
+    def _process_data_events(self, time_limit: float | None) -> None:
+        """``process_data_events`` on the connection, with pika 1.4's behaviour on channel closes.
+
+        pika 1.5 also raises a channel's close by the broker (a refused publish,
+        the 404 of a passive probe, a consumer channel's 406) from the next
+        ``process_data_events``, even after the call on that channel raised it
+        or its owner handled it. pika 1.4 raised it only there. The connection
+        is still open, so only a lost connection must surface from the I/O
+        loop: taken for one, a channel's close made the transport reconnect
+        and declare every route again (re-creating a queue an operator had
+        deleted)."""
+        import pika.exceptions
+
+        try:
+            self._connection.process_data_events(time_limit=time_limit)
+        except pika.exceptions.AMQPChannelError:
+            if not self._connection.is_open:
+                raise
 
     def _publish(self, envelope: MessageEnvelope) -> PublishOutcome:
         """Publish a message to RabbitMQ.
@@ -1024,7 +1043,7 @@ class SyncTransport:
         ):
             return
         try:
-            self._connection.process_data_events(time_limit=0)
+            self._process_data_events(0)
         except get_connection_errors() as e:
             logger.warning("Publisher connection was closed while idle (%s); reconnecting before publishing", e)
             self.disconnect()
@@ -1660,7 +1679,7 @@ class SyncTransport:
                 # process_data_events drains ALL channels' consumers + queued
                 # add_callback_threadsafe callbacks (acks from worker threads).
                 try:
-                    self._connection.process_data_events(time_limit=self.poll_interval)
+                    self._process_data_events(self.poll_interval)
                 except ValueError as exc:
                     # pika's SelectConnection ioloop raises a bare
                     # ValueError("Timeout closed before call") when the
@@ -1741,7 +1760,7 @@ class SyncTransport:
         other direct pika call.
         """
         if self._connection is not None and self._connection.is_open:
-            self._connection.process_data_events(time_limit=time_limit)
+            self._process_data_events(time_limit)
 
     # ── DLQ / inspection (DLQInspector protocol) ──────────────────────────
 

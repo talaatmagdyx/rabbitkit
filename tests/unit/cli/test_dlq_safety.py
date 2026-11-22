@@ -402,3 +402,32 @@ class TestReplayLoopPreventionCli:
         assert result.exit_code == 2 and "REFUSED" in result.output
         channel.basic_publish.assert_not_called()
         assert queue.events.count("get") == 1 and queue.unacked == {}
+
+
+class TestBasicGetUnderPika15Types:
+    """pika 1.5 types every part of ``basic_get``'s answer as optional."""
+
+    def test_an_empty_queue_is_none(self) -> None:
+        from rabbitkit.cli.commands.dlq import _basic_get
+
+        channel = MagicMock()
+        channel.basic_get.return_value = (None, None, None)
+        assert _basic_get(channel, "q") is None
+
+    def test_a_message_keeps_its_fields_and_decodes_non_utf8_names(self) -> None:
+        from rabbitkit.cli.commands.dlq import _basic_get
+
+        method = MagicMock(delivery_tag=7, routing_key=b"rk-\xff", exchange=None, redelivered=True)
+        properties = MagicMock()
+        channel = MagicMock()
+        channel.basic_get.return_value = (method, properties, b"body")
+        got = _basic_get(channel, "q")
+        assert got is not None
+        assert (got.delivery_tag, got.routing_key, got.exchange, got.redelivered) == (7, "rk-\ufffd", "", True)
+        assert (got.properties, got.body) == (properties, b"body")
+        channel.basic_get.assert_called_once_with(queue="q", auto_ack=False)
+
+    def test_text_leaves_str_and_none_alone(self) -> None:
+        from rabbitkit.cli.commands.dlq import _text
+
+        assert (_text("id-1"), _text(None), _text(b"id-2")) == ("id-1", None, "id-2")

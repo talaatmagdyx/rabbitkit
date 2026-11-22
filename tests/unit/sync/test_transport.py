@@ -3350,3 +3350,50 @@ class TestObservabilityHooks:
         self._connect(transport)
         transport._consumer_channels = {"a": MagicMock(is_open=True), "b": MagicMock(is_open=False)}
         assert transport.channels_active == 2
+
+
+# ── pika 1.5: a channel's close raised again from the I/O loop ───────────────
+
+
+class TestProcessDataEventsChannelClose:
+    """pika 1.5 raises a channel's close by the broker from the next
+    ``process_data_events`` too; pika 1.4 did not. Only a lost connection
+    may surface from the I/O loop (a channel close taken for one made the
+    transport reconnect and declare every route again)."""
+
+    def _with_connection(self, error: BaseException, *, open_after: bool) -> SyncTransport:
+        transport = _make_transport()
+        connection = MagicMock()
+        connection.process_data_events.side_effect = error
+        connection.is_open = open_after
+        transport._connection = connection
+        return transport
+
+    def test_a_channel_close_on_an_open_connection_is_not_raised(self) -> None:
+        import pika.exceptions
+
+        transport = self._with_connection(pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND"), open_after=True)
+        transport._process_data_events(0)  # no raise
+        transport._connection.process_data_events.assert_called_once_with(time_limit=0)
+
+    def test_a_channel_close_on_a_closed_connection_is_raised(self) -> None:
+        import pika.exceptions
+
+        transport = self._with_connection(pika.exceptions.ChannelClosedByBroker(320, "SHUTDOWN"), open_after=False)
+        with pytest.raises(pika.exceptions.ChannelClosedByBroker):
+            transport._process_data_events(0)
+
+    def test_a_lost_connection_is_raised(self) -> None:
+        import pika.exceptions
+
+        transport = self._with_connection(pika.exceptions.ConnectionClosedByBroker(320, "SHUTDOWN"), open_after=True)
+        with pytest.raises(pika.exceptions.ConnectionClosedByBroker):
+            transport._process_data_events(0.5)
+
+    def test_the_idle_check_keeps_the_connection_after_a_refused_publish(self) -> None:
+        import pika.exceptions
+
+        transport = self._with_connection(pika.exceptions.ChannelClosedByBroker(404, "NOT_FOUND"), open_after=True)
+        with patch.object(transport, "disconnect") as disconnect:
+            transport._detect_closed_idle_connection()
+        disconnect.assert_not_called()

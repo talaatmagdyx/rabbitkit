@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import typer
+
+if TYPE_CHECKING:
+    import pika
+    from pika.adapters.blocking_connection import BlockingChannel
 
 dlq_app = typer.Typer(help="Dead-letter queue commands.")
 
@@ -87,6 +91,42 @@ def _tripwire_message(queue: str) -> str:
         "counts as a delivery, and past its delivery limit RabbitMQ drops the message. Stopped "
         "before going further. Pass --management-url to verify the limit, or make the queue "
         f"unlimited first: {unlimited_fix(None)}."
+    )
+
+
+class _Got(NamedTuple):
+    """One message from ``basic_get``, with the fields a ``GetOk`` always carries."""
+
+    delivery_tag: int
+    routing_key: str
+    exchange: str
+    redelivered: bool
+    properties: pika.BasicProperties
+    body: bytes
+
+
+def _text(value: str | bytes | None) -> str | None:
+    """An AMQP short string: pika decodes it to ``str``, or leaves ``bytes`` when it is not UTF-8."""
+    return value.decode(errors="replace") if isinstance(value, bytes) else value
+
+
+def _basic_get(channel: BlockingChannel, queue: str) -> _Got | None:
+    """One unacknowledged message, or ``None`` when the queue is empty.
+
+    pika 1.5 types every part of ``basic_get``'s answer as optional; a ``GetOk``
+    always comes with its delivery tag, properties and body."""
+    method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
+    if method is None:
+        return None
+    if method.delivery_tag is None or properties is None or body is None:  # pragma: no cover - not on the wire
+        raise RuntimeError("basic_get answered a GetOk without its delivery tag, properties or body")
+    return _Got(
+        method.delivery_tag,
+        _text(method.routing_key) or "",
+        _text(method.exchange) or "",
+        method.redelivered,
+        properties,
+        body,
     )
 
 
@@ -186,9 +226,10 @@ def dlq_inspect(
     fetch = DEFAULT_MAX_QUORUM_SCAN + 1 if whole else limit
     try:
         for _ in range(fetch):
-            method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
+            method = _basic_get(channel, queue)
             if method is None:
                 break
+            properties, body = method.properties, method.body
             held.append(method.delivery_tag)
             headers = dict(properties.headers or {})
             if armed and DELIVERY_COUNT_HEADER in headers:
@@ -199,8 +240,8 @@ def dlq_inspect(
                     "routing_key": method.routing_key,
                     "exchange": method.exchange,
                     "redelivered": method.redelivered,
-                    "message_id": properties.message_id,
-                    "correlation_id": properties.correlation_id,
+                    "message_id": _text(properties.message_id),
+                    "correlation_id": _text(properties.correlation_id),
                     "headers": headers,
                     "body_preview": body[:200].decode(errors="replace"),
                 }
@@ -392,9 +433,10 @@ def dlq_replay(
     held: list[int] = []
     try:
         for _ in range(limit):
-            method, properties, body = channel.basic_get(queue=queue, auto_ack=False)
+            method = _basic_get(channel, queue)
             if method is None:
                 break
+            properties, body = method.properties, method.body
 
             if vetted is False and DELIVERY_COUNT_HEADER in (properties.headers or {}):
                 held.append(method.delivery_tag)
@@ -411,7 +453,7 @@ def dlq_replay(
 
             if not ignore_replay_limit and replay_count(original_headers) >= max_replays:
                 typer.echo(
-                    f"REFUSED (stays on DLQ): message_id={properties.message_id} was already replayed "
+                    f"REFUSED (stays on DLQ): message_id={_text(properties.message_id)} was already replayed "
                     f"{replay_count(original_headers)} time(s) (--max-replays {max_replays}); fix the cause or "
                     "pass --ignore-replay-limit",
                     err=True,
@@ -431,7 +473,7 @@ def dlq_replay(
 
             if target == "" and rk == queue:
                 typer.echo(
-                    f"SKIPPED (stays on DLQ): message_id={properties.message_id} would be published back "
+                    f"SKIPPED (stays on DLQ): message_id={_text(properties.message_id)} would be published back "
                     f"into {queue!r}; pass --routing-key",
                     err=True,
                 )
@@ -453,7 +495,7 @@ def dlq_replay(
             except (pika_exceptions.UnroutableError, pika_exceptions.NackError) as exc:
                 held.append(method.delivery_tag)
                 typer.echo(
-                    f"FAILED (stays on DLQ): routing_key={rk!r}  message_id={properties.message_id}  ({exc})",
+                    f"FAILED (stays on DLQ): routing_key={rk!r}  message_id={_text(properties.message_id)}  ({exc})",
                     err=True,
                 )
                 failed += 1
@@ -463,7 +505,7 @@ def dlq_replay(
                 continue
 
             channel.basic_ack(delivery_tag=method.delivery_tag)
-            typer.echo(f"Replayed: routing_key={rk!r}  message_id={properties.message_id}")
+            typer.echo(f"Replayed: routing_key={rk!r}  message_id={_text(properties.message_id)}")
             replayed += 1
     finally:
         _release(channel, held)

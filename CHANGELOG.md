@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-11-22
+
+An async publish never raises `CancelledError` for a connection it did not cancel, and pika 1.5 is
+supported (a refused publish or a deleted queue no longer makes the sync transport reconnect).
+
 ### Fixed
 
 - Async publish: a publish waiting for its confirm when the publisher connection was replaced

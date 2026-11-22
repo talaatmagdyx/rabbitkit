@@ -25,6 +25,10 @@ from rabbitkit.core.config import ConnectionConfig, PoolConfig, SecurityConfig
 from rabbitkit.core.types import DIRECT_REPLY_TO_QUEUE, MessageEnvelope, PublishStatus
 
 
+async def _hang(*_: Any, **__: Any) -> None:
+    await asyncio.sleep(30)
+
+
 def _transport(**kwargs: Any) -> AsyncTransportImpl:
     transport = AsyncTransportImpl(connection_config=ConnectionConfig(), security_config=SecurityConfig(), **kwargs)
     transport._connected = True
@@ -178,8 +182,29 @@ class TestFailureClassification:
     @pytest.mark.asyncio
     async def test_cancellation_propagates(self) -> None:
         transport = _transport()
+        task = asyncio.create_task(transport._publish_on_channel(_channel(AsyncMock(side_effect=_hang)), _env()))
+        await asyncio.sleep(0.01)
+        task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await transport._publish_on_channel(_channel(AsyncMock(side_effect=asyncio.CancelledError())), _env())
+            await task
+
+    @pytest.mark.asyncio
+    async def test_a_confirm_failed_by_a_closed_connection_is_unknown_not_a_cancellation(self) -> None:
+        """aiormq fails the pending confirms of a channel or connection it closes
+        with CancelledError, its default close reason (the pool replacing the
+        publisher connection does exactly that). Nobody cancelled this task:
+        raised, it escaped every ``except Exception`` and left a consumer's
+        delivery unsettled."""
+        transport = _transport()
+        outcome = await transport._publish_on_channel(_channel(AsyncMock(side_effect=asyncio.CancelledError())), _env())
+        assert (outcome.status, outcome.reason) == (PublishStatus.UNKNOWN, "connection_lost")
+
+    @pytest.mark.asyncio
+    async def test_a_confirm_failed_by_a_closed_connection_during_shutdown_is_unknown_shutdown(self) -> None:
+        transport = _transport()
+        transport._publish_shutdown = True
+        outcome = await transport._publish_on_channel(_channel(AsyncMock(side_effect=asyncio.CancelledError())), _env())
+        assert (outcome.status, outcome.reason) == (PublishStatus.UNKNOWN, "shutdown")
 
 
 # ── per-call timeout ────────────────────────────────────────────────
@@ -307,10 +332,22 @@ class TestFastPath:
         with patch.object(transport, "_get_fast_channel", new=AsyncMock(side_effect=asyncio.CancelledError())):
             with pytest.raises(asyncio.CancelledError):
                 await transport.publish(_env())
+        channel = _channel(AsyncMock(side_effect=_hang))
+        with patch.object(transport, "_get_fast_channel", new=AsyncMock(return_value=channel)):
+            task = asyncio.create_task(transport.publish(_env()))
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert transport.publishes_in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_send_failed_by_a_closed_connection_is_unknown_not_a_cancellation(self) -> None:
+        transport = _transport(confirm_delivery=False)
         channel = _channel(AsyncMock(side_effect=asyncio.CancelledError()))
         with patch.object(transport, "_get_fast_channel", new=AsyncMock(return_value=channel)):
-            with pytest.raises(asyncio.CancelledError):
-                await transport.publish(_env())
+            outcome = await transport.publish(_env())
+        assert (outcome.status, outcome.reason) == (PublishStatus.UNKNOWN, "connection_lost")
         assert transport.publishes_in_flight == 0
 
 

@@ -69,6 +69,15 @@ _REUSABLE_STATUSES = frozenset(
 _BROKER_ANSWERS = frozenset({PublishStatus.CONFIRMED, PublishStatus.NACKED, PublishStatus.RETURNED})
 
 
+def _really_cancelled() -> bool:
+    """True when the running task is being cancelled (``Task.cancel``, a
+    timeout, a task group), so a ``CancelledError`` must propagate. False for
+    one raised by a closed channel's pending futures in a task nobody
+    cancelled."""
+    task = asyncio.current_task()
+    return task is None or task.cancelling() > 0
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     """True if *exc* looks like a dead connection/channel, not a message- or
     broker-decision-level failure (item 6). Reuses the same tuple
@@ -1062,8 +1071,10 @@ class AsyncTransportImpl:
                 envelope.routing_key,
             )
             return self._outcome(envelope, PublishStatus.NACKED, PublishReason.NACKED, e)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as e:
+            if _really_cancelled():
+                raise
+            return self._closed_under_publish(envelope, e)
         except Exception as e:
             return self._classify_publish_failure(e, envelope, exclusive=exclusive)
         delivery = getattr(result, "delivery", None)
@@ -1136,6 +1147,17 @@ class AsyncTransportImpl:
             return self._unknown(envelope, reason, exc)
         logger.error("Async publish failed: %s", exc)
         return self._outcome(envelope, PublishStatus.ERROR, PublishReason.PUBLISH_ERROR, exc)
+
+    def _closed_under_publish(self, envelope: MessageEnvelope, exc: asyncio.CancelledError) -> PublishOutcome:
+        """``exchange.publish`` raised ``CancelledError`` although this task is
+        not being cancelled: aiormq fails the confirms pending on a channel or
+        connection it closes with its default close reason, ``CancelledError``
+        (a replaced publisher connection, a channel closed under the publish).
+        The frames may have reached the broker: UNKNOWN, like any lost
+        connection. Raised instead, it escaped every ``except Exception`` and
+        a consumer's delivery was never settled."""
+        reason = PublishReason.SHUTDOWN if self._publish_shutdown else PublishReason.CONNECTION_LOST
+        return self._unknown(envelope, reason, exc)
 
     def _unknown(self, envelope: MessageEnvelope, reason: str, exc: BaseException) -> PublishOutcome:
         logger.warning(
@@ -1334,8 +1356,10 @@ class AsyncTransportImpl:
                 routing_key=envelope.routing_key,
                 mandatory=envelope.mandatory,
             )
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as e:
+            if _really_cancelled():
+                raise
+            outcome = self._closed_under_publish(envelope, e)
         except Exception as e:
             outcome = self._classify_publish_failure(e, envelope, exclusive=False)
         else:

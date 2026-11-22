@@ -259,6 +259,37 @@ async def test_connection_lost_after_send_is_unknown_and_never_republished(rabbi
 
 
 @pytest.mark.asyncio
+async def test_a_publisher_connection_replaced_under_held_confirms_reports_unknown(rabbit: dict[str, Any]) -> None:
+    """replacing the publisher connection (the pool's rebuild) closed it with
+    aiormq's default close reason, CancelledError: every publish still waiting
+    for its confirm RAISED CancelledError although nobody cancelled it, so a
+    consumer's ``except Exception`` let it through and its delivery was never
+    settled."""
+    from rabbitkit.core.config import PublisherConfig
+    from rabbitkit.core.types import MessageEnvelope, PublishStatus
+
+    queue = _name("replaced")
+    await _declare(rabbit["url"], queue)
+    publisher = PublisherConfig(confirm_timeout=30.0)
+    async with _broker(_config(rabbit["url"], publisher=publisher)) as broker:
+        conn_pool = broker._transport._conn_pool
+        with _dropping_confirms():
+            # 8 fit the default channel pool (10): each holds its channel until its confirm arrives
+            tasks = [
+                asyncio.create_task(broker.publish(MessageEnvelope(routing_key=queue, body=b"x"))) for _ in range(8)
+            ]
+            assert await _await_ready(rabbit["url"], queue, 8) == 8  # every frame reached the broker
+            await conn_pool._rebuild_publisher_connection(stale=conn_pool._publisher_connection)
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+
+        assert [r for r in results if isinstance(r, BaseException)] == []  # nothing raised, CancelledError least
+        assert {(r.status, r.reason) for r in results} == {(PublishStatus.UNKNOWN, "connection_lost")}
+        after = await broker.publish(MessageEnvelope(routing_key=queue, body=b"y"))
+        assert after.status is PublishStatus.CONFIRMED  # the replacement connection works
+    assert await _await_ready(rabbit["url"], queue, 9) == 9  # no hidden republish
+
+
+@pytest.mark.asyncio
 async def test_missing_exchange_is_an_error_published_once(rabbit: dict[str, Any]) -> None:
     """a 404 was treated as a connection error: retried once (two
     publishes, two channels closed), then reported as a generic ERROR."""

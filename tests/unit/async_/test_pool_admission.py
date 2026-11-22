@@ -250,6 +250,33 @@ class TestChannelPoolWaiting:
         assert pool.created_count == 0
 
     @pytest.mark.asyncio
+    async def test_an_open_after_waiting_for_a_slot_that_runs_out_is_admission(self) -> None:
+        """A call that waited for a free slot opens a channel with what is left
+        of its budget; that open timing out says nothing about the connection
+        (rebuilding the publisher connection here cancelled every publish still
+        waiting for its confirm on it)."""
+        conn = AsyncMock()
+        opens = 0
+
+        async def channel(**_: Any) -> Any:
+            nonlocal opens
+            opens += 1
+            if opens == 1:
+                return _channel()
+            await asyncio.sleep(5)  # the second open would outlast the waiter's remaining budget
+            return _channel()  # pragma: no cover
+
+        conn.channel = channel
+        pool = AsyncChannelPool(conn, pool_size=1, acquire_timeout=0.2)
+        held = await pool.acquire()
+        waiter = asyncio.create_task(pool.acquire())
+        await asyncio.sleep(0.1)  # half the budget spent waiting
+        pool.discard(held)  # a slot frees up: the waiter opens a new channel
+        with pytest.raises(ChannelPoolExhaustedError):
+            await waiter
+        assert pool.created_count == 0
+
+    @pytest.mark.asyncio
     async def test_own_open_timeout_still_raises_plain_timeout(self) -> None:
         """The pool's own channel-open bound expiring means a wedged
         connection: a plain TimeoutError, which the connection pool rebuilds on."""

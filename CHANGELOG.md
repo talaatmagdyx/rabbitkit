@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Async publish: a publish waiting for its confirm when the publisher connection was replaced
+  raised `asyncio.CancelledError`, although nobody cancelled it. aiormq fails the confirms
+  pending on a channel or connection it closes with its default close reason,
+  `CancelledError`, and the transport re-raised every `CancelledError`. Code with a correct
+  `except Exception` boundary let it through, so a consumer that publishes from its handler
+  never settled its delivery (it stayed unacknowledged until the process died or the broker's
+  `consumer_timeout`). Such a publish now returns `UNKNOWN` (`connection_lost`, or `shutdown`
+  during a stop): its frames may have reached the broker. A real cancellation of the task
+  (`Task.cancel()`, a timeout, a task group) still propagates. The retry and dead-letter
+  handoffs publish through the same path, so they no longer strand a delivery either.
+- Async channel pool: a publish that waited for a free channel, then opened one with what was
+  left of its budget and ran out, raised a plain `TimeoutError`, which the connection pool takes
+  for a dead connection: it rebuilt a healthy publisher connection under load, failing every
+  publish still waiting for its confirm on it. That case is now `ChannelPoolExhaustedError`
+  (`NOT_SENT`, `admission_timeout`), like a caller's own deadline. An open that times out with
+  the pool's full open bound still raises the plain `TimeoutError` and rebuilds.
+
 ## [0.20.2] — 2026-11-03
 
 A crash of an async stream consumer replays at most `commit_every` messages again.

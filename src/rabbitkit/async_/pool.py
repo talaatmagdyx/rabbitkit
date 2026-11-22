@@ -294,6 +294,7 @@ class AsyncChannelPool:
         if self._found_closed_pending:
             self._found_closed_pending = False
             _found_closed = True
+        waited = False
         while True:
             if self._closed:
                 raise ChannelPoolClosedError("channel pool is closed")
@@ -308,7 +309,10 @@ class AsyncChannelPool:
                     f"Timed out after {budget}s waiting for a channel from the pool (pool_size={self._pool_size})."
                 )
             if self._created < self._pool_size:
-                caller_bound = timeout is not None and timeout < self._acquire_timeout
+                # The open gets less than the pool's own open bound when the caller's deadline
+                # is shorter, or when this call already spent part of its budget waiting for a
+                # slot: its timeout then says nothing about the connection.
+                caller_bound = waited or (timeout is not None and timeout < self._acquire_timeout)
                 return await self._open_channel(remaining, rebuilt=_found_closed, caller_bound=caller_bound)
             self._log_exhausted()
             fut: asyncio.Future[None] = loop.create_future()
@@ -329,6 +333,7 @@ class AsyncChannelPool:
                         f"Timed out after {budget}s waiting for a channel from the pool (pool_size={self._pool_size})."
                     ) from None
                 raise
+            waited = True
 
     async def _open_channel(self, remaining: float, *, rebuilt: bool, caller_bound: bool) -> Any:
         # perf-M-2: reserve the slot synchronously, open the channel (network
@@ -349,8 +354,9 @@ class AsyncChannelPool:
             self._created = max(0, self._created - 1)
             self._wake_one()
             if caller_bound and isinstance(exc, TimeoutError):
-                # The CALLER's deadline ran out, not the connection: admission
-                # timeout, which must not trigger a connection rebuild.
+                # The CALLER's deadline ran out (or what was left of it after
+                # waiting for a slot), not the connection: admission timeout,
+                # which must not trigger a connection rebuild.
                 raise ChannelPoolExhaustedError("publish deadline expired while opening a channel") from exc
             raise
         if self._closed:

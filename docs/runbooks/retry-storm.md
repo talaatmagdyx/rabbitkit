@@ -10,8 +10,9 @@ queue are retried, or `rabbitkit_retry_handoff_paused == 1`.
 - `retry_handoff_paused == 1`: the retry publish to the delay queue fails
   (`rabbitkit_retry_handoff_failures_total`), so the handoff backs off and
   messages are requeued on the source queue instead of moving forward.
-  After the outage it returns to 0 within `recovery_deadline + backoff_max`
-  (330 s by default) of the last handoff failure, or at once on a confirmed
+  After the outage it returns to 0 about `recovery_deadline + backoff_max`
+  (330 s by default) plus one metrics sample (up to 5 s) after the last
+  handoff failure, or at once on a confirmed
   handoff, so the alert resolves on its own (rabbitkit 0.20.4 or later).
 
 ## Triage

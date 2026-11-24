@@ -16,10 +16,13 @@ exponential backoff with jitter per consecutive failure and reports
 an owner can stop the consumer and let the broker redeliver.
 
 A streak ends on a handoff success, or once no handoff failure has happened
-for ``recovery_deadline + backoff_max`` (the *quiet period*). A route whose
-delay queue is still broken keeps failing well inside that window (the
-middleware holds a failing delivery at most ``backoff_max``, then the broker
-redelivers it), so its streak keeps growing to ``EXHAUSTED``. A route that
+for ``recovery_deadline + backoff_max`` (the *quiet period*). A delivery
+that keeps failing against a broken delay queue fails again well inside that
+window (the middleware holds it at most ``backoff_max``, then the broker
+redelivers it), so its streak keeps growing to ``EXHAUSTED``. Sparse failures
+(further apart than the quiet period, each redelivery succeeding in its
+handler) each start a new streak: the streak reflects current handoff
+failures, not the health of the delay queue. A route that
 recovered and then handled its deliveries without a new handoff is healthy
 again after the quiet period, instead of staying paused (and turning
 ``EXHAUSTED`` by time alone) until its next handoff.

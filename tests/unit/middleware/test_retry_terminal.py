@@ -451,6 +451,29 @@ class TestHandoffBrake:
         assert _calls(msg) == [("nack", True)]
 
     @pytest.mark.asyncio
+    async def test_cancelled_backoff_on_a_dead_channel_still_propagates_the_cancellation(self) -> None:
+        """The connection is lost during the hold: the client cancels the task and the nack fails on
+        the closed channel. The broker requeues the delivery when the channel closes; the
+        cancellation must still reach the caller (it used to be replaced by the nack's error)."""
+        rec = _Recorder(PublishStatus.RETURNED)
+        mw = _mw(rec, handoff=RetryHandoffConfig(jitter=0.0, backoff_initial=30.0, backoff_max=30.0))
+        msg = _message()
+        attempts: list[bool] = []
+
+        async def dead_channel_nack(rq: bool) -> None:
+            attempts.append(rq)
+            raise RuntimeError("channel is closed")
+
+        msg._nack_async_fn = dead_channel_nack
+        task = asyncio.ensure_future(mw._route_to_delay_queue_async(msg, 0, ConnectionError("x")))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await task
+        assert attempts == [True]  # the requeue was attempted once
+
+    @pytest.mark.asyncio
     async def test_exhausted_holds_for_backoff_max_and_logs_critical_once(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

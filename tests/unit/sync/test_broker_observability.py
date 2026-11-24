@@ -190,6 +190,38 @@ class TestRetryHandoffPaused:
             broker._sample_metrics_throttled()  # throttled, and the route is failing again anyway
         assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 1.0
 
+    def test_the_io_tick_clears_an_idle_route_without_a_metrics_middleware(self) -> None:
+        """A RetryMiddleware with its own collector and no MetricsMiddleware anywhere: the broker
+        has no broker metrics, yet the I/O tick still clears the idle route (async parity)."""
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.retry_handoff import RetryHandoffTracker
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        collector = RecordingCollector()
+        broker = SyncBroker()
+        broker._transport = _transport()
+        assert broker._broker_metrics is None
+        now = [0.0]
+        retry = RetryConfig(max_retries=1, delays=(1,))
+        mw = RetryMiddleware(
+            retry,
+            publish_fn=MagicMock(return_value=PublishOutcome(status=PublishStatus.NACKED)),
+            metrics_collector=collector,
+            metrics_config=_CFG,
+            handoff_tracker=RetryHandoffTracker(retry.handoff, clock=lambda: now[0]),
+        )
+
+        @broker.subscriber(queue="orders", retry=retry, middlewares=[mw])
+        def handle(body: bytes) -> None:
+            pass
+
+        self._fail_a_handoff(mw)
+        assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 1.0
+        now[0] += 330.0
+        with patch("rabbitkit.sync.broker.time.monotonic", return_value=100.0):
+            broker._sample_metrics_throttled()
+        assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 0.0
+
     def test_stop_sets_the_gauge_to_0(self) -> None:
         collector = RecordingCollector()
         broker = SyncBroker(middlewares=[MetricsMiddleware(collector)])

@@ -339,7 +339,8 @@ class RetryMiddleware(BaseMiddleware):
             # Hold every failing delivery for the full backoff_max: with
             # prefetch N this caps the route at N handler runs per
             # backoff_max — effectively pausing the queue — until a handoff
-            # succeeds again (record_success resets the streak).
+            # succeeds again (record_success resets the streak), or the
+            # quiet period passes with no handoff failure.
             backoff = self._handoff.config.backoff_max
             if not self._exhausted_logged:
                 self._exhausted_logged = True
@@ -765,10 +766,24 @@ class RetryMiddleware(BaseMiddleware):
             try:
                 if self._sleep_on_handoff_failure and backoff > 0 and not message.is_settled:
                     await asyncio.sleep(backoff)
-            finally:
-                # Delay-queue publish failed — DO NOT ack (see sync variant).
+            except asyncio.CancelledError:
+                # Cancelled during the hold: by stop() (the channel is open, the nack requeues it)
+                # or by the client after a lost connection (the nack fails on the closed channel
+                # and the broker requeues the delivery when the channel closes). Either way the
+                # cancellation propagates; a failed nack must not replace it.
                 if not message.is_settled:
-                    await message.nack_async(requeue=True)
+                    try:
+                        await message.nack_async(requeue=True)
+                    except Exception:  # dead channel: the broker requeues the delivery on close
+                        logger.warning(
+                            "Requeue after a cancelled retry hold failed (channel gone); the broker "
+                            "requeues the delivery when the channel closes",
+                            exc_info=True,
+                        )
+                raise
+            # Delay-queue publish failed — DO NOT ack (see sync variant).
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
             return
 
         if not message.is_settled:

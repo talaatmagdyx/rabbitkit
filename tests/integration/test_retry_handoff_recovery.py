@@ -306,7 +306,7 @@ async def test_async_gauge_stays_1_while_the_retry_topology_stays_broken(rabbit:
                 samples.append(collector.paused(q))
                 await asyncio.sleep(0.05)
             assert samples and set(samples) == {1.0}, sorted(set(map(str, samples)))
-            assert len(succeeded) == good  # the other deliveries kept flowing
+            await _until(lambda: len(succeeded) == good, 20, "the successful deliveries")  # kept flowing
             assert mw.handoff_tracker.is_exhausted
             await asyncio.to_thread(_assert_held_not_lost, rabbit, q, 1, 1)
     finally:

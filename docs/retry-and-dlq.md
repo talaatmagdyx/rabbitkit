@@ -45,9 +45,12 @@ retry = RetryConfig.exponential(max_retries=5, initial_delay=2, multiplier=3, ma
 # delays == (2, 6, 18, 54, 162)
 ```
 
-There is no immediate-retry mode: every retry waits in a delay queue, and a
-failed handoff to the delay queue is braked before the message can come back
-(see *Handoff failures* below), so a failure can never spin the handler.
+There is no immediate-retry mode: every retry waits in a delay queue. On the
+async broker a failed handoff to the delay queue is braked before the message
+can come back (see *Handoff failures* below), so a failure cannot spin the
+handler. The sync broker does not sleep: a failed handoff is nacked at once and
+the delivery comes straight back, so a broken delay queue spins the handler
+(bounded by prefetch, never a loss) unless `on_handoff_failure` pauses the route.
 
 **Handler settlement signals are not failures.** `AckMessage`,
 `NackMessage` and `RejectMessage` raised by a handler pass straight through
@@ -79,9 +82,14 @@ A failure streak ends, and `retry_handoff_paused` returns to 0, in either case:
 A delivery that succeeds in its handler is not a handoff, so it never ends a
 streak by itself: with a broken delay queue, successful deliveries between
 failing ones keep the gauge at 1 and the streak still reaches `EXHAUSTED`.
-A route whose delay queue is still broken fails again well inside the quiet
-period (a failing delivery is held at most `backoff_max`, then redelivered),
-so its streak keeps growing. A later failure after a quiet period starts a
+A delivery that keeps failing against a broken delay queue fails again well
+inside the quiet period (it is held at most `backoff_max`, then redelivered),
+so its streak keeps growing. Sparse failures, further apart than the quiet
+period with each redelivery succeeding in its handler, each start a new streak
+and never reach `EXHAUSTED`: the gauge reflects current handoff failures, not
+the health of the delay queue. Alert on
+`increase(rabbitkit_retry_handoff_failures_total[15m]) > 0` to catch a broken
+delay queue under sparse traffic. A later failure after a quiet period starts a
 new streak at `backoff_initial`; it is not `EXHAUSTED` at once. `stop()` sets
 the gauge to 0 for its routes and keeps the streak.
 

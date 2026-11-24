@@ -59,7 +59,7 @@ state also updates the moment a connection drops or comes back.
 | `rabbitkit_messages_retried_total` | counter | `queue`, `category` | RetryMiddleware | Failures handed to a retry delay queue. |
 | `rabbitkit_messages_dead_lettered_total` | counter | `queue`, `category` | RetryMiddleware | Terminal failures sent to the DLQ. |
 | `rabbitkit_retry_handoff_failures_total` | counter | `queue` | RetryMiddleware | Retry/DLQ copy publishes that failed. |
-| `rabbitkit_retry_handoff_paused` | gauge | `queue` | RetryMiddleware | 1 while a route's retry handoff is backing off. |
+| `rabbitkit_retry_handoff_paused` | gauge | `queue` | RetryMiddleware | 1 while a route's retry handoff failure streak lasts: it stays 1 for at least the quiet period (`recovery_deadline + backoff_max`, 330 s by default, plus up to one 5 s sample) after any handoff failure, so an alert on it should hold longer than that. |
 | `rabbitkit_dedup_fallback_total` | counter | `queue` | DeduplicationMiddleware | Messages processed despite a Redis error. |
 | `rabbitkit_rate_limit_dropped_total` | counter | `reason` | RateLimitMiddleware | Messages settled without running the handler. |
 | `rabbitkit_consumer_cancelled_total` | counter | `queue` | broker (BrokerMetrics) | Consumers the broker cancelled (basic.cancel). |

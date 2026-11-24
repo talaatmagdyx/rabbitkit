@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.4] — 2026-11-24 (proposed, not released)
+## [0.20.4] — 2026-11-24
 
 `retry_handoff_paused` returns to 0 once a route's retry handoff failures stop, and a handoff
 failure long after a recovered outage starts a new streak instead of being EXHAUSTED at once.

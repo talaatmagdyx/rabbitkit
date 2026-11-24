@@ -601,6 +601,9 @@ class RetryHandoffConfig:
     * ``max_consecutive_failures`` and ``recovery_deadline`` define when the
       tracker reports ``exhausted`` so an owner can stop the consumer and
       let the broker redeliver instead of spinning.
+    * A failure streak ends on a confirmed handoff, or after
+      ``recovery_deadline + backoff_max`` without a handoff failure (the
+      quiet period); ``retry_handoff_paused`` then returns to 0.
     """
 
     backoff_initial: float = 0.5

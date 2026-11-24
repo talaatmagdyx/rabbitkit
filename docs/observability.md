@@ -58,8 +58,8 @@ state also updates the moment a connection drops or comes back.
 | `rabbitkit_settlement_outcome_unknown_total` | counter | `queue` | MetricsMiddleware | Settlements whose frame may not have reached the broker (redelivery possible). |
 | `rabbitkit_messages_retried_total` | counter | `queue`, `category` | RetryMiddleware | Failures handed to a retry delay queue. |
 | `rabbitkit_messages_dead_lettered_total` | counter | `queue`, `category` | RetryMiddleware | Terminal failures sent to the DLQ. |
-| `rabbitkit_retry_handoff_failures_total` | counter | `queue` | RetryMiddleware | Retry/DLQ copy publishes that failed. |
-| `rabbitkit_retry_handoff_paused` | gauge | `queue` | RetryMiddleware | 1 while a route's retry handoff is backing off. |
+| `rabbitkit_retry_handoff_failures_total` | counter | `queue` | RetryMiddleware | Failed delay-queue publishes (not DLQ copies). |
+| `rabbitkit_retry_handoff_paused` | gauge | `queue` | RetryMiddleware | 1 while a route's retry handoff failure streak lasts: it stays 1 for at least the quiet period (`recovery_deadline + backoff_max`, 330 s by default, plus up to one 5 s sample) after any handoff failure, so an alert on it should hold longer than that. |
 | `rabbitkit_dedup_fallback_total` | counter | `queue` | DeduplicationMiddleware | Messages processed despite a Redis error. |
 | `rabbitkit_rate_limit_dropped_total` | counter | `reason` | RateLimitMiddleware | Messages settled without running the handler. |
 | `rabbitkit_consumer_cancelled_total` | counter | `queue` | broker (BrokerMetrics) | Consumers the broker cancelled (basic.cancel). |
@@ -251,7 +251,10 @@ Alerting guidance:
 - **`retry_handoff_failures_total` rising / `retry_handoff_paused == 1`** —
   the delay-queue topology is unreachable (deleted queue, DLX policy
   mismatch, connection flapping). Messages are being nack-requeued, not
-  lost, but nothing is progressing.
+  lost, but nothing is progressing. The gauge returns to 0 on the next
+  confirmed handoff, or once the route has had no handoff failure for
+  `recovery_deadline + backoff_max` (330 s by default), and on `stop()`; see
+  [Handoff failures](retry-and-dlq.md#handoff-failures).
 - **`settlement_items_total{status="stale"}`** — deferred acks are
   outliving their channel (reconnects under MANUAL/batch-commit consumers).
   Shorten the batch window or ack sooner.

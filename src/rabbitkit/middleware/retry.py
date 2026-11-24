@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
 import warnings
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -256,6 +257,15 @@ class RetryMiddleware(BaseMiddleware):
         # instead so the owner can pause admission.
         self._sleep_on_handoff_failure = sleep_on_handoff_failure
         self._exhausted_logged = False
+        # retry_handoff_paused bookkeeping. The queues whose gauge this
+        # middleware set to 1 (bounded: the broker stamps the route's own
+        # queue name on every delivery, so one entry per route it serves),
+        # and whether a failure streak is open. Guarded by _paused_lock: sync
+        # routes record failures on worker threads while the broker refreshes
+        # the gauge from its I/O thread.
+        self._paused_lock = threading.Lock()
+        self._paused_queues: set[str] = set()
+        self._streak_open = False
         # predicates run first (True=transient, False=permanent, None=defer to the
         # built-in type tuples, then unknown_policy). Lets callers classify by
         # something other than exception type (e.g. an HTTP status attribute).
@@ -322,14 +332,15 @@ class RetryMiddleware(BaseMiddleware):
         backoff = self._handoff.record_failure()
         if self._metrics_config is not None:
             self._record_metric(self._metrics_config.retry_handoff_failures_total, message)
-            self._set_paused_gauge(message, 1.0)
+        self._mark_paused(message)
         state = self._handoff.state
         if state is HandoffState.EXHAUSTED:
             # Exhausted = the destination has been broken for a long time.
             # Hold every failing delivery for the full backoff_max: with
             # prefetch N this caps the route at N handler runs per
             # backoff_max — effectively pausing the queue — until a handoff
-            # succeeds again (record_success resets the streak).
+            # succeeds again (record_success resets the streak), or the
+            # quiet period passes with no handoff failure.
             backoff = self._handoff.config.backoff_max
             if not self._exhausted_logged:
                 self._exhausted_logged = True
@@ -362,22 +373,96 @@ class RetryMiddleware(BaseMiddleware):
         return backoff
 
     def _record_handoff_success(self, message: RabbitMessage) -> None:
-        was_paused = self._handoff.is_paused
         self._handoff.record_success()
-        if self._exhausted_logged:
-            self._exhausted_logged = False
+        ended, was_exhausted = self._end_streak_if_healthy()
+        if ended and was_exhausted:
             logger.warning("Retry handoff recovered: delay-queue publishes are confirmed again")
-        if was_paused and self._metrics_config is not None:
-            self._set_paused_gauge(message, 0.0)
 
-    def _set_paused_gauge(self, message: RabbitMessage, value: float) -> None:
+    # ── retry_handoff_paused ──────────────────────────────────────────────
+    #
+    # 1 from a handoff failure until the route's failure streak ends: on a
+    # confirmed handoff, or once the tracker's quiet period (recovery_deadline
+    # + backoff_max) has passed without a handoff failure. The quiet period is
+    # noticed by the next delivery of the route or by the broker's periodic
+    # refresh (refresh_handoff_paused), whichever comes first. A delivery that
+    # merely succeeds in its handler is not a handoff and proves nothing about
+    # the delay queue, so it never clears the gauge on its own.
+
+    @staticmethod
+    def _paused_queue(message: RabbitMessage) -> str:
+        return str(message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown")
+
+    def _write_paused_gauge(self, queue: str, value: float) -> bool:
+        """Write the gauge; False when there is no collector with ``set_gauge``."""
         if self._metrics_collector is None or self._metrics_config is None:
-            return
+            return False
         set_gauge = getattr(self._metrics_collector, "set_gauge", None)
         if set_gauge is None:
+            return False
+        set_gauge(self._metrics_config.retry_handoff_paused, {"queue": queue}, value)
+        return True
+
+    def _set_paused_gauge(self, message: RabbitMessage, value: float) -> None:
+        self._write_paused_gauge(self._paused_queue(message), value)
+
+    def _mark_paused(self, message: RabbitMessage) -> None:
+        queue = self._paused_queue(message)
+        with self._paused_lock:
+            self._streak_open = True
+            if self._write_paused_gauge(queue, 1.0):
+                self._paused_queues.add(queue)
+
+    def _zero_paused_locked(self) -> None:
+        for queue in sorted(self._paused_queues):
+            self._write_paused_gauge(queue, 0.0)
+        self._paused_queues.clear()
+
+    def _end_streak_if_healthy(self) -> tuple[bool, bool]:
+        """Once the tracker's streak is over: gauge to 0, EXHAUSTED alarm re-armed.
+
+        Returns ``(ended, was_exhausted)``. Checked under the lock against the
+        tracker's live state, so a failure recorded concurrently (another
+        worker thread) keeps the gauge at 1.
+        """
+        with self._paused_lock:
+            if not self._streak_open or self._handoff.is_paused:
+                return False, False
+            self._streak_open = False
+            self._zero_paused_locked()
+            was_exhausted, self._exhausted_logged = self._exhausted_logged, False
+        return True, was_exhausted
+
+    def refresh_handoff_paused(self) -> None:
+        """Clear ``retry_handoff_paused`` when the failure streak has ended.
+
+        The route's deliveries call this, and so does the broker's periodic
+        metrics sample (about every 5 s), so an idle route that recovered is
+        cleared too. A route whose handoffs are still failing stays at 1.
+        Cheap no-op without an open streak.
+        """
+        if not self._streak_open:
             return
-        queue = message.headers.get("x-rabbitkit-original-queue") or message.routing_key or "unknown"
-        set_gauge(self._metrics_config.retry_handoff_paused, {"queue": str(queue)}, value)
+        ended, was_exhausted = self._end_streak_if_healthy()
+        if ended:
+            (logger.warning if was_exhausted else logger.info)(
+                "Retry handoff no longer paused: no handoff failure for %.0fs (recovery_deadline + backoff_max); "
+                "the failure streak is over",
+                self._handoff.quiet_period,
+            )
+
+    def _refresh_paused_before_delivery(self) -> None:
+        try:
+            self.refresh_handoff_paused()
+        except Exception:  # a metrics failure must never fail the delivery itself
+            logger.warning("Refreshing retry_handoff_paused failed", exc_info=True)
+
+    def clear_handoff_paused(self) -> None:
+        """Set ``retry_handoff_paused`` to 0 for every queue this middleware
+        paused: the route stopped, so nothing is backing off. The broker calls
+        it from ``stop()``. The failure streak itself is kept; a failure after
+        a restart sets the gauge to 1 again."""
+        with self._paused_lock:
+            self._zero_paused_locked()
 
     def consume_scope(
         self,
@@ -400,6 +485,8 @@ class RetryMiddleware(BaseMiddleware):
         untouched whatever the classifier, predicates or ``unknown_policy``
         say, so the pipeline settles exactly as the handler asked (R-D1).
         """
+        if self._streak_open:
+            self._refresh_paused_before_delivery()
         try:
             return call_next(message)
         except _SETTLEMENT_SIGNALS:
@@ -416,6 +503,8 @@ class RetryMiddleware(BaseMiddleware):
         """Async retry scope. See :meth:`consume_scope` (H8) for why this
         returns ``REQUEUED_FOR_RETRY`` rather than ``None``, and why
         settlement signals pass through."""
+        if self._streak_open:
+            self._refresh_paused_before_delivery()
         try:
             return await call_next(message)
         except _SETTLEMENT_SIGNALS:
@@ -672,15 +761,31 @@ class RetryMiddleware(BaseMiddleware):
             # prefetch, a copy of the same failure — straight back; sleeping
             # after the nack (the old order) let the redelivery run in
             # parallel, ~930 handler executions/s against a deleted delay
-            # queue. The sleep is bounded (backoff_max) and cancellable; the
-            # nack runs in ``finally`` so shutdown still requeues it.
+            # queue. The sleep is bounded (backoff_max) and cancellable: a
+            # cancellation (stop(), processing_timeout, or the client after a
+            # lost connection) requeues it in the except branch and propagates;
+            # otherwise the nack after the sleep requeues it.
             try:
                 if self._sleep_on_handoff_failure and backoff > 0 and not message.is_settled:
                     await asyncio.sleep(backoff)
-            finally:
-                # Delay-queue publish failed — DO NOT ack (see sync variant).
+            except asyncio.CancelledError:
+                # Cancelled during the hold: by stop() (the channel is open, the nack requeues it)
+                # or by the client after a lost connection (the nack fails on the closed channel
+                # and the broker requeues the delivery when the channel closes). Either way the
+                # cancellation propagates; a failed nack must not replace it.
                 if not message.is_settled:
-                    await message.nack_async(requeue=True)
+                    try:
+                        await message.nack_async(requeue=True)
+                    except Exception:  # dead channel: the broker requeues the delivery on close
+                        logger.warning(
+                            "Requeue after a cancelled retry hold failed (channel gone); the broker "
+                            "requeues the delivery when the channel closes",
+                            exc_info=True,
+                        )
+                raise
+            # Delay-queue publish failed — DO NOT ack (see sync variant).
+            if not message.is_settled:
+                await message.nack_async(requeue=True)
             return
 
         if not message.is_settled:
@@ -860,6 +965,27 @@ class RetryMiddleware(BaseMiddleware):
             sanitized.summary or "<omitted>",
         )
         raise exc
+
+
+def refresh_retry_handoff_paused(routes: Iterable[Any], *, stopped: bool = False) -> None:
+    """Broker hook: refresh ``retry_handoff_paused`` for every
+    :class:`RetryMiddleware` on *routes* (:meth:`RetryMiddleware.refresh_handoff_paused`),
+    or set it to 0 when the broker stopped (:meth:`RetryMiddleware.clear_handoff_paused`).
+
+    Never raises: it runs from the async heartbeat, the sync I/O tick and
+    ``stop()``, none of which a metrics failure may break.
+    """
+    for route in routes:
+        for mw in route.route_middlewares:
+            if not isinstance(mw, RetryMiddleware):
+                continue
+            try:
+                if stopped:
+                    mw.clear_handoff_paused()
+                else:
+                    mw.refresh_handoff_paused()
+            except Exception:  # a metrics refresh must never break the heartbeat or stop()
+                logger.warning("Refreshing retry_handoff_paused failed", exc_info=True)
 
 
 def dlq_queue_definition(

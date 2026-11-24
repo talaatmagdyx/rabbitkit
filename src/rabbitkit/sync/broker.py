@@ -63,7 +63,7 @@ from rabbitkit.core.types import (
 )
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.metrics import BrokerMetrics
-from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
+from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition, refresh_retry_handoff_paused
 from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
 from rabbitkit.sync.deadlines import LateSettlementError, SyncDeadlines
@@ -545,6 +545,8 @@ class SyncBroker:
             self._transport.disconnect()
 
         self._started = False
+        # Stopped routes are not backing off: retry_handoff_paused goes to 0.
+        refresh_retry_handoff_paused(self._registry.routes, stopped=True)
         self._set_lifecycle_gauges(connected=False)
         logger.info("SyncBroker stopped")
 
@@ -846,18 +848,26 @@ class SyncBroker:
     _METRICS_SAMPLE_INTERVAL: float = 5.0
 
     def _sample_metrics_throttled(self) -> None:
-        """I/O-tick hook: sample at most every ``_METRICS_SAMPLE_INTERVAL``."""
-        if self._broker_metrics is None:
-            return
+        """I/O-tick hook: sample at most every ``_METRICS_SAMPLE_INTERVAL``. The retry-handoff
+        gauge is refreshed on the same tick even without broker metrics: a ``RetryMiddleware``
+        may carry its own collector (no ``MetricsMiddleware``), and an idle route must still be
+        cleared (the async heartbeat does the same)."""
         now = time.monotonic()
-        if now - self._metrics_sampled_at >= self._METRICS_SAMPLE_INTERVAL:
-            self._metrics_sampled_at = now
-            self._sample_metrics()
+        if now - self._metrics_sampled_at < self._METRICS_SAMPLE_INTERVAL:
+            return
+        self._metrics_sampled_at = now
+        if self._broker_metrics is None:
+            refresh_retry_handoff_paused(self._registry.routes)
+            return
+        self._sample_metrics()
 
     def _sample_metrics(self) -> None:
         """Refresh the sampled broker gauges: connection state, open
         channels, publishes and bytes in flight, blocked state, per-route
         consuming, worker-pool backlog."""
+        # retry_handoff_paused of a route whose handoff failure streak ended,
+        # idle routes included (never raises).
+        refresh_retry_handoff_paused(self._registry.routes)
         metrics, transport = self._broker_metrics, self._transport
         if metrics is None or transport is None:
             return

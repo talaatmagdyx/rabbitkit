@@ -141,3 +141,80 @@ class TestBackoffNeverOverflows:
         delays = [t.record_failure() for _ in range(1_100)]
         assert all(0 < d <= t.config.backoff_max for d in delays)
         assert delays[-1] == t.config.backoff_max * (1 - t.config.jitter + 2 * t.config.jitter * 0.5)
+
+
+class TestStreakEndsAfterAQuietPeriod:
+    """A failure streak ends after ``recovery_deadline + backoff_max`` with no
+    handoff failure, not only on a handoff success (0.20.4).
+
+    Before, a route that recovered and then only handled deliveries
+    successfully (no further handoff) kept its streak forever: it stayed
+    paused, turned EXHAUSTED by time alone, and its next handoff failure,
+    hours later, was EXHAUSTED at once.
+    """
+
+    def test_streak_is_cleared_once_the_quiet_period_has_passed(self) -> None:
+        t, clock = _tracker(backoff_max=30.0, recovery_deadline=300.0, jitter=0.0)
+        for _ in range(3):
+            t.record_failure()
+        clock.t += 329.0  # 1 s short of recovery_deadline + backoff_max after the last failure
+        assert t.is_paused
+        clock.t += 1.0
+        assert t.state is HandoffState.HEALTHY
+        assert not t.is_paused and not t.is_exhausted
+        assert t.consecutive_failures == 0
+        assert t.first_failure_at is None and t.last_backoff == 0.0
+        assert t.total_failures == 3  # lifetime count is kept
+
+    def test_a_failure_long_after_a_short_streak_starts_a_new_streak(self) -> None:
+        t, clock = _tracker(max_consecutive_failures=100, recovery_deadline=300.0, jitter=0.0)
+        for _ in range(3):
+            t.record_failure()
+        clock.t += 3600.0
+        assert t.record_failure() == t.config.backoff_initial
+        assert t.state is HandoffState.DEGRADED  # was EXHAUSTED by "deadline" at once
+        assert t.consecutive_failures == 1
+        assert t.first_failure_at == clock.t
+
+    def test_a_failure_long_after_an_exhausted_streak_is_not_exhausted(self) -> None:
+        t, clock = _tracker(max_consecutive_failures=20, jitter=0.0)
+        for _ in range(20):
+            t.record_failure()
+        assert t.is_exhausted
+        clock.t += 3600.0
+        t.record_failure()
+        assert t.state is HandoffState.DEGRADED
+        assert t.consecutive_failures == 1
+
+    def test_failures_spaced_just_below_the_quiet_period_stay_one_streak(self) -> None:
+        t, clock = _tracker(max_consecutive_failures=10**6, recovery_deadline=300.0, backoff_max=30.0, jitter=0.0)
+        backoffs: list[float] = []
+        for _ in range(5):
+            backoffs.append(t.record_failure())
+            clock.t += 329.0  # just under the 330 s quiet period
+        assert t.consecutive_failures == 5
+        assert backoffs == [0.5, 1.0, 2.0, 4.0, 8.0]  # the backoff keeps growing
+        assert t.state is HandoffState.EXHAUSTED  # 1,316 s without a handoff success
+        assert t.first_failure_at == 100.0
+
+    def test_failures_spaced_below_the_quiet_period_still_exhaust_by_count(self) -> None:
+        t, clock = _tracker(max_consecutive_failures=5, recovery_deadline=10**6, backoff_max=30.0, jitter=0.0)
+        for _ in range(4):
+            t.record_failure()
+            clock.t += 30.0
+        assert t.state is HandoffState.DEGRADED
+        t.record_failure()
+        assert t.state is HandoffState.EXHAUSTED
+        assert t.consecutive_failures == 5
+
+    def test_continuous_failures_still_exhaust_by_deadline(self) -> None:
+        t, clock = _tracker(max_consecutive_failures=10**6, recovery_deadline=300.0, backoff_max=30.0, jitter=0.0)
+        t.record_failure()
+        for _ in range(9):  # one failure per backoff_max, the EXHAUSTED hold
+            clock.t += 30.0
+            t.record_failure()
+        assert t.state is HandoffState.DEGRADED  # 270 s into the streak
+        clock.t += 30.0
+        t.record_failure()
+        assert t.state is HandoffState.EXHAUSTED  # 300 s: recovery_deadline reached
+        assert t.first_failure_at == 100.0

@@ -73,7 +73,7 @@ from rabbitkit.core.types import (
 )
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.metrics import BrokerMetrics
-from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
+from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition, refresh_retry_handoff_paused
 from rabbitkit.serialization.base import Serializer
 
 if TYPE_CHECKING:
@@ -1046,6 +1046,8 @@ class AsyncBroker:
             await self._transport.disconnect(timeout=self._remaining(deadline))
 
         self._started = False
+        # Stopped routes are not backing off: retry_handoff_paused goes to 0.
+        refresh_retry_handoff_paused(self._registry.routes, stopped=True)
         self._set_lifecycle_gauges(connected=False)
         logger.info("AsyncBroker stopped")
 
@@ -1277,6 +1279,9 @@ class AsyncBroker:
         blocked state, per-route consuming and the worker-pool backlog. Runs
         at start and on every heartbeat tick (``_HEARTBEAT_INTERVAL``), never
         on the publish or consume hot path."""
+        # retry_handoff_paused of a route whose handoff failure streak ended,
+        # idle routes included (never raises).
+        refresh_retry_handoff_paused(self._registry.routes)
         metrics, transport = self._broker_metrics, self._transport
         if metrics is None or transport is None:
             return

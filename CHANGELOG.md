@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-11-24
+
+`retry_handoff_paused` returns to 0 once a route's retry handoff failures stop, and a handoff
+failure long after a recovered outage starts a new streak instead of being EXHAUSTED at once.
+
+### Fixed
+
+- Retry handoff: `retry_handoff_paused` stayed 1 forever on a route that recovered from a retry
+  handoff outage and then handled its deliveries without a new retry; rabbitkit's own
+  `RetryStormDetected` alert fired for good. Only a confirmed delay-queue publish ended a
+  failure streak, and a delivery that succeeds in its handler is not one. A streak now also ends
+  after a quiet period of `recovery_deadline + backoff_max` (330 s by default) without a handoff
+  failure. The route's next delivery or the broker's periodic metrics sample (about every 5 s)
+  notices it, so an idle route is cleared too; `stop()` sets the gauge to 0 for its routes.
+  - The cleanup cannot hide an ongoing outage. Handler successes neither clear the gauge nor
+    reset the streak, so a broken delay queue under a mixed workload keeps the gauge at 1 and
+    still reaches `EXHAUSTED` by count or deadline. A route whose handoffs keep failing fails
+    again well inside the quiet period: a failing delivery is held at most `backoff_max`, then
+    redelivered.
+  - The same stale streak made the tracker turn `EXHAUSTED` by time alone, and the route's next
+    handoff failure, hours later, was `EXHAUSTED` at once (held `backoff_max`,
+    `on_handoff_exhausted` fired). After a quiet period it now starts a new streak at
+    `backoff_initial`, and the CRITICAL "EXHAUSTED" log line is written again for a new outage
+    (it was reset only by a confirmed handoff, so an outage that ended without one silenced it for the rest of the process).
+  - `RetryHandoffTracker.state`, `is_paused`, `consecutive_failures`, `first_failure_at` and
+    `last_backoff` report the live streak: they return to their healthy values after the quiet
+    period. `total_failures`, hook signatures, configuration and metric names are unchanged.
+  - New: `RetryHandoffTracker.quiet_period`, and `RetryMiddleware.refresh_handoff_paused()` /
+    `clear_handoff_paused()` for applications that drive a `RetryMiddleware` outside a broker.
+  - Sparse failures: handoff failures more than the quiet period apart, against a delay queue
+    that stays broken, each start a new streak and never reach `EXHAUSTED`. Watch
+    `retry_handoff_failures_total` for that case; `on_handoff_exhausted` covers continuous
+    failure.
+  - Alerting: the gauge stays 1 for at least the quiet period after any handoff failure, so an
+    alert on `retry_handoff_paused == 1` should hold longer than `recovery_deadline +
+    backoff_max` (rabbitkit's own `RetryStormDetected` uses 10 minutes).
+- Async retry hold: a task cancelled during the hold on a closed channel (the client cancels it
+  after a lost connection) lost its `CancelledError`: the requeue `nack` failed on the dead
+  channel and its error replaced the cancellation, and the pipeline logged it as an exception
+  after settlement. The cancellation now propagates; the failed requeue is logged (the broker
+  requeues the delivery when the channel closes). Delivery outcomes are unchanged.
+- Docs: the sync broker does not brake a failed handoff (`retry-and-dlq.md` said a failure can
+  never spin the handler).
+- Sync broker: the retry-handoff gauge of an idle route is refreshed on the I/O tick even when
+  the route has no `MetricsMiddleware` (a `RetryMiddleware` with its own collector), as the
+  async heartbeat already did.
+
 ## [0.20.3] — 2026-11-22
 
 An async publish never raises `CancelledError` for a connection it did not cancel, and pika 1.5 is

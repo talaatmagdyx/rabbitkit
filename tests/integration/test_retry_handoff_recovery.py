@@ -262,6 +262,59 @@ async def test_async_outage_holds_deliveries_and_the_gauge_clears_after_recovery
         _delete(rabbit, q)
 
 
+# ── async: the retry topology stays broken → the gauge stays 1 ─────────────
+
+
+@pytest.mark.asyncio
+async def test_async_gauge_stays_1_while_the_retry_topology_stays_broken(rabbit: dict[str, Any]) -> None:
+    """The retry queues refuse publishes for more than twice the quiet period.
+    One delivery keeps failing (it needs a retry it cannot get) while other
+    deliveries succeed in the handler. Sampled every 50 ms, through the
+    heartbeat refreshes and the successful deliveries, the gauge never reads 0
+    and the streak still becomes EXHAUSTED."""
+    from rabbitkit import AsyncBroker, RabbitQueue
+    from rabbitkit.middleware.metrics import MetricsMiddleware
+
+    q = _name("rk-broken")
+    collector = _Collector()
+    succeeded: list[str] = []
+    broker = AsyncBroker(_config(rabbit, prefetch=4))
+    broker._HEARTBEAT_INTERVAL = 0.2  # refresh often: it must still not clear the gauge
+
+    @broker.subscriber(RabbitQueue(q), retry=_retry(), middlewares=[MetricsMiddleware(collector)])
+    async def handle(body: bytes, message: RabbitMessage) -> None:
+        if (message.message_id or "").startswith("bad"):
+            raise TimeoutError("downstream down")
+        succeeded.append(message.message_id or "")
+
+    policy = _block_retry_queues(rabbit, q)
+    try:
+        async with asyncio.timeout(60):
+            await broker.start(install_signal_handlers=False)
+            await await_consumers(rabbit["url"], q)
+            mw = _retry_mw(broker)
+            await asyncio.to_thread(_publish, rabbit, q, ["bad-1"])
+            await _until(lambda: collector.paused(q) == 1.0, 20, "the first refused handoff")
+            samples: list[float | None] = []
+            loop = asyncio.get_running_loop()
+            end = loop.time() + 2 * QUIET + 1.0
+            good = 0
+            while loop.time() < end:
+                if good < 40:  # successful deliveries between the failing ones
+                    await asyncio.to_thread(_publish, rabbit, q, [f"good-{good}"])
+                    good += 1
+                samples.append(collector.paused(q))
+                await asyncio.sleep(0.05)
+            assert samples and set(samples) == {1.0}, sorted(set(map(str, samples)))
+            assert len(succeeded) == good  # the other deliveries kept flowing
+            assert mw.handoff_tracker.is_exhausted
+            await asyncio.to_thread(_assert_held_not_lost, rabbit, q, 1, 1)
+    finally:
+        await broker.stop()
+        _unblock(rabbit, policy)
+        _delete(rabbit, q)
+
+
 # ── async: the connection is lost while deliveries are held ────────────────
 
 

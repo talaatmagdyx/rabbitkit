@@ -852,7 +852,7 @@ _SPECS: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
     ),
     ("messages_retried_total", "counter", ("queue", "category"), _RETRY, "Failures handed to a retry delay queue."),
     ("messages_dead_lettered_total", "counter", ("queue", "category"), _RETRY, "Terminal failures sent to the DLQ."),
-    ("retry_handoff_failures_total", "counter", ("queue",), _RETRY, "Retry/DLQ copy publishes that failed."),
+    ("retry_handoff_failures_total", "counter", ("queue",), _RETRY, "Failed delay-queue publishes (not DLQ copies)."),
     ("retry_handoff_paused", "gauge", ("queue",), _RETRY, "1 while a route's retry handoff is backing off."),
     (
         "dedup_fallback_total",

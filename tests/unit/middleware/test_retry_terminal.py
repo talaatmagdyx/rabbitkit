@@ -474,6 +474,40 @@ class TestHandoffBrake:
         assert attempts == [True]  # the requeue was attempted once
 
     @pytest.mark.asyncio
+    async def test_cancelled_backoff_after_the_message_was_settled_does_not_nack_again(self) -> None:
+        rec = _Recorder(PublishStatus.RETURNED)
+        mw = _mw(rec, handoff=RetryHandoffConfig(jitter=0.0, backoff_initial=30.0, backoff_max=30.0))
+        msg = _message()
+        task = asyncio.ensure_future(mw._route_to_delay_queue_async(msg, 0, ConnectionError("x")))
+        await asyncio.sleep(0.05)
+        await msg.ack_async()  # settled elsewhere during the hold (for example by the pipeline)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await task
+        assert _calls(msg) == [("ack", None)]  # no nack after the settlement
+
+    @pytest.mark.asyncio
+    async def test_a_failed_requeue_after_a_cancelled_backoff_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rec = _Recorder(PublishStatus.RETURNED)
+        mw = _mw(rec, handoff=RetryHandoffConfig(jitter=0.0, backoff_initial=30.0, backoff_max=30.0))
+        msg = _message()
+
+        async def dead_channel_nack(rq: bool) -> None:
+            raise RuntimeError("channel is closed")
+
+        msg._nack_async_fn = dead_channel_nack
+        task = asyncio.ensure_future(mw._route_to_delay_queue_async(msg, 0, ConnectionError("x")))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with caplog.at_level("WARNING", logger="rabbitkit.middleware.retry"), pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await task
+        assert any("cancelled retry hold failed" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_exhausted_holds_for_backoff_max_and_logs_critical_once(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

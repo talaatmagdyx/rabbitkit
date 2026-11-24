@@ -761,8 +761,10 @@ class RetryMiddleware(BaseMiddleware):
             # prefetch, a copy of the same failure — straight back; sleeping
             # after the nack (the old order) let the redelivery run in
             # parallel, ~930 handler executions/s against a deleted delay
-            # queue. The sleep is bounded (backoff_max) and cancellable; the
-            # nack runs in ``finally`` so shutdown still requeues it.
+            # queue. The sleep is bounded (backoff_max) and cancellable: a
+            # cancellation (stop(), processing_timeout, or the client after a
+            # lost connection) requeues it in the except branch and propagates;
+            # otherwise the nack after the sleep requeues it.
             try:
                 if self._sleep_on_handoff_failure and backoff > 0 and not message.is_settled:
                     await asyncio.sleep(backoff)

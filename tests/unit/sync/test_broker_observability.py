@@ -222,6 +222,18 @@ class TestRetryHandoffPaused:
             broker._sample_metrics_throttled()
         assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 0.0
 
+    def test_the_io_tick_refresh_without_broker_metrics_is_throttled(self) -> None:
+        broker = SyncBroker()
+        broker._transport = _transport()
+        with (
+            patch("rabbitkit.sync.broker.refresh_retry_handoff_paused") as refresh,
+            patch("rabbitkit.sync.broker.time.monotonic", side_effect=[100.0, 101.0, 106.0]),
+        ):
+            broker._sample_metrics_throttled()
+            broker._sample_metrics_throttled()
+            broker._sample_metrics_throttled()
+        assert refresh.call_count == 2  # 100 and 106; 101 is inside the 5 s interval
+
     def test_stop_sets_the_gauge_to_0(self) -> None:
         collector = RecordingCollector()
         broker = SyncBroker(middlewares=[MetricsMiddleware(collector)])

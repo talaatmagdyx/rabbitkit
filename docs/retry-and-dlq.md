@@ -69,6 +69,26 @@ per outage; wire `on_handoff_exhausted` to stop the route if you prefer.
 The sync path never sleeps on pika's I/O thread; it reports the backoff via
 `on_handoff_failure`.
 
+A failure streak ends, and `retry_handoff_paused` returns to 0, in either case:
+
+| Event | When it is noticed |
+|---|---|
+| A retry handoff is confirmed | at once |
+| No handoff failure for `recovery_deadline + backoff_max` (330 s by default: the *quiet period*, `RetryHandoffTracker.quiet_period`) | at the route's next delivery or the broker's metrics refresh (every 5 s), so an idle route is cleared too |
+
+A delivery that succeeds in its handler is not a handoff, so it never ends a
+streak by itself: with a broken delay queue, successful deliveries between
+failing ones keep the gauge at 1 and the streak still reaches `EXHAUSTED`.
+A route whose delay queue is still broken fails again well inside the quiet
+period (a failing delivery is held at most `backoff_max`, then redelivered),
+so its streak keeps growing. A later failure after a quiet period starts a
+new streak at `backoff_initial`; it is not `EXHAUSTED` at once. `stop()` sets
+the gauge to 0 for its routes and keeps the streak.
+
+Before 0.20.4 only a confirmed handoff ended a streak: a route that recovered
+and then handled its deliveries without a new retry kept the gauge at 1
+forever, and its next handoff failure was `EXHAUSTED` immediately.
+
 ---
 
 ## Every Route Gets a Dead-Letter Path by Default

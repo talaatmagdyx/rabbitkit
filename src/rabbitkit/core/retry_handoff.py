@@ -14,6 +14,15 @@ The tracker is transport-free and clock-injectable. It computes a capped
 exponential backoff with jitter per consecutive failure and reports
 ``exhausted`` once either bound (count or wall-clock deadline) is hit so
 an owner can stop the consumer and let the broker redeliver.
+
+A streak ends on a handoff success, or once no handoff failure has happened
+for ``recovery_deadline + backoff_max`` (the *quiet period*). A route whose
+delay queue is still broken keeps failing well inside that window (the
+middleware holds a failing delivery at most ``backoff_max``, then the broker
+redelivers it), so its streak keeps growing to ``EXHAUSTED``. A route that
+recovered and then handled its deliveries without a new handoff is healthy
+again after the quiet period, instead of staying paused (and turning
+``EXHAUSTED`` by time alone) until its next handoff.
 """
 
 from __future__ import annotations
@@ -49,7 +58,9 @@ class RetryHandoffTracker:
 
     ``record_failure()`` returns the backoff (seconds) the caller should
     apply before letting the next redelivery through. ``record_success()``
-    resets the streak. The tracker never sleeps itself.
+    resets the streak; so does a quiet period of ``recovery_deadline +
+    backoff_max`` without a failure (see the module docstring). The tracker
+    never sleeps itself.
     """
 
     def __init__(
@@ -76,8 +87,15 @@ class RetryHandoffTracker:
         return self._config
 
     @property
+    def quiet_period(self) -> float:
+        """Seconds without a handoff failure after which a streak is over:
+        ``recovery_deadline + backoff_max``."""
+        return self._config.recovery_deadline + self._config.backoff_max
+
+    @property
     def consecutive_failures(self) -> int:
         with self._lock:
+            self._expire_locked(self._clock())
             return self._consecutive
 
     @property
@@ -88,11 +106,13 @@ class RetryHandoffTracker:
     @property
     def last_backoff(self) -> float:
         with self._lock:
+            self._expire_locked(self._clock())
             return self._last_backoff
 
     @property
     def first_failure_at(self) -> float | None:
         with self._lock:
+            self._expire_locked(self._clock())
             return self._first_failure_at
 
     @property
@@ -101,15 +121,27 @@ class RetryHandoffTracker:
             return self._state_locked()
 
     def _state_locked(self) -> HandoffState:
+        now = self._clock()
+        self._expire_locked(now)
         if self._consecutive == 0:
             return HandoffState.HEALTHY
         if self._consecutive >= self._config.max_consecutive_failures:
             return HandoffState.EXHAUSTED
-        if self._first_failure_at is not None and (
-            self._clock() - self._first_failure_at >= self._config.recovery_deadline
-        ):
+        if self._first_failure_at is not None and (now - self._first_failure_at >= self._config.recovery_deadline):
             return HandoffState.EXHAUSTED
         return HandoffState.DEGRADED
+
+    def _expire_locked(self, now: float) -> None:
+        """End the streak once the quiet period has passed since its last failure."""
+        last = self._last_failure_at
+        if last is not None and now - last >= self.quiet_period:
+            self._clear_streak_locked()
+
+    def _clear_streak_locked(self) -> None:
+        self._consecutive = 0
+        self._first_failure_at = None
+        self._last_failure_at = None
+        self._last_backoff = 0.0
 
     @property
     def is_exhausted(self) -> bool:
@@ -126,6 +158,7 @@ class RetryHandoffTracker:
         """Register one handoff failure; return the backoff to apply (seconds)."""
         with self._lock:
             now = self._clock()
+            self._expire_locked(now)  # a failure after a quiet period starts a new streak
             self._consecutive += 1
             self._total += 1
             if self._first_failure_at is None:
@@ -142,16 +175,10 @@ class RetryHandoffTracker:
     def record_success(self) -> None:
         """A handoff succeeded: the streak ends; the deadline clock resets."""
         with self._lock:
-            self._consecutive = 0
-            self._first_failure_at = None
-            self._last_failure_at = None
-            self._last_backoff = 0.0
+            self._clear_streak_locked()
 
     def reset(self) -> None:
         """Forget everything (e.g. after a deliberate consumer restart)."""
         with self._lock:
-            self._consecutive = 0
+            self._clear_streak_locked()
             self._total = 0
-            self._first_failure_at = None
-            self._last_failure_at = None
-            self._last_backoff = 0.0

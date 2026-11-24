@@ -63,7 +63,7 @@ from rabbitkit.core.types import (
 )
 from rabbitkit.middleware.base import BaseMiddleware
 from rabbitkit.middleware.metrics import BrokerMetrics
-from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition
+from rabbitkit.middleware.retry import RetryRouter, dlq_queue_definition, refresh_retry_handoff_paused
 from rabbitkit.serialization.base import Serializer
 from rabbitkit.sync.connection import get_connection_errors, get_infrastructure_errors
 from rabbitkit.sync.deadlines import LateSettlementError, SyncDeadlines
@@ -545,6 +545,8 @@ class SyncBroker:
             self._transport.disconnect()
 
         self._started = False
+        # Stopped routes are not backing off: retry_handoff_paused goes to 0.
+        refresh_retry_handoff_paused(self._registry.routes, stopped=True)
         self._set_lifecycle_gauges(connected=False)
         logger.info("SyncBroker stopped")
 
@@ -858,6 +860,9 @@ class SyncBroker:
         """Refresh the sampled broker gauges: connection state, open
         channels, publishes and bytes in flight, blocked state, per-route
         consuming, worker-pool backlog."""
+        # retry_handoff_paused of a route whose handoff failure streak ended,
+        # idle routes included (never raises).
+        refresh_retry_handoff_paused(self._registry.routes)
         metrics, transport = self._broker_metrics, self._transport
         if metrics is None or transport is None:
             return

@@ -251,7 +251,10 @@ Alerting guidance:
 - **`retry_handoff_failures_total` rising / `retry_handoff_paused == 1`** —
   the delay-queue topology is unreachable (deleted queue, DLX policy
   mismatch, connection flapping). Messages are being nack-requeued, not
-  lost, but nothing is progressing.
+  lost, but nothing is progressing. The gauge returns to 0 on the next
+  confirmed handoff, or once the route has had no handoff failure for
+  `recovery_deadline + backoff_max` (330 s by default), and on `stop()`; see
+  [Handoff failures](retry-and-dlq.md#handoff-failures).
 - **`settlement_items_total{status="stale"}`** — deferred acks are
   outliving their channel (reconnects under MANUAL/batch-commit consumers).
   Shorten the batch window or ack sooner.

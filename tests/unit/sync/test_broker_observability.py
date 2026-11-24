@@ -137,3 +137,71 @@ def test_lifecycle_gauges_before_the_metrics_are_wired() -> None:
     broker._set_lifecycle_gauges(connected=False)
     assert collector.gauge(_CFG.broker_connected) == 0.0
     assert collector.gauge(_CFG.connection_up, role="shared") is None
+
+
+class TestRetryHandoffPaused:
+    """``retry_handoff_paused`` follows the route's handoff failure streak
+    (0.20.4): the I/O-tick sample clears an idle route whose streak ended,
+    and stop() sets it to 0."""
+
+    @staticmethod
+    def _route(broker: SyncBroker, collector: RecordingCollector) -> tuple[Any, list[float]]:
+        from rabbitkit.core.config import RetryConfig
+        from rabbitkit.core.retry_handoff import RetryHandoffTracker
+        from rabbitkit.middleware.retry import RetryMiddleware
+
+        now = [0.0]
+        retry = RetryConfig(max_retries=1, delays=(1,))
+        mw = RetryMiddleware(
+            retry,
+            publish_fn=MagicMock(return_value=PublishOutcome(status=PublishStatus.NACKED)),
+            metrics_collector=collector,
+            metrics_config=_CFG,
+            handoff_tracker=RetryHandoffTracker(retry.handoff, clock=lambda: now[0]),
+        )
+
+        @broker.subscriber(queue="orders", retry=retry, middlewares=[mw, MetricsMiddleware(collector)])
+        def handle(body: bytes) -> None:
+            pass
+
+        return mw, now
+
+    @staticmethod
+    def _fail_a_handoff(mw: Any) -> None:
+        from rabbitkit.core.message import RabbitMessage
+
+        def fail(message: RabbitMessage) -> None:
+            raise TimeoutError("redis down")
+
+        message = RabbitMessage(body=b"{}", routing_key="orders", headers={"x-rabbitkit-original-queue": "orders"})
+        message._nack_fn = MagicMock()
+        mw.consume_scope(fail, message)
+
+    def test_the_io_tick_sample_clears_an_idle_route_after_the_quiet_period(self) -> None:
+        collector = RecordingCollector()
+        broker = _broker(collector)
+        mw, now = self._route(broker, collector)
+        self._fail_a_handoff(mw)
+        now[0] += 330.0
+        with patch("rabbitkit.sync.broker.time.monotonic", side_effect=[100.0, 101.0]):
+            broker._sample_metrics_throttled()
+            assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 0.0
+            self._fail_a_handoff(mw)
+            broker._sample_metrics_throttled()  # throttled, and the route is failing again anyway
+        assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 1.0
+
+    def test_stop_sets_the_gauge_to_0(self) -> None:
+        collector = RecordingCollector()
+        broker = SyncBroker(middlewares=[MetricsMiddleware(collector)])
+        mw, _ = self._route(broker, collector)
+        with patch("rabbitkit.sync.transport.make_pika_connection_params"):
+            with patch("pika.BlockingConnection") as connection:
+                channel = MagicMock()
+                channel.is_open = True
+                connection.return_value.channel.return_value = channel
+                connection.return_value.is_open = True
+                broker.start()
+        self._fail_a_handoff(mw)
+        assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 1.0
+        broker.stop()
+        assert collector.gauge(_CFG.retry_handoff_paused, queue="orders") == 0.0
